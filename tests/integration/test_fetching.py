@@ -23,6 +23,7 @@ async def test_http_error_status(crawler, server, code):
     with pytest.raises(HTTPStatusError) as exc_info:
         await crawler.fetch_url(str(server.make_url(f"/status/{code}")))
     assert exc_info.value.status == code
+    assert exc_info.value.url.endswith(f"/status/{code}")
 
 
 async def test_unreachable_host(crawler, closed_port_url):
@@ -52,10 +53,12 @@ async def test_total_timeout(server):
             await crawler.fetch_url(str(server.make_url("/delay/2")))
 
 
-async def test_mixed_batch_does_not_crash(crawler, server, closed_port_url):
+async def test_fetch_urls_skips_failures(crawler, server, closed_port_url):
     ok_url = str(server.make_url("/ok"))
     urls = [ok_url, str(server.make_url("/status/404")), closed_port_url]
-    assert list(await crawler.fetch_urls(urls)) == [ok_url]
+    pages = await crawler.fetch_urls(urls)
+    assert list(pages) == [ok_url]
+    assert "hello" in pages[ok_url]
 
 
 async def test_concurrent_is_faster_than_sequential(server):

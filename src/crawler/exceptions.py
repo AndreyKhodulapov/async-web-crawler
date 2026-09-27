@@ -17,8 +17,8 @@ class FetchError(Exception):
 class HTTPStatusError(FetchError):
     """The server responded with a 4xx or 5xx status code."""
 
-    def __init__(self, url: str, status: int, reason: str = "") -> None:
-        super().__init__(url, f"HTTP {status} {reason}".rstrip())
+    def __init__(self, url: str, status: int, reason: str) -> None:
+        super().__init__(url, f"HTTP {status} {reason}")
         self.status = status
 
 

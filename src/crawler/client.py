@@ -22,8 +22,6 @@ from crawler.models import FetchResult
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1"
-
 
 class AsyncCrawler:
     """Downloads web pages concurrently over a shared connection pool.
@@ -32,6 +30,8 @@ class AsyncCrawler:
 
         async with AsyncCrawler(max_concurrent=5) as crawler:
             pages = await crawler.fetch_urls(urls)
+
+    Every fetch method raises `RuntimeError` when called on a closed crawler.
     """
 
     def __init__(
@@ -41,7 +41,7 @@ class AsyncCrawler:
         total_timeout: float = 30.0,
         connect_timeout: float = 10.0,
         read_timeout: float = 20.0,
-        user_agent: str = DEFAULT_USER_AGENT,
+        user_agent: str = "AsyncWebCrawler/0.1",
     ) -> None:
         if max_concurrent < 1:
             raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
@@ -60,7 +60,6 @@ class AsyncCrawler:
             sock_read=read_timeout,
         )
         self._user_agent = user_agent
-        # Caps the number of requests in flight; extra tasks wait here.
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
@@ -89,19 +88,25 @@ class AsyncCrawler:
         result = await self.fetch_result(url)
         if result.error is not None:
             raise result.error
+        assert result.content is not None
         return result.content
 
     async def fetch_urls(self, urls: Iterable[str]) -> dict[str, str]:
         """Download pages concurrently; return bodies of successful ones only.
 
-        Failures are logged and skipped. Use :meth:`fetch_many` to inspect them.
+        Failures are logged and skipped. Use `fetch_many` to inspect them.
         """
         unique_urls = list(dict.fromkeys(urls))
         results = await self.fetch_many(unique_urls)
-        return {result.url: result.content for result in results if result.ok}
+        return {
+            result.url: result.content
+            for result in results
+            if result.content is not None
+        }
 
     async def fetch_many(self, urls: Iterable[str]) -> list[FetchResult]:
         """Download pages concurrently; return one result per URL, in order."""
+        self._ensure_open()
         # fetch_result() never raises FetchError, so one failed URL does not
         # cancel its siblings. Unexpected exceptions (bugs) still propagate.
         async with asyncio.TaskGroup() as group:
@@ -109,13 +114,8 @@ class AsyncCrawler:
         return [task.result() for task in tasks]
 
     async def fetch_result(self, url: str) -> FetchResult:
-        """Download a single page, reporting failures in the result.
-
-        Raises:
-            RuntimeError: the crawler was already closed when this was called.
-        """
-        if self._closed:
-            raise RuntimeError("AsyncCrawler is closed")
+        """Download a single page, reporting failures in the result."""
+        self._ensure_open()
         async with self._semaphore:
             logger.info("Fetching %s", url)
             started = time.perf_counter()
@@ -152,6 +152,10 @@ class AsyncCrawler:
             logger.debug("HTTP session closed")
         self._session = None
 
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("AsyncCrawler is closed")
+
     def _get_session(self) -> aiohttp.ClientSession:
         # The session is created lazily because aiohttp requires a running
         # event loop. There is no await between the check and the assignment,
@@ -161,8 +165,6 @@ class AsyncCrawler:
         return self._session
 
     def _create_session(self) -> aiohttp.ClientSession:
-        # The connector owns the connection pool: keep-alive connections are
-        # reused across requests instead of opening a new socket every time.
         # certifi ships Mozilla's CA bundle, so TLS verification works even on
         # Python builds that do not see the system certificate store.
         ssl_context = ssl.create_default_context(cafile=certifi.where())

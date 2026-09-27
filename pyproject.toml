@@ -7,3 +7,6 @@ addopts = "-m 'not network'"
 markers = [
     "network: tests that require real internet access (deselected by default)",
 ]
+
+[tool.ruff]
+line-length = 88

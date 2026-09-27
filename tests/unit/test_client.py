@@ -1,4 +1,8 @@
-"""Unit tests for AsyncCrawler with the HTTP session replaced by fakes."""
+"""Unit tests for AsyncCrawler with the HTTP session replaced by fakes.
+
+Only cases that a real server cannot reproduce live here; the happy path and
+the error mapping are covered by the integration tests.
+"""
 
 import asyncio
 from unittest.mock import MagicMock
@@ -11,7 +15,6 @@ from crawler import (
     CrawlerClosedError,
     FetchResult,
     FetchTimeoutError,
-    HTTPStatusError,
     NetworkError,
 )
 
@@ -54,9 +57,9 @@ class FakeRequest:
 class FakeSession:
     """Serves canned responses or raises canned exceptions per URL."""
 
-    def __init__(self, routes: dict | None = None, latency: float = 0.0) -> None:
-        self.routes = routes or {}
-        self.latency = latency
+    def __init__(self) -> None:
+        self.routes: dict[str, FakeResponse | BaseException] = {}
+        self.latency = 0.0
         self.closed = False
         self.in_flight = 0
         self.peak_in_flight = 0
@@ -135,6 +138,8 @@ class TestLifecycle:
         await crawler.close()
         with pytest.raises(RuntimeError, match="closed"):
             await crawler.fetch_url("http://a")
+        with pytest.raises(RuntimeError, match="closed"):
+            await crawler.fetch_many(["http://a", "http://b"])
 
     async def test_close_during_batch_fails_only_queued_urls(
         self, crawler, fake_session
@@ -142,7 +147,8 @@ class TestLifecycle:
         fake_session.latency = 0.1
         urls = [f"http://site/{i}" for i in range(5)]
         batch = asyncio.create_task(crawler.fetch_many(urls))
-        await asyncio.sleep(0.05)  # the first 3 requests are in flight
+        while fake_session.in_flight < crawler.max_concurrent:
+            await asyncio.sleep(0)
         await crawler.close()
 
         results = await batch  # must not raise
@@ -158,43 +164,18 @@ class TestLifecycle:
 
 
 class TestErrorMapping:
-    async def test_success_returns_text(self, crawler, fake_session):
-        fake_session.routes["http://a"] = FakeResponse(b"hello")
-        assert await crawler.fetch_url("http://a") == "hello"
-
-    async def test_http_error_status(self, crawler, fake_session):
-        fake_session.routes["http://a"] = FakeResponse(status=404)
-        with pytest.raises(HTTPStatusError) as exc_info:
-            await crawler.fetch_url("http://a")
-        assert exc_info.value.status == 404
-        assert exc_info.value.url == "http://a"
-
-    @pytest.mark.parametrize(
-        "exception",
-        [asyncio.TimeoutError(), aiohttp.ServerTimeoutError("read timeout")],
-        ids=["asyncio", "aiohttp"],
-    )
-    async def test_timeout(self, crawler, fake_session, exception):
+    async def test_server_timeout_is_a_timeout(self, crawler, fake_session):
         # aiohttp.ServerTimeoutError is also a ClientError: it must still be
         # reported as a timeout, not as a generic network error.
-        fake_session.routes["http://a"] = exception
+        fake_session.routes["http://a"] = aiohttp.ServerTimeoutError("read timeout")
         with pytest.raises(FetchTimeoutError):
             await crawler.fetch_url("http://a")
 
-    async def test_network_error(self, crawler, fake_session):
+    async def test_network_error_keeps_cause(self, crawler, fake_session):
         fake_session.routes["http://a"] = aiohttp.ClientConnectionError("refused")
         with pytest.raises(NetworkError, match="refused") as exc_info:
             await crawler.fetch_url("http://a")
         assert isinstance(exc_info.value.__cause__, aiohttp.ClientConnectionError)
-
-    async def test_too_many_redirects_is_network_error(self, crawler, fake_session):
-        # TooManyRedirects subclasses ClientResponseError but carries a 3xx
-        # status; it must not be reported as an HTTP error status.
-        fake_session.routes["http://a"] = aiohttp.TooManyRedirects(
-            request_info=MagicMock(), history=(MagicMock(),) * 10, status=302
-        )
-        with pytest.raises(NetworkError, match="too many redirects"):
-            await crawler.fetch_url("http://a")
 
     async def test_unexpected_exception_propagates(self, crawler, fake_session):
         fake_session.routes["http://a"] = KeyError("bug")
@@ -233,14 +214,6 @@ class TestFetchMany:
 
 
 class TestFetchUrls:
-    async def test_returns_only_successful_pages(self, crawler, fake_session):
-        fake_session.routes["http://a"] = FakeResponse(b"A")
-        fake_session.routes["http://b"] = FakeResponse(status=404)
-        fake_session.routes["http://c"] = asyncio.TimeoutError()
-        assert await crawler.fetch_urls(["http://a", "http://b", "http://c"]) == {
-            "http://a": "A"
-        }
-
     async def test_duplicates_are_fetched_once(self, crawler, fake_session):
         await crawler.fetch_urls(["http://a", "http://a", "http://b"])
         assert fake_session.requested == ["http://a", "http://b"]
