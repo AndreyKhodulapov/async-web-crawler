@@ -31,7 +31,8 @@ class AsyncCrawler:
         async with AsyncCrawler(max_concurrent=5) as crawler:
             pages = await crawler.fetch_urls(urls)
 
-    Every fetch method raises `RuntimeError` when called on a closed crawler.
+    Fetching from a closed crawler fails with `CrawlerClosedError`, reported
+    the same way as any other per-URL failure.
     """
 
     def __init__(
@@ -106,7 +107,6 @@ class AsyncCrawler:
 
     async def fetch_many(self, urls: Iterable[str]) -> list[FetchResult]:
         """Download pages concurrently; return one result per URL, in order."""
-        self._ensure_open()
         # fetch_result() never raises FetchError, so one failed URL does not
         # cancel its siblings. Unexpected exceptions (bugs) still propagate.
         async with asyncio.TaskGroup() as group:
@@ -115,7 +115,6 @@ class AsyncCrawler:
 
     async def fetch_result(self, url: str) -> FetchResult:
         """Download a single page, reporting failures in the result."""
-        self._ensure_open()
         async with self._semaphore:
             logger.info("Fetching %s", url)
             started = time.perf_counter()
@@ -147,14 +146,10 @@ class AsyncCrawler:
     async def close(self) -> None:
         """Close the underlying session. Safe to call more than once."""
         self._closed = True
-        if self._session is not None and not self._session.closed:
+        if self._session is not None:
             await self._session.close()
+            self._session = None
             logger.debug("HTTP session closed")
-        self._session = None
-
-    def _ensure_open(self) -> None:
-        if self._closed:
-            raise RuntimeError("AsyncCrawler is closed")
 
     def _get_session(self) -> aiohttp.ClientSession:
         # The session is created lazily because aiohttp requires a running
@@ -165,9 +160,11 @@ class AsyncCrawler:
         return self._session
 
     def _create_session(self) -> aiohttp.ClientSession:
-        # certifi ships Mozilla's CA bundle, so TLS verification works even on
-        # Python builds that do not see the system certificate store.
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        # certifi's CA bundle is added on top of the system store: TLS then
+        # works on Python builds without system certificates, and locally
+        # installed CAs (corporate proxies) stay trusted.
+        ssl_context = ssl.create_default_context()
+        ssl_context.load_verify_locations(cafile=certifi.where())
         connector = aiohttp.TCPConnector(
             limit=self.max_concurrent, ttl_dns_cache=300, ssl=ssl_context
         )
@@ -183,18 +180,17 @@ class AsyncCrawler:
         The size is measured after content decoding (gzip, deflate, ...),
         so it may be larger than the number of bytes sent over the network.
         """
-        # close() may have been called while this task waited for the
-        # semaphore. Report it as a per-URL failure so that the rest of a
-        # fetch_many() batch still returns results.
+        # Checked here rather than in the public methods: close() may run
+        # while this task waits for the semaphore, and a per-URL failure
+        # keeps the rest of a fetch_many() batch intact.
         if self._closed:
-            raise CrawlerClosedError(url, "crawler was closed before the request")
+            raise CrawlerClosedError(url, "crawler is closed")
         session = self._get_session()
         try:
             async with session.get(url) as response:
                 response.raise_for_status()
                 body = await response.read()
-                # Decode the bytes already in memory instead of calling
-                # response.text(), which would keep a second copy of the body.
+                # A wrong charset header should not drop the whole page.
                 text = body.decode(response.get_encoding(), errors="replace")
                 return response.status, text, len(body)
         # Order matters: TooManyRedirects is a ClientResponseError, which is a

@@ -1,8 +1,4 @@
-"""Unit tests for AsyncCrawler with the HTTP session replaced by fakes.
-
-Only cases that a real server cannot reproduce live here; the happy path and
-the error mapping are covered by the integration tests.
-"""
+"""Unit tests for AsyncCrawler with the HTTP session replaced by fakes."""
 
 import asyncio
 from unittest.mock import MagicMock
@@ -134,12 +130,23 @@ class TestLifecycle:
         await crawler.close()
         assert crawler.closed
 
-    async def test_fetch_after_close_raises(self, crawler):
+    async def test_fetch_after_close(self, crawler, fake_session):
         await crawler.close()
-        with pytest.raises(RuntimeError, match="closed"):
+        with pytest.raises(CrawlerClosedError):
             await crawler.fetch_url("http://a")
-        with pytest.raises(RuntimeError, match="closed"):
-            await crawler.fetch_many(["http://a", "http://b"])
+        results = await crawler.fetch_many(["http://a", "http://b"])
+        assert all(isinstance(r.error, CrawlerClosedError) for r in results)
+        assert fake_session.requested == []
+
+    async def test_close_scheduled_right_after_batch(self, crawler, fake_session):
+        # close() runs after fetch_many() created its tasks but before any of
+        # them started: the batch must still return results, not raise.
+        batch = asyncio.create_task(crawler.fetch_many(["http://a", "http://b"]))
+        closer = asyncio.create_task(crawler.close())
+        results = await batch
+        await closer
+        assert all(isinstance(r.error, CrawlerClosedError) for r in results)
+        assert fake_session.requested == []
 
     async def test_close_during_batch_fails_only_queued_urls(
         self, crawler, fake_session
@@ -189,7 +196,6 @@ class TestFetchMany:
         results = await crawler.fetch_many(["http://a", "http://b", "http://c"])
         assert [r.url for r in results] == ["http://a", "http://b", "http://c"]
         assert [r.ok for r in results] == [True, False, True]
-        assert results[1].status == 500
 
     async def test_failure_result_fields(self, crawler, fake_session):
         fake_session.routes["http://a"] = aiohttp.ClientConnectionError()

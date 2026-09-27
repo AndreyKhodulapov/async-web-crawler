@@ -41,14 +41,9 @@ async def test_redirect_loop(crawler, server):
         await crawler.fetch_url(str(server.make_url("/redirect-loop")))
 
 
-async def test_read_timeout(server):
-    async with AsyncCrawler(read_timeout=0.2) as crawler:
-        with pytest.raises(FetchTimeoutError):
-            await crawler.fetch_url(str(server.make_url("/delay/2")))
-
-
-async def test_total_timeout(server):
-    async with AsyncCrawler(total_timeout=0.2) as crawler:
+@pytest.mark.parametrize("timeout", ["read_timeout", "total_timeout"])
+async def test_timeout(server, timeout):
+    async with AsyncCrawler(**{timeout: 0.2}) as crawler:
         with pytest.raises(FetchTimeoutError):
             await crawler.fetch_url(str(server.make_url("/delay/2")))
 

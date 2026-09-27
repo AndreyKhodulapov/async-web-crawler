@@ -99,8 +99,9 @@ asyncio.run(main())
 
 Closing the crawler while a batch is running does not break the batch.
 Requests already in flight fail with `NetworkError`, and requests still
-waiting for a free slot fail with `CrawlerClosedError`. Calling any fetch
-method on a closed crawler raises `RuntimeError`.
+waiting for a free slot fail with `CrawlerClosedError`. Fetching from an
+already closed crawler fails the same way: `fetch_url` raises
+`CrawlerClosedError`, the other methods report it per URL.
 
 ## Tests
 

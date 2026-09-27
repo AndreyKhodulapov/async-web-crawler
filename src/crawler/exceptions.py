@@ -31,4 +31,4 @@ class FetchTimeoutError(FetchError):
 
 
 class CrawlerClosedError(FetchError):
-    """The crawler was closed while the request was waiting to start."""
+    """The crawler was closed before the request could start."""
