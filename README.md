@@ -24,7 +24,7 @@ Python 3.11+
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt        # runtime only
-pip install -r requirements-dev.txt    # runtime + test tools
+pip install -r requirements-dev.txt    # runtime + test and lint tools
 ```
 
 ## Demo
@@ -106,9 +106,14 @@ method on a closed crawler raises `RuntimeError`.
 
 ```bash
 pytest                      # unit + integration, no internet needed
-pytest tests/unit           # crawler logic with a fake HTTP session
+pytest tests/unit           # edge cases with a fake HTTP session
 pytest tests/integration    # real HTTP against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
+```
+
+```bash
+ruff format src tests       # format
+ruff check src tests        # lint
 ```
 
 ## Project structure
@@ -122,7 +127,7 @@ src/
     ├── exceptions.py       # FetchError hierarchy
     └── logging_config.py   # log format setup
 tests/
-├── unit/                   # no network: session replaced by fakes
+├── unit/                   # session replaced by fakes: closing, error mapping
 └── integration/            # local HTTP server; live tests marked `network`
 docs/
 └── asyncio_concepts.md     # notes on async concepts used here
