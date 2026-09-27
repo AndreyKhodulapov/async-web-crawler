@@ -35,6 +35,11 @@ async def test_invalid_url(crawler):
         await crawler.fetch_url("not a url")
 
 
+async def test_redirect_loop(crawler, server):
+    with pytest.raises(NetworkError, match="too many redirects"):
+        await crawler.fetch_url(str(server.make_url("/redirect-loop")))
+
+
 async def test_read_timeout(server):
     async with AsyncCrawler(read_timeout=0.2) as crawler:
         with pytest.raises(FetchTimeoutError):
@@ -69,5 +74,6 @@ async def test_concurrent_is_faster_than_sequential(server):
 
     assert len(pages) == count
     assert sequential >= delay * count
-    # Requests overlap, so the batch takes about one delay, not five.
-    assert concurrent < delay * 2
+    # Requests overlap, so the batch takes about one delay instead of five.
+    # A relative bound keeps the test stable on slow machines.
+    assert concurrent < sequential / 2

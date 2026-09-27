@@ -27,16 +27,39 @@ DEFAULT_URLS = [
 ]
 
 
+LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
+
+
+def positive(number_type: type[int] | type[float]) -> Callable[[str], int | float]:
+    """Build an argparse type that accepts only numbers greater than zero."""
+
+    def parse(raw: str) -> int | float:
+        try:
+            value = number_type(raw)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+        if value <= 0:
+            raise argparse.ArgumentTypeError(f"must be positive, got {raw}")
+        return value
+
+    return parse
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("urls", nargs="*", default=DEFAULT_URLS, help="URLs to fetch")
     parser.add_argument(
-        "--concurrency", type=int, default=10, help="max parallel requests"
+        "--concurrency", type=positive(int), default=10, help="max parallel requests"
     )
     parser.add_argument(
-        "--timeout", type=float, default=5.0, help="total timeout per request, s"
+        "--timeout",
+        type=positive(float),
+        default=5.0,
+        help="total timeout per request, s",
     )
-    parser.add_argument("--log-level", default="INFO", help="DEBUG, INFO, WARNING, ...")
+    parser.add_argument(
+        "--log-level", type=str.upper, choices=LOG_LEVELS, default="INFO"
+    )
     return parser.parse_args()
 
 
@@ -86,7 +109,7 @@ def print_report(title: str, results: list[FetchResult], total: float) -> None:
 
 async def main() -> None:
     args = parse_args()
-    setup_logging(args.log_level.upper())
+    setup_logging(args.log_level)
     urls = list(args.urls)
 
     sequential, sequential_time = await timed(run_sequential, urls, args)

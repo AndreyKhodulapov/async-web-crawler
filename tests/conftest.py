@@ -20,6 +20,10 @@ async def delay(request: web.Request) -> web.Response:
     return web.Response(text="done")
 
 
+async def redirect_loop(request: web.Request) -> web.Response:
+    raise web.HTTPFound("/redirect-loop")
+
+
 @pytest.fixture
 async def server(aiohttp_server):
     """Local HTTP server with predictable endpoints; no internet required."""
@@ -27,6 +31,7 @@ async def server(aiohttp_server):
     app.router.add_get("/ok", ok)
     app.router.add_get("/status/{code}", status)
     app.router.add_get("/delay/{seconds}", delay)
+    app.router.add_get("/redirect-loop", redirect_loop)
     return await aiohttp_server(app)
 
 

@@ -9,8 +9,9 @@ timeouts, and reports failures without stopping the rest of the batch.
 - Concurrent downloads with a configurable concurrency limit (`asyncio.Semaphore`)
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
 - Separate connect, read and total timeouts
-- Clear error types: `HTTPStatusError`, `NetworkError`, `FetchTimeoutError`
-  (all subclasses of `FetchError`)
+- Clear error types: `HTTPStatusError`, `NetworkError` (including redirect
+  loops), `FetchTimeoutError` and `CrawlerClosedError`, all subclasses of
+  `FetchError`
 - Logging for every request: start, success (status, size, time) and failure
 
 ## Requirements
@@ -65,7 +66,8 @@ Speedup: 1.9x
 ```
 
 A concurrent run takes about as long as its slowest request. In the default
-list that is the request that hits the timeout.
+list that is the request that hits the timeout. `SIZE` is the body size after
+content decoding (gzip, deflate), so it can exceed the bytes transferred.
 
 ## Usage
 
@@ -94,6 +96,11 @@ asyncio.run(main())
 | `fetch_urls(urls)` | `{url: text}` for successful pages | failed URLs are logged and skipped |
 | `fetch_many(urls)` | `list[FetchResult]` in input order | error stored per result |
 | `close()` | - | safe to call twice; called by `async with` |
+
+Closing the crawler while a batch is running does not break the batch.
+Requests already in flight fail with `NetworkError`, and requests still
+waiting for a free slot fail with `CrawlerClosedError`. Starting a new fetch
+on a closed crawler raises `RuntimeError`.
 
 ## Tests
 

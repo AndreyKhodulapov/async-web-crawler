@@ -28,3 +28,7 @@ class NetworkError(FetchError):
 
 class FetchTimeoutError(FetchError):
     """The request did not complete within the configured timeouts."""
+
+
+class CrawlerClosedError(FetchError):
+    """The crawler was closed while the request was waiting to start."""

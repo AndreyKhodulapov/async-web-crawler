@@ -8,6 +8,7 @@ import pytest
 
 from crawler import (
     AsyncCrawler,
+    CrawlerClosedError,
     FetchResult,
     FetchTimeoutError,
     HTTPStatusError,
@@ -32,8 +33,8 @@ class FakeResponse:
     async def read(self) -> bytes:
         return self._body
 
-    async def text(self, errors: str = "strict") -> str:
-        return self._body.decode("utf-8", errors=errors)
+    def get_encoding(self) -> str:
+        return "utf-8"
 
 
 class FakeRequest:
@@ -135,6 +136,21 @@ class TestLifecycle:
         with pytest.raises(RuntimeError, match="closed"):
             await crawler.fetch_url("http://a")
 
+    async def test_close_during_batch_fails_only_queued_urls(
+        self, crawler, fake_session
+    ):
+        fake_session.latency = 0.1
+        urls = [f"http://site/{i}" for i in range(5)]
+        batch = asyncio.create_task(crawler.fetch_many(urls))
+        await asyncio.sleep(0.05)  # the first 3 requests are in flight
+        await crawler.close()
+
+        results = await batch  # must not raise
+
+        assert [r.ok for r in results] == [True, True, True, False, False]
+        assert all(isinstance(r.error, CrawlerClosedError) for r in results[3:])
+        assert fake_session.requested == urls[:3]
+
     async def test_context_manager_closes_session(self, crawler, fake_session):
         async with crawler as active:
             await active.fetch_url("http://a")
@@ -170,6 +186,15 @@ class TestErrorMapping:
         with pytest.raises(NetworkError, match="refused") as exc_info:
             await crawler.fetch_url("http://a")
         assert isinstance(exc_info.value.__cause__, aiohttp.ClientConnectionError)
+
+    async def test_too_many_redirects_is_network_error(self, crawler, fake_session):
+        # TooManyRedirects subclasses ClientResponseError but carries a 3xx
+        # status; it must not be reported as an HTTP error status.
+        fake_session.routes["http://a"] = aiohttp.TooManyRedirects(
+            request_info=MagicMock(), history=(MagicMock(),) * 10, status=302
+        )
+        with pytest.raises(NetworkError, match="too many redirects"):
+            await crawler.fetch_url("http://a")
 
     async def test_unexpected_exception_propagates(self, crawler, fake_session):
         fake_session.routes["http://a"] = KeyError("bug")

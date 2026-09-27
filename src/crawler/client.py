@@ -12,6 +12,7 @@ import aiohttp
 import certifi
 
 from crawler.exceptions import (
+    CrawlerClosedError,
     FetchError,
     FetchTimeoutError,
     HTTPStatusError,
@@ -108,13 +109,18 @@ class AsyncCrawler:
         return [task.result() for task in tasks]
 
     async def fetch_result(self, url: str) -> FetchResult:
-        """Download a single page, reporting failures in the result."""
-        session = self._get_session()
+        """Download a single page, reporting failures in the result.
+
+        Raises:
+            RuntimeError: the crawler was already closed when this was called.
+        """
+        if self._closed:
+            raise RuntimeError("AsyncCrawler is closed")
         async with self._semaphore:
             logger.info("Fetching %s", url)
             started = time.perf_counter()
             try:
-                status, content, size = await self._request(session, url)
+                status, content, size = await self._request(url)
             except FetchError as error:
                 elapsed = time.perf_counter() - started
                 logger.warning(
@@ -150,8 +156,6 @@ class AsyncCrawler:
         # The session is created lazily because aiohttp requires a running
         # event loop. There is no await between the check and the assignment,
         # so concurrent tasks cannot create two sessions.
-        if self._closed:
-            raise RuntimeError("AsyncCrawler is closed")
         if self._session is None:
             self._session = self._create_session()
         return self._session
@@ -171,19 +175,31 @@ class AsyncCrawler:
             headers={"User-Agent": self._user_agent},
         )
 
-    @staticmethod
-    async def _request(
-        session: aiohttp.ClientSession, url: str
-    ) -> tuple[int, str, int]:
-        """Perform the GET request; return (status, text, size in bytes)."""
+    async def _request(self, url: str) -> tuple[int, str, int]:
+        """Perform the GET request; return (status, text, body size in bytes).
+
+        The size is measured after content decoding (gzip, deflate, ...),
+        so it may be larger than the number of bytes sent over the network.
+        """
+        # close() may have been called while this task waited for the
+        # semaphore. Report it as a per-URL failure so that the rest of a
+        # fetch_many() batch still returns results.
+        if self._closed:
+            raise CrawlerClosedError(url, "crawler was closed before the request")
+        session = self._get_session()
         try:
             async with session.get(url) as response:
                 response.raise_for_status()
                 body = await response.read()
-                text = await response.text(errors="replace")
+                # Decode the bytes already in memory instead of calling
+                # response.text(), which would keep a second copy of the body.
+                text = body.decode(response.get_encoding(), errors="replace")
                 return response.status, text, len(body)
-        # Order matters: ClientResponseError is a ClientError, and aiohttp's
-        # ServerTimeoutError is both a ClientError and a TimeoutError.
+        # Order matters: TooManyRedirects is a ClientResponseError, which is a
+        # ClientError; aiohttp's ServerTimeoutError is both a ClientError and
+        # a TimeoutError.
+        except aiohttp.TooManyRedirects as exc:
+            raise NetworkError(url, f"too many redirects ({len(exc.history)})") from exc
         except aiohttp.ClientResponseError as exc:
             raise HTTPStatusError(url, exc.status, exc.message) from exc
         except TimeoutError as exc:
