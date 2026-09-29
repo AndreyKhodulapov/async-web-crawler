@@ -2,7 +2,7 @@
 
 import pytest
 
-from crawler.urls import is_same_host, is_valid_http_url, normalize_url, resolve_url
+from crawler.urls import get_host, is_same_host, is_valid_http_url, normalize_url, resolve_url
 
 BASE = "https://example.com/docs/guide/intro.html?lang=en"
 
@@ -69,6 +69,15 @@ def test_resolve_with_invalid_base_keeps_only_absolute_links():
         ("http://./", None),
         ("http://user:pw@Example.com:8080/", "http://user:pw@example.com:8080/"),
         ("http://" + "a" * 70 + "é.com/", None),
+        # Path and query are percent-encoded as an HTTP client sends them.
+        (
+            "https://example.com/café?q=crème brûlée",
+            "https://example.com/caf%C3%A9?q=cr%C3%A8me%20br%C3%BBl%C3%A9e",
+        ),
+        ("https://example.com/caf%c3%a9", "https://example.com/caf%C3%A9"),
+        ("https://example.com/a b", "https://example.com/a%20b"),
+        ("https://example.com/a%2Fb?x=%26&y=1+2", "https://example.com/a%2Fb?x=%26&y=1+2"),
+        ("https://example.com/\ud800", None),
     ],
 )
 def test_normalize(url, expected):
@@ -109,3 +118,17 @@ def test_is_valid_http_url(url, valid):
 )
 def test_is_same_host(url, other, same):
     assert is_same_host(url, other) is same
+
+
+@pytest.mark.parametrize(
+    ("url", "host"),
+    [
+        ("https://Example.COM:8443/a", "example.com"),
+        ("https://bücher.de/", "xn--bcher-kva.de"),
+        ("http://[::1]:8080/", "::1"),
+        ("ftp://example.com/", None),
+        ("not a url", None),
+    ],
+)
+def test_get_host(url, host):
+    assert get_host(url) == host

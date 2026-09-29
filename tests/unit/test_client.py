@@ -34,6 +34,8 @@ class FakeResponse:
         self.content_type = content_type or "application/octet-stream"
         # None means "not redirected": FakeSession fills in the requested URL.
         self.url = url
+        self.history = () if url is None else (MagicMock(),)
+        self.read_count = 0
 
     def raise_for_status(self) -> None:
         if self.status >= 400:
@@ -45,6 +47,7 @@ class FakeResponse:
             )
 
     async def read(self) -> bytes:
+        self.read_count += 1
         return self._body
 
     def get_encoding(self) -> str:
@@ -115,6 +118,11 @@ class TestInit:
     def test_rejects_non_positive_concurrency(self, value):
         with pytest.raises(ValueError, match="max_concurrent"):
             AsyncCrawler(max_concurrent=value)
+
+    @pytest.mark.parametrize(("name", "value"), [("max_depth", -1), ("max_per_domain", 0)])
+    def test_rejects_invalid_crawl_limits(self, name, value):
+        with pytest.raises(ValueError, match=name):
+            AsyncCrawler(**{name: value})
 
     @pytest.mark.parametrize("name", ["total_timeout", "connect_timeout", "read_timeout"])
     def test_rejects_non_positive_timeouts(self, name):
@@ -242,12 +250,14 @@ class TestFetchMany:
         assert result.elapsed >= 0
         assert result.final_url == "http://a"
         assert result.content_type == "text/html"
+        assert result.redirected is False
 
     async def test_redirect_and_missing_content_type(self, crawler, fake_session):
         fake_session.routes["http://a"] = FakeResponse(content_type=None, url="https://a/home")
         [result] = await crawler.fetch_many(["http://a"])
         assert result.final_url == "https://a/home"
         assert result.content_type is None
+        assert result.redirected is True
 
     async def test_unexpected_error_does_not_cancel_batch(self, crawler, fake_session):
         fake_session.latency = 0.01
@@ -286,6 +296,17 @@ class TestFetchAndParse:
         fake_session.routes["http://a"] = FakeResponse(b"<h1>Hi</h1>", content_type=None)
         page = await crawler.fetch_and_parse("http://a")
         assert page["headings"] == [{"level": 1, "text": "Hi"}]
+
+    async def test_non_html_body_is_not_downloaded(self, crawler, fake_session):
+        archive = FakeResponse(b"PK\x03\x04", content_type="application/zip")
+        fake_session.routes["http://a/file.zip"] = archive
+        page = await crawler.fetch_and_parse("http://a/file.zip")
+        assert page["errors"] == ["unsupported content type: application/zip"]
+        assert archive.read_count == 0
+
+    async def test_plain_fetch_still_reads_non_html_body(self, crawler, fake_session):
+        fake_session.routes["http://a/data"] = FakeResponse(b"{}", content_type="application/json")
+        assert await crawler.fetch_url("http://a/data") == "{}"
 
     async def test_uses_injected_parser(self, monkeypatch, fake_session):
         crawler = AsyncCrawler(parser=HTMLParser(same_host_only=True))

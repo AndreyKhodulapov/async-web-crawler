@@ -44,3 +44,38 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
     "header-base64": (CAFE.encode(), "base64", "Café"),
     "header-unknown": (CAFE.encode(), "no-such-charset", "Café"),
 }
+
+
+# A small site for crawl tests, served under /site/. Depths from /site/:
+#   0  /site/
+#   1  a.html, b.html, missing.html (404), files/manual.pdf (404), the same
+#      site on another host ({other_host} becomes http://localhost:<port>)
+#   2  moved (redirects to c.html), a/deeper.html
+#   3  a/deepest.html, c.html
+# Cycles, duplicate links and self-links check that no page is fetched twice.
+# /site/exits.html is not linked from the others: it starts crawls whose
+# links redirect to another host (to-other-host) or to c.html (moved).
+# /site/names.html links to pages whose URLs need percent-encoding, one of
+# them twice: as raw text and already encoded.
+SITE_PAGES: dict[str, str] = {
+    "/site/": """
+        <title>Home</title>
+        <a href="a.html">A</a> <a href="b.html">B</a> <a href="a.html#part">A again</a>
+        <a href="missing.html">Broken</a> <a href="files/manual.pdf">Manual</a>
+        <a href="{other_host}/site/">Same site, other host</a> <a href="mailto:owner@site">Mail</a>
+    """,
+    "/site/a.html": """
+        <title>A</title><a href="/site/">Home</a> <a href="moved">Moved</a> <a href="a/deeper.html">Deeper</a>
+    """,
+    "/site/b.html": '<title>B</title><a href="a.html">A</a> <a href="b.html">Self</a>',
+    "/site/a/deeper.html": '<title>Deeper</title><a href="deepest.html">Deepest</a> <a href="../c.html">C</a>',
+    "/site/a/deepest.html": '<title>Deepest</title><a href="/site/">Home</a>',
+    "/site/c.html": "<title>C</title>",
+    "/site/exits.html": '<title>Exits</title><a href="to-other-host">Sign in</a> <a href="moved">Moved</a>',
+    "/site/names.html": """
+        <title>Names</title>
+        <a href="café.html">Raw</a> <a href="caf%C3%A9.html">Encoded</a> <a href="a b.html">Space</a>
+    """,
+    "/site/café.html": "<title>Café</title>",
+    "/site/a b.html": "<title>Space</title>",
+}
