@@ -10,8 +10,8 @@ from crawler.exceptions import (
     NetworkError,
     UnexpectedError,
 )
-from crawler.models import FetchResult
-from crawler.parser import HTMLParser, ParsedPage
+from crawler.models import FetchResult, ParsedPage
+from crawler.parser import HTMLParser
 from crawler.urls import is_same_host
 
 __all__ = [

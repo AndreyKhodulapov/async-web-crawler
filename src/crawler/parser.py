@@ -5,11 +5,12 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from typing import Literal, TypedDict, TypeVar
+from typing import TypeVar
 
 from bs4 import BeautifulSoup
-from bs4.element import CData, NavigableString, PageElement, Tag
+from bs4.element import Comment, Declaration, Doctype, NavigableString, PageElement, ProcessingInstruction, Tag
 
+from crawler.models import Heading, Image, ItemList, Metadata, ParsedPage, Table
 from crawler.urls import is_same_host, resolve_url
 
 logger = logging.getLogger(__name__)
@@ -22,56 +23,6 @@ _HIDDEN_TAGS = frozenset({"script", "style", "noscript", "template"})
 # The document head holds metadata, not page content: its text, links and
 # images are left out too. Metadata extractors look into it on purpose.
 _NON_CONTENT_TAGS = _HIDDEN_TAGS | {"head", "title"}
-
-
-class Metadata(TypedDict):
-    title: str | None
-    description: str | None
-    keywords: list[str]
-    language: str | None
-    canonical: str | None
-
-
-class Image(TypedDict):
-    src: str
-    alt: str
-
-
-class Heading(TypedDict):
-    level: int
-    text: str
-
-
-class Table(TypedDict):
-    caption: str | None
-    headers: list[str]
-    rows: list[list[str]]
-
-
-class ItemList(TypedDict):
-    type: Literal["ul", "ol"]
-    items: list[str]
-
-
-class ParsedPage(TypedDict):
-    """Structured data extracted from one page.
-
-    `url` is the requested URL, `final_url` the one after redirects;
-    relative links are resolved against the latter. `errors` lists problems
-    met while parsing; the fields they affected keep their empty defaults.
-    """
-
-    url: str
-    final_url: str
-    title: str | None
-    text: str
-    links: list[str]
-    metadata: Metadata
-    headings: list[Heading]
-    images: list[Image]
-    tables: list[Table]
-    lists: list[ItemList]
-    errors: list[str]
 
 
 class HTMLParser:
@@ -290,11 +241,11 @@ class HTMLParser:
                 if first_cells and all(cell.name == "th" for cell in first_cells):
                     head_rows, rows = rows[:1], rows[1:]
             headers = [_visible_text(cell) for cell in _cells(head_rows[-1])] if head_rows else []
-            body = [[_visible_text(cell) for cell in cells] for row in rows if (cells := _cells(row))]
+            row_texts = [[_visible_text(cell) for cell in cells] for row in rows if (cells := _cells(row))]
             # A caption is always a direct child; a deeper one is a nested table's.
             caption = table.find("caption", recursive=False)
             caption_text = _visible_text(caption) if caption is not None else ""
-            tables.append(Table(caption=caption_text or None, headers=headers, rows=body))
+            tables.append(Table(caption=caption_text or None, headers=headers, rows=row_texts))
         return tables
 
     def extract_lists(self, soup: BeautifulSoup) -> list[ItemList]:
@@ -428,8 +379,11 @@ def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
                     parts.append(" ")
                     stack.append(None)
                 stack.extend(reversed(node.contents))
-        # Subclasses such as Comment, Doctype or Script are not page text.
-        elif isinstance(node, NavigableString) and type(node) in (NavigableString, CData):
+        # Markup-level strings are not page text. Other subclasses are: bs4
+        # wraps the text of <rt> and <rp> in its own classes.
+        elif isinstance(node, NavigableString) and not isinstance(
+            node, (Comment, Declaration, Doctype, ProcessingInstruction)
+        ):
             parts.append(node)
     return _clean("".join(parts))
 

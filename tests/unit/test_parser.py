@@ -4,7 +4,7 @@ import logging
 
 import pytest
 from bs4 import BeautifulSoup
-from conftest import fixture_html
+from pages import fixture_html
 
 import crawler.parser as parser_module
 from crawler import HTMLParser
@@ -20,6 +20,11 @@ def parser() -> HTMLParser:
 @pytest.fixture
 def valid_page(parser):
     return parser.parse(fixture_html("valid_page.html"), PAGE_URL)
+
+
+@pytest.fixture
+def broken_page(parser):
+    return parser.parse(fixture_html("broken_page.html"), "https://example.com/")
 
 
 def soup(html: str) -> BeautifulSoup:
@@ -213,6 +218,11 @@ class TestExtractText:
         html = "<p>a<b>b</b>, c<br>d</p><div>e</div><span>f</span><span>g</span>"
         assert parser.extract_text(soup(html)) == "ab, c d e fg"
 
+    def test_ruby_annotations_are_kept(self, parser):
+        # bs4 wraps <rt> and <rp> text in its own NavigableString subclasses.
+        html = "<p>漢<ruby>字<rp>(</rp><rt>じ</rt><rp>)</rp></ruby>!</p>"
+        assert parser.extract_text(soup(html)) == "漢字(じ)!"
+
 
 class TestMetadata:
     def test_open_graph_fallback(self, parser):
@@ -248,19 +258,15 @@ class TestMetadata:
 
 
 class TestBrokenHTML:
-    def test_broken_page_is_repaired(self, parser):
-        page = parser.parse(fixture_html("broken_page.html"), "https://example.com/")
-        assert page["errors"] == []
-        assert page["title"] == "Broken <b>page"  # <title> content is plain text in HTML
-        assert page["headings"] == [{"level": 2, "text": "Heading inside link"}]
-        assert page["tables"] == [{"caption": None, "headers": [], "rows": [["cell 1", "cell 2"], ["cell 3"]]}]
-        assert page["lists"] == [{"type": "ul", "items": ["one", "two"]}]
-        assert page["images"] == [{"src": "https://example.com/pic.png", "alt": "unquoted"}]
-        assert "First paragraph never closed Second block" in page["text"]
-
-    def test_invalid_links_are_dropped(self, parser):
-        page = parser.parse(fixture_html("broken_page.html"), "https://example.com/")
-        assert page["links"] == ["https://example.com/in-heading", "https://example.com/last"]
+    def test_broken_page_is_repaired(self, broken_page):
+        assert broken_page["errors"] == []
+        assert broken_page["title"] == "Broken <b>page"  # <title> content is plain text in HTML
+        assert broken_page["headings"] == [{"level": 2, "text": "Heading inside link"}]
+        assert broken_page["tables"] == [{"caption": None, "headers": [], "rows": [["cell 1", "cell 2"], ["cell 3"]]}]
+        assert broken_page["lists"] == [{"type": "ul", "items": ["one", "two"]}]
+        assert broken_page["images"] == [{"src": "https://example.com/pic.png", "alt": "unquoted"}]
+        assert broken_page["links"] == ["https://example.com/in-heading", "https://example.com/last"]
+        assert "First paragraph never closed Second block" in broken_page["text"]
 
     def test_deep_nesting_does_not_overflow(self, parser):
         page = parser.parse("<div>" * 20_000 + "deep", "https://example.com/")

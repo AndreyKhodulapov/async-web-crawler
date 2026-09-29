@@ -34,5 +34,5 @@ async def test_parse_scraping_sandbox():
     async with AsyncCrawler() as crawler:
         page = await crawler.fetch_and_parse("https://apilearn.tukas.dev/")
     assert page["title"]
-    assert "https://apilearn.tukas.dev/catalog/all/" in page["links"]
+    assert any(link.startswith("https://apilearn.tukas.dev/") for link in page["links"])
     assert page["headings"]

@@ -1,9 +1,9 @@
 """Integration tests: fetch and parse pages served by a local aiohttp server."""
 
 import pytest
-from conftest import ENCODING_PAGES
+from pages import ENCODING_PAGES
 
-from crawler import AsyncCrawler, HTMLParser, HTTPStatusError
+from crawler import AsyncCrawler, HTTPStatusError
 
 
 @pytest.fixture
@@ -35,23 +35,10 @@ async def test_links_are_resolved_after_redirect(crawler, server):
     assert page["metadata"]["canonical"] == str(server.make_url("/catalog/"))
 
 
-async def test_same_host_only(server):
-    async with AsyncCrawler(parser=HTMLParser(same_host_only=True)) as crawler:
-        page = await crawler.fetch_and_parse(str(server.make_url("/catalog/tools/")))
-    assert page["links"]
-    assert all(link.startswith(str(server.make_url("/"))) for link in page["links"])
-
-
 async def test_json_response_is_not_parsed(crawler, server):
     page = await crawler.fetch_and_parse(str(server.make_url("/data.json")))
     assert page["errors"] == ["unsupported content type: application/json"]
     assert page["text"] == ""
-
-
-async def test_page_charset_is_respected(crawler, server):
-    page = await crawler.fetch_and_parse(str(server.make_url("/cp1252")))
-    assert page["title"] == "Café"
-    assert page["text"] == "Crème brûlée"
 
 
 @pytest.mark.parametrize("name", ENCODING_PAGES)

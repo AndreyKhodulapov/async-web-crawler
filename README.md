@@ -228,9 +228,9 @@ src/
 ├── main.py                 # demo CLI: `parse` and `benchmark` commands
 └── crawler/
     ├── client.py           # AsyncCrawler
-    ├── parser.py           # HTMLParser and ParsedPage
+    ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
-    ├── models.py           # FetchResult
+    ├── models.py           # FetchResult, ParsedPage
     └── exceptions.py       # FetchError hierarchy
 tests/
 ├── fixtures/               # valid and broken HTML pages

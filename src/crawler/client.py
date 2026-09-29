@@ -21,8 +21,8 @@ from crawler.exceptions import (
     NetworkError,
     UnexpectedError,
 )
-from crawler.models import FetchResult
-from crawler.parser import HTMLParser, ParsedPage
+from crawler.models import FetchResult, ParsedPage
+from crawler.parser import HTMLParser
 from crawler.urls import is_valid_http_url
 
 logger = logging.getLogger(__name__)
