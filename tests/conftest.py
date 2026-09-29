@@ -71,6 +71,8 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
     "meta-utf16": (('<meta charset="utf-16">' + CAFE).encode(), None, "Café"),
     "meta-utf32": (('<meta charset="utf-32">' + CAFE).encode(), None, "Café"),
     # Charsets that name no codec, or a codec that cannot decode a page.
+    # "undefined" raises UnicodeError, which the client otherwise maps to
+    # InvalidURLError for the IDNA step: decoding must handle it first.
     "meta-unknown": (('<meta charset="no-such-charset">' + CAFE).encode(), None, "Café"),
     "meta-undefined": (('<meta charset="undefined">' + CAFE).encode(), None, "Café"),
     "meta-idna": (('<meta charset="idna">' + CAFE).encode(), None, "Café"),

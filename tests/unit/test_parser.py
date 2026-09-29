@@ -163,6 +163,18 @@ class TestTables:
         assert table["headers"] == ["A"]
         assert table["rows"] == [["A"]]
 
+    def test_rows_inside_hidden_elements_are_skipped(self, parser):
+        html = """
+            <table>
+              <thead><template><tr><th>T</th></tr></template><tr><th>A</th></tr></thead>
+              <template><tr><td>row template</td></tr></template>
+              <noscript><tr><td>no-js row</td></tr></noscript>
+              <tr><td>1</td></tr>
+            </table>"""
+        [table] = parser.extract_tables(soup(html))
+        assert table["headers"] == ["A"]
+        assert table["rows"] == [["1"]]
+
     def test_first_row_without_cells(self, parser):
         [table] = parser.extract_tables(soup("<table><tr></tr><tr><td>1</td></tr></table>"))
         assert table["headers"] == []
@@ -173,6 +185,10 @@ class TestExtractText:
     def test_selector(self, parser):
         html = '<p class="lead">First</p><p>Other</p><p class="lead">Second</p>'
         assert parser.extract_text(soup(html), ".lead") == "First Second"
+
+    def test_selector_skips_hidden_matches(self, parser):
+        html = '<noscript><p class="x">hidden</p></noscript><p class="x">shown</p>'
+        assert parser.extract_text(soup(html), ".x") == "shown"
 
     def test_selector_without_matches(self, parser):
         assert parser.extract_text(soup("<p>text</p>"), "article") == ""

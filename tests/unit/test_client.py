@@ -249,13 +249,6 @@ class TestFetchMany:
         assert result.final_url == "https://a/home"
         assert result.content_type is None
 
-    @pytest.mark.parametrize("encoding", ["base64", "idna", "undefined", "no-such-charset"])
-    async def test_unusable_charset_falls_back_to_utf8(self, crawler, fake_session, encoding):
-        # "undefined" raises UnicodeError, which _request maps to InvalidURLError
-        # for the IDNA step: decoding must handle it before that.
-        fake_session.routes["http://a"] = FakeResponse("pagé".encode(), encoding=encoding)
-        assert await crawler.fetch_url("http://a") == "pagé"
-
     async def test_unexpected_error_does_not_cancel_batch(self, crawler, fake_session):
         fake_session.latency = 0.01
         fake_session.routes["http://b"] = KeyError("bug")

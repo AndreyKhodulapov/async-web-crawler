@@ -191,7 +191,7 @@ class HTMLParser:
             soupsieve.SelectorSyntaxError: `selector` is not valid CSS.
         """
         if selector is not None:
-            matches = soup.select(selector)
+            matches = [tag for tag in soup.select(selector) if tag.find_parent(_HIDDEN_TAGS) is None]
             matched = {id(tag) for tag in matches}
             # The text of a nested match is already part of its ancestor's.
             roots = [tag for tag in matches if not any(id(parent) in matched for parent in tag.parents)]
@@ -279,7 +279,9 @@ class HTMLParser:
             head_rows: list[Tag] = []
             rows: list[Tag] = []
             for row in table.find_all("tr"):
-                if row.find_parent("table") is not table:
+                # The table itself is visible, so a hidden ancestor of a row
+                # (a <template> with a row template, a <noscript>) is inside it.
+                if row.find_parent("table") is not table or row.find_parent(_HIDDEN_TAGS) is not None:
                     continue
                 in_thead = row.parent is not None and row.parent.name == "thead"
                 (head_rows if in_thead else rows).append(row)
