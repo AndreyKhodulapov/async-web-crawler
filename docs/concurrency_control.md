@@ -102,6 +102,10 @@ load under control.
 - Include/exclude regular expressions, compiled once up front so that a
   bad pattern fails fast. Exclude wins over include.
 - Filters apply to discovered links only: the start URLs are an explicit choice.
+- The HTTP client follows redirects by itself, so a link inside the scope can
+  land outside it (a sign-in page on another domain). The final URL is checked
+  again, and such a page is dropped. Not requesting the other host at all
+  would need `allow_redirects=False` and manual redirect handling.
 
 ## Measuring progress
 

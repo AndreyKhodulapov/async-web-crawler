@@ -379,7 +379,13 @@ class ProgressAwareHandler(logging.StreamHandler):
 
     def emit(self, record: logging.LogRecord) -> None:
         if self._live:
-            self.stream.write("\r\033[K")
+            # Like StreamHandler.emit: a failed write (closed terminal, broken
+            # pipe) must not raise into the code that logged the record.
+            try:
+                self.stream.write("\r\033[K")
+            except (OSError, ValueError):
+                self.handleError(record)
+                return
         super().emit(record)
 
 

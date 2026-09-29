@@ -53,6 +53,8 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 #   2  moved (redirects to c.html), a/deeper.html
 #   3  a/deepest.html, c.html
 # Cycles, duplicate links and self-links check that no page is fetched twice.
+# /site/exits.html is not linked from the others: it starts crawls whose
+# links redirect to another host (to-other-host) or to c.html (moved).
 SITE_PAGES: dict[str, str] = {
     "/site/": """
         <title>Home</title>
@@ -67,4 +69,5 @@ SITE_PAGES: dict[str, str] = {
     "/site/a/deeper.html": '<title>Deeper</title><a href="deepest.html">Deepest</a> <a href="../c.html">C</a>',
     "/site/a/deepest.html": '<title>Deepest</title><a href="/site/">Home</a>',
     "/site/c.html": "<title>C</title>",
+    "/site/exits.html": '<title>Exits</title><a href="to-other-host">Sign in</a> <a href="moved">Moved</a>',
 }

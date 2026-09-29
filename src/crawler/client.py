@@ -26,7 +26,7 @@ from crawler.models import CrawlStats, FetchResult, ParsedPage
 from crawler.parser import HTMLParser, is_html_content_type
 from crawler.queue import CrawlerQueue
 from crawler.semaphores import SemaphoreManager
-from crawler.urls import get_host, is_valid_http_url
+from crawler.urls import get_host, is_valid_http_url, normalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -253,9 +253,12 @@ class AsyncCrawler:
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
         the pages they redirect to); `include_patterns` and `exclude_patterns`
-        are regular expressions, see `UrlFilter`.
+        are regular expressions, see `UrlFilter`. A link that passes the
+        filters but redirects to a URL that does not is dropped: the page is
+        not returned and its links are not followed.
 
-        Failed pages do not stop the crawl: they are listed in `failed_urls`.
+        Failed and dropped pages do not stop the crawl: they are listed in
+        `failed_urls` with the reason.
         The state of the crawl (`processed_urls`, `visited_urls`,
         `failed_urls`, `url_depths`, `crawl_stats()`) is reset on every call
         and stays available after it returns.
@@ -342,7 +345,7 @@ class AsyncCrawler:
             queue.mark_failed(url, f"{type(error).__name__}: {error.message}")
             return
 
-        final_url = page["final_url"]
+        final_url = normalize_url(page["final_url"]) or page["final_url"]
         if final_url != url:
             # A later link to the redirect target must not fetch the page again.
             queue.mark_seen(final_url)
@@ -351,6 +354,13 @@ class AsyncCrawler:
                 # A start URL that redirects ("example.com" -> "www.example.com")
                 # defines the site as much as the URL itself.
                 url_filter.allow_host(final_host)
+            elif depth > 0 and not url_filter.allows(final_url):
+                # aiohttp follows redirects on its own, so a link inside the
+                # crawl scope can lead out of it, e.g. to a sign-in page on
+                # another domain. Such a page is not part of the site.
+                logger.info("Dropped %s: redirected out of scope to %s", url, final_url)
+                queue.mark_failed(url, f"redirected out of scope: {final_url}")
+                return
 
         queued = 0
         if depth < self.max_depth:
@@ -416,7 +426,13 @@ class AsyncCrawler:
                     # just to be rejected by the parser. Leaving the block
                     # without reading closes the connection mid-transfer.
                     logger.info("Skipping body of %s: %s is not HTML", url, content_type)
-                    return _Response(response.status, "", 0, str(response.url), content_type)
+                    return _Response(
+                        status=response.status,
+                        content="",
+                        size=0,
+                        final_url=str(response.url),
+                        content_type=content_type,
+                    )
                 body = await response.read()
                 return _Response(
                     status=response.status,

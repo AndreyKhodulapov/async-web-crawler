@@ -253,8 +253,10 @@ twice if a direct link to it is downloaded at the same moment.
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
 
-Filters apply to discovered links, not to the start URLs. Invalid start URLs
-or patterns raise `ValueError` before anything is fetched. After a crawl, and
+Filters apply to discovered links, not to the start URLs. A link that passes
+them but redirects to a URL that does not, such as a sign-in page on another
+domain, is dropped and listed in `failed_urls` as `redirected out of scope`.
+Invalid start URLs or patterns raise `ValueError` before anything is fetched. After a crawl, and
 during one, the crawler exposes its state:
 
 | Attribute | Content |

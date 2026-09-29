@@ -99,6 +99,22 @@ async def test_start_url_redirect_to_other_host_keeps_that_host(server, url):
     assert f"http://localhost:{server.port}/site/a.html" in crawler.processed_urls
 
 
+async def test_redirect_out_of_the_start_hosts_is_dropped(url, server):
+    crawler = await crawl(url("/site/exits.html"), max_depth=1, same_domain_only=True)
+
+    assert set(crawler.processed_urls) == {url("/site/exits.html"), url("/site/moved")}
+    assert crawler.failed_urls == {
+        url("/site/to-other-host"): f"redirected out of scope: http://localhost:{server.port}/site/"
+    }
+
+
+async def test_redirect_to_an_excluded_url_is_dropped(url):
+    crawler = await crawl(url("/site/exits.html"), max_depth=1, exclude_patterns=[r"/c\.html$"])
+
+    assert url("/site/moved") not in crawler.processed_urls
+    assert crawler.failed_urls[url("/site/moved")] == f"redirected out of scope: {url('/site/c.html')}"
+
+
 async def test_exclude_patterns(url, site):
     crawler = await crawl(url("/site/"), exclude_patterns=[r"\.pdf$", r"missing"])
 
