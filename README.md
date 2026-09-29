@@ -10,8 +10,10 @@ timeouts, and reports failures without stopping the rest of the batch.
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
 - Separate connect, read and total timeouts
 - Clear error types: `HTTPStatusError`, `NetworkError` (including redirect
-  loops), `FetchTimeoutError` and `CrawlerClosedError`, all subclasses of
-  `FetchError`
+  loops), `FetchTimeoutError`, `InvalidURLError`, `CrawlerClosedError` and
+  `UnexpectedError`, all subclasses of `FetchError`
+- One failing URL never breaks a batch: even unforeseen exceptions are
+  logged with a traceback and reported as `UnexpectedError`
 - Logging for every request: start, success (status, size, time) and failure
 
 ## Requirements

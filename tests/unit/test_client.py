@@ -11,7 +11,9 @@ from crawler import (
     CrawlerClosedError,
     FetchResult,
     FetchTimeoutError,
+    InvalidURLError,
     NetworkError,
+    UnexpectedError,
 )
 
 
@@ -184,10 +186,31 @@ class TestErrorMapping:
             await crawler.fetch_url("http://a")
         assert isinstance(exc_info.value.__cause__, aiohttp.ClientConnectionError)
 
-    async def test_unexpected_exception_propagates(self, crawler, fake_session):
+    async def test_unexpected_exception_is_wrapped_and_logged(
+        self, crawler, fake_session, caplog
+    ):
         fake_session.routes["http://a"] = KeyError("bug")
-        with pytest.raises(KeyError):
+        with pytest.raises(UnexpectedError, match="KeyError") as exc_info:
             await crawler.fetch_url("http://a")
+        assert isinstance(exc_info.value.__cause__, KeyError)
+        # The traceback must reach the log, otherwise the bug goes unnoticed.
+        [record] = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert record.exc_info is not None
+
+    async def test_cancellation_is_not_swallowed(self, crawler, fake_session):
+        fake_session.routes["http://a"] = asyncio.CancelledError()
+        with pytest.raises(asyncio.CancelledError):
+            await crawler.fetch_url("http://a")
+
+    @pytest.mark.parametrize(
+        "url", ["//no-scheme", "not a url", "ftp://example.com", "http://[::1"]
+    )
+    async def test_malformed_url_is_rejected_before_request(
+        self, crawler, fake_session, url
+    ):
+        with pytest.raises(InvalidURLError):
+            await crawler.fetch_url(url)
+        assert fake_session.requested == []
 
 
 class TestFetchMany:
@@ -212,6 +235,13 @@ class TestFetchMany:
         assert result.size == 6  # bytes, not characters
         assert result.status == 200
         assert result.elapsed >= 0
+
+    async def test_unexpected_error_does_not_cancel_batch(self, crawler, fake_session):
+        fake_session.latency = 0.01
+        fake_session.routes["http://b"] = KeyError("bug")
+        results = await crawler.fetch_many(["http://a", "http://b", "http://c"])
+        assert [r.ok for r in results] == [True, False, True]
+        assert isinstance(results[1].error, UnexpectedError)
 
     async def test_concurrency_is_limited(self, crawler, fake_session):
         fake_session.latency = 0.02
