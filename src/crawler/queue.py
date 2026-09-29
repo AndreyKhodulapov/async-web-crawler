@@ -18,7 +18,8 @@ class CrawlerQueue:
     waiting, being fetched or already done.
 
     Lifecycle of a URL: `add_url` -> `get_next` (in progress) ->
-    `mark_processed`, `mark_failed` or `mark_skipped`. Workers loop until `get_next` returns
+    `mark_processed`, `mark_failed`, `mark_skipped` or `mark_blocked`.
+    Workers loop until `get_next` returns
     None, which happens when there is nothing left to do (see `get_next`)
     or after `close`.
     """
@@ -37,6 +38,7 @@ class CrawlerQueue:
         self.visited: set[str] = set()  # URLs handed out by get_next
         self.failed: dict[str, str] = {}  # URL -> error description
         self.skipped: dict[str, str] = {}  # URL -> why it was left out
+        self.blocked: dict[str, str] = {}  # URL -> why it may not be fetched
 
     @property
     def closed(self) -> bool:
@@ -103,6 +105,21 @@ class CrawlerQueue:
         self._finish(url)
         self.skipped[url] = reason
 
+    def mark_blocked(self, url: str, reason: str) -> None:
+        """Finish a URL that may not be fetched at all, e.g. disallowed by robots.txt."""
+        self._finish(url)
+        self.blocked[url] = reason
+
+    def requeue(self, url: str, priority: int = 0) -> None:
+        """Put a URL taken by `get_next` back unfetched; works after `close` too.
+
+        The URL is no longer visited or in progress and keeps its depth; it
+        is counted as queued, as if it had never been taken.
+        """
+        self._finish(url)
+        self.visited.discard(url)
+        heapq.heappush(self._heap, (priority, next(self._sequence), url))
+
     def close(self) -> None:
         """Stop handing out URLs: every current and future `get_next` returns None.
 
@@ -118,6 +135,7 @@ class CrawlerQueue:
             "processed": self._processed_count,
             "failed": len(self.failed),
             "skipped": len(self.skipped),
+            "blocked": len(self.blocked),
             "seen": len(self._depths),
         }
 

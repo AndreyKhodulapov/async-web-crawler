@@ -42,7 +42,7 @@ def normalize_url(url: str) -> str | None:
     if parts.username is not None:
         userinfo = parts.netloc.rpartition("@")[0]
         netloc = f"{userinfo}@{netloc}"
-    path, query = _percent_encode(parts.path or "/"), _percent_encode(parts.query)
+    path, query = percent_encode(parts.path or "/"), percent_encode(parts.query)
     if path is None or query is None:
         return None
     return urlunsplit((scheme, netloc, path, query, ""))
@@ -80,7 +80,7 @@ def is_same_host(url: str, other: str) -> bool:
     return host is not None and host == get_host(other)
 
 
-def _percent_encode(component: str) -> str | None:
+def percent_encode(component: str) -> str | None:
     """Percent-encode non-ASCII characters, spaces and the like; None if impossible.
 
     Characters that RFC 3986 allows in a path or query are kept, and so are

@@ -1,0 +1,295 @@
+"""robots.txt: downloading, parsing (RFC 9309) and caching per site."""
+
+import asyncio
+import functools
+import logging
+import math
+import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import urlsplit
+
+from crawler.exceptions import CrawlerClosedError, FetchError
+from crawler.urls import normalize_url, percent_encode
+
+logger = logging.getLogger(__name__)
+
+# Downloads a URL and returns (HTTP status, body); raises FetchError when no
+# response arrives at all.
+RobotsFetcher = Callable[[str], Awaitable[tuple[int, str]]]
+
+
+def product_token(user_agent: str) -> str:
+    """The name robots.txt knows a crawler by: "MyBot/1.0 (+https://...)" gives "mybot"."""
+    match = re.match(r"[A-Za-z_-]+", user_agent.strip())
+    return match.group().lower() if match else ""
+
+
+@dataclass(frozen=True, slots=True)
+class _Rule:
+    allow: bool
+    path: str  # percent-encoded like crawled URLs, "*" and "$" kept
+    pattern: re.Pattern[str]
+
+    @classmethod
+    def parse(cls, allow: bool, value: str) -> "_Rule | None":
+        path = percent_encode(value)
+        if not path:  # "Disallow:" with no path means nothing is disallowed
+            return None
+        # "*" matches any sequence of characters, "$" at the end anchors the
+        # pattern to the end of the URL; everything else is literal.
+        anchored = path.endswith("$")
+        body = path[:-1] if anchored else path
+        regex = ".*".join(re.escape(part) for part in body.split("*"))
+        return cls(allow, path, re.compile(regex + (r"\Z" if anchored else "")))
+
+
+@dataclass(slots=True)
+class _Group:
+    agents: list[str]
+    rules: list[_Rule] = field(default_factory=list)
+    crawl_delay: float | None = None
+
+
+class RobotsRules:
+    """The rules of one site's robots.txt.
+
+    Follows RFC 9309: the group for the crawler's product token (matched
+    case-insensitively) applies, or the "*" group if there is none; several
+    groups for the same agent are merged. Among the rules that match a URL
+    the longest one wins, and Allow wins a tie. "*" and "$" work as
+    wildcards. /robots.txt itself is always allowed.
+
+    Crawl-delay is not part of the RFC, but many sites use it; when several
+    matching groups set it, the largest value is taken.
+
+    `unreachable` tells why robots.txt could not be read, e.g. "HTTP 503";
+    everything is disallowed then.
+    """
+
+    def __init__(self, groups: list[_Group], sitemaps: list[str], *, unreachable: str | None = None) -> None:
+        self._groups = groups
+        self.sitemaps = sitemaps
+        self.unreachable = unreachable
+
+    @classmethod
+    def parse(cls, text: str) -> "RobotsRules":
+        groups: list[_Group] = []
+        sitemaps: list[str] = []
+        group: _Group | None = None
+        # Consecutive User-agent lines share one group; any other rule line
+        # closes the list of agents, so the next User-agent starts a new group.
+        collecting_agents = False
+        for line in text.splitlines():
+            key, _, value = line.split("#", 1)[0].partition(":")
+            key, value = key.strip().lower(), value.strip()
+            if key == "user-agent":
+                agent = "*" if value == "*" else product_token(value)
+                if collecting_agents and group is not None:
+                    group.agents.append(agent)
+                else:
+                    group = _Group(agents=[agent])
+                    groups.append(group)
+                    collecting_agents = True
+            elif key == "sitemap":
+                # Sitemaps belong to the whole file, not to a group.
+                sitemaps.append(value)
+            elif key in ("allow", "disallow", "crawl-delay"):
+                collecting_agents = False
+                if group is None:
+                    continue  # rules before the first User-agent apply to nobody
+                if key == "crawl-delay":
+                    group.crawl_delay = _parse_delay(value, group.crawl_delay)
+                elif rule := _Rule.parse(key == "allow", value):
+                    group.rules.append(rule)
+        return cls(groups, sitemaps)
+
+    @classmethod
+    def allow_all(cls) -> "RobotsRules":
+        return cls([], [])
+
+    @classmethod
+    def forbid_all(cls, reason: str) -> "RobotsRules":
+        return cls([], [], unreachable=reason)
+
+    def can_fetch(self, url: str, user_agent: str = "*") -> bool:
+        """Whether a crawler with this User-Agent may fetch `url`; False for an invalid URL."""
+        normalized = normalize_url(url)
+        if normalized is None:
+            return False
+        parts = urlsplit(normalized)
+        target = parts.path + (f"?{parts.query}" if parts.query else "")
+        if target == "/robots.txt":
+            return True
+        if self.unreachable is not None:
+            return False
+        best_length, allowed = -1, True
+        for group in self._groups_for(user_agent):
+            for rule in group.rules:
+                if rule.pattern.match(target) and (
+                    len(rule.path) > best_length or (len(rule.path) == best_length and rule.allow)
+                ):
+                    best_length, allowed = len(rule.path), rule.allow
+        return allowed
+
+    def crawl_delay(self, user_agent: str = "*") -> float | None:
+        delays = [group.crawl_delay for group in self._groups_for(user_agent) if group.crawl_delay is not None]
+        return max(delays, default=None)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "unreachable": self.unreachable,
+            "groups": [
+                {
+                    "user_agents": group.agents,
+                    "allow": [rule.path for rule in group.rules if rule.allow],
+                    "disallow": [rule.path for rule in group.rules if not rule.allow],
+                    "crawl_delay": group.crawl_delay,
+                }
+                for group in self._groups
+            ],
+            "sitemaps": self.sitemaps,
+        }
+
+    def _groups_for(self, user_agent: str) -> list[_Group]:
+        token = product_token(user_agent)
+        own = [group for group in self._groups if token and token in group.agents]
+        return own or [group for group in self._groups if "*" in group.agents]
+
+
+class RobotsParser:
+    """Fetches robots.txt once per site and answers whether URLs may be crawled.
+
+    Usage::
+
+        robots = RobotsParser(fetch)                  # fetch(url) -> (status, body)
+        await robots.fetch_robots("https://example.com/any/page")
+        robots.can_fetch("https://example.com/private/", "MyBot/1.0")
+        robots.get_crawl_delay("https://example.com/", "MyBot/1.0")
+
+    Rules are cached per origin (scheme, host and port), as robots.txt
+    applies to exactly one origin. Concurrent requests for a site that has
+    not been fetched yet share a single download.
+
+    The HTTP status decides what happens when there is no usable file
+    (RFC 9309): 4xx means there are no rules and everything is allowed;
+    5xx, 429 and network errors mean the site is unreachable and
+    everything is disallowed. 429 is treated as a server error, as major
+    search engines do: the site is asking crawlers to back off.
+    Files over 500 KiB are cut to that size, the minimum the RFC requires
+    crawlers to read.
+    """
+
+    MAX_SIZE = 500 * 1024
+
+    def __init__(self, fetch: RobotsFetcher, *, max_crawl_delay: float = 30.0) -> None:
+        if max_crawl_delay < 0:
+            raise ValueError(f"max_crawl_delay must be >= 0, got {max_crawl_delay}")
+        self._fetch = fetch
+        self.max_crawl_delay = max_crawl_delay
+        self._rules: dict[str, RobotsRules] = {}
+        self._downloads: dict[str, asyncio.Task[RobotsRules]] = {}
+
+    async def fetch_robots(self, base_url: str) -> dict[str, Any]:
+        """Download (or take from the cache) robots.txt of the site of `base_url`.
+
+        Returns the parsed rules as a dict: "groups" (user agents, allow and
+        disallow paths, crawl delay), "sitemaps" and "unreachable" (why
+        robots.txt could not be read, None if it could).
+
+        Raises:
+            ValueError: `base_url` is not a valid http(s) URL.
+            CrawlerClosedError: the fetcher is closed; nothing is cached.
+        """
+        return (await self._rules_for(base_url)).to_dict()
+
+    async def is_allowed(self, url: str, user_agent: str = "*") -> bool:
+        """`can_fetch`, downloading the site's robots.txt first if needed."""
+        return (await self._rules_for(url)).can_fetch(url, user_agent)
+
+    def can_fetch(self, url: str, user_agent: str = "*") -> bool:
+        """Whether `user_agent` may fetch `url`. The site's rules must have been fetched.
+
+        Raises:
+            LookupError: robots.txt of this site has not been fetched yet.
+        """
+        return self._cached(url).can_fetch(url, user_agent)
+
+    def get_crawl_delay(self, url: str, user_agent: str = "*") -> float:
+        """Crawl-delay of the site of `url` for `user_agent`, capped at `max_crawl_delay`; 0 if unset.
+
+        The cap keeps a site asking for, say, one request a day from
+        freezing the crawl. The site's rules must have been fetched.
+        """
+        delay = self._cached(url).crawl_delay(user_agent)
+        return 0.0 if delay is None else min(delay, self.max_crawl_delay)
+
+    def unreachable_reason(self, url: str) -> str | None:
+        """Why robots.txt of the site of `url` could not be read, or None. The rules must have been fetched."""
+        return self._cached(url).unreachable
+
+    def _cached(self, url: str) -> RobotsRules:
+        origin = _origin(url)
+        if origin not in self._rules:
+            raise LookupError(f"robots.txt of {origin} has not been fetched yet")
+        return self._rules[origin]
+
+    async def _rules_for(self, url: str) -> RobotsRules:
+        origin = _origin(url)
+        if origin in self._rules:
+            return self._rules[origin]
+        download = self._downloads.get(origin)
+        if download is None:
+            download = asyncio.create_task(self._download(origin))
+            self._downloads[origin] = download
+            download.add_done_callback(functools.partial(self._forget_download, origin))
+        # A caller cancelled while waiting must not cancel the download
+        # that other callers are waiting for too.
+        return await asyncio.shield(download)
+
+    def _forget_download(self, origin: str, download: asyncio.Task[RobotsRules]) -> None:
+        del self._downloads[origin]
+        if not download.cancelled():
+            # Marks the exception as retrieved: when every caller was
+            # cancelled, nobody else would, and asyncio would log it.
+            download.exception()
+
+    async def _download(self, origin: str) -> RobotsRules:
+        url = f"{origin}/robots.txt"
+        try:
+            status, text = await self._fetch(url)
+        except CrawlerClosedError:
+            raise  # not an answer from the site: nothing to cache
+        except FetchError as error:
+            rules = RobotsRules.forbid_all(f"{type(error).__name__}: {error.message}")
+        else:
+            if 200 <= status < 300:
+                rules = RobotsRules.parse(text[: self.MAX_SIZE])
+            elif status == 429 or status >= 500:
+                rules = RobotsRules.forbid_all(f"HTTP {status}")
+            else:
+                logger.info("robots.txt of %s answered HTTP %d, everything is allowed", origin, status)
+                rules = RobotsRules.allow_all()
+        if rules.unreachable is not None:
+            logger.warning("robots.txt of %s is unreachable, the site is disallowed: %s", origin, rules.unreachable)
+        self._rules[origin] = rules
+        return rules
+
+
+def _origin(url: str) -> str:
+    normalized = normalize_url(url)
+    if normalized is None:
+        raise ValueError(f"not an absolute http(s) URL: {url!r}")
+    parts = urlsplit(normalized)
+    return f"{parts.scheme}://{parts.netloc.rpartition('@')[2]}"
+
+
+def _parse_delay(value: str, current: float | None) -> float | None:
+    try:
+        delay = float(value)
+    except ValueError:
+        return current
+    if not math.isfinite(delay) or delay < 0:
+        return current
+    return delay

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
+from helpers import UNTHROTTLED
 
 from crawler import (
     AsyncCrawler,
@@ -12,8 +13,10 @@ from crawler import (
     FetchResult,
     FetchTimeoutError,
     HTMLParser,
+    HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    RobotsDisallowedError,
     UnexpectedError,
 )
 
@@ -26,11 +29,14 @@ class FakeResponse:
         encoding: str = "utf-8",
         content_type: str | None = "text/html",
         url: str | None = None,
+        retry_after: str | None = None,
     ) -> None:
         self.status = status
         self._body = body
         self._encoding = encoding
         self.headers = {} if content_type is None else {"Content-Type": content_type}
+        if retry_after is not None:
+            self.headers["Retry-After"] = retry_after
         self.content_type = content_type or "application/octet-stream"
         # None means "not redirected": FakeSession fills in the requested URL.
         self.url = url
@@ -44,6 +50,7 @@ class FakeResponse:
                 history=(),
                 status=self.status,
                 message="Error",
+                headers=self.headers,
             )
 
     async def read(self) -> bytes:
@@ -68,18 +75,26 @@ class FakeRequest:
         return None
 
 
+Outcome = FakeResponse | BaseException
+
+
 class FakeSession:
-    """Serves canned responses or raises canned exceptions per URL."""
+    """Serves canned responses or raises canned exceptions per URL.
+
+    A list of outcomes is served one per request; the last one repeats.
+    """
 
     def __init__(self) -> None:
-        self.routes: dict[str, FakeResponse | BaseException] = {}
+        self.routes: dict[str, Outcome | list[Outcome]] = {}
         self.latency = 0.0
         self.closed = False
         self.in_flight = 0
         self.peak_in_flight = 0
         self.requested: list[str] = []
+        self.user_agents: list[str | None] = []  # per-request User-Agent headers
 
-    def get(self, url: str) -> FakeRequest:
+    def get(self, url: str, headers: dict[str, str] | None = None) -> FakeRequest:
+        self.user_agents.append(None if headers is None else headers.get("User-Agent"))
         return FakeRequest(self, url)
 
     async def handle(self, url: str) -> FakeResponse:
@@ -89,6 +104,8 @@ class FakeSession:
         try:
             await asyncio.sleep(self.latency)
             outcome = self.routes.get(url, FakeResponse())
+            if isinstance(outcome, list):
+                outcome = outcome.pop(0) if len(outcome) > 1 else outcome[0]
             if isinstance(outcome, BaseException):
                 raise outcome
             if outcome.url is None:
@@ -107,10 +124,18 @@ def fake_session() -> FakeSession:
 
 
 @pytest.fixture
-def crawler(monkeypatch, fake_session) -> AsyncCrawler:
-    crawler = AsyncCrawler(max_concurrent=3)
-    monkeypatch.setattr(crawler, "_create_session", lambda: fake_session)
-    return crawler
+def make_crawler(monkeypatch, fake_session):
+    def make(**options) -> AsyncCrawler:
+        crawler = AsyncCrawler(**{"max_concurrent": 3, **UNTHROTTLED, **options})
+        monkeypatch.setattr(crawler, "_create_session", lambda: fake_session)
+        return crawler
+
+    return make
+
+
+@pytest.fixture
+def crawler(make_crawler) -> AsyncCrawler:
+    return make_crawler()
 
 
 class TestInit:
@@ -308,9 +333,86 @@ class TestFetchAndParse:
         fake_session.routes["http://a/data"] = FakeResponse(b"{}", content_type="application/json")
         assert await crawler.fetch_url("http://a/data") == "{}"
 
-    async def test_uses_injected_parser(self, monkeypatch, fake_session):
-        crawler = AsyncCrawler(parser=HTMLParser(same_host_only=True))
-        monkeypatch.setattr(crawler, "_create_session", lambda: fake_session)
+    async def test_uses_injected_parser(self, make_crawler, fake_session):
+        crawler = make_crawler(parser=HTMLParser(same_host_only=True))
         fake_session.routes["http://a/"] = FakeResponse(b"<a href='/x'>in</a><a href='http://b/'>out</a>")
         page = await crawler.fetch_and_parse("http://a/")
         assert page["links"] == ["http://a/x"]
+
+
+class TestRetries:
+    async def test_transient_failure_is_retried(self, make_crawler, fake_session):
+        crawler = make_crawler(max_retries=2, backoff_base=0.001)
+        fake_session.routes["http://a"] = [FakeResponse(status=503), aiohttp.ServerTimeoutError(), FakeResponse(b"ok")]
+        assert await crawler.fetch_url("http://a") == "ok"
+        assert fake_session.requested == ["http://a"] * 3
+
+    async def test_gives_up_after_max_retries(self, make_crawler, fake_session):
+        crawler = make_crawler(max_retries=2, backoff_base=0.001)
+        fake_session.routes["http://a"] = FakeResponse(status=503)
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_url("http://a")
+        assert len(fake_session.requested) == 3
+
+    async def test_permanent_failure_is_not_retried(self, make_crawler, fake_session):
+        crawler = make_crawler(max_retries=2, backoff_base=0.001)
+        fake_session.routes["http://a"] = FakeResponse(status=404)
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_url("http://a")
+        assert len(fake_session.requested) == 1
+
+    async def test_retry_after_header_is_kept_in_the_error(self, crawler, fake_session):
+        fake_session.routes["http://a"] = FakeResponse(status=429, retry_after="120")
+        with pytest.raises(HTTPStatusError) as exc_info:
+            await crawler.fetch_url("http://a")
+        assert exc_info.value.retry_after == 120
+
+    async def test_backoff_holds_back_the_whole_host(self, make_crawler, fake_session):
+        crawler = make_crawler(max_retries=1, backoff_base=0.2)
+        fake_session.routes["http://a/slow"] = [FakeResponse(status=503), FakeResponse()]
+        retrying = asyncio.create_task(crawler.fetch_url("http://a/slow"))
+        await asyncio.sleep(0.01)  # the first attempt has failed, the retry waits
+
+        assert crawler.rate_limiter.reserve("a") > 0  # other pages of the host wait too
+        assert crawler.rate_limiter.reserve("b") == 0
+        await retrying
+
+
+class TestUserAgents:
+    async def test_session_user_agent_by_default(self, crawler, fake_session):
+        await crawler.fetch_url("http://a")
+        assert fake_session.user_agents == [None]
+
+    async def test_rotation_between_requests(self, make_crawler, fake_session):
+        agents = ["TestBot/1.0 (desktop)", "TestBot/1.0 (mobile)"]
+        crawler = make_crawler(user_agent="TestBot/1.0", user_agents=agents)
+        for url in ("http://a", "http://b", "http://c"):
+            await crawler.fetch_url(url)
+        assert fake_session.user_agents == [agents[0], agents[1], agents[0]]
+
+    def test_rotated_agents_must_share_the_robots_name(self):
+        with pytest.raises(ValueError, match="'testbot'"):
+            AsyncCrawler(user_agent="TestBot/1.0", user_agents=["TestBot/1.0", "Mozilla/5.0 (Windows NT 10.0)"])
+
+    def test_single_string_is_rejected(self):
+        with pytest.raises(TypeError, match="got a string"):
+            AsyncCrawler(user_agents="TestBot/1.0")
+
+
+class TestRobots:
+    async def test_disallowed_url_is_not_requested(self, make_crawler, fake_session):
+        crawler = make_crawler(respect_robots=True)
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(
+            b"User-agent: *\nDisallow: /private/", content_type="text/plain"
+        )
+        with pytest.raises(RobotsDisallowedError):
+            await crawler.fetch_url("http://a/private/page")
+        assert await crawler.fetch_url("http://a/public") == "page"
+        assert fake_session.requested == ["http://a/robots.txt", "http://a/public"]
+
+    async def test_closed_crawler_does_not_fetch_robots_txt(self, make_crawler, fake_session):
+        crawler = make_crawler(respect_robots=True)
+        await crawler.close()
+        with pytest.raises(CrawlerClosedError):
+            await crawler.fetch_url("http://a/page")
+        assert fake_session.requested == []

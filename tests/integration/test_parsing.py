@@ -1,6 +1,7 @@
 """Integration tests: fetch and parse pages served by a local aiohttp server."""
 
 import pytest
+from helpers import UNTHROTTLED
 from pages import ENCODING_PAGES
 
 from crawler import AsyncCrawler, HTTPStatusError
@@ -8,7 +9,7 @@ from crawler import AsyncCrawler, HTTPStatusError
 
 @pytest.fixture
 async def crawler():
-    async with AsyncCrawler() as crawler:
+    async with AsyncCrawler(**UNTHROTTLED) as crawler:
         yield crawler
 
 

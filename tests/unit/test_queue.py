@@ -114,21 +114,23 @@ class TestGetNext:
 class TestStatus:
     async def test_stats_follow_the_lifecycle(self):
         queue = CrawlerQueue()
-        for name in ("a", "b", "c", "d"):
+        for name in ("a", "b", "c", "d", "e"):
             queue.add_url(f"http://site/{name}")
-        a, b, c = await take(queue), await take(queue), await take(queue)
+        a, b, c, d = await take(queue), await take(queue), await take(queue), await take(queue)
         assert queue.get_stats() == {
             "queued": 1,
-            "in_progress": 3,
+            "in_progress": 4,
             "processed": 0,
             "failed": 0,
             "skipped": 0,
-            "seen": 4,
+            "blocked": 0,
+            "seen": 5,
         }
 
         queue.mark_processed(a)
         queue.mark_failed(b, "HTTPStatusError: HTTP 404 Not Found")
         queue.mark_skipped(c, "redirected out of scope: http://other/")
+        queue.mark_blocked(d, "disallowed by robots.txt")
 
         assert queue.get_stats() == {
             "queued": 1,
@@ -136,15 +138,37 @@ class TestStatus:
             "processed": 1,
             "failed": 1,
             "skipped": 1,
-            "seen": 4,
+            "blocked": 1,
+            "seen": 5,
         }
-        assert queue.visited == {a, b, c}
+        assert queue.visited == {a, b, c, d}
         assert queue.failed == {b: "HTTPStatusError: HTTP 404 Not Found"}
         assert queue.skipped == {c: "redirected out of scope: http://other/"}
+        assert queue.blocked == {d: "disallowed by robots.txt"}
+
+    async def test_requeue_puts_a_url_back_even_after_close(self):
+        queue = CrawlerQueue()
+        queue.add_url("http://site/a", priority=1, depth=1)
+        page = await take(queue)
+        queue.close()
+
+        queue.requeue(page, priority=1)
+
+        assert queue.visited == set()
+        assert queue.depth(page) == 1
+        assert queue.get_stats()["queued"] == 1
+        assert queue.get_stats()["in_progress"] == 0
+        assert await queue.get_next() is None  # still closed
 
     @pytest.mark.parametrize(
         ("mark", "args"),
-        [("mark_processed", ()), ("mark_failed", ("error",)), ("mark_skipped", ("reason",))],
+        [
+            ("mark_processed", ()),
+            ("mark_failed", ("error",)),
+            ("mark_skipped", ("reason",)),
+            ("mark_blocked", ("reason",)),
+            ("requeue", ()),
+        ],
     )
     async def test_marking_a_url_not_in_progress_is_an_error(self, mark, args):
         queue = CrawlerQueue()

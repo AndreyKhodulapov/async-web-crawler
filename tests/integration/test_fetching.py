@@ -3,6 +3,7 @@
 import time
 
 import pytest
+from helpers import UNTHROTTLED
 
 from crawler import (
     AsyncCrawler,
@@ -15,7 +16,7 @@ from crawler import (
 
 @pytest.fixture
 async def crawler():
-    async with AsyncCrawler(max_concurrent=10) as crawler:
+    async with AsyncCrawler(max_concurrent=10, **UNTHROTTLED) as crawler:
         yield crawler
 
 
@@ -50,7 +51,7 @@ async def test_redirect_loop(crawler, server):
 
 @pytest.mark.parametrize("timeout", ["read_timeout", "total_timeout"])
 async def test_timeout(server, timeout):
-    async with AsyncCrawler(**{timeout: 0.2}) as crawler:
+    async with AsyncCrawler(**{timeout: 0.2}, **UNTHROTTLED) as crawler:
         with pytest.raises(FetchTimeoutError):
             await crawler.fetch_url(str(server.make_url("/delay/2")))
 
@@ -67,7 +68,7 @@ async def test_concurrent_is_faster_than_sequential(server):
     delay, count = 0.3, 5
     urls = [str(server.make_url(f"/delay/{delay}?n={i}")) for i in range(count)]
 
-    async with AsyncCrawler(max_concurrent=count) as crawler:
+    async with AsyncCrawler(max_concurrent=count, **UNTHROTTLED) as crawler:
         started = time.perf_counter()
         for url in urls:
             await crawler.fetch_url(url)

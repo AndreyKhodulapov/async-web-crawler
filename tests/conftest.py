@@ -1,5 +1,6 @@
 import asyncio
 import socket
+import time
 from collections import Counter
 
 import pytest
@@ -8,13 +9,25 @@ from pages import ENCODING_PAGES, SITE_PAGES, fixture_html
 
 
 class SiteState:
-    """What the crawl-test site has served: hits per path and peak concurrency."""
+    """What the crawl-test site has served, and its robots.txt.
+
+    `log` lists (host, path, time) of every request to /site/ pages,
+    /flaky/ and robots.txt, in the order they arrived. `robots` is the body
+    of /robots.txt, served with `robots_status`; None means 404.
+    """
 
     def __init__(self) -> None:
         self.hits: Counter[str] = Counter()
+        self.log: list[tuple[str, str, float]] = []
         self.latency = 0.0
         self.in_flight = 0
         self.peak_in_flight = 0
+        self.robots: str | None = None
+        self.robots_status = 200
+
+    def record(self, request: web.Request) -> None:
+        self.hits[request.path] += 1
+        self.log.append((request.url.host, request.path, time.monotonic()))
 
 
 SITE_STATE = web.AppKey("site_state", SiteState)
@@ -55,9 +68,26 @@ async def encoding_page(request: web.Request) -> web.Response:
     return web.Response(body=body, headers={"Content-Type": content_type})
 
 
+async def robots_txt(request: web.Request) -> web.Response:
+    state = request.app[SITE_STATE]
+    state.record(request)
+    if state.robots is None:
+        raise web.HTTPNotFound()
+    return web.Response(text=state.robots, status=state.robots_status)
+
+
+async def flaky(request: web.Request) -> web.Response:
+    """Answers 503 with Retry-After: 0 the first `fails` times, then a page."""
+    state = request.app[SITE_STATE]
+    state.record(request)
+    if state.hits[request.path] <= int(request.match_info["fails"]):
+        raise web.HTTPServiceUnavailable(headers={"Retry-After": "0"})
+    return web.Response(text="<title>Recovered</title>", content_type="text/html")
+
+
 async def site_page(request: web.Request) -> web.Response:
     state = request.app[SITE_STATE]
-    state.hits[request.path] += 1
+    state.record(request)
     state.in_flight += 1
     state.peak_in_flight = max(state.peak_in_flight, state.in_flight)
     try:
@@ -88,6 +118,8 @@ async def server(aiohttp_server):
     app.router.add_get("/data.json", json_data)
     app.router.add_get("/encoding/{name}", encoding_page)
     app.router.add_get("/site/{path:.*}", site_page)
+    app.router.add_get("/robots.txt", robots_txt)
+    app.router.add_get("/flaky/{fails}", flaky)
     return await aiohttp_server(app)
 
 

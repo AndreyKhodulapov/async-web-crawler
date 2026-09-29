@@ -43,25 +43,43 @@ class CrawlStats:
     """Progress of a crawl at one moment.
 
     `skipped` counts pages fetched but left out because they redirected
-    outside the crawl scope. `in_progress` counts pages taken by workers:
+    outside the crawl scope; `blocked` counts pages robots.txt did not allow
+    to fetch. `in_progress` counts pages taken by workers:
     waiting for a free slot, being fetched or parsed. `active_requests` counts only HTTP requests
     holding a slot, so it never exceeds the concurrency limits. `elapsed`
     runs from the start of the crawl to now, or to its end once it has finished.
+
+    `requests` counts HTTP requests sent, robots.txt and retries included;
+    `retries` counts the retries alone. `current_rps` is the request rate
+    over the last few seconds, `avg_delay` the average gap between two
+    requests to the same host, `avg_wait` the average time a request waited
+    for the rate limit.
     """
 
     processed: int = 0
     failed: int = 0
     skipped: int = 0
+    blocked: int = 0
     queued: int = 0
     in_progress: int = 0
     active_requests: int = 0
     elapsed: float = 0.0
+    requests: int = 0
+    retries: int = 0
+    current_rps: float = 0.0
+    avg_delay: float = 0.0
+    avg_wait: float = 0.0
 
     @property
     def pages_per_second(self) -> float:
-        """Finished pages per second: processed, failed and skipped."""
+        """Fetched pages per second: processed, failed and skipped."""
         finished = self.processed + self.failed + self.skipped
         return finished / self.elapsed if self.elapsed > 0 else 0.0
+
+    @property
+    def requests_per_second(self) -> float:
+        """Average request rate over the whole crawl."""
+        return self.requests / self.elapsed if self.elapsed > 0 else 0.0
 
 
 class Metadata(TypedDict):
