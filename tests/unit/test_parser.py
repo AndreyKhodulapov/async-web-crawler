@@ -108,6 +108,16 @@ class TestLinks:
         assert page["links"] == ["https://example.com/static/a.html"]
         assert page["images"][0]["src"] == "https://example.com/static/i.png"
 
+    def test_same_host_uses_page_host_not_base_tag(self):
+        html = '<base href="https://cdn.example.net/"><a href="https://example.com/x">own</a><a href="y">cdn</a>'
+        page = HTMLParser(same_host_only=True).parse(html, "https://example.com/")
+        assert page["links"] == ["https://example.com/x"]
+
+    def test_same_host_matches_punycode_final_url(self):
+        html = '<a href="https://bücher.de/a">a</a><a href="/b">b</a>'
+        page = HTMLParser(same_host_only=True).parse(html, "https://xn--bcher-kva.de/")
+        assert page["links"] == ["https://xn--bcher-kva.de/a", "https://xn--bcher-kva.de/b"]
+
     def test_invalid_base_tag_is_ignored(self, parser):
         page = parser.parse('<base href="javascript:x"><a href="a">a</a>', "https://example.com/dir/")
         assert page["links"] == ["https://example.com/dir/a"]
@@ -123,6 +133,38 @@ class TestLinks:
             "https://example.com/a",
             "https://example.com/A",
         ]
+
+
+class TestTables:
+    def test_nested_caption_stays_with_nested_table(self, parser):
+        html = "<table><tr><td><table><caption>Inner</caption><tr><td>x</td></tr></table></td></tr></table>"
+        outer, inner = parser.extract_tables(soup(html))
+        assert outer["caption"] is None
+        assert inner["caption"] == "Inner"
+
+    def test_multi_row_thead_uses_last_row(self, parser):
+        html = """
+            <table>
+              <thead>
+                <tr><th colspan="2">Group</th></tr>
+                <tr><th>A</th><th>B</th></tr>
+              </thead>
+              <tbody><tr><td>1</td><td>2</td></tr></tbody>
+            </table>"""
+        [table] = parser.extract_tables(soup(html))
+        assert table["headers"] == ["A", "B"]
+        assert table["rows"] == [["1", "2"]]
+
+    def test_body_row_equal_to_header_is_kept(self, parser):
+        html = "<table><thead><tr><th>A</th></tr></thead><tbody><tr><th>A</th></tr></tbody></table>"
+        [table] = parser.extract_tables(soup(html))
+        assert table["headers"] == ["A"]
+        assert table["rows"] == [["A"]]
+
+    def test_first_row_without_cells(self, parser):
+        [table] = parser.extract_tables(soup("<table><tr></tr><tr><td>1</td></tr></table>"))
+        assert table["headers"] == []
+        assert table["rows"] == [["1"]]
 
 
 class TestExtractText:
@@ -152,6 +194,10 @@ class TestMetadata:
         metadata = parser.extract_metadata(soup(html))
         assert metadata["title"] == "OG title"
         assert metadata["description"] == "OG desc"
+
+    def test_empty_meta_is_skipped(self, parser):
+        html = '<meta name="description" content="  "><meta name="description" content="Real text">'
+        assert parser.extract_metadata(soup(html))["description"] == "Real text"
 
     def test_missing_metadata(self, parser):
         assert parser.extract_metadata(soup("<p>x</p>")) == {
@@ -217,7 +263,10 @@ class TestBrokenHTML:
         assert page["errors"] == [f"unsupported content type: {content_type}"]
         assert page["text"] == ""
 
-    @pytest.mark.parametrize("content_type", ["text/html", "application/xhtml+xml", None])
+    @pytest.mark.parametrize(
+        "content_type",
+        ["text/html", "application/xhtml+xml", None, "TEXT/HTML", "text/html; charset=utf-8"],
+    )
     def test_html_content_types(self, parser, content_type):
         page = parser.parse("<p>ok</p>", "https://example.com/", content_type=content_type)
         assert page["text"] == "ok"

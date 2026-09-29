@@ -40,11 +40,25 @@ BeautifulSoup is a tree API on top of a pluggable parser:
 - **Normalization** lets you deduplicate: lowercase the scheme and host, drop
   the default port and the `#fragment` (it is the same page), turn an empty
   path into `/`.
+- **Internationalized domains** (IDN) have two spellings: Unicode
+  (`bücher.de`) and ASCII punycode (`xn--bcher-kva.de`), which is what goes
+  over the wire. HTTP clients report the final URL in punycode, so convert
+  hosts before comparing them.
 - **Filtering**: only `http(s)` URLs are crawlable. Skip `mailto:`, `tel:`,
   `javascript:`, `data:`, empty and fragment-only hrefs. Reject malformed
   hosts and ports.
 - **Internal vs external**: compare hostnames. `www.example.com` and
   `example.com` are different hosts unless you decide otherwise.
+
+## Character encoding
+
+- Bytes become text only with the right encoding. Its sources, by priority:
+  a byte order mark, the `charset` in the `Content-Type` header, then
+  `<meta charset>` (or `<meta http-equiv="Content-Type">`) in the first
+  bytes of the page.
+- Many servers omit the header charset, and HTTP clients then assume UTF-8.
+  Pages in legacy encodings (windows-1251, windows-1252) come out as
+  replacement characters unless you read the `<meta>` declaration.
 
 ## Parsing inside an async program
 

@@ -55,6 +55,17 @@ async def cp1252_page(request: web.Request) -> web.Response:
     return web.Response(body=body, content_type="text/html", charset="windows-1252")
 
 
+async def meta_charset_page(request: web.Request) -> web.Response:
+    # The encoding is declared only in the markup, not in the header.
+    body = '<meta charset="windows-1252"><title>Café</title>'.encode("cp1252")
+    return web.Response(body=body, headers={"Content-Type": "text/html"})
+
+
+async def header_charset_wins_page(request: web.Request) -> web.Response:
+    body = '<meta charset="utf-8"><title>Café</title>'.encode("cp1252")
+    return web.Response(body=body, content_type="text/html", charset="windows-1252")
+
+
 @pytest.fixture
 async def server(aiohttp_server):
     """Local HTTP server with predictable endpoints; no internet required."""
@@ -67,6 +78,8 @@ async def server(aiohttp_server):
     app.router.add_get("/moved", moved)
     app.router.add_get("/data.json", json_data)
     app.router.add_get("/cp1252", cp1252_page)
+    app.router.add_get("/meta-charset", meta_charset_page)
+    app.router.add_get("/header-charset-wins", header_charset_wins_page)
     return await aiohttp_server(app)
 
 

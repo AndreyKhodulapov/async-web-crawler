@@ -131,7 +131,9 @@ class HTMLParser:
         started = time.perf_counter()
         page = _empty_page(url, final_url or url)
 
-        if content_type is not None and content_type not in HTML_CONTENT_TYPES:
+        # Media types are case-insensitive and may carry parameters
+        # ("text/html; charset=utf-8").
+        if content_type is not None and content_type.split(";")[0].strip().lower() not in HTML_CONTENT_TYPES:
             self._report(page, f"unsupported content type: {content_type}")
             return page
         if not html.strip():
@@ -149,7 +151,7 @@ class HTMLParser:
         )
         page["title"] = page["metadata"]["title"]
         page["text"] = self._extract(page, "text", self.extract_text, soup, default="")
-        page["links"] = self._extract(page, "links", self.extract_links, soup, base_url, default=[])
+        page["links"] = self._extract(page, "links", self.extract_links, soup, base_url, page["final_url"], default=[])
         page["headings"] = self._extract(page, "headings", self.extract_headings, soup, default=[])
         page["images"] = self._extract(page, "images", self.extract_images, soup, base_url, default=[])
         page["tables"] = self._extract(page, "tables", self.extract_tables, soup, default=[])
@@ -168,13 +170,20 @@ class HTMLParser:
         )
         return page
 
-    def extract_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
-        """Return absolute URLs of all <a href> links, deduplicated, in page order."""
+    def extract_links(self, soup: BeautifulSoup, base_url: str, page_url: str | None = None) -> list[str]:
+        """Return absolute URLs of all <a href> links, deduplicated, in page order.
+
+        Relative links are resolved against `base_url`. With `same_host_only`,
+        links are kept only if they share the host of `page_url`: a <base href>
+        may point to another host, such as a CDN, which is not the site itself.
+        `page_url` defaults to `base_url`.
+        """
+        own_url = page_url or base_url
         links: dict[str, None] = {}  # an ordered set
         skipped = 0
         for anchor in soup.find_all("a", href=True):
             link = resolve_url(_attr(anchor, "href"), base_url)
-            if link is None or (self.same_host_only and not is_same_host(link, base_url)):
+            if link is None or (self.same_host_only and not is_same_host(link, own_url)):
                 skipped += 1
                 continue
             links[link] = None
@@ -263,26 +272,28 @@ class HTMLParser:
         """Return tables as a caption, header cells and rows of cell text.
 
         Headers come from <thead>, or from the first row when all its cells
-        are <th>. Rows of nested tables belong to those tables only.
-        Colspan and rowspan are not expanded.
+        are <th>. If <thead> has several rows, the last one is used: it names
+        the columns, while the rows above usually group them. Rows of nested
+        tables belong to those tables only. Colspan and rowspan are not
+        expanded.
         """
         tables = []
         for table in soup.find_all("table"):
-            rows = [row for row in table.find_all("tr") if row.find_parent("table") is table]
-            headers: list[str] = []
-            if rows:
-                first = rows[0]
-                cells = first.find_all(["th", "td"], recursive=False)
-                in_thead = first.find_parent("thead") is not None
-                if cells and (in_thead or all(cell.name == "th" for cell in cells)):
-                    headers = [_visible_text(cell) for cell in cells]
-                    rows = rows[1:]
-            body = [
-                [_visible_text(cell) for cell in cells]
-                for row in rows
-                if (cells := row.find_all(["th", "td"], recursive=False))
-            ]
-            caption = table.find("caption")
+            head_rows: list[Tag] = []
+            rows: list[Tag] = []
+            for row in table.find_all("tr"):
+                if row.find_parent("table") is not table:
+                    continue
+                in_thead = row.parent is not None and row.parent.name == "thead"
+                (head_rows if in_thead else rows).append(row)
+            if not head_rows and rows:
+                first_cells = _cells(rows[0])
+                if first_cells and all(cell.name == "th" for cell in first_cells):
+                    head_rows, rows = rows[:1], rows[1:]
+            headers = [_visible_text(cell) for cell in _cells(head_rows[-1])] if head_rows else []
+            body = [[_visible_text(cell) for cell in cells] for row in rows if (cells := _cells(row))]
+            # A caption is always a direct child; a deeper one is a nested table's.
+            caption = table.find("caption", recursive=False)
             caption_text = _visible_text(caption) if caption is not None else ""
             tables.append(Table(caption=caption_text or None, headers=headers, rows=body))
         return tables
@@ -359,11 +370,16 @@ def _base_url(soup: BeautifulSoup, page_url: str) -> str:
 
 
 def _meta_content(soup: BeautifulSoup, attribute: str, value: str) -> str | None:
+    """Return the first non-empty content of <meta attribute=value>, if any."""
     pattern = re.compile(f"^{re.escape(value)}$", re.IGNORECASE)
-    tag = soup.find("meta", attrs={attribute: pattern, "content": True})
-    if tag is None:
-        return None
-    return _clean(_attr(tag, "content")) or None
+    for tag in soup.find_all("meta", attrs={attribute: pattern, "content": True}):
+        if content := _clean(_attr(tag, "content")):
+            return content
+    return None
+
+
+def _cells(row: Tag) -> list[Tag]:
+    return row.find_all(["th", "td"], recursive=False)
 
 
 def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:

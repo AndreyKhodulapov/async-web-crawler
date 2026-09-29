@@ -17,6 +17,7 @@ from crawler import (
     NetworkError,
     UnexpectedError,
 )
+from crawler.client import _sniff_charset
 
 
 class FakeResponse:
@@ -318,3 +319,18 @@ class TestFetchAndParse:
         fake_session.routes["http://a/"] = FakeResponse(b"<a href='/x'>in</a><a href='http://b/'>out</a>")
         page = await crawler.fetch_and_parse("http://a/")
         assert page["links"] == ["http://a/x"]
+
+
+class TestSniffCharset:
+    @pytest.mark.parametrize(
+        ("body", "expected"),
+        [
+            (b'<meta charset="windows-1252"><p>caf\xe9</p>', "windows-1252"),
+            (b'<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-2">', "iso-8859-2"),
+            (b'<meta charset="no-such-charset">', "utf-8"),
+            (b"<p>no declaration</p>", "utf-8"),
+            (b"\x89PNG\r\n", "utf-8"),
+        ],
+    )
+    def test_declared_charset(self, body, expected):
+        assert _sniff_charset(MagicMock(), body) == expected

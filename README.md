@@ -22,6 +22,8 @@ metadata, text, absolute links, images, headings, tables and lists.
 - Relative links resolved against `<base href>` or the final URL after
   redirects, normalized, deduplicated and validated; external links can be
   filtered out
+- Page encoding is taken from the `Content-Type` header, or from
+  `<meta charset>` when the header has none
 - Broken HTML is repaired by the parser; a failing extractor is logged and
   reported in `errors`, and the other fields are still returned
 

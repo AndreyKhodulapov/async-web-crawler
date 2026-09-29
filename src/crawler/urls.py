@@ -2,6 +2,8 @@
 
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
+import idna
+
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
@@ -18,8 +20,9 @@ def normalize_url(url: str) -> str | None:
     """Return a canonical form of an absolute http(s) URL, or None if invalid.
 
     Two spellings of the same address map to one string, so links can be
-    deduplicated: the scheme and host are lowercased, the default port and the
-    fragment are dropped, and an empty path becomes "/".
+    deduplicated: the scheme and host are lowercased, an internationalized
+    host is converted to punycode, the default port and the fragment are
+    dropped, and an empty path becomes "/".
     """
     try:
         parts = urlsplit(url.strip())
@@ -29,13 +32,17 @@ def normalize_url(url: str) -> str | None:
     scheme = parts.scheme.lower()
     if scheme not in _DEFAULT_PORTS or not parts.hostname:
         return None
+    host = _encode_host(parts.hostname)
+    if host is None:
+        return None
 
-    # Rebuild netloc by hand: `hostname` loses IPv6 brackets and userinfo.
-    userinfo, _, host_port = parts.netloc.rpartition("@")
-    host = host_port.lower()
-    if port == _DEFAULT_PORTS[scheme]:
-        host = host.removesuffix(f":{port}")
-    netloc = f"{userinfo}@{host}" if userinfo else host
+    # `hostname` is already lowercased but loses IPv6 brackets.
+    netloc = f"[{host}]" if ":" in host else host
+    if port is not None and port != _DEFAULT_PORTS[scheme]:
+        netloc += f":{port}"
+    if parts.username is not None:
+        userinfo = parts.netloc.rpartition("@")[0]
+        netloc = f"{userinfo}@{netloc}"
     return urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
 
 
@@ -57,9 +64,30 @@ def resolve_url(href: str, base_url: str) -> str | None:
 
 
 def is_same_host(url: str, other: str) -> bool:
-    """Return True if both URLs point to the same host (ports are ignored)."""
-    try:
-        host = urlsplit(url).hostname
-        return host is not None and host == urlsplit(other).hostname
-    except ValueError:
+    """Return True if both URLs point to the same host (ports are ignored).
+
+    Hosts are compared after normalization, so "bücher.de" and its punycode
+    form "xn--bcher-kva.de" are the same host.
+    """
+    first, second = normalize_url(url), normalize_url(other)
+    if first is None or second is None:
         return False
+    return urlsplit(first).hostname == urlsplit(second).hostname
+
+
+def _encode_host(host: str) -> str | None:
+    """Return the ASCII (punycode) form of a host, or None if it is invalid.
+
+    Mirrors yarl, which aiohttp uses for the final URL of a response: UTS #46
+    mapping first, then the stdlib IDNA 2003 codec for hosts it rejects.
+    """
+    if host.isascii():
+        return host
+    try:
+        return idna.encode(host, uts46=True).decode("ascii")
+    except UnicodeError:
+        pass
+    try:
+        return host.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None

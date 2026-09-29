@@ -1,6 +1,7 @@
 """Asynchronous HTTP client that downloads many pages concurrently."""
 
 import asyncio
+import codecs
 import logging
 import ssl
 import time
@@ -10,6 +11,7 @@ from typing import NamedTuple, Self
 
 import aiohttp
 import certifi
+from bs4.dammit import EncodingDetector
 
 from crawler.exceptions import (
     CrawlerClosedError,
@@ -224,6 +226,7 @@ class AsyncCrawler:
             connector=connector,
             timeout=self._timeout,
             headers={"User-Agent": self._user_agent},
+            fallback_charset_resolver=_sniff_charset,
         )
 
     async def _request(self, url: str) -> _Response:
@@ -268,6 +271,24 @@ class AsyncCrawler:
             raise InvalidURLError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
+
+
+def _sniff_charset(response: aiohttp.ClientResponse, body: bytes) -> str:
+    """Pick an encoding when the Content-Type header has no charset.
+
+    aiohttp calls this only in that case and would otherwise assume UTF-8.
+    Many pages declare their encoding in the markup instead:
+    <meta charset="..."> or <meta http-equiv="Content-Type" content="...">.
+    """
+    declared = EncodingDetector.find_declared_encoding(body, is_html=True)
+    if declared is not None:
+        try:
+            codecs.lookup(declared)
+        except LookupError:
+            logger.debug("Unknown declared charset %r for %s", declared, response.url)
+        else:
+            return declared
+    return "utf-8"
 
 
 def _decode(body: bytes, encoding: str) -> str:

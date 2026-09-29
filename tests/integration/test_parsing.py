@@ -53,6 +53,13 @@ async def test_page_charset_is_respected(crawler, server):
     assert page["text"] == "Crème brûlée"
 
 
+@pytest.mark.parametrize("path", ["/meta-charset", "/header-charset-wins"])
+async def test_charset_from_meta_or_header(crawler, server, path):
+    # The header charset wins over <meta>; <meta> is used when the header has none.
+    page = await crawler.fetch_and_parse(str(server.make_url(path)))
+    assert page["title"] == "Café"
+
+
 async def test_http_error_is_raised(crawler, server):
     with pytest.raises(HTTPStatusError):
         await crawler.fetch_and_parse(str(server.make_url("/status/500")))

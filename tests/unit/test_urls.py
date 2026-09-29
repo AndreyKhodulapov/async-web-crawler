@@ -62,7 +62,11 @@ def test_resolve_with_invalid_base_keeps_only_absolute_links():
         ("https://example.com/a?x=1#frag", "https://example.com/a?x=1"),
         ("http://User@Example.com/", "http://User@example.com/"),
         ("http://[::1]:80/", "http://[::1]/"),
-        ("https://BÜCHER.de/", "https://bücher.de/"),
+        ("https://BÜCHER.de/", "https://xn--bcher-kva.de/"),
+        ("https://xn--bcher-kva.de/", "https://xn--bcher-kva.de/"),
+        ("http://example.com:/a", "http://example.com/a"),
+        ("http://user:pw@Example.com:8080/", "http://user:pw@example.com:8080/"),
+        ("http://" + "a" * 70 + "é.com/", None),
     ],
 )
 def test_normalize(url, expected):
@@ -92,6 +96,9 @@ def test_is_valid_http_url(url, valid):
         ("https://www.example.com/", "https://example.com/", False),
         ("https://example.com/", "not a url", False),
         ("http://[::1/", "http://[::1/", False),
+        # yarl reports the final URL of a response in punycode.
+        ("https://bücher.de/katalog", "https://xn--bcher-kva.de/", True),
+        ("https://BÜCHER.de/", "https://bücher.de/", True),
     ],
 )
 def test_is_same_host(url, other, same):
