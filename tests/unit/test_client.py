@@ -34,6 +34,7 @@ class FakeResponse:
         self.content_type = content_type or "application/octet-stream"
         # None means "not redirected": FakeSession fills in the requested URL.
         self.url = url
+        self.history = () if url is None else (MagicMock(),)
         self.read_count = 0
 
     def raise_for_status(self) -> None:
@@ -249,12 +250,14 @@ class TestFetchMany:
         assert result.elapsed >= 0
         assert result.final_url == "http://a"
         assert result.content_type == "text/html"
+        assert result.redirected is False
 
     async def test_redirect_and_missing_content_type(self, crawler, fake_session):
         fake_session.routes["http://a"] = FakeResponse(content_type=None, url="https://a/home")
         [result] = await crawler.fetch_many(["http://a"])
         assert result.final_url == "https://a/home"
         assert result.content_type is None
+        assert result.redirected is True
 
     async def test_unexpected_error_does_not_cancel_batch(self, crawler, fake_session):
         fake_session.latency = 0.01

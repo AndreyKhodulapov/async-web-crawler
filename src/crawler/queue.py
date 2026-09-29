@@ -18,7 +18,7 @@ class CrawlerQueue:
     waiting, being fetched or already done.
 
     Lifecycle of a URL: `add_url` -> `get_next` (in progress) ->
-    `mark_processed` or `mark_failed`. Workers loop until `get_next` returns
+    `mark_processed`, `mark_failed` or `mark_skipped`. Workers loop until `get_next` returns
     None, which happens when there is nothing left to do (see `get_next`)
     or after `close`.
     """
@@ -36,6 +36,7 @@ class CrawlerQueue:
         self._closed = False
         self.visited: set[str] = set()  # URLs handed out by get_next
         self.failed: dict[str, str] = {}  # URL -> error description
+        self.skipped: dict[str, str] = {}  # URL -> why it was left out
 
     @property
     def closed(self) -> bool:
@@ -97,6 +98,11 @@ class CrawlerQueue:
         self._finish(url)
         self.failed[url] = error
 
+    def mark_skipped(self, url: str, reason: str) -> None:
+        """Finish a URL that was fetched fine but is not wanted, e.g. after a redirect."""
+        self._finish(url)
+        self.skipped[url] = reason
+
     def close(self) -> None:
         """Stop handing out URLs: every current and future `get_next` returns None.
 
@@ -111,6 +117,7 @@ class CrawlerQueue:
             "in_progress": len(self._in_progress),
             "processed": self._processed_count,
             "failed": len(self.failed),
+            "skipped": len(self.skipped),
             "seen": len(self._depths),
         }
 

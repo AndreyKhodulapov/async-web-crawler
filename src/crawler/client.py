@@ -37,6 +37,7 @@ class _Response(NamedTuple):
     size: int
     final_url: str
     content_type: str | None
+    redirected: bool
 
 
 class AsyncCrawler:
@@ -131,6 +132,11 @@ class AsyncCrawler:
         return self._queue.failed
 
     @property
+    def skipped_urls(self) -> dict[str, str]:
+        """URL -> reason for pages the latest crawl fetched but left out. Do not modify."""
+        return self._queue.skipped
+
+    @property
     def url_depths(self) -> Mapping[str, int]:
         """Depth of every URL the latest crawl accepted: 0 for start URLs."""
         return self._queue.depths
@@ -161,13 +167,7 @@ class AsyncCrawler:
         result = await self._fetch(url, html_only=True)
         if result.error is not None:
             raise result.error
-        assert result.content is not None
-        return await self._parser.parse_html(
-            result.content,
-            url,
-            final_url=result.final_url,
-            content_type=result.content_type,
-        )
+        return await self._parse(result)
 
     async def fetch_urls(self, urls: Iterable[str]) -> dict[str, str]:
         """Download pages concurrently; return bodies of successful ones only.
@@ -232,7 +232,18 @@ class AsyncCrawler:
                 size=response.size,
                 final_url=response.final_url,
                 content_type=response.content_type,
+                redirected=response.redirected,
             )
+
+    async def _parse(self, result: FetchResult) -> ParsedPage:
+        """Parse a successful fetch result."""
+        assert result.content is not None
+        return await self._parser.parse_html(
+            result.content,
+            result.url,
+            final_url=result.final_url,
+            content_type=result.content_type,
+        )
 
     async def crawl(
         self,
@@ -254,14 +265,14 @@ class AsyncCrawler:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
         the pages they redirect to); `include_patterns` and `exclude_patterns`
         are regular expressions, see `UrlFilter`. A link that passes the
-        filters but redirects to a URL that does not is dropped: the page is
-        not returned and its links are not followed.
+        filters but redirects to a URL that does not is skipped: the page is
+        not returned, its links are not followed, and it is listed in
+        `skipped_urls` with the reason.
 
-        Failed and dropped pages do not stop the crawl: they are listed in
-        `failed_urls` with the reason.
+        Failed pages do not stop the crawl: they are listed in `failed_urls`.
         The state of the crawl (`processed_urls`, `visited_urls`,
-        `failed_urls`, `url_depths`, `crawl_stats()`) is reset on every call
-        and stays available after it returns.
+        `failed_urls`, `skipped_urls`, `url_depths`, `crawl_stats()`) is
+        reset on every call and stays available after it returns.
 
         Raises:
             TypeError: a single string is passed instead of a list of URLs or patterns.
@@ -301,9 +312,10 @@ class AsyncCrawler:
             self._crawl_finished = time.perf_counter()
         stats = self.crawl_stats()
         logger.info(
-            "Crawl finished: %d processed, %d failed, %d left in queue, %.2fs",
+            "Crawl finished: %d processed, %d failed, %d skipped, %d left in queue, %.2fs",
             stats.processed,
             stats.failed,
+            stats.skipped,
             stats.queued,
             stats.elapsed,
         )
@@ -317,6 +329,7 @@ class AsyncCrawler:
         return CrawlStats(
             processed=stats["processed"],
             failed=stats["failed"],
+            skipped=stats["skipped"],
             queued=stats["queued"],
             in_progress=stats["in_progress"],
             active_requests=self._limits.active,
@@ -339,27 +352,28 @@ class AsyncCrawler:
 
     async def _crawl_page(self, url: str, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
         depth = queue.depth(url)
-        try:
-            page = await self.fetch_and_parse(url)
-        except FetchError as error:
-            queue.mark_failed(url, f"{type(error).__name__}: {error.message}")
+        result = await self._fetch(url, html_only=True)
+        if result.error is not None:
+            queue.mark_failed(url, f"{type(result.error).__name__}: {result.error.message}")
             return
+        page = await self._parse(result)
 
-        final_url = normalize_url(page["final_url"]) or page["final_url"]
-        if final_url != url:
+        if result.redirected:
+            # Normalized like the links, so that patterns see the same form.
+            final_url = normalize_url(page["final_url"])
+            assert final_url is not None  # aiohttp has just fetched it
             # A later link to the redirect target must not fetch the page again.
             queue.mark_seen(final_url)
-            final_host = get_host(final_url)
-            if depth == 0 and final_host is not None:
+            if depth == 0:
                 # A start URL that redirects ("example.com" -> "www.example.com")
                 # defines the site as much as the URL itself.
-                url_filter.allow_host(final_host)
-            elif depth > 0 and not url_filter.allows(final_url):
+                url_filter.allow_host_of(final_url)
+            elif not url_filter.allows(final_url):
                 # aiohttp follows redirects on its own, so a link inside the
                 # crawl scope can lead out of it, e.g. to a sign-in page on
                 # another domain. Such a page is not part of the site.
-                logger.info("Dropped %s: redirected out of scope to %s", url, final_url)
-                queue.mark_failed(url, f"redirected out of scope: {final_url}")
+                logger.info("Skipped %s: redirected out of scope to %s", url, final_url)
+                queue.mark_skipped(url, f"redirected out of scope: {final_url}")
                 return
 
         queued = 0
@@ -432,6 +446,7 @@ class AsyncCrawler:
                         size=0,
                         final_url=str(response.url),
                         content_type=content_type,
+                        redirected=bool(response.history),
                     )
                 body = await response.read()
                 return _Response(
@@ -440,6 +455,7 @@ class AsyncCrawler:
                     size=len(body),
                     final_url=str(response.url),
                     content_type=content_type,
+                    redirected=bool(response.history),
                 )
         # Order matters: TooManyRedirects is a ClientResponseError, which is a
         # ClientError; aiohttp's ServerTimeoutError is both a ClientError and

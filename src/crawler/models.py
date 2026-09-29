@@ -11,7 +11,9 @@ class FetchResult:
     """Outcome of fetching a single URL, successful or not.
 
     Exactly one of ``content`` and ``error`` is set. ``final_url`` is the
-    address after redirects; ``content_type`` is the media type without
+    address after redirects, and ``redirected`` tells whether there were
+    any: comparing the two URLs is not enough, as the HTTP client spells
+    ``final_url`` in its own way. ``content_type`` is the media type without
     parameters, or None if the server did not send a Content-Type header.
     """
 
@@ -23,6 +25,7 @@ class FetchResult:
     error: FetchError | None = None
     final_url: str | None = None
     content_type: str | None = None
+    redirected: bool = False
 
     @property
     def ok(self) -> bool:
@@ -39,14 +42,16 @@ class FetchResult:
 class CrawlStats:
     """Progress of a crawl at one moment.
 
-    `in_progress` counts pages taken by workers: waiting for a free slot,
-    being fetched or parsed. `active_requests` counts only HTTP requests
+    `skipped` counts pages fetched but left out because they redirected
+    outside the crawl scope. `in_progress` counts pages taken by workers:
+    waiting for a free slot, being fetched or parsed. `active_requests` counts only HTTP requests
     holding a slot, so it never exceeds the concurrency limits. `elapsed`
     runs from the start of the crawl to now, or to its end once it has finished.
     """
 
     processed: int = 0
     failed: int = 0
+    skipped: int = 0
     queued: int = 0
     in_progress: int = 0
     active_requests: int = 0
@@ -54,8 +59,9 @@ class CrawlStats:
 
     @property
     def pages_per_second(self) -> float:
-        """Finished pages, successful or not, per second."""
-        return (self.processed + self.failed) / self.elapsed if self.elapsed > 0 else 0.0
+        """Finished pages per second: processed, failed and skipped."""
+        finished = self.processed + self.failed + self.skipped
+        return finished / self.elapsed if self.elapsed > 0 else 0.0
 
 
 class Metadata(TypedDict):

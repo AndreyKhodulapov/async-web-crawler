@@ -287,7 +287,7 @@ async def run_parse(args: argparse.Namespace) -> None:
 
 def format_progress(stats: CrawlStats) -> str:
     return (
-        f"pages {stats.processed} | failed {stats.failed} | queued {stats.queued} | "
+        f"pages {stats.processed} | failed {stats.failed} | skipped {stats.skipped} | queued {stats.queued} | "
         f"in progress {stats.in_progress} | requests {stats.active_requests} | "
         f"{stats.pages_per_second:.1f} pages/s | {stats.elapsed:.1f}s"
     )
@@ -319,12 +319,13 @@ def print_crawl_report(crawler: AsyncCrawler) -> None:
             page = crawler.processed_urls[url]
             result = f"ok, {len(page['errors'])} warning(s)" if page["errors"] else "ok"
             print(f"{depth:>5}  {result:<36}  {len(page['links']):>5}  {url}")
-        elif url in crawler.failed_urls:
-            result = textwrap.shorten(crawler.failed_urls[url], width=36, placeholder="...")
+        elif url in crawler.failed_urls or url in crawler.skipped_urls:
+            reason = crawler.failed_urls.get(url) or f"skipped, {crawler.skipped_urls[url]}"
+            result = textwrap.shorten(reason, width=36, placeholder="...")
             print(f"{depth:>5}  {result:<36}  {'':>5}  {url}")
     print(
-        f"Crawled: {stats.processed} pages, failed: {stats.failed}, left in queue: {stats.queued}, "
-        f"speed: {stats.pages_per_second:.1f} pages/s"
+        f"Crawled: {stats.processed} pages, failed: {stats.failed}, skipped: {stats.skipped}, "
+        f"left in queue: {stats.queued}, speed: {stats.pages_per_second:.1f} pages/s"
     )
 
 
@@ -335,12 +336,16 @@ def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
         "stats": {
             "processed": stats.processed,
             "failed": stats.failed,
+            "skipped": stats.skipped,
             "queued": stats.queued,
             "elapsed": round(stats.elapsed, 3),
             "pages_per_second": round(stats.pages_per_second, 2),
         },
         "pages": [{"depth": depths[url], **page} for url, page in crawler.processed_urls.items()],
         "failed": [{"url": url, "depth": depths[url], "error": error} for url, error in crawler.failed_urls.items()],
+        "skipped": [
+            {"url": url, "depth": depths[url], "reason": reason} for url, reason in crawler.skipped_urls.items()
+        ],
     }
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nFull results saved to {path}")

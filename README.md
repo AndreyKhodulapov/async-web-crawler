@@ -71,7 +71,7 @@ is not checked yet, so point the crawler only at sites that allow crawling.
 While it runs, a progress line is updated every second:
 
 ```
-pages 25 | failed 0 | queued 15 | in progress 5 | requests 2 | 5.0 pages/s | 5.0s
+pages 25 | failed 0 | skipped 0 | queued 15 | in progress 5 | requests 2 | 5.0 pages/s | 5.0s
 ```
 
 `in progress` counts pages taken by workers; `requests` counts those actually
@@ -87,11 +87,11 @@ DEPTH  RESULT                                LINKS  URL
     1  ok                                        3  https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html
     ...
     2  ok                                        9  https://books.toscrape.com/catalogue/in-her-wake_980/index.html
-Crawled: 30 pages, failed: 0, left in queue: 15, speed: 5.4 pages/s
+Crawled: 30 pages, failed: 0, skipped: 0, left in queue: 15, speed: 5.4 pages/s
 ```
 
-With `--json`, the parsed pages (with their depth), the failed URLs with
-their errors and the statistics are saved to a file.
+With `--json`, the parsed pages (with their depth), the failed and skipped
+URLs with the reasons and the statistics are saved to a file.
 
 ### parse
 
@@ -241,8 +241,9 @@ report it per URL.
 `crawl()` runs `max_concurrent` workers over a priority queue of URLs. A link
 found on a page at depth `d` gets depth `d + 1` and is followed only up to
 `max_depth`, so the site is walked breadth-first. `max_pages` caps the pages
-fetched, failed ones included. URLs are normalized, and each one is fetched at
-most once. The target of a redirect is remembered too; it may still be fetched
+fetched, failed ones included. URLs are normalized (including their
+percent-encoding, so `/café` and `/caf%C3%A9` are one page), and each one is
+fetched at most once. The target of a redirect is remembered too; it may still be fetched
 twice if a direct link to it is downloaded at the same moment.
 
 | Option | Effect |
@@ -253,9 +254,11 @@ twice if a direct link to it is downloaded at the same moment.
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
 
-Filters apply to discovered links, not to the start URLs. A link that passes
-them but redirects to a URL that does not, such as a sign-in page on another
-domain, is dropped and listed in `failed_urls` as `redirected out of scope`.
+Filters apply to discovered links, not to the start URLs. Patterns match the
+normalized URL both percent-encoded and decoded, so `r"/café"` works. A link
+that passes the filters but redirects to a URL that does not, such as a
+sign-in page on another domain, is skipped: it is left out of the results
+and listed in `skipped_urls` as `redirected out of scope`.
 Invalid start URLs or patterns raise `ValueError` before anything is fetched. After a crawl, and
 during one, the crawler exposes its state:
 
@@ -263,9 +266,10 @@ during one, the crawler exposes its state:
 |-----------|---------|
 | `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()` |
 | `failed_urls` | `{url: "ErrorType: message"}` |
+| `skipped_urls` | `{url: reason}` for pages fetched but left out, e.g. redirected out of scope |
 | `visited_urls` | every URL taken for fetching, successful or not |
 | `url_depths` | depth of every URL accepted into the queue |
-| `crawl_stats()` | `CrawlStats`: processed, failed, queued, in progress, active requests, elapsed, pages per second |
+| `crawl_stats()` | `CrawlStats`: processed, failed, skipped, queued, in progress, active requests, elapsed, pages per second |
 
 The building blocks can be used on their own: `CrawlerQueue` (priorities,
 deduplication, completion detection), `SemaphoreManager` (global and

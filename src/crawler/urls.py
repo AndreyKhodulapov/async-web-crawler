@@ -1,6 +1,7 @@
 """URL helpers: validation, normalization and resolution of relative links."""
 
-from urllib.parse import urljoin, urlsplit, urlunsplit
+import re
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import idna
 
@@ -17,6 +18,8 @@ def normalize_url(url: str) -> str | None:
     deduplicated: the scheme and host are lowercased, an internationalized
     host is converted to punycode, a trailing dot in the host, the default
     port and the fragment are dropped, and an empty path becomes "/".
+    The path and query are percent-encoded the way an HTTP client sends
+    them: "/café" and "/caf%C3%A9" are the same address.
     """
     try:
         parts = urlsplit(url.strip())
@@ -39,7 +42,10 @@ def normalize_url(url: str) -> str | None:
     if parts.username is not None:
         userinfo = parts.netloc.rpartition("@")[0]
         netloc = f"{userinfo}@{netloc}"
-    return urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
+    path, query = _percent_encode(parts.path or "/"), _percent_encode(parts.query)
+    if path is None or query is None:
+        return None
+    return urlunsplit((scheme, netloc, path, query, ""))
 
 
 def resolve_url(href: str, base_url: str) -> str | None:
@@ -72,6 +78,20 @@ def is_same_host(url: str, other: str) -> bool:
     """Return True if both URLs point to the same host (ports are ignored)."""
     host = get_host(url)
     return host is not None and host == get_host(other)
+
+
+def _percent_encode(component: str) -> str | None:
+    """Percent-encode non-ASCII characters, spaces and the like; None if impossible.
+
+    Characters that RFC 3986 allows in a path or query are kept, and so are
+    existing escapes, whose hex digits are uppercased: "%d0" and "%D0" are
+    the same byte. A lone surrogate cannot be encoded as UTF-8.
+    """
+    try:
+        encoded = quote(component, safe="/?:@!$&'()*+,;=-._~%")
+    except UnicodeEncodeError:
+        return None
+    return re.sub(r"%[0-9a-fA-F]{2}", lambda escape: escape.group().upper(), encoded)
 
 
 def _encode_host(host: str) -> str | None:

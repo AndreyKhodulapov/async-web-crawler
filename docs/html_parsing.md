@@ -39,7 +39,9 @@ BeautifulSoup is a tree API on top of a pluggable parser:
   to `/docs/` changes where `href="intro"` points.
 - **Normalization** lets you deduplicate: lowercase the scheme and host, drop
   the default port and the `#fragment` (it is the same page), turn an empty
-  path into `/`.
+  path into `/`, and percent-encode the path and query the way the HTTP
+  client will (`/café` and `/caf%C3%A9` are one page; `%c3` equals `%C3`).
+  Keep existing escapes as they are: `%2F` is not the same as `/`.
 - **Internationalized domains** (IDN) have two spellings: Unicode
   (`bücher.de`) and ASCII punycode (`xn--bcher-kva.de`), which is what goes
   over the wire. HTTP clients report the final URL in punycode, so convert

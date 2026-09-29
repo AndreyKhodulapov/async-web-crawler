@@ -55,6 +55,8 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 # Cycles, duplicate links and self-links check that no page is fetched twice.
 # /site/exits.html is not linked from the others: it starts crawls whose
 # links redirect to another host (to-other-host) or to c.html (moved).
+# /site/names.html links to pages whose URLs need percent-encoding, one of
+# them twice: as raw text and already encoded.
 SITE_PAGES: dict[str, str] = {
     "/site/": """
         <title>Home</title>
@@ -70,4 +72,10 @@ SITE_PAGES: dict[str, str] = {
     "/site/a/deepest.html": '<title>Deepest</title><a href="/site/">Home</a>',
     "/site/c.html": "<title>C</title>",
     "/site/exits.html": '<title>Exits</title><a href="to-other-host">Sign in</a> <a href="moved">Moved</a>',
+    "/site/names.html": """
+        <title>Names</title>
+        <a href="café.html">Raw</a> <a href="caf%C3%A9.html">Encoded</a> <a href="a b.html">Space</a>
+    """,
+    "/site/café.html": "<title>Café</title>",
+    "/site/a b.html": "<title>Space</title>",
 }

@@ -114,22 +114,40 @@ class TestGetNext:
 class TestStatus:
     async def test_stats_follow_the_lifecycle(self):
         queue = CrawlerQueue()
-        for name in ("a", "b", "c"):
+        for name in ("a", "b", "c", "d"):
             queue.add_url(f"http://site/{name}")
-        a, b = await take(queue), await take(queue)
-        assert queue.get_stats() == {"queued": 1, "in_progress": 2, "processed": 0, "failed": 0, "seen": 3}
+        a, b, c = await take(queue), await take(queue), await take(queue)
+        assert queue.get_stats() == {
+            "queued": 1,
+            "in_progress": 3,
+            "processed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "seen": 4,
+        }
 
         queue.mark_processed(a)
         queue.mark_failed(b, "HTTPStatusError: HTTP 404 Not Found")
+        queue.mark_skipped(c, "redirected out of scope: http://other/")
 
-        assert queue.get_stats() == {"queued": 1, "in_progress": 0, "processed": 1, "failed": 1, "seen": 3}
-        assert queue.visited == {a, b}
+        assert queue.get_stats() == {
+            "queued": 1,
+            "in_progress": 0,
+            "processed": 1,
+            "failed": 1,
+            "skipped": 1,
+            "seen": 4,
+        }
+        assert queue.visited == {a, b, c}
         assert queue.failed == {b: "HTTPStatusError: HTTP 404 Not Found"}
+        assert queue.skipped == {c: "redirected out of scope: http://other/"}
 
-    @pytest.mark.parametrize("mark", ["mark_processed", "mark_failed"])
-    async def test_marking_a_url_not_in_progress_is_an_error(self, mark):
+    @pytest.mark.parametrize(
+        ("mark", "args"),
+        [("mark_processed", ()), ("mark_failed", ("error",)), ("mark_skipped", ("reason",))],
+    )
+    async def test_marking_a_url_not_in_progress_is_an_error(self, mark, args):
         queue = CrawlerQueue()
         queue.add_url("http://site/a")
-        args = ("http://site/a",) if mark == "mark_processed" else ("http://site/a", "error")
         with pytest.raises(ValueError, match="not in progress"):
-            getattr(queue, mark)(*args)
+            getattr(queue, mark)("http://site/a", *args)

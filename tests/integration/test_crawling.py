@@ -99,20 +99,37 @@ async def test_start_url_redirect_to_other_host_keeps_that_host(server, url):
     assert f"http://localhost:{server.port}/site/a.html" in crawler.processed_urls
 
 
-async def test_redirect_out_of_the_start_hosts_is_dropped(url, server):
+async def test_redirect_out_of_the_start_hosts_is_skipped(url, server):
     crawler = await crawl(url("/site/exits.html"), max_depth=1, same_domain_only=True)
 
     assert set(crawler.processed_urls) == {url("/site/exits.html"), url("/site/moved")}
-    assert crawler.failed_urls == {
+    assert crawler.failed_urls == {}
+    assert crawler.skipped_urls == {
         url("/site/to-other-host"): f"redirected out of scope: http://localhost:{server.port}/site/"
     }
+    assert crawler.crawl_stats().skipped == 1
 
 
-async def test_redirect_to_an_excluded_url_is_dropped(url):
+async def test_redirect_to_an_excluded_url_is_skipped(url):
     crawler = await crawl(url("/site/exits.html"), max_depth=1, exclude_patterns=[r"/c\.html$"])
 
     assert url("/site/moved") not in crawler.processed_urls
-    assert crawler.failed_urls[url("/site/moved")] == f"redirected out of scope: {url('/site/c.html')}"
+    assert crawler.skipped_urls[url("/site/moved")] == f"redirected out of scope: {url('/site/c.html')}"
+
+
+async def test_urls_needing_percent_encoding(url, site):
+    # No redirect happens here, although the client reports the final URL
+    # percent-encoded; raw and encoded links to one page are one URL; the
+    # include patterns are written in the decoded form.
+    crawler = await crawl(url("/site/names.html"), max_depth=1, include_patterns=[r"/café\.html", r"/a b\.html"])
+
+    assert set(crawler.processed_urls) == {
+        url("/site/names.html"),
+        url("/site/caf%C3%A9.html"),
+        url("/site/a%20b.html"),
+    }
+    assert crawler.skipped_urls == crawler.failed_urls == {}
+    assert site.hits["/site/café.html"] == 1
 
 
 async def test_exclude_patterns(url, site):
@@ -146,6 +163,7 @@ async def test_stats_after_crawl(url):
 
     assert stats.processed == len(crawler.processed_urls) == 5
     assert stats.failed == len(crawler.failed_urls) == 2
+    assert stats.skipped == 0
     assert stats.in_progress == stats.active_requests == 0
     assert stats.queued == 0
     assert stats.pages_per_second > 0
