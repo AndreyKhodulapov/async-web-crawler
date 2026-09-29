@@ -11,6 +11,8 @@ from crawler import (
     CrawlerClosedError,
     FetchResult,
     FetchTimeoutError,
+    HTMLParser,
+    HTTPStatusError,
     InvalidURLError,
     NetworkError,
     UnexpectedError,
@@ -18,10 +20,21 @@ from crawler import (
 
 
 class FakeResponse:
-    def __init__(self, body: bytes = b"page", status: int = 200, encoding: str = "utf-8") -> None:
+    def __init__(
+        self,
+        body: bytes = b"page",
+        status: int = 200,
+        encoding: str = "utf-8",
+        content_type: str | None = "text/html",
+        url: str | None = None,
+    ) -> None:
         self.status = status
         self._body = body
         self._encoding = encoding
+        self.headers = {} if content_type is None else {"Content-Type": content_type}
+        self.content_type = content_type or "application/octet-stream"
+        # None means "not redirected": FakeSession fills in the requested URL.
+        self.url = url
 
     def raise_for_status(self) -> None:
         if self.status >= 400:
@@ -76,6 +89,8 @@ class FakeSession:
             outcome = self.routes.get(url, FakeResponse())
             if isinstance(outcome, BaseException):
                 raise outcome
+            if outcome.url is None:
+                outcome.url = url
             return outcome
         finally:
             self.in_flight -= 1
@@ -226,6 +241,14 @@ class TestFetchMany:
         assert result.size == 6  # bytes, not characters
         assert result.status == 200
         assert result.elapsed >= 0
+        assert result.final_url == "http://a"
+        assert result.content_type == "text/html"
+
+    async def test_redirect_and_missing_content_type(self, crawler, fake_session):
+        fake_session.routes["http://a"] = FakeResponse(content_type=None, url="https://a/home")
+        [result] = await crawler.fetch_many(["http://a"])
+        assert result.final_url == "https://a/home"
+        assert result.content_type is None
 
     async def test_non_text_charset_falls_back_to_utf8(self, crawler, fake_session):
         fake_session.routes["http://a"] = FakeResponse(b"page", encoding="base64")
@@ -251,3 +274,47 @@ class TestFetchUrls:
 
     async def test_empty_input(self, crawler):
         assert await crawler.fetch_urls([]) == {}
+
+
+class TestFetchAndParse:
+    async def test_returns_parsed_page(self, crawler, fake_session):
+        html = b"<title>Home</title><body><p>Hello</p><a href='/about'>About</a></body>"
+        fake_session.routes["http://site/"] = FakeResponse(html)
+        page = await crawler.fetch_and_parse("http://site/")
+        assert page["url"] == "http://site/"
+        assert page["title"] == "Home"
+        assert page["text"] == "Hello About"
+        assert page["links"] == ["http://site/about"]
+        assert page["errors"] == []
+
+    async def test_links_are_resolved_against_final_url(self, crawler, fake_session):
+        html = b"<a href='next'>next</a>"
+        fake_session.routes["http://site/docs"] = FakeResponse(html, url="https://site/docs/")
+        page = await crawler.fetch_and_parse("http://site/docs")
+        assert page["url"] == "http://site/docs"
+        assert page["final_url"] == "https://site/docs/"
+        assert page["links"] == ["https://site/docs/next"]
+
+    async def test_non_html_is_not_parsed(self, crawler, fake_session, caplog):
+        fake_session.routes["http://api"] = FakeResponse(b'{"a": "<b>"}', content_type="application/json")
+        page = await crawler.fetch_and_parse("http://api")
+        assert page["text"] == ""
+        assert page["errors"] == ["unsupported content type: application/json"]
+        assert "unsupported content type" in caplog.text
+
+    async def test_missing_content_type_is_parsed_as_html(self, crawler, fake_session):
+        fake_session.routes["http://a"] = FakeResponse(b"<h1>Hi</h1>", content_type=None)
+        page = await crawler.fetch_and_parse("http://a")
+        assert page["headings"] == [{"level": 1, "text": "Hi"}]
+
+    async def test_fetch_error_is_raised(self, crawler, fake_session):
+        fake_session.routes["http://a"] = FakeResponse(status=404)
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_and_parse("http://a")
+
+    async def test_uses_injected_parser(self, monkeypatch, fake_session):
+        crawler = AsyncCrawler(parser=HTMLParser(same_host_only=True))
+        monkeypatch.setattr(crawler, "_create_session", lambda: fake_session)
+        fake_session.routes["http://a/"] = FakeResponse(b"<a href='/x'>in</a><a href='http://b/'>out</a>")
+        page = await crawler.fetch_and_parse("http://a/")
+        assert page["links"] == ["http://a/x"]

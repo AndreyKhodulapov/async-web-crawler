@@ -11,6 +11,7 @@ from crawler.exceptions import (
     UnexpectedError,
 )
 from crawler.models import FetchResult
+from crawler.parser import HTMLParser, ParsedPage
 
 __all__ = [
     "AsyncCrawler",
@@ -18,8 +19,10 @@ __all__ = [
     "FetchError",
     "FetchResult",
     "FetchTimeoutError",
+    "HTMLParser",
     "HTTPStatusError",
     "InvalidURLError",
     "NetworkError",
+    "ParsedPage",
     "UnexpectedError",
 ]
