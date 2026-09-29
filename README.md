@@ -243,8 +243,9 @@ found on a page at depth `d` gets depth `d + 1` and is followed only up to
 `max_depth`, so the site is walked breadth-first. `max_pages` caps the pages
 fetched, failed ones included. URLs are normalized (including their
 percent-encoding, so `/café` and `/caf%C3%A9` are one page), and each one is
-fetched at most once. The target of a redirect is remembered too; it may still be fetched
-twice if a direct link to it is downloaded at the same moment.
+fetched at most once. The target of a redirect is remembered too, but only
+once the response arrives: if a direct link to it was queued or fetched before
+that, the page is downloaded twice and appears in the results under both URLs.
 
 | Option | Effect |
 |--------|--------|

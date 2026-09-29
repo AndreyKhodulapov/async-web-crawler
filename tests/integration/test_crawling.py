@@ -54,9 +54,9 @@ async def test_every_page_is_fetched_once(url, site):
     site.latency = 0.01
     crawler = await crawl(url("/site/"), max_concurrent=10, max_depth=5)
 
-    # The redirect target is the one exception: when "moved" and a direct
-    # link to c.html are in flight at the same time, nothing tells the crawler
-    # they are the same page until the response arrives.
+    # The redirect target is the one exception: when a direct link to c.html
+    # is queued or in flight before "moved" is answered, nothing tells the
+    # crawler they are the same page until the response arrives.
     fetched_twice = {path for path, hits in site.hits.items() if hits > 1}
     assert fetched_twice <= {"/site/c.html"}
     assert site.hits["/site/"] == 1

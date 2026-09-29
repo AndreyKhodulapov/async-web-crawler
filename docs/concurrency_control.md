@@ -89,9 +89,10 @@ load under control.
   for the same page.
 - Deduplication is only as good as normalization: `HTTP://Site:80/a#top`
   and `http://site/a` are one page.
-- Redirects: the target is added to the seen set after the response. If a
-  direct link to the target is already being fetched at the same time, the page
-  is downloaded twice. Nothing reveals the duplicate before the response arrives.
+- Redirects: the target is added to the seen set only after the response. If
+  a direct link to the target was queued or fetched before that, the page is
+  downloaded twice and shows up under both URLs. Nothing reveals the duplicate
+  before the response arrives.
 - Some duplicates cannot be detected by URL at all (`/` and `/index.html`).
   `<link rel="canonical">` or content hashing handles those.
 

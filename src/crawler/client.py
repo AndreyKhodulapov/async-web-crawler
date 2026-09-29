@@ -344,8 +344,8 @@ class AsyncCrawler:
             try:
                 await self._crawl_page(url, queue, url_filter)
             except Exception as exc:
-                # fetch_and_parse() reports expected failures as FetchError,
-                # so this is a bug; it must not kill the worker, and the URL
+                # _fetch() reports expected failures in the result, so this
+                # is a bug; it must not kill the worker, and the URL
                 # must leave the in-progress state, or get_next() would wait forever.
                 logger.exception("Unexpected error while crawling %s", url)
                 queue.mark_failed(url, f"UnexpectedError: {type(exc).__name__}: {exc}")
