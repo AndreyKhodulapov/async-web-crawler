@@ -4,11 +4,19 @@ An asynchronous web crawler built on `asyncio`, `aiohttp` and BeautifulSoup.
 It downloads many pages concurrently over a shared connection pool, limits
 concurrency, applies timeouts, and reports failures without stopping the rest
 of the batch. Downloaded pages are parsed into structured data: title,
-metadata, text, absolute links, images, headings, tables and lists.
+metadata, text, absolute links, images, headings, tables and lists. Starting
+from a few URLs, it can crawl a whole site: it follows links breadth-first up
+to a given depth, never fetches a page twice, and shows live progress.
 
 ## Features
 
-- Concurrent downloads with a configurable concurrency limit (`asyncio.Semaphore`)
+- Concurrent downloads with a global concurrency limit and an optional
+  per-domain limit (`SemaphoreManager`)
+- Site crawling with a priority queue of URLs (`CrawlerQueue`), a pool of
+  workers, depth and page limits, deduplication of normalized URLs, and
+  filters: same domain only, include and exclude regular expressions
+- Live crawl statistics: pages done, queued, failed, requests in flight,
+  pages per second
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
 - Separate connect, read and total timeouts
 - Clear error types: `HTTPStatusError`, `NetworkError` (including redirect
@@ -44,9 +52,46 @@ pip install -e .                       # or: the package alone, runtime deps onl
 
 ## Demo
 
-The demo has two commands: `parse` extracts data from pages, `benchmark`
-compares sequential and concurrent fetching. Both accept `--concurrency`,
-`--timeout` and `--log-level`. Logs go to stderr and the report goes to stdout.
+The demo has three commands: `crawl` follows links from start pages, `parse`
+extracts data from pages, and `benchmark` compares sequential and concurrent
+fetching. All of them accept `--concurrency`, `--timeout` and `--log-level`.
+Logs and progress go to stderr; the report goes to stdout.
+
+### crawl
+
+```bash
+python src/main.py crawl                                     # books.toscrape.com, depth 2, 50 pages
+python src/main.py crawl https://books.toscrape.com/ --max-depth 1 --max-pages 20 --same-domain
+python src/main.py crawl --exclude '/category/' --include '/catalogue/' --json crawl.json
+python src/main.py crawl --per-domain 4 --concurrency 20     # at most 4 requests to one host at a time
+```
+
+The default start page is a sandbox made for crawling practice. robots.txt
+is not checked yet, so point the crawler only at sites that allow crawling.
+While it runs, a progress line is updated every second:
+
+```
+pages 25 | failed 0 | queued 15 | in progress 5 | requests 2 | 5.0 pages/s | 5.0s
+```
+
+`in progress` counts pages taken by workers; `requests` counts those actually
+being downloaded, which never exceeds `--per-domain` for a single site. Request
+logs are hidden by default so that they do not break the line; pass
+`--log-level INFO` to see them. At the end it prints every page in the order it
+was found:
+
+```
+=== Crawl (30 pages, 5.57s) ===
+DEPTH  RESULT                                LINKS  URL
+    0  ok                                       73  https://books.toscrape.com/
+    1  ok                                        3  https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html
+    ...
+    2  ok                                        9  https://books.toscrape.com/catalogue/in-her-wake_980/index.html
+Crawled: 30 pages, failed: 0, left in queue: 15, speed: 5.4 pages/s
+```
+
+With `--json`, the parsed pages (with their depth), the failed URLs with
+their errors and the statistics are saved to a file.
 
 ### parse
 
@@ -61,10 +106,8 @@ By default it parses real sites of different kinds:
 - Wikipedia: a large server-rendered page.
 - A scraping sandbox with tables. It answers HTTP 429 when requests come too
   fast.
-- An online-course platform whose HTML is only a JavaScript shell, so little
-  text is found.
-- A marketplace behind anti-bot protection, which shows how a failed page is
-  reported.
+- A URL that answers HTTP 403, as sites behind anti-bot protection do, which
+  shows how a failed page is reported.
 
 For every page it prints a summary, then a table with statistics:
 
@@ -85,21 +128,20 @@ For every page it prints a summary, then a table with statistics:
     ...
     "... and 627 more"
   ],
-  "images_count": 23,
+  "images_count": 22,
   "headings": ["h1: Main Page", "h1: Welcome to Wikipedia", ...],
   "tables_count": 1,
   "lists_count": 35,
   "errors": []
 }
 ...
-=== Summary (5 pages, 0.79s) ===
+=== Summary (4 pages, 0.91s) ===
 URL                                      RESULT                      TEXT     LINKS    IMAGES  HEADINGS    TABLES     LISTS
-https://en.wikipedia.org/wiki/Main_Page  ok                         11609       632        23        10         1        35
+https://en.wikipedia.org/wiki/Main_Page  ok                         11609       632        22        10         1        35
 https://apilearn.tukas.dev/              ok                         12235        28         2        12         0        14
 https://apilearn.tukas.dev/exercises/    ok                         35331        40         1         3         6         7
-https://stepik.org/                      ok                           306        17        10         0         0         2
-https://www.ozon.ru/                     HTTPStatusError 403
-Parsed: 4/5 pages, links: 717, text: 59481 chars
+https://httpbin.org/status/403           HTTPStatusError 403
+Parsed: 3/4 pages, links: 700, text: 59175 chars
 ```
 
 ### benchmark
@@ -163,6 +205,15 @@ async def main() -> None:
         page = await crawler.fetch_and_parse("https://en.wikipedia.org/wiki/Main_Page")
         print(page["title"], len(page["links"]), page["links"][:3])
 
+    async with AsyncCrawler(max_concurrent=10, max_depth=2, max_per_domain=2) as crawler:
+        results = await crawler.crawl(
+            start_urls=["https://books.toscrape.com/"],
+            max_pages=50,
+            same_domain_only=True,
+            exclude_patterns=[r"/category/"],
+        )
+        print(f"Crawled {len(results)} pages, failed: {len(crawler.failed_urls)}")
+
 
 asyncio.run(main())
 ```
@@ -174,6 +225,7 @@ asyncio.run(main())
 | `fetch_urls(urls)` | `{url: text}` for successful pages | failed URLs are logged and skipped |
 | `fetch_many(urls)` | `list[FetchResult]` in input order | error stored per result |
 | `fetch_and_parse(url)` | `ParsedPage` dict | download errors raise a `FetchError` subclass; parsing problems go to `page["errors"]` |
+| `crawl(start_urls, max_pages)` | `{url: ParsedPage}` for fetched pages | failed URLs go to `failed_urls` |
 | `close()` | - | safe to call twice; called by `async with` |
 
 Closing the crawler while a batch is running does not break the batch.
@@ -183,6 +235,39 @@ fails with `NetworkError`, one that is already reading the body runs until it
 completes or hits `total_timeout`. Fetching from an already closed crawler
 fails the same way: `fetch_url` raises `CrawlerClosedError`, the other methods
 report it per URL.
+
+### Crawling
+
+`crawl()` runs `max_concurrent` workers over a priority queue of URLs. A link
+found on a page at depth `d` gets depth `d + 1` and is followed only up to
+`max_depth`, so the site is walked breadth-first. `max_pages` caps the pages
+fetched, failed ones included. URLs are normalized, and each one is fetched at
+most once. The target of a redirect is remembered too; it may still be fetched
+twice if a direct link to it is downloaded at the same moment.
+
+| Option | Effect |
+|--------|--------|
+| `AsyncCrawler(max_depth=2)` | how far from the start pages to go; 0 fetches the start pages only |
+| `AsyncCrawler(max_per_domain=None)` | parallel requests to one host; `None` means only `max_concurrent` applies |
+| `same_domain_only=False` | follow links on the start hosts only (and on the hosts they redirect to) |
+| `include_patterns=()` | regular expressions; a link must match at least one |
+| `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
+
+Filters apply to discovered links, not to the start URLs. Invalid start URLs
+or patterns raise `ValueError` before anything is fetched. After a crawl, and
+during one, the crawler exposes its state:
+
+| Attribute | Content |
+|-----------|---------|
+| `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()` |
+| `failed_urls` | `{url: "ErrorType: message"}` |
+| `visited_urls` | every URL taken for fetching, successful or not |
+| `url_depths` | depth of every URL accepted into the queue |
+| `crawl_stats()` | `CrawlStats`: processed, failed, queued, in progress, active requests, elapsed, pages per second |
+
+The building blocks can be used on their own: `CrawlerQueue` (priorities,
+deduplication, completion detection), `SemaphoreManager` (global and
+per-domain limits) and `UrlFilter`.
 
 ### Parsed page
 
@@ -211,8 +296,8 @@ keep only links to the page's own host.
 
 ```bash
 pytest                      # unit + integration, no internet needed
-pytest tests/unit           # parser and URL edge cases, fake HTTP session
-pytest tests/integration    # real HTTP against a local aiohttp server
+pytest tests/unit           # parser, URLs, queue, semaphores, filters, client with a fake session
+pytest tests/integration    # real HTTP and crawls against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
 ```
 
@@ -225,18 +310,23 @@ ruff check src tests        # lint
 
 ```
 src/
-├── main.py                 # demo CLI: `parse` and `benchmark` commands
+├── main.py                 # demo CLI: `crawl`, `parse` and `benchmark` commands
 └── crawler/
-    ├── client.py           # AsyncCrawler
+    ├── client.py           # AsyncCrawler: fetching, parsing, crawl()
+    ├── queue.py            # CrawlerQueue: URL priority queue and statuses
+    ├── semaphores.py       # SemaphoreManager: global and per-domain limits
+    ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
-    ├── models.py           # FetchResult, ParsedPage
+    ├── models.py           # FetchResult, ParsedPage, CrawlStats
     └── exceptions.py       # FetchError hierarchy
 tests/
 ├── fixtures/               # valid and broken HTML pages
-├── unit/                   # parser, URLs, client with a fake session
+├── pages.py                # test pages and a small site for crawl tests
+├── unit/                   # parser, URLs, queue, semaphores, filters, client
 └── integration/            # local HTTP server; live tests marked `network`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here
+├── concurrency_control.md  # notes on queues, limits and crawl order
 └── html_parsing.md         # notes on HTML parsing and URL handling
 ```

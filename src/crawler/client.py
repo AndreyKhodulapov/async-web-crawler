@@ -4,7 +4,7 @@ import asyncio
 import logging
 import ssl
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from types import TracebackType
 from typing import NamedTuple, Self
 
@@ -21,9 +21,12 @@ from crawler.exceptions import (
     NetworkError,
     UnexpectedError,
 )
-from crawler.models import FetchResult, ParsedPage
+from crawler.filters import UrlFilter
+from crawler.models import CrawlStats, FetchResult, ParsedPage
 from crawler.parser import HTMLParser
-from crawler.urls import is_valid_http_url
+from crawler.queue import CrawlerQueue
+from crawler.semaphores import SemaphoreManager
+from crawler.urls import get_host, is_valid_http_url
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +44,13 @@ class AsyncCrawler:
 
     Can be used as an async context manager, or closed explicitly::
 
-        async with AsyncCrawler(max_concurrent=5) as crawler:
+        async with AsyncCrawler(max_concurrent=5, max_depth=2) as crawler:
             pages = await crawler.fetch_urls(urls)
             page = await crawler.fetch_and_parse("https://example.com")
+            site = await crawler.crawl(["https://example.com"], same_domain_only=True)
+
+    At most `max_concurrent` requests run at once, and at most
+    `max_per_domain` to one host (no per-host limit when it is None).
 
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
     the same way as any other per-URL failure. Closing does not interrupt
@@ -59,14 +66,16 @@ class AsyncCrawler:
         self,
         max_concurrent: int = 10,
         *,
+        max_depth: int = 2,
+        max_per_domain: int | None = None,
         total_timeout: float = 30.0,
         connect_timeout: float = 10.0,
         read_timeout: float = 20.0,
         user_agent: str = DEFAULT_USER_AGENT,
         parser: HTMLParser | None = None,
     ) -> None:
-        if max_concurrent < 1:
-            raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
+        if max_depth < 0:
+            raise ValueError(f"max_depth must be >= 0, got {max_depth}")
         for name, value in (
             ("total_timeout", total_timeout),
             ("connect_timeout", connect_timeout),
@@ -75,7 +84,10 @@ class AsyncCrawler:
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
 
+        # Validates max_concurrent and max_per_domain.
+        self._limits = SemaphoreManager(max_concurrent, max_per_domain)
         self.max_concurrent = max_concurrent
+        self.max_depth = max_depth
         # `connect` covers DNS resolution and waiting for a pooled connection,
         # unlike `sock_connect`, which is only the TCP handshake.
         self._timeout = aiohttp.ClientTimeout(
@@ -85,9 +97,13 @@ class AsyncCrawler:
         )
         self._user_agent = user_agent
         self._parser = parser or HTMLParser()
-        self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
+        # State of the latest crawl() call.
+        self._queue = CrawlerQueue()
+        self.processed_urls: dict[str, ParsedPage] = {}
+        self._crawl_started: float | None = None
+        self._crawl_finished: float | None = None
 
     async def __aenter__(self) -> Self:
         return self
@@ -103,6 +119,21 @@ class AsyncCrawler:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def visited_urls(self) -> set[str]:
+        """URLs the latest crawl took for fetching, successful or not. Do not modify."""
+        return self._queue.visited
+
+    @property
+    def failed_urls(self) -> dict[str, str]:
+        """URL -> error description for pages the latest crawl could not fetch. Do not modify."""
+        return self._queue.failed
+
+    @property
+    def url_depths(self) -> Mapping[str, int]:
+        """Depth of every URL the latest crawl accepted: 0 for start URLs."""
+        return self._queue.depths
 
     async def fetch_url(self, url: str) -> str:
         """Download a single page and return its decoded body.
@@ -156,7 +187,7 @@ class AsyncCrawler:
 
     async def fetch_result(self, url: str) -> FetchResult:
         """Download a single page, reporting failures in the result."""
-        async with self._semaphore:
+        async with self._limits.slot(url):
             logger.info("Fetching %s", url)
             started = time.perf_counter()
             try:
@@ -199,6 +230,130 @@ class AsyncCrawler:
                 content_type=response.content_type,
             )
 
+    async def crawl(
+        self,
+        start_urls: Iterable[str],
+        max_pages: int = 100,
+        *,
+        same_domain_only: bool = False,
+        include_patterns: Iterable[str] = (),
+        exclude_patterns: Iterable[str] = (),
+    ) -> dict[str, ParsedPage]:
+        """Crawl from the start URLs following links; return pages by normalized URL.
+
+        Pages are fetched by `max_concurrent` workers, breadth-first: a link
+        found on a page at depth d gets depth d + 1 and is followed only up
+        to `max_depth`. Every URL is fetched at most once. `max_pages` caps
+        the number of pages fetched, failed ones included.
+
+        Filters apply to discovered links, not to the start URLs:
+        `same_domain_only` keeps links on the hosts of the start URLs (and of
+        the pages they redirect to); `include_patterns` and `exclude_patterns`
+        are regular expressions, see `UrlFilter`.
+
+        Failed pages do not stop the crawl: they are listed in `failed_urls`.
+        The state of the crawl (`processed_urls`, `visited_urls`,
+        `failed_urls`, `url_depths`, `crawl_stats()`) is reset on every call
+        and stays available after it returns.
+
+        Raises:
+            ValueError: `max_pages` is not positive or a start URL is invalid.
+            RuntimeError: another crawl is running on this crawler.
+        """
+        if max_pages < 1:
+            raise ValueError(f"max_pages must be >= 1, got {max_pages}")
+        start_urls = list(start_urls)
+        invalid = [url for url in start_urls if not is_valid_http_url(url)]
+        if invalid:
+            raise ValueError(f"invalid start URLs: {', '.join(map(repr, invalid))}")
+        if self._crawl_started is not None and self._crawl_finished is None:
+            raise RuntimeError("a crawl is already running on this crawler")
+
+        url_filter = UrlFilter(
+            allowed_hosts={get_host(url) for url in start_urls} if same_domain_only else None,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+        )
+        self._queue = CrawlerQueue()
+        self.processed_urls = {}
+        for url in start_urls:
+            self._queue.add_url(url, priority=0, depth=0)
+
+        logger.info(
+            "Crawl started: %d start URLs, max_depth=%d, max_pages=%d", len(start_urls), self.max_depth, max_pages
+        )
+        self._crawl_started, self._crawl_finished = time.perf_counter(), None
+        try:
+            async with asyncio.TaskGroup() as group:
+                for _ in range(self.max_concurrent):
+                    group.create_task(self._crawl_worker(self._queue, url_filter, max_pages))
+        finally:
+            self._crawl_finished = time.perf_counter()
+        stats = self.crawl_stats()
+        logger.info(
+            "Crawl finished: %d processed, %d failed, %d left in queue, %.2fs",
+            stats.processed,
+            stats.failed,
+            stats.queued,
+            stats.elapsed,
+        )
+        return self.processed_urls
+
+    def crawl_stats(self) -> CrawlStats:
+        """Progress of the running crawl, or the result of the latest one."""
+        if self._crawl_started is None:
+            return CrawlStats()
+        stats = self._queue.get_stats()
+        return CrawlStats(
+            processed=stats["processed"],
+            failed=stats["failed"],
+            queued=stats["queued"],
+            in_progress=stats["in_progress"],
+            active_requests=self._limits.active,
+            elapsed=(self._crawl_finished or time.perf_counter()) - self._crawl_started,
+        )
+
+    async def _crawl_worker(self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int) -> None:
+        while (url := await queue.get_next()) is not None:
+            if len(queue.visited) >= max_pages:
+                # This URL is the last one allowed: the others stop taking new ones.
+                queue.close()
+            try:
+                await self._crawl_page(url, queue, url_filter)
+            except Exception as exc:
+                # fetch_and_parse() reports expected failures as FetchError,
+                # so this is a bug; it must not kill the worker, and the URL
+                # must leave the in-progress state, or get_next() would wait forever.
+                logger.exception("Unexpected error while crawling %s", url)
+                queue.mark_failed(url, f"UnexpectedError: {type(exc).__name__}: {exc}")
+
+    async def _crawl_page(self, url: str, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
+        depth = queue.depth(url)
+        try:
+            page = await self.fetch_and_parse(url)
+        except FetchError as error:
+            queue.mark_failed(url, f"{type(error).__name__}: {error.message}")
+            return
+
+        final_url = page["final_url"]
+        if final_url != url:
+            # A later link to the redirect target must not fetch the page again.
+            queue.mark_seen(final_url)
+            final_host = get_host(final_url)
+            if depth == 0 and final_host is not None:
+                # A start URL that redirects ("example.com" -> "www.example.com")
+                # defines the site as much as the URL itself.
+                url_filter.allow_host(final_host)
+
+        queued = 0
+        if depth < self.max_depth:
+            for link in page["links"]:
+                if url_filter.allows(link) and queue.add_url(link, priority=depth + 1, depth=depth + 1):
+                    queued += 1
+        self.processed_urls[url] = page
+        queue.mark_processed(url)
+        logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
+
     async def close(self) -> None:
         """Close the underlying session. Safe to call more than once."""
         self._closed = True
@@ -235,7 +390,7 @@ class AsyncCrawler:
         so it may be larger than the number of bytes sent over the network.
         """
         # Checked here rather than in the public methods: close() may run
-        # while this task waits for the semaphore, and a per-URL failure
+        # while this task waits for a free slot, and a per-URL failure
         # keeps the rest of a fetch_many() batch intact.
         if self._closed:
             raise CrawlerClosedError(url, "crawler is closed")

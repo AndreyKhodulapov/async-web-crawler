@@ -35,6 +35,29 @@ class FetchResult:
         return cls(url=url, elapsed=elapsed, status=status, error=error)
 
 
+@dataclass(frozen=True, slots=True)
+class CrawlStats:
+    """Progress of a crawl at one moment.
+
+    `in_progress` counts pages taken by workers: waiting for a free slot,
+    being fetched or parsed. `active_requests` counts only HTTP requests
+    holding a slot, so it never exceeds the concurrency limits. `elapsed`
+    runs from the start of the crawl to now, or to its end once it has finished.
+    """
+
+    processed: int = 0
+    failed: int = 0
+    queued: int = 0
+    in_progress: int = 0
+    active_requests: int = 0
+    elapsed: float = 0.0
+
+    @property
+    def pages_per_second(self) -> float:
+        """Finished pages, successful or not, per second."""
+        return (self.processed + self.failed) / self.elapsed if self.elapsed > 0 else 0.0
+
+
 class Metadata(TypedDict):
     title: str | None
     description: str | None

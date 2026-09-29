@@ -66,6 +66,8 @@ batch. `CancelledError` is a `BaseException` and passes through.
 - Why limit at all: to avoid overloading target servers, running out of file
   descriptors, or getting banned. Unlimited fan-out is also no faster once the
   network is saturated.
+- Per-host limits, queues and crawl order are covered in
+  [concurrency_control.md](concurrency_control.md).
 
 ## Connection pooling
 

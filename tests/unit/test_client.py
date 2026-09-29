@@ -116,6 +116,11 @@ class TestInit:
         with pytest.raises(ValueError, match="max_concurrent"):
             AsyncCrawler(max_concurrent=value)
 
+    @pytest.mark.parametrize(("name", "value"), [("max_depth", -1), ("max_per_domain", 0)])
+    def test_rejects_invalid_crawl_limits(self, name, value):
+        with pytest.raises(ValueError, match=name):
+            AsyncCrawler(**{name: value})
+
     @pytest.mark.parametrize("name", ["total_timeout", "connect_timeout", "read_timeout"])
     def test_rejects_non_positive_timeouts(self, name):
         with pytest.raises(ValueError, match=name):

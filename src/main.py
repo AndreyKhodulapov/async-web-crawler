@@ -3,31 +3,58 @@
 Usage:
     python src/main.py benchmark [options] [URL ...]   # sequential vs concurrent fetching
     python src/main.py parse [options] [URL ...]       # fetch pages and extract data
+    python src/main.py crawl [options] [URL ...]       # follow links from start pages
 """
 
 import argparse
 import asyncio
 import json
 import logging
+import re
+import sys
 import textwrap
 import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from crawler import AsyncCrawler, FetchError, FetchResult, HTMLParser, HTTPStatusError, ParsedPage, is_same_host
+from crawler import (
+    AsyncCrawler,
+    CrawlStats,
+    FetchError,
+    FetchResult,
+    HTMLParser,
+    HTTPStatusError,
+    ParsedPage,
+    is_same_host,
+    is_valid_http_url,
+)
 
 
-def positive(number_type: type[int] | type[float]) -> Callable[[str], int | float]:
+def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) -> Callable[[str], int | float]:
     def parse(raw: str) -> int | float:
         try:
             value = number_type(raw)
         except ValueError:
             raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
-        if value <= 0:
-            raise argparse.ArgumentTypeError(f"must be positive, got {raw}")
+        if value < 0 or (value == 0 and not allow_zero):
+            raise argparse.ArgumentTypeError(f"must be {'non-negative' if allow_zero else 'positive'}, got {raw}")
         return value
 
     return parse
+
+
+def http_url(raw: str) -> str:
+    if not is_valid_http_url(raw):
+        raise argparse.ArgumentTypeError(f"not an absolute http(s) URL: {raw!r}")
+    return raw
+
+
+def regex(raw: str) -> str:
+    try:
+        re.compile(raw)
+    except re.error as exc:
+        raise argparse.ArgumentTypeError(f"invalid regular expression {raw!r}: {exc}") from None
+    return raw
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,8 +76,7 @@ def parse_args() -> argparse.Namespace:
         "https://en.wikipedia.org/wiki/Main_Page",  # large server-rendered page
         "https://apilearn.tukas.dev/",  # scraping sandbox; answers HTTP 429 to bursts
         "https://apilearn.tukas.dev/exercises/",  # same site, a page with tables
-        "https://stepik.org/",  # JavaScript app: the HTML is only a shell
-        "https://www.ozon.ru/",  # anti-bot protection: HTTP 403
+        "https://httpbin.org/status/403",  # an access denied response, as anti-bot protection gives
     ]
 
     common = argparse.ArgumentParser(add_help=False)
@@ -81,12 +107,39 @@ def parse_args() -> argparse.Namespace:
     parse.add_argument("--same-host", action="store_true", help="keep only links to the page's own host")
     parse.add_argument("--preview", type=positive(int), default=5, help="links and headings shown per page")
     parse.add_argument("--json", type=Path, metavar="PATH", help="save full results to a JSON file")
+
+    crawl = commands.add_parser("crawl", parents=[common], help="follow links from start pages, show live progress")
+    # A sandbox made for crawling practice. robots.txt is not checked yet,
+    # so the default must be a site that welcomes crawlers.
+    crawl.add_argument("urls", nargs="*", type=http_url, default=["https://books.toscrape.com/"], help="start URLs")
+    crawl.add_argument("--max-depth", type=positive(int, allow_zero=True), default=2, help="0 = start pages only")
+    crawl.add_argument("--max-pages", type=positive(int), default=50, help="pages to fetch, failed ones included")
+    crawl.add_argument("--per-domain", type=positive(int), default=2, help="max parallel requests to one host")
+    crawl.add_argument("--same-domain", action="store_true", help="follow links on the start hosts only")
+    crawl.add_argument(
+        "--include", type=regex, action="append", default=[], metavar="REGEX", help="follow matching links only"
+    )
+    crawl.add_argument(
+        "--exclude", type=regex, action="append", default=[], metavar="REGEX", help="skip matching links"
+    )
+    crawl.add_argument("--json", type=Path, metavar="PATH", help="save pages, errors and stats to a JSON file")
+    # Request logs would break the live progress line; --log-level INFO shows them.
+    crawl.set_defaults(log_level="WARNING")
     return parser.parse_args()
 
 
-def make_crawler(concurrency: int, timeout: float, parser: HTMLParser | None = None) -> AsyncCrawler:
+def make_crawler(
+    concurrency: int,
+    timeout: float,
+    parser: HTMLParser | None = None,
+    *,
+    max_depth: int = 2,
+    max_per_domain: int | None = None,
+) -> AsyncCrawler:
     return AsyncCrawler(
         max_concurrent=concurrency,
+        max_depth=max_depth,
+        max_per_domain=max_per_domain,
         total_timeout=timeout,
         connect_timeout=timeout,
         read_timeout=timeout,
@@ -232,6 +285,87 @@ async def run_parse(args: argparse.Namespace) -> None:
         save_json(args.json, urls, outcomes)
 
 
+def format_progress(stats: CrawlStats) -> str:
+    return (
+        f"pages {stats.processed} | failed {stats.failed} | queued {stats.queued} | "
+        f"in progress {stats.in_progress} | requests {stats.active_requests} | "
+        f"{stats.pages_per_second:.1f} pages/s | {stats.elapsed:.1f}s"
+    )
+
+
+async def show_progress(crawler: AsyncCrawler, crawl_task: asyncio.Task[object], interval: float = 1.0) -> None:
+    """Print crawl progress to stderr every `interval` seconds until the crawl ends."""
+    # In a terminal the line is redrawn in place; in a file or pipe every
+    # update goes on a line of its own.
+    live = sys.stderr.isatty()
+    while not crawl_task.done():
+        await asyncio.wait({crawl_task}, timeout=interval)
+        line = format_progress(crawler.crawl_stats())
+        if live:
+            print(f"\r\033[K{line}", end="", file=sys.stderr, flush=True)
+        else:
+            print(line, file=sys.stderr, flush=True)
+    if live:
+        print(file=sys.stderr)
+
+
+def print_crawl_report(crawler: AsyncCrawler) -> None:
+    stats = crawler.crawl_stats()
+    print(f"\n=== Crawl ({len(crawler.visited_urls)} pages, {stats.elapsed:.2f}s) ===")
+    print(f"{'DEPTH':>5}  {'RESULT':<36}  {'LINKS':>5}  URL")
+    # url_depths keeps the order in which pages were found: breadth-first.
+    for url, depth in crawler.url_depths.items():
+        if url in crawler.processed_urls:
+            page = crawler.processed_urls[url]
+            result = f"ok, {len(page['errors'])} warning(s)" if page["errors"] else "ok"
+            print(f"{depth:>5}  {result:<36}  {len(page['links']):>5}  {url}")
+        elif url in crawler.failed_urls:
+            result = textwrap.shorten(crawler.failed_urls[url], width=36, placeholder="...")
+            print(f"{depth:>5}  {result:<36}  {'':>5}  {url}")
+    print(
+        f"Crawled: {stats.processed} pages, failed: {stats.failed}, left in queue: {stats.queued}, "
+        f"speed: {stats.pages_per_second:.1f} pages/s"
+    )
+
+
+def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
+    stats = crawler.crawl_stats()
+    depths = crawler.url_depths
+    report = {
+        "stats": {
+            "processed": stats.processed,
+            "failed": stats.failed,
+            "queued": stats.queued,
+            "elapsed": round(stats.elapsed, 3),
+            "pages_per_second": round(stats.pages_per_second, 2),
+        },
+        "pages": [{"depth": depths[url], **page} for url, page in crawler.processed_urls.items()],
+        "failed": [{"url": url, "depth": depths[url], "error": error} for url, error in crawler.failed_urls.items()],
+    }
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nFull results saved to {path}")
+
+
+async def run_crawl(args: argparse.Namespace) -> None:
+    crawler = make_crawler(args.concurrency, args.timeout, max_depth=args.max_depth, max_per_domain=args.per_domain)
+    async with crawler:
+        crawl_task = asyncio.create_task(
+            crawler.crawl(
+                args.urls,
+                max_pages=args.max_pages,
+                same_domain_only=args.same_domain,
+                include_patterns=args.include,
+                exclude_patterns=args.exclude,
+            )
+        )
+        await show_progress(crawler, crawl_task)
+        await crawl_task
+
+    print_crawl_report(crawler)
+    if args.json is not None:
+        save_crawl_json(args.json, crawler)
+
+
 async def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -239,10 +373,8 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    if args.command == "benchmark":
-        await run_benchmark(args)
-    else:
-        await run_parse(args)
+    commands = {"benchmark": run_benchmark, "parse": run_parse, "crawl": run_crawl}
+    await commands[args.command](args)
 
 
 if __name__ == "__main__":

@@ -59,16 +59,19 @@ def resolve_url(href: str, base_url: str) -> str | None:
     return normalize_url(absolute)
 
 
-def is_same_host(url: str, other: str) -> bool:
-    """Return True if both URLs point to the same host (ports are ignored).
+def get_host(url: str) -> str | None:
+    """Return the normalized host of an http(s) URL, or None if the URL is invalid.
 
-    Hosts are compared after normalization, so "bücher.de" and its punycode
-    form "xn--bcher-kva.de" are the same host.
+    "bücher.de" and its punycode form "xn--bcher-kva.de" give the same host.
     """
-    first, second = normalize_url(url), normalize_url(other)
-    if first is None or second is None:
-        return False
-    return urlsplit(first).hostname == urlsplit(second).hostname
+    normalized = normalize_url(url)
+    return None if normalized is None else urlsplit(normalized).hostname
+
+
+def is_same_host(url: str, other: str) -> bool:
+    """Return True if both URLs point to the same host (ports are ignored)."""
+    host = get_host(url)
+    return host is not None and host == get_host(other)
 
 
 def _encode_host(host: str) -> str | None:
