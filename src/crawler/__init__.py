@@ -10,7 +10,9 @@ from crawler.exceptions import (
     NetworkError,
     UnexpectedError,
 )
-from crawler.models import FetchResult
+from crawler.models import FetchResult, ParsedPage
+from crawler.parser import HTMLParser
+from crawler.urls import is_same_host
 
 __all__ = [
     "AsyncCrawler",
@@ -18,8 +20,11 @@ __all__ = [
     "FetchError",
     "FetchResult",
     "FetchTimeoutError",
+    "HTMLParser",
     "HTTPStatusError",
     "InvalidURLError",
     "NetworkError",
+    "ParsedPage",
     "UnexpectedError",
+    "is_same_host",
 ]

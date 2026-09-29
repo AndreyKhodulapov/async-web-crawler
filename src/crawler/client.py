@@ -6,11 +6,11 @@ import ssl
 import time
 from collections.abc import Iterable
 from types import TracebackType
-from typing import Self
-from urllib.parse import urlsplit
+from typing import NamedTuple, Self
 
 import aiohttp
 import certifi
+from bs4.dammit import EncodingDetector
 
 from crawler.exceptions import (
     CrawlerClosedError,
@@ -21,9 +21,19 @@ from crawler.exceptions import (
     NetworkError,
     UnexpectedError,
 )
-from crawler.models import FetchResult
+from crawler.models import FetchResult, ParsedPage
+from crawler.parser import HTMLParser
+from crawler.urls import is_valid_http_url
 
 logger = logging.getLogger(__name__)
+
+
+class _Response(NamedTuple):
+    status: int
+    content: str
+    size: int
+    final_url: str
+    content_type: str | None
 
 
 class AsyncCrawler:
@@ -33,12 +43,17 @@ class AsyncCrawler:
 
         async with AsyncCrawler(max_concurrent=5) as crawler:
             pages = await crawler.fetch_urls(urls)
+            page = await crawler.fetch_and_parse("https://example.com")
 
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
     the same way as any other per-URL failure. Closing does not interrupt
     requests that are already in flight: they finish on their own or hit
     `total_timeout`.
     """
+
+    # Sites such as Wikipedia ask bots to identify themselves with a contact
+    # URL and may block generic user agents.
+    DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
 
     def __init__(
         self,
@@ -47,7 +62,8 @@ class AsyncCrawler:
         total_timeout: float = 30.0,
         connect_timeout: float = 10.0,
         read_timeout: float = 20.0,
-        user_agent: str = "AsyncWebCrawler/0.1",
+        user_agent: str = DEFAULT_USER_AGENT,
+        parser: HTMLParser | None = None,
     ) -> None:
         if max_concurrent < 1:
             raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
@@ -68,6 +84,7 @@ class AsyncCrawler:
             sock_read=read_timeout,
         )
         self._user_agent = user_agent
+        self._parser = parser or HTMLParser()
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
@@ -99,6 +116,27 @@ class AsyncCrawler:
         assert result.content is not None
         return result.content
 
+    async def fetch_and_parse(self, url: str) -> ParsedPage:
+        """Download a page and extract structured data from it.
+
+        Relative links are resolved against the URL reached after redirects.
+        Parsing problems never raise: they are logged and listed in the
+        result's `errors`, e.g. for a response that is not HTML.
+
+        Raises:
+            FetchError: a subclass describing why the download failed.
+        """
+        result = await self.fetch_result(url)
+        if result.error is not None:
+            raise result.error
+        assert result.content is not None
+        return await self._parser.parse_html(
+            result.content,
+            url,
+            final_url=result.final_url,
+            content_type=result.content_type,
+        )
+
     async def fetch_urls(self, urls: Iterable[str]) -> dict[str, str]:
         """Download pages concurrently; return bodies of successful ones only.
 
@@ -122,7 +160,7 @@ class AsyncCrawler:
             logger.info("Fetching %s", url)
             started = time.perf_counter()
             try:
-                status, content, size = await self._request(url)
+                response = await self._request(url)
             except FetchError as error:
                 elapsed = time.perf_counter() - started
                 logger.warning(
@@ -147,11 +185,19 @@ class AsyncCrawler:
             logger.info(
                 "Fetched %s: status=%d size=%dB elapsed=%.2fs",
                 url,
-                status,
-                size,
+                response.status,
+                response.size,
                 elapsed,
             )
-            return FetchResult(url=url, elapsed=elapsed, status=status, content=content, size=size)
+            return FetchResult(
+                url=url,
+                elapsed=elapsed,
+                status=response.status,
+                content=response.content,
+                size=response.size,
+                final_url=response.final_url,
+                content_type=response.content_type,
+            )
 
     async def close(self) -> None:
         """Close the underlying session. Safe to call more than once."""
@@ -179,10 +225,11 @@ class AsyncCrawler:
             connector=connector,
             timeout=self._timeout,
             headers={"User-Agent": self._user_agent},
+            fallback_charset_resolver=_sniff_charset,
         )
 
-    async def _request(self, url: str) -> tuple[int, str, int]:
-        """Perform the GET request; return (status, text, body size in bytes).
+    async def _request(self, url: str) -> _Response:
+        """Perform the GET request and read the whole body.
 
         The size is measured after content decoding (gzip, deflate, ...),
         so it may be larger than the number of bytes sent over the network.
@@ -198,7 +245,16 @@ class AsyncCrawler:
             async with session.get(url) as response:
                 response.raise_for_status()
                 body = await response.read()
-                return response.status, _decode(body, response.get_encoding()), len(body)
+                # aiohttp reports "application/octet-stream" when the header
+                # is missing; None lets callers tell the two cases apart.
+                has_type = aiohttp.hdrs.CONTENT_TYPE in response.headers
+                return _Response(
+                    status=response.status,
+                    content=_decode(body, response.get_encoding()),
+                    size=len(body),
+                    final_url=str(response.url),
+                    content_type=response.content_type if has_type else None,
+                )
         # Order matters: TooManyRedirects is a ClientResponseError, which is a
         # ClientError; aiohttp's ServerTimeoutError is both a ClientError and
         # a TimeoutError; InvalidURL is a ClientError too.
@@ -216,26 +272,52 @@ class AsyncCrawler:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
 
 
-def _decode(body: bytes, encoding: str) -> str:
-    # A wrong charset header should not drop the whole page: undecodable bytes
-    # are replaced, and a charset naming a non-text codec (e.g. "base64")
-    # falls back to UTF-8.
+def _sniff_charset(response: aiohttp.ClientResponse, body: bytes) -> str:
+    """Pick an encoding when the Content-Type header has no charset.
+
+    aiohttp calls this only in that case and would otherwise assume UTF-8.
+    Many pages declare their encoding in the markup instead:
+    <meta charset="..."> or <meta http-equiv="Content-Type" content="...">.
+    """
+    declared = EncodingDetector.find_declared_encoding(body, is_html=True)
+    if declared is None:
+        return "utf-8"
+    if not _is_ascii_compatible(declared):
+        # The declaration was found by reading the bytes as ASCII, so they
+        # cannot be UTF-16 and the like; the HTML spec says to use UTF-8.
+        # This also rejects unknown names and codecs such as "undefined",
+        # "idna" or "base64" that cannot decode a page at all.
+        logger.debug("Ignoring declared charset %r for %s", declared, response.url)
+        return "utf-8"
+    return declared
+
+
+def _is_ascii_compatible(encoding: str) -> bool:
+    # A charset that decodes printable ASCII unchanged can read the markup.
+    probe = bytes(range(0x20, 0x7F)) + b"\t\n\r"
     try:
-        return body.decode(encoding, errors="replace")
-    except LookupError:
+        return probe.decode(encoding, errors="replace") == probe.decode("ascii")
+    except (LookupError, UnicodeError):
+        return False
+
+
+def _decode(body: bytes, encoding: str) -> str:
+    # A byte order mark overrides any declared charset (HTML spec) and is not
+    # part of the text. A wrong charset should not drop the whole page:
+    # undecodable bytes are replaced, and a charset naming a codec that cannot
+    # decode text (e.g. "base64" or "undefined") falls back to UTF-8.
+    body, bom_encoding = EncodingDetector.strip_byte_order_mark(body)
+    try:
+        return body.decode(bom_encoding or encoding, errors="replace")
+    except (LookupError, UnicodeError):
         return body.decode("utf-8", errors="replace")
 
 
 def _validate_url(url: str) -> None:
-    """Reject URLs without an http(s) scheme or a host before sending them.
+    """Reject URLs without an http(s) scheme, a host or a valid port before sending them.
 
     aiohttp does not wrap every malformed URL: "//host" fails on an internal
     assert, so such input is caught here instead.
     """
-    try:
-        parts = urlsplit(url)
-        valid = parts.scheme in ("http", "https") and bool(parts.hostname)
-    except ValueError:  # e.g. an unclosed IPv6 bracket: "http://[::1"
-        valid = False
-    if not valid:
-        raise InvalidURLError(url, "expected an absolute http(s) URL")
+    if not is_valid_http_url(url):
+        raise InvalidURLError(url, "expected an absolute http(s) URL with a valid host and port")
