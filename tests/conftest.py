@@ -1,4 +1,5 @@
 import asyncio
+import codecs
 import socket
 from collections.abc import Callable
 from pathlib import Path
@@ -66,6 +67,16 @@ async def header_charset_wins_page(request: web.Request) -> web.Response:
     return web.Response(body=body, content_type="text/html", charset="windows-1252")
 
 
+async def utf16_bom_page(request: web.Request) -> web.Response:
+    body = codecs.BOM_UTF16_LE + "<title>Café</title>".encode("utf-16-le")
+    return web.Response(body=body, headers={"Content-Type": "text/html"})
+
+
+async def bogus_meta_charset_page(request: web.Request) -> web.Response:
+    body = '<meta charset="undefined"><title>Café</title>'.encode()
+    return web.Response(body=body, headers={"Content-Type": "text/html"})
+
+
 @pytest.fixture
 async def server(aiohttp_server):
     """Local HTTP server with predictable endpoints; no internet required."""
@@ -80,6 +91,8 @@ async def server(aiohttp_server):
     app.router.add_get("/cp1252", cp1252_page)
     app.router.add_get("/meta-charset", meta_charset_page)
     app.router.add_get("/header-charset-wins", header_charset_wins_page)
+    app.router.add_get("/utf16-bom", utf16_bom_page)
+    app.router.add_get("/bogus-meta-charset", bogus_meta_charset_page)
     return await aiohttp_server(app)
 
 

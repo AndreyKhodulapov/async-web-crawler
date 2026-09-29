@@ -53,9 +53,10 @@ async def test_page_charset_is_respected(crawler, server):
     assert page["text"] == "Crème brûlée"
 
 
-@pytest.mark.parametrize("path", ["/meta-charset", "/header-charset-wins"])
-async def test_charset_from_meta_or_header(crawler, server, path):
-    # The header charset wins over <meta>; <meta> is used when the header has none.
+@pytest.mark.parametrize("path", ["/meta-charset", "/header-charset-wins", "/utf16-bom", "/bogus-meta-charset"])
+async def test_page_encoding(crawler, server, path):
+    # Priority: byte order mark, header charset, <meta>, then UTF-8. A <meta>
+    # naming a codec that cannot decode the page is ignored.
     page = await crawler.fetch_and_parse(str(server.make_url(path)))
     assert page["title"] == "Café"
 

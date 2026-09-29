@@ -1,6 +1,7 @@
 """Unit tests for AsyncCrawler with the HTTP session replaced by fakes."""
 
 import asyncio
+import codecs
 from unittest.mock import MagicMock
 
 import aiohttp
@@ -17,7 +18,7 @@ from crawler import (
     NetworkError,
     UnexpectedError,
 )
-from crawler.client import _sniff_charset
+from crawler.client import _decode, _sniff_charset
 
 
 class FakeResponse:
@@ -328,9 +329,39 @@ class TestSniffCharset:
             (b'<meta charset="windows-1252"><p>caf\xe9</p>', "windows-1252"),
             (b'<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-2">', "iso-8859-2"),
             (b'<meta charset="no-such-charset">', "utf-8"),
+            # Found in ASCII bytes, so they cannot really be UTF-16/32 (HTML spec).
+            (b'<meta charset="utf-16">', "utf-8"),
+            (b'<meta charset="utf-32">', "utf-8"),
+            # Codecs that exist but cannot decode a page.
+            (b'<meta charset="undefined">', "utf-8"),
+            (b'<meta charset="idna">', "utf-8"),
+            (b'<meta charset="punycode">', "utf-8"),
+            (b'<meta charset="base64">', "utf-8"),
+            (b'<meta charset="shift_jis">', "shift_jis"),
             (b"<p>no declaration</p>", "utf-8"),
             (b"\x89PNG\r\n", "utf-8"),
         ],
     )
     def test_declared_charset(self, body, expected):
         assert _sniff_charset(MagicMock(), body) == expected
+
+
+class TestDecode:
+    @pytest.mark.parametrize(
+        ("body", "declared"),
+        [
+            (codecs.BOM_UTF8 + "café".encode(), "windows-1252"),
+            (codecs.BOM_UTF16_LE + "café".encode("utf-16-le"), "utf-8"),
+            (codecs.BOM_UTF16_BE + "café".encode("utf-16-be"), "utf-8"),
+        ],
+    )
+    def test_byte_order_mark_wins_and_is_stripped(self, body, declared):
+        assert _decode(body, declared) == "café"
+
+    @pytest.mark.parametrize("encoding", ["undefined", "idna", "base64", "no-such-charset"])
+    def test_unusable_charset_falls_back_to_utf8(self, encoding):
+        assert _decode("café".encode(), encoding) == "café"
+
+    async def test_undefined_header_charset_is_not_an_invalid_url(self, crawler, fake_session):
+        fake_session.routes["http://a"] = FakeResponse(b"page", encoding="undefined")
+        assert await crawler.fetch_url("http://a") == "page"

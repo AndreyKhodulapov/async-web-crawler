@@ -183,6 +183,14 @@ class TestExtractText:
         html = "<nav>Menu</nav><article>One</article><article>Two</article>"
         assert parser.extract_text(soup(html)) == "Menu One Two"
 
+    def test_nested_articles_are_one_article(self, parser):
+        html = "<nav>menu</nav><article>Post<article>comment</article></article><footer>legal</footer>"
+        assert parser.extract_text(soup(html)) == "Post comment"
+
+    def test_nested_selector_matches_are_not_repeated(self, parser):
+        html = "<div>a<div>b</div></div><div>c</div>"
+        assert parser.extract_text(soup(html), "div") == "a b c"
+
     def test_inline_and_block_whitespace(self, parser):
         html = "<p>a<b>b</b>, c<br>d</p><div>e</div><span>f</span><span>g</span>"
         assert parser.extract_text(soup(html)) == "ab, c d e fg"
@@ -210,6 +218,11 @@ class TestMetadata:
 
     def test_svg_title_in_body_is_not_page_title(self, parser):
         assert parser.extract_metadata(soup("<body><svg><title>icon</title></svg></body>"))["title"] is None
+
+    @pytest.mark.parametrize("rel", ["Canonical", "CANONICAL", "alternate canonical"])
+    def test_canonical_rel_is_case_insensitive(self, parser, rel):
+        metadata = parser.extract_metadata(soup(f'<link rel="{rel}" href="/c">'), "https://example.com/")
+        assert metadata["canonical"] == "https://example.com/c"
 
     def test_canonical_without_base_url_is_kept_raw(self, parser):
         metadata = parser.extract_metadata(soup('<link rel="canonical" href="/c">'))

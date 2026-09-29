@@ -21,8 +21,8 @@ def normalize_url(url: str) -> str | None:
 
     Two spellings of the same address map to one string, so links can be
     deduplicated: the scheme and host are lowercased, an internationalized
-    host is converted to punycode, the default port and the fragment are
-    dropped, and an empty path becomes "/".
+    host is converted to punycode, a trailing dot in the host, the default
+    port and the fragment are dropped, and an empty path becomes "/".
     """
     try:
         parts = urlsplit(url.strip())
@@ -32,8 +32,9 @@ def normalize_url(url: str) -> str | None:
     scheme = parts.scheme.lower()
     if scheme not in _DEFAULT_PORTS or not parts.hostname:
         return None
-    host = _encode_host(parts.hostname)
-    if host is None:
+    # "example.com." (a fully qualified name) is the same host as "example.com".
+    host = _encode_host(parts.hostname.rstrip("."))
+    if not host:
         return None
 
     # `hostname` is already lowercased but loses IPv6 brackets.

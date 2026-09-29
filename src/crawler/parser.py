@@ -26,6 +26,7 @@ _LIST_TAGS = frozenset({"ul", "ol"})
 # A list item's own text leaves out nested lists: they are reported separately.
 _LIST_ITEM_SKIP = _NON_CONTENT_TAGS | _LIST_TAGS
 _WHITESPACE = re.compile(r"\s+")
+_CANONICAL = re.compile(r"^canonical$", re.IGNORECASE)
 # Elements that start on a new line in a browser. Text on both sides of them
 # is separated by a space; text inside inline elements (<b>, <a>, ...) is
 # joined as is, so "<b>to</b>, go" stays "to, go".
@@ -195,18 +196,23 @@ class HTMLParser:
         """Return the visible text of the page or of the elements matching `selector`.
 
         Without a selector the main content is used: <main>, else a single
-        <article>, else <body>. Scripts, styles and similar elements are
-        skipped and whitespace is collapsed.
+        top-level <article>, else <body>. Scripts, styles and similar
+        elements are skipped and whitespace is collapsed. An element that is
+        inside another matched element is not counted twice.
 
         Raises:
             soupsieve.SelectorSyntaxError: `selector` is not valid CSS.
         """
         if selector is not None:
-            roots = soup.select(selector)
+            matches = soup.select(selector)
+            matched = {id(tag) for tag in matches}
+            # The text of a nested match is already part of its ancestor's.
+            roots = [tag for tag in matches if not any(id(parent) in matched for parent in tag.parents)]
         else:
-            articles = soup.find_all("article", limit=2)
-            # Several <article> elements usually mean a listing page, where
-            # the whole body is the content.
+            # Several top-level <article> elements usually mean a listing
+            # page, where the whole body is the content. Nested ones, such as
+            # comments inside a post, belong to their article.
+            articles = [tag for tag in soup.find_all("article") if tag.find_parent("article") is None]
             article = articles[0] if len(articles) == 1 else None
             roots = [soup.find("main") or article or soup.body or soup]
         return " ".join(filter(None, (_visible_text(root) for root in roots)))
@@ -224,7 +230,8 @@ class HTMLParser:
         keywords = _meta_content(soup, "name", "keywords") or ""
 
         canonical = None
-        canonical_tag = soup.find("link", rel="canonical", href=True)
+        # rel values are case-insensitive: "Canonical" is valid too.
+        canonical_tag = soup.find("link", rel=_CANONICAL, href=True)
         if canonical_tag is not None:
             href = _attr(canonical_tag, "href").strip()
             canonical = resolve_url(href, base_url) if base_url else (href or None)

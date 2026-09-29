@@ -1,7 +1,6 @@
 """Asynchronous HTTP client that downloads many pages concurrently."""
 
 import asyncio
-import codecs
 import logging
 import ssl
 import time
@@ -31,6 +30,9 @@ logger = logging.getLogger(__name__)
 # Sites such as Wikipedia ask bots to identify themselves with a contact URL
 # and may block generic user agents.
 DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
+
+# Printable ASCII: a charset that decodes it unchanged can read the markup.
+_ASCII_PROBE = bytes(range(0x20, 0x7F)) + b"\t\n\r"
 
 
 class _Response(NamedTuple):
@@ -281,23 +283,34 @@ def _sniff_charset(response: aiohttp.ClientResponse, body: bytes) -> str:
     <meta charset="..."> or <meta http-equiv="Content-Type" content="...">.
     """
     declared = EncodingDetector.find_declared_encoding(body, is_html=True)
-    if declared is not None:
-        try:
-            codecs.lookup(declared)
-        except LookupError:
-            logger.debug("Unknown declared charset %r for %s", declared, response.url)
-        else:
-            return declared
-    return "utf-8"
+    if declared is None:
+        return "utf-8"
+    if not _is_ascii_compatible(declared):
+        # The declaration was found by reading the bytes as ASCII, so they
+        # cannot be UTF-16 and the like; the HTML spec says to use UTF-8.
+        # This also rejects unknown names and codecs such as "undefined",
+        # "idna" or "base64" that cannot decode a page at all.
+        logger.debug("Ignoring declared charset %r for %s", declared, response.url)
+        return "utf-8"
+    return declared
+
+
+def _is_ascii_compatible(encoding: str) -> bool:
+    try:
+        return _ASCII_PROBE.decode(encoding, errors="replace") == _ASCII_PROBE.decode("ascii")
+    except (LookupError, UnicodeError):
+        return False
 
 
 def _decode(body: bytes, encoding: str) -> str:
-    # A wrong charset header should not drop the whole page: undecodable bytes
-    # are replaced, and a charset naming a non-text codec (e.g. "base64")
-    # falls back to UTF-8.
+    # A byte order mark overrides any declared charset (HTML spec) and is not
+    # part of the text. A wrong charset should not drop the whole page:
+    # undecodable bytes are replaced, and a charset naming a codec that cannot
+    # decode text (e.g. "base64" or "undefined") falls back to UTF-8.
+    body, bom_encoding = EncodingDetector.strip_byte_order_mark(body)
     try:
-        return body.decode(encoding, errors="replace")
-    except LookupError:
+        return body.decode(bom_encoding or encoding, errors="replace")
+    except (LookupError, UnicodeError):
         return body.decode("utf-8", errors="replace")
 
 

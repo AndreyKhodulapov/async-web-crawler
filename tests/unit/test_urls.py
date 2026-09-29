@@ -65,6 +65,8 @@ def test_resolve_with_invalid_base_keeps_only_absolute_links():
         ("https://BÜCHER.de/", "https://xn--bcher-kva.de/"),
         ("https://xn--bcher-kva.de/", "https://xn--bcher-kva.de/"),
         ("http://example.com:/a", "http://example.com/a"),
+        ("https://Example.com./a", "https://example.com/a"),
+        ("http://./", None),
         ("http://user:pw@Example.com:8080/", "http://user:pw@example.com:8080/"),
         ("http://" + "a" * 70 + "é.com/", None),
     ],
@@ -99,6 +101,7 @@ def test_is_valid_http_url(url, valid):
         # yarl reports the final URL of a response in punycode.
         ("https://bücher.de/katalog", "https://xn--bcher-kva.de/", True),
         ("https://BÜCHER.de/", "https://bücher.de/", True),
+        ("https://example.com./about", "https://example.com/", True),
     ],
 )
 def test_is_same_host(url, other, same):
