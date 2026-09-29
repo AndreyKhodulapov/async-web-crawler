@@ -276,24 +276,33 @@ class TestBrokenHTML:
 
     def test_hidden_content_is_ignored_by_every_extractor(self, parser):
         html = """
+            <head><title>Real</title></head>
             <body>
-              <p>Shown</p>
+              <p>Shown</p> <a href="page">shown link</a>
               <noscript>
+                <title>Hidden</title>
+                <meta name="description" content="hidden description">
+                <link rel="canonical" href="https://other.example/">
                 <img src="https://tracker.example/pixel.gif" alt="">
                 <h1>Enable JavaScript</h1>
                 <a href="/nojs">no-js version</a>
                 <ul><li>hidden item</li></ul>
               </noscript>
               <template>
+                <base href="https://cdn.example/">
+                <main><article>Template content</article></main>
                 <h2>Row template</h2>
                 <table><tr><td>cell</td></tr></table>
               </template>
             </body>"""
         page = parser.parse(html, "https://example.com/")
-        assert page["text"] == "Shown"
+        assert page["title"] == "Real"
+        assert page["metadata"]["description"] is None
+        assert page["metadata"]["canonical"] is None
+        assert page["text"] == "Shown shown link"
         assert page["images"] == []
         assert page["headings"] == []
-        assert page["links"] == []
+        assert page["links"] == ["https://example.com/page"]
         assert page["lists"] == []
         assert page["tables"] == []
 

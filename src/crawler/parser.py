@@ -16,9 +16,12 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Elements whose content is never shown to the reader as part of the page:
-# their text, links, images and other elements are left out.
-_NON_CONTENT_TAGS = frozenset({"script", "style", "noscript", "template", "head", "title"})
+# Elements a browser never renders: everything inside them, from text to a
+# <base> or <main>, is left out of every field.
+_HIDDEN_TAGS = frozenset({"script", "style", "noscript", "template"})
+# The document head holds metadata, not page content: its text, links and
+# images are left out too. Metadata extractors look into it on purpose.
+_NON_CONTENT_TAGS = _HIDDEN_TAGS | {"head", "title"}
 
 
 class Metadata(TypedDict):
@@ -196,9 +199,10 @@ class HTMLParser:
             # Several top-level <article> elements usually mean a listing
             # page, where the whole body is the content. Nested ones, such as
             # comments inside a post, belong to their article.
-            articles = [tag for tag in soup.find_all("article") if tag.find_parent("article") is None]
+            articles = [tag for tag in _content_tags(soup, "article") if tag.find_parent("article") is None]
             article = articles[0] if len(articles) == 1 else None
-            roots = [soup.find("main") or article or soup.body or soup]
+            main = _first_content_tag(soup, "main")
+            roots = [main or article or soup.body or soup]
         return " ".join(filter(None, (_visible_text(root) for root in roots)))
 
     def extract_metadata(self, soup: BeautifulSoup, base_url: str | None = None) -> Metadata:
@@ -209,13 +213,15 @@ class HTMLParser:
         """
         # An inline <svg> may have its own <title> (a tooltip); it is not the
         # page title. Documents without <head> put the real one in <body>.
-        title_tag = next((tag for tag in soup.find_all("title") if tag.find_parent("svg") is None), None)
+        titles = _content_tags(soup, "title", skip=_HIDDEN_TAGS)
+        title_tag = next((tag for tag in titles if tag.find_parent("svg") is None), None)
         title = _clean(title_tag.get_text()) if title_tag is not None else None
         keywords = _meta_content(soup, "name", "keywords") or ""
 
         canonical = None
         # rel values are case-insensitive: "Canonical" is valid too.
-        canonical_tag = soup.find("link", rel=re.compile("^canonical$", re.IGNORECASE), href=True)
+        rel = re.compile("^canonical$", re.IGNORECASE)
+        canonical_tag = _first_content_tag(soup, "link", skip=_HIDDEN_TAGS, rel=rel, href=True)
         if canonical_tag is not None:
             href = _attr(canonical_tag, "href").strip()
             canonical = resolve_url(href, base_url) if base_url else (href or None)
@@ -357,7 +363,7 @@ def _empty_page(url: str, final_url: str) -> ParsedPage:
 
 def _base_url(soup: BeautifulSoup, page_url: str) -> str:
     """Return the URL relative links are resolved against: <base href> or the page URL."""
-    base = soup.find("base", href=True)
+    base = _first_content_tag(soup, "base", skip=_HIDDEN_TAGS, href=True)
     if base is not None:
         return resolve_url(_attr(base, "href"), page_url) or page_url
     return page_url
@@ -366,7 +372,7 @@ def _base_url(soup: BeautifulSoup, page_url: str) -> str:
 def _meta_content(soup: BeautifulSoup, attribute: str, value: str) -> str | None:
     """Return the first non-empty content of <meta attribute=value>, if any."""
     pattern = re.compile(f"^{re.escape(value)}$", re.IGNORECASE)
-    for tag in soup.find_all("meta", attrs={attribute: pattern, "content": True}):
+    for tag in _content_tags(soup, "meta", skip=_HIDDEN_TAGS, attrs={attribute: pattern, "content": True}):
         if content := _clean(_attr(tag, "content")):
             return content
     return None
@@ -376,9 +382,20 @@ def _cells(row: Tag) -> list[Tag]:
     return row.find_all(["th", "td"], recursive=False)
 
 
-def _content_tags(soup: BeautifulSoup, name: str | list[str], **attrs: bool) -> list[Tag]:
-    """Find tags by name, leaving out those inside <noscript>, <template> and the like."""
-    return [tag for tag in soup.find_all(name, **attrs) if tag.find_parent(_NON_CONTENT_TAGS) is None]
+def _content_tags(
+    soup: BeautifulSoup, name: str | list[str], *, skip: frozenset[str] = _NON_CONTENT_TAGS, **filters: object
+) -> list[Tag]:
+    """Find tags by name, leaving out those inside elements named in `skip`.
+
+    `filters` are passed on to `find_all`: attribute values or `attrs`.
+    """
+    return [tag for tag in soup.find_all(name, **filters) if tag.find_parent(skip) is None]
+
+
+def _first_content_tag(
+    soup: BeautifulSoup, name: str, *, skip: frozenset[str] = _NON_CONTENT_TAGS, **filters: object
+) -> Tag | None:
+    return next(iter(_content_tags(soup, name, skip=skip, **filters)), None)
 
 
 def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
