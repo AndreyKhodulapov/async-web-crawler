@@ -4,7 +4,13 @@ import time
 
 import pytest
 
-from crawler import AsyncCrawler, FetchTimeoutError, HTTPStatusError, NetworkError
+from crawler import (
+    AsyncCrawler,
+    FetchTimeoutError,
+    HTTPStatusError,
+    InvalidURLError,
+    NetworkError,
+)
 
 
 @pytest.fixture
@@ -31,9 +37,10 @@ async def test_unreachable_host(crawler, closed_port_url):
         await crawler.fetch_url(closed_port_url)
 
 
-async def test_invalid_url(crawler):
-    with pytest.raises(NetworkError):
-        await crawler.fetch_url("not a url")
+async def test_idna_error_is_an_invalid_url(crawler):
+    # Passes URL validation, but aiohttp fails on IDNA-encoding the host.
+    with pytest.raises(InvalidURLError):
+        await crawler.fetch_url("http://" + "a" * 70 + ".com")
 
 
 async def test_redirect_loop(crawler, server):

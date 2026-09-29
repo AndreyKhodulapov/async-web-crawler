@@ -6,9 +6,7 @@ from aiohttp import web
 
 
 async def ok(request: web.Request) -> web.Response:
-    return web.Response(
-        text="<html><body>hello</body></html>", content_type="text/html"
-    )
+    return web.Response(text="<html><body>hello</body></html>", content_type="text/html")
 
 
 async def status(request: web.Request) -> web.Response:

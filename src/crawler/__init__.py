@@ -6,7 +6,9 @@ from crawler.exceptions import (
     FetchError,
     FetchTimeoutError,
     HTTPStatusError,
+    InvalidURLError,
     NetworkError,
+    UnexpectedError,
 )
 from crawler.models import FetchResult
 
@@ -17,5 +19,7 @@ __all__ = [
     "FetchResult",
     "FetchTimeoutError",
     "HTTPStatusError",
+    "InvalidURLError",
     "NetworkError",
+    "UnexpectedError",
 ]

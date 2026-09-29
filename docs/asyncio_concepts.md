@@ -52,9 +52,12 @@ Short, interview-ready notes on the ideas this crawler is built on.
 | `asyncio.as_completed(aws)` | yields results as they finish | process results as early as possible |
 | `asyncio.wait(aws, return_when=...)` | returns `(done, pending)` sets | fine-grained control |
 
-This crawler uses `TaskGroup` and catches expected per-URL errors *inside*
-each task. One broken URL does not cancel the others, while real bugs
-still stop the whole batch.
+This crawler uses `TaskGroup` and catches per-URL errors *inside* each
+task, so one broken URL never cancels the others. Expected failures are
+mapped to domain exceptions; anything else is caught by a last-resort
+`except Exception`, logged with its traceback (`logger.exception`) and
+reported as `UnexpectedError`, so bugs stay visible without killing the
+batch. `CancelledError` is a `BaseException` and passes through.
 
 ## Limiting concurrency: Semaphore
 
@@ -77,9 +80,9 @@ still stop the whole batch.
 ## Timeouts
 
 - Without a timeout, a slow or dead server can hang a task forever.
-- `aiohttp.ClientTimeout` supports `total` (the whole request),
-  `sock_connect` (establishing a connection) and `sock_read` (the gap between
-  received chunks).
+- `aiohttp.ClientTimeout` supports `total` (the whole request), `connect`
+  (DNS, TCP/TLS handshake and waiting for a pooled connection), `sock_connect`
+  (the TCP handshake alone) and `sock_read` (the gap between received chunks).
 - Generic tools: `asyncio.timeout(seconds)` (3.11+) and `asyncio.wait_for`.
   Since 3.11, `asyncio.TimeoutError` is an alias of the built-in `TimeoutError`.
 

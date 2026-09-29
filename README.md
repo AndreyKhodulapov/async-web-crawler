@@ -10,8 +10,10 @@ timeouts, and reports failures without stopping the rest of the batch.
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
 - Separate connect, read and total timeouts
 - Clear error types: `HTTPStatusError`, `NetworkError` (including redirect
-  loops), `FetchTimeoutError` and `CrawlerClosedError`, all subclasses of
-  `FetchError`
+  loops), `FetchTimeoutError`, `InvalidURLError`, `CrawlerClosedError` and
+  `UnexpectedError`, all subclasses of `FetchError`
+- One failing URL never breaks a batch: even unforeseen exceptions are
+  logged with a traceback and reported as `UnexpectedError`
 - Logging for every request: start, success (status, size, time) and failure
 
 ## Requirements
@@ -23,8 +25,8 @@ Python 3.11+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt        # runtime only
 pip install -r requirements-dev.txt    # runtime + test and lint tools
+pip install -e .                       # or: the package alone, runtime deps only
 ```
 
 ## Demo
@@ -98,10 +100,12 @@ asyncio.run(main())
 | `close()` | - | safe to call twice; called by `async with` |
 
 Closing the crawler while a batch is running does not break the batch.
-Requests already in flight fail with `NetworkError`, and requests still
-waiting for a free slot fail with `CrawlerClosedError`. Fetching from an
-already closed crawler fails the same way: `fetch_url` raises
-`CrawlerClosedError`, the other methods report it per URL.
+Requests still waiting for a free slot fail with `CrawlerClosedError`.
+Requests already in flight are not interrupted: one that is still connecting
+fails with `NetworkError`, one that is already reading the body runs until it
+completes or hits `total_timeout`. Fetching from an already closed crawler
+fails the same way: `fetch_url` raises `CrawlerClosedError`, the other methods
+report it per URL.
 
 ## Tests
 
@@ -125,8 +129,7 @@ src/
 └── crawler/
     ├── client.py           # AsyncCrawler
     ├── models.py           # FetchResult
-    ├── exceptions.py       # FetchError hierarchy
-    └── logging_config.py   # log format setup
+    └── exceptions.py       # FetchError hierarchy
 tests/
 ├── unit/                   # session replaced by fakes: closing, error mapping
 └── integration/            # local HTTP server; live tests marked `network`

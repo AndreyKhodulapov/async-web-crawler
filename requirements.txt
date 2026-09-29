@@ -1,3 +1,2 @@
 aiohttp>=3.10,<4
-aiofiles>=24.1
 certifi>=2024.2.2

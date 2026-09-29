@@ -30,5 +30,13 @@ class FetchTimeoutError(FetchError):
     """The request did not complete within the configured timeouts."""
 
 
+class InvalidURLError(FetchError):
+    """The URL is malformed or does not use the http(s) scheme."""
+
+
 class CrawlerClosedError(FetchError):
     """The crawler was closed before the request could start."""
+
+
+class UnexpectedError(FetchError):
+    """An unforeseen exception (most likely a bug); the traceback is logged."""

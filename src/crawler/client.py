@@ -7,6 +7,7 @@ import time
 from collections.abc import Iterable
 from types import TracebackType
 from typing import Self
+from urllib.parse import urlsplit
 
 import aiohttp
 import certifi
@@ -16,7 +17,9 @@ from crawler.exceptions import (
     FetchError,
     FetchTimeoutError,
     HTTPStatusError,
+    InvalidURLError,
     NetworkError,
+    UnexpectedError,
 )
 from crawler.models import FetchResult
 
@@ -32,7 +35,9 @@ class AsyncCrawler:
             pages = await crawler.fetch_urls(urls)
 
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
-    the same way as any other per-URL failure.
+    the same way as any other per-URL failure. Closing does not interrupt
+    requests that are already in flight: they finish on their own or hit
+    `total_timeout`.
     """
 
     def __init__(
@@ -55,9 +60,11 @@ class AsyncCrawler:
                 raise ValueError(f"{name} must be positive, got {value}")
 
         self.max_concurrent = max_concurrent
+        # `connect` covers DNS resolution and waiting for a pooled connection,
+        # unlike `sock_connect`, which is only the TCP handshake.
         self._timeout = aiohttp.ClientTimeout(
             total=total_timeout,
-            sock_connect=connect_timeout,
+            connect=connect_timeout,
             sock_read=read_timeout,
         )
         self._user_agent = user_agent
@@ -99,16 +106,12 @@ class AsyncCrawler:
         """
         unique_urls = list(dict.fromkeys(urls))
         results = await self.fetch_many(unique_urls)
-        return {
-            result.url: result.content
-            for result in results
-            if result.content is not None
-        }
+        return {result.url: result.content for result in results if result.content is not None}
 
     async def fetch_many(self, urls: Iterable[str]) -> list[FetchResult]:
         """Download pages concurrently; return one result per URL, in order."""
-        # fetch_result() never raises FetchError, so one failed URL does not
-        # cancel its siblings. Unexpected exceptions (bugs) still propagate.
+        # fetch_result() reports every per-URL failure in its result, so one
+        # failed URL never cancels its siblings in the TaskGroup.
         async with asyncio.TaskGroup() as group:
             tasks = [group.create_task(self.fetch_result(url)) for url in urls]
         return [task.result() for task in tasks]
@@ -130,6 +133,15 @@ class AsyncCrawler:
                     error.message,
                 )
                 return FetchResult.failure(url, error, elapsed)
+            except Exception as exc:
+                # Last line of defense: a bug or an error type we did not
+                # anticipate fails only this URL instead of cancelling the
+                # whole batch. The traceback is logged so it stays visible.
+                elapsed = time.perf_counter() - started
+                logger.exception("Unexpected error for %s after %.2fs", url, elapsed)
+                error = UnexpectedError(url, f"{type(exc).__name__}: {exc}")
+                error.__cause__ = exc
+                return FetchResult.failure(url, error, elapsed)
 
             elapsed = time.perf_counter() - started
             logger.info(
@@ -139,9 +151,7 @@ class AsyncCrawler:
                 size,
                 elapsed,
             )
-            return FetchResult(
-                url=url, elapsed=elapsed, status=status, content=content, size=size
-            )
+            return FetchResult(url=url, elapsed=elapsed, status=status, content=content, size=size)
 
     async def close(self) -> None:
         """Close the underlying session. Safe to call more than once."""
@@ -153,8 +163,7 @@ class AsyncCrawler:
 
     def _get_session(self) -> aiohttp.ClientSession:
         # The session is created lazily because aiohttp requires a running
-        # event loop. There is no await between the check and the assignment,
-        # so concurrent tasks cannot create two sessions.
+        # event loop.
         if self._session is None:
             self._session = self._create_session()
         return self._session
@@ -165,9 +174,7 @@ class AsyncCrawler:
         # installed CAs (corporate proxies) stay trusted.
         ssl_context = ssl.create_default_context()
         ssl_context.load_verify_locations(cafile=certifi.where())
-        connector = aiohttp.TCPConnector(
-            limit=self.max_concurrent, ttl_dns_cache=300, ssl=ssl_context
-        )
+        connector = aiohttp.TCPConnector(limit=self.max_concurrent, ttl_dns_cache=300, ssl=ssl_context)
         return aiohttp.ClientSession(
             connector=connector,
             timeout=self._timeout,
@@ -185,22 +192,50 @@ class AsyncCrawler:
         # keeps the rest of a fetch_many() batch intact.
         if self._closed:
             raise CrawlerClosedError(url, "crawler is closed")
+        _validate_url(url)
         session = self._get_session()
         try:
             async with session.get(url) as response:
                 response.raise_for_status()
                 body = await response.read()
-                # A wrong charset header should not drop the whole page.
-                text = body.decode(response.get_encoding(), errors="replace")
-                return response.status, text, len(body)
+                return response.status, _decode(body, response.get_encoding()), len(body)
         # Order matters: TooManyRedirects is a ClientResponseError, which is a
         # ClientError; aiohttp's ServerTimeoutError is both a ClientError and
-        # a TimeoutError.
+        # a TimeoutError; InvalidURL is a ClientError too.
         except aiohttp.TooManyRedirects as exc:
             raise NetworkError(url, f"too many redirects ({len(exc.history)})") from exc
         except aiohttp.ClientResponseError as exc:
             raise HTTPStatusError(url, exc.status, exc.message) from exc
         except TimeoutError as exc:
             raise FetchTimeoutError(url, "request timed out") from exc
+        # UnicodeError comes from IDNA encoding of the host, e.g. a domain
+        # label longer than 63 characters; aiohttp does not wrap it.
+        except (aiohttp.InvalidURL, UnicodeError) as exc:
+            raise InvalidURLError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
+
+
+def _decode(body: bytes, encoding: str) -> str:
+    # A wrong charset header should not drop the whole page: undecodable bytes
+    # are replaced, and a charset naming a non-text codec (e.g. "base64")
+    # falls back to UTF-8.
+    try:
+        return body.decode(encoding, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
+
+
+def _validate_url(url: str) -> None:
+    """Reject URLs without an http(s) scheme or a host before sending them.
+
+    aiohttp does not wrap every malformed URL: "//host" fails on an internal
+    assert, so such input is caught here instead.
+    """
+    try:
+        parts = urlsplit(url)
+        valid = parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:  # e.g. an unclosed IPv6 bracket: "http://[::1"
+        valid = False
+    if not valid:
+        raise InvalidURLError(url, "expected an absolute http(s) URL")
