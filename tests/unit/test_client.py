@@ -34,6 +34,7 @@ class FakeResponse:
         self.content_type = content_type or "application/octet-stream"
         # None means "not redirected": FakeSession fills in the requested URL.
         self.url = url
+        self.read_count = 0
 
     def raise_for_status(self) -> None:
         if self.status >= 400:
@@ -45,6 +46,7 @@ class FakeResponse:
             )
 
     async def read(self) -> bytes:
+        self.read_count += 1
         return self._body
 
     def get_encoding(self) -> str:
@@ -291,6 +293,17 @@ class TestFetchAndParse:
         fake_session.routes["http://a"] = FakeResponse(b"<h1>Hi</h1>", content_type=None)
         page = await crawler.fetch_and_parse("http://a")
         assert page["headings"] == [{"level": 1, "text": "Hi"}]
+
+    async def test_non_html_body_is_not_downloaded(self, crawler, fake_session):
+        archive = FakeResponse(b"PK\x03\x04", content_type="application/zip")
+        fake_session.routes["http://a/file.zip"] = archive
+        page = await crawler.fetch_and_parse("http://a/file.zip")
+        assert page["errors"] == ["unsupported content type: application/zip"]
+        assert archive.read_count == 0
+
+    async def test_plain_fetch_still_reads_non_html_body(self, crawler, fake_session):
+        fake_session.routes["http://a/data"] = FakeResponse(b"{}", content_type="application/json")
+        assert await crawler.fetch_url("http://a/data") == "{}"
 
     async def test_uses_injected_parser(self, monkeypatch, fake_session):
         crawler = AsyncCrawler(parser=HTMLParser(same_host_only=True))

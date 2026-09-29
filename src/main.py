@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
         "--exclude", type=regex, action="append", default=[], metavar="REGEX", help="skip matching links"
     )
     crawl.add_argument("--json", type=Path, metavar="PATH", help="save pages, errors and stats to a JSON file")
-    # Request logs would break the live progress line; --log-level INFO shows them.
+    # A log line per request would bury the progress line; --log-level INFO shows them.
     crawl.set_defaults(log_level="WARNING")
     return parser.parse_args()
 
@@ -366,12 +366,30 @@ async def run_crawl(args: argparse.Namespace) -> None:
         save_crawl_json(args.json, crawler)
 
 
+class ProgressAwareHandler(logging.StreamHandler):
+    """Writes log records to stderr, erasing the live progress line first.
+
+    The progress line ends with "\r" instead of a newline, so a record would
+    otherwise be glued to its end. The next progress update redraws it below.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(sys.stderr)
+        self._live = sys.stderr.isatty()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._live:
+            self.stream.write("\r\033[K")
+        super().emit(record)
+
+
 async def main() -> None:
     args = parse_args()
     logging.basicConfig(
         level=args.log_level,
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%H:%M:%S",
+        handlers=[ProgressAwareHandler()],
     )
     commands = {"benchmark": run_benchmark, "parse": run_parse, "crawl": run_crawl}
     await commands[args.command](args)

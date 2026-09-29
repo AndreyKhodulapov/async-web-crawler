@@ -114,4 +114,4 @@ async def test_slot_is_released_on_error():
 async def test_idle_domains_are_forgotten():
     manager = SemaphoreManager(max_concurrent=5, max_per_domain=1)
     await Load(manager).run(requests_to("a", 3) + requests_to("b", 3))
-    assert manager._domains == {}
+    assert manager._domains == manager._users == manager._active == {}

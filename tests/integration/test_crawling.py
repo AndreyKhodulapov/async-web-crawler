@@ -74,8 +74,10 @@ async def test_redirect_target_is_not_fetched_again(url, site):
 
 
 async def test_max_pages_counts_failed_pages_too(url, site):
+    # Breadth-first order: the start page, then a.html, b.html and missing.html.
     crawler = await crawl(url("/site/"), max_pages=4)
 
+    assert set(crawler.failed_urls) == {url("/site/missing.html")}
     assert len(crawler.visited_urls) == 4
     assert site.hits.total() == 4
     assert crawler.crawl_stats().queued > 0
@@ -151,6 +153,8 @@ async def test_invalid_start_urls_are_rejected():
             await crawler.crawl(["https://example.com", "ftp://site/"])
         with pytest.raises(ValueError, match="max_pages"):
             await crawler.crawl(["https://example.com"], max_pages=0)
+        with pytest.raises(TypeError, match="got a string"):
+            await crawler.crawl("https://example.com")
 
 
 async def test_second_concurrent_crawl_is_rejected(url, site):

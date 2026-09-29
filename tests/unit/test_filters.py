@@ -59,6 +59,12 @@ def test_all_rules_combined():
 
 
 @pytest.mark.parametrize("field", ["include_patterns", "exclude_patterns"])
+def test_single_string_instead_of_a_list_is_rejected(field):
+    with pytest.raises(TypeError, match="got a string"):
+        UrlFilter(**{field: "pdf"})
+
+
+@pytest.mark.parametrize("field", ["include_patterns", "exclude_patterns"])
 def test_invalid_pattern_is_rejected_early(field):
     with pytest.raises(ValueError, match=r"invalid pattern '\(unclosed'"):
         UrlFilter(**{field: ["(unclosed"]})

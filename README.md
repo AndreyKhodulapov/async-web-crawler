@@ -75,9 +75,9 @@ pages 25 | failed 0 | queued 15 | in progress 5 | requests 2 | 5.0 pages/s | 5.0
 ```
 
 `in progress` counts pages taken by workers; `requests` counts those actually
-being downloaded, which never exceeds `--per-domain` for a single site. Request
-logs are hidden by default so that they do not break the line; pass
-`--log-level INFO` to see them. At the end it prints every page in the order it
+being downloaded, which never exceeds `--per-domain` for a single site.
+Warnings, such as a failed page, are printed above the line; per-request logs
+are hidden by default, pass `--log-level INFO` to see them. At the end it prints every page in the order it
 was found:
 
 ```
@@ -286,8 +286,9 @@ per-domain limits) and `UrlFilter`.
 | `lists` | `<ul>`/`<ol>` as `{"type", "items"}`; nested lists are separate entries |
 | `errors` | parsing problems; empty when everything went fine |
 
-Responses whose `Content-Type` is not HTML are not parsed: the page comes
-back empty with the reason in `errors`. The parser can be used on its own:
+Responses whose `Content-Type` is not HTML are not parsed, and their body is
+not even downloaded: the page comes back empty with the reason in `errors`.
+This keeps a crawl from pulling in archives or videos it finds links to. The parser can be used on its own:
 `HTMLParser().parse(html, url)`, or `await HTMLParser().parse_html(html, url)`
 in async code. Pass `AsyncCrawler(parser=HTMLParser(same_host_only=True))` to
 keep only links to the page's own host.

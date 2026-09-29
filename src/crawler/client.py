@@ -23,7 +23,7 @@ from crawler.exceptions import (
 )
 from crawler.filters import UrlFilter
 from crawler.models import CrawlStats, FetchResult, ParsedPage
-from crawler.parser import HTMLParser
+from crawler.parser import HTMLParser, is_html_content_type
 from crawler.queue import CrawlerQueue
 from crawler.semaphores import SemaphoreManager
 from crawler.urls import get_host, is_valid_http_url
@@ -152,12 +152,13 @@ class AsyncCrawler:
 
         Relative links are resolved against the URL reached after redirects.
         Parsing problems never raise: they are logged and listed in the
-        result's `errors`, e.g. for a response that is not HTML.
+        result's `errors`, e.g. for a response that is not HTML. The body of
+        such a response is not downloaded at all.
 
         Raises:
             FetchError: a subclass describing why the download failed.
         """
-        result = await self.fetch_result(url)
+        result = await self._fetch(url, html_only=True)
         if result.error is not None:
             raise result.error
         assert result.content is not None
@@ -187,11 +188,14 @@ class AsyncCrawler:
 
     async def fetch_result(self, url: str) -> FetchResult:
         """Download a single page, reporting failures in the result."""
+        return await self._fetch(url)
+
+    async def _fetch(self, url: str, *, html_only: bool = False) -> FetchResult:
         async with self._limits.slot(url):
             logger.info("Fetching %s", url)
             started = time.perf_counter()
             try:
-                response = await self._request(url)
+                response = await self._request(url, html_only=html_only)
             except FetchError as error:
                 elapsed = time.perf_counter() - started
                 logger.warning(
@@ -257,9 +261,12 @@ class AsyncCrawler:
         and stays available after it returns.
 
         Raises:
-            ValueError: `max_pages` is not positive or a start URL is invalid.
+            TypeError: a single string is passed instead of a list of URLs or patterns.
+            ValueError: `max_pages` is not positive, a start URL or a pattern is invalid.
             RuntimeError: another crawl is running on this crawler.
         """
+        if isinstance(start_urls, str):
+            raise TypeError(f"expected a list of start URLs, got a string: {start_urls!r}")
         if max_pages < 1:
             raise ValueError(f"max_pages must be >= 1, got {max_pages}")
         start_urls = list(start_urls)
@@ -383,9 +390,11 @@ class AsyncCrawler:
             fallback_charset_resolver=_sniff_charset,
         )
 
-    async def _request(self, url: str) -> _Response:
+    async def _request(self, url: str, *, html_only: bool = False) -> _Response:
         """Perform the GET request and read the whole body.
 
+        With `html_only`, the body of a response whose Content-Type is not
+        HTML is not read: the content is empty and the size is 0.
         The size is measured after content decoding (gzip, deflate, ...),
         so it may be larger than the number of bytes sent over the network.
         """
@@ -399,16 +408,22 @@ class AsyncCrawler:
         try:
             async with session.get(url) as response:
                 response.raise_for_status()
-                body = await response.read()
                 # aiohttp reports "application/octet-stream" when the header
                 # is missing; None lets callers tell the two cases apart.
-                has_type = aiohttp.hdrs.CONTENT_TYPE in response.headers
+                content_type = response.content_type if aiohttp.hdrs.CONTENT_TYPE in response.headers else None
+                if html_only and not is_html_content_type(content_type):
+                    # A link to an archive or a video must not be downloaded
+                    # just to be rejected by the parser. Leaving the block
+                    # without reading closes the connection mid-transfer.
+                    logger.info("Skipping body of %s: %s is not HTML", url, content_type)
+                    return _Response(response.status, "", 0, str(response.url), content_type)
+                body = await response.read()
                 return _Response(
                     status=response.status,
                     content=_decode(body, response.get_encoding()),
                     size=len(body),
                     final_url=str(response.url),
-                    content_type=response.content_type if has_type else None,
+                    content_type=content_type,
                 )
         # Order matters: TooManyRedirects is a ClientResponseError, which is a
         # ClientError; aiohttp's ServerTimeoutError is both a ClientError and

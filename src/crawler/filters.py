@@ -44,6 +44,10 @@ class UrlFilter:
 
 
 def _compile(patterns: Iterable[str]) -> list[re.Pattern[str]]:
+    # A string is an iterable of characters: "pdf" would become three
+    # one-letter patterns and reject almost every URL.
+    if isinstance(patterns, str):
+        raise TypeError(f"expected a list of patterns, got a string: {patterns!r}")
     compiled = []
     for pattern in patterns:
         try:

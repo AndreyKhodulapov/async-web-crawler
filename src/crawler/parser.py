@@ -69,10 +69,7 @@ class HTMLParser:
         started = time.perf_counter()
         page = _empty_page(url, final_url or url)
 
-        # Media types are case-insensitive and may carry parameters
-        # ("text/html; charset=utf-8"). A missing Content-Type is parsed as HTML.
-        html_types = ("text/html", "application/xhtml+xml")
-        if content_type is not None and content_type.split(";")[0].strip().lower() not in html_types:
+        if not is_html_content_type(content_type):
             self._report(page, f"unsupported content type: {content_type}")
             return page
         if not html.strip():
@@ -296,6 +293,17 @@ class HTMLParser:
     def _report(page: ParsedPage, problem: str) -> None:
         logger.warning("%s: %s", page["url"], problem)
         page["errors"].append(problem)
+
+
+def is_html_content_type(content_type: str | None) -> bool:
+    """Return True for an HTML media type, or when the type is unknown (None).
+
+    Media types are case-insensitive and may carry parameters
+    ("text/html; charset=utf-8").
+    """
+    if content_type is None:
+        return True
+    return content_type.split(";")[0].strip().lower() in ("text/html", "application/xhtml+xml")
 
 
 def _empty_page(url: str, final_url: str) -> ParsedPage:

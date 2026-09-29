@@ -54,6 +54,8 @@ class SemaphoreManager:
                     yield
                 finally:
                     self._active[domain] -= 1
+                    if not self._active[domain]:
+                        del self._active[domain]
         finally:
             self._users[domain] -= 1
             if not self._users[domain]:
@@ -63,7 +65,7 @@ class SemaphoreManager:
     def get_stats(self) -> dict[str, object]:
         return {
             "active": self.active,
-            "active_by_domain": {domain: count for domain, count in self._active.items() if count},
+            "active_by_domain": dict(self._active),
         }
 
     def _domain_semaphore(self, domain: str) -> contextlib.AbstractAsyncContextManager[object]:
