@@ -37,23 +37,10 @@ async def test_unreachable_host(crawler, closed_port_url):
         await crawler.fetch_url(closed_port_url)
 
 
-@pytest.mark.parametrize(
-    "url",
-    [
-        "not a url",
-        "//no-scheme",  # aiohttp itself fails on an internal assert
-        "http://" + "a" * 70 + ".com",  # IDNA label too long: UnicodeError
-    ],
-)
-async def test_invalid_url(crawler, url):
+async def test_idna_error_is_an_invalid_url(crawler):
+    # Passes URL validation, but aiohttp fails on IDNA-encoding the host.
     with pytest.raises(InvalidURLError):
-        await crawler.fetch_url(url)
-
-
-async def test_invalid_url_does_not_break_batch(crawler, server):
-    ok_url = str(server.make_url("/ok"))
-    pages = await crawler.fetch_urls(["//no-scheme", ok_url])
-    assert list(pages) == [ok_url]
+        await crawler.fetch_url("http://" + "a" * 70 + ".com")
 
 
 async def test_redirect_loop(crawler, server):

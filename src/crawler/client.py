@@ -35,7 +35,9 @@ class AsyncCrawler:
             pages = await crawler.fetch_urls(urls)
 
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
-    the same way as any other per-URL failure.
+    the same way as any other per-URL failure. Closing does not interrupt
+    requests that are already in flight: they finish on their own or hit
+    `total_timeout`.
     """
 
     def __init__(
@@ -58,9 +60,11 @@ class AsyncCrawler:
                 raise ValueError(f"{name} must be positive, got {value}")
 
         self.max_concurrent = max_concurrent
+        # `connect` covers DNS resolution and waiting for a pooled connection,
+        # unlike `sock_connect`, which is only the TCP handshake.
         self._timeout = aiohttp.ClientTimeout(
             total=total_timeout,
-            sock_connect=connect_timeout,
+            connect=connect_timeout,
             sock_read=read_timeout,
         )
         self._user_agent = user_agent
@@ -102,11 +106,7 @@ class AsyncCrawler:
         """
         unique_urls = list(dict.fromkeys(urls))
         results = await self.fetch_many(unique_urls)
-        return {
-            result.url: result.content
-            for result in results
-            if result.content is not None
-        }
+        return {result.url: result.content for result in results if result.content is not None}
 
     async def fetch_many(self, urls: Iterable[str]) -> list[FetchResult]:
         """Download pages concurrently; return one result per URL, in order."""
@@ -151,9 +151,7 @@ class AsyncCrawler:
                 size,
                 elapsed,
             )
-            return FetchResult(
-                url=url, elapsed=elapsed, status=status, content=content, size=size
-            )
+            return FetchResult(url=url, elapsed=elapsed, status=status, content=content, size=size)
 
     async def close(self) -> None:
         """Close the underlying session. Safe to call more than once."""
@@ -165,8 +163,7 @@ class AsyncCrawler:
 
     def _get_session(self) -> aiohttp.ClientSession:
         # The session is created lazily because aiohttp requires a running
-        # event loop. There is no await between the check and the assignment,
-        # so concurrent tasks cannot create two sessions.
+        # event loop.
         if self._session is None:
             self._session = self._create_session()
         return self._session
@@ -177,9 +174,7 @@ class AsyncCrawler:
         # installed CAs (corporate proxies) stay trusted.
         ssl_context = ssl.create_default_context()
         ssl_context.load_verify_locations(cafile=certifi.where())
-        connector = aiohttp.TCPConnector(
-            limit=self.max_concurrent, ttl_dns_cache=300, ssl=ssl_context
-        )
+        connector = aiohttp.TCPConnector(limit=self.max_concurrent, ttl_dns_cache=300, ssl=ssl_context)
         return aiohttp.ClientSession(
             connector=connector,
             timeout=self._timeout,
@@ -203,9 +198,7 @@ class AsyncCrawler:
             async with session.get(url) as response:
                 response.raise_for_status()
                 body = await response.read()
-                # A wrong charset header should not drop the whole page.
-                text = body.decode(response.get_encoding(), errors="replace")
-                return response.status, text, len(body)
+                return response.status, _decode(body, response.get_encoding()), len(body)
         # Order matters: TooManyRedirects is a ClientResponseError, which is a
         # ClientError; aiohttp's ServerTimeoutError is both a ClientError and
         # a TimeoutError; InvalidURL is a ClientError too.
@@ -221,6 +214,16 @@ class AsyncCrawler:
             raise InvalidURLError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
+
+
+def _decode(body: bytes, encoding: str) -> str:
+    # A wrong charset header should not drop the whole page: undecodable bytes
+    # are replaced, and a charset naming a non-text codec (e.g. "base64")
+    # falls back to UTF-8.
+    try:
+        return body.decode(encoding, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
 
 
 def _validate_url(url: str) -> None:

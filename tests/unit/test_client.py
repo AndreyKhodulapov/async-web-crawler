@@ -18,9 +18,10 @@ from crawler import (
 
 
 class FakeResponse:
-    def __init__(self, body: bytes = b"page", status: int = 200) -> None:
+    def __init__(self, body: bytes = b"page", status: int = 200, encoding: str = "utf-8") -> None:
         self.status = status
         self._body = body
+        self._encoding = encoding
 
     def raise_for_status(self) -> None:
         if self.status >= 400:
@@ -35,7 +36,7 @@ class FakeResponse:
         return self._body
 
     def get_encoding(self) -> str:
-        return "utf-8"
+        return self._encoding
 
 
 class FakeRequest:
@@ -101,9 +102,7 @@ class TestInit:
         with pytest.raises(ValueError, match="max_concurrent"):
             AsyncCrawler(max_concurrent=value)
 
-    @pytest.mark.parametrize(
-        "name", ["total_timeout", "connect_timeout", "read_timeout"]
-    )
+    @pytest.mark.parametrize("name", ["total_timeout", "connect_timeout", "read_timeout"])
     def test_rejects_non_positive_timeouts(self, name):
         with pytest.raises(ValueError, match=name):
             AsyncCrawler(**{name: 0})
@@ -150,9 +149,7 @@ class TestLifecycle:
         assert all(isinstance(r.error, CrawlerClosedError) for r in results)
         assert fake_session.requested == []
 
-    async def test_close_during_batch_fails_only_queued_urls(
-        self, crawler, fake_session
-    ):
+    async def test_close_during_batch_fails_only_queued_urls(self, crawler, fake_session):
         fake_session.latency = 0.1
         urls = [f"http://site/{i}" for i in range(5)]
         batch = asyncio.create_task(crawler.fetch_many(urls))
@@ -186,9 +183,7 @@ class TestErrorMapping:
             await crawler.fetch_url("http://a")
         assert isinstance(exc_info.value.__cause__, aiohttp.ClientConnectionError)
 
-    async def test_unexpected_exception_is_wrapped_and_logged(
-        self, crawler, fake_session, caplog
-    ):
+    async def test_unexpected_exception_is_wrapped_and_logged(self, crawler, fake_session, caplog):
         fake_session.routes["http://a"] = KeyError("bug")
         with pytest.raises(UnexpectedError, match="KeyError") as exc_info:
             await crawler.fetch_url("http://a")
@@ -202,12 +197,8 @@ class TestErrorMapping:
         with pytest.raises(asyncio.CancelledError):
             await crawler.fetch_url("http://a")
 
-    @pytest.mark.parametrize(
-        "url", ["//no-scheme", "not a url", "ftp://example.com", "http://[::1"]
-    )
-    async def test_malformed_url_is_rejected_before_request(
-        self, crawler, fake_session, url
-    ):
+    @pytest.mark.parametrize("url", ["//no-scheme", "not a url", "ftp://example.com", "http://[::1"])
+    async def test_malformed_url_is_rejected_before_request(self, crawler, fake_session, url):
         with pytest.raises(InvalidURLError):
             await crawler.fetch_url(url)
         assert fake_session.requested == []
@@ -235,6 +226,10 @@ class TestFetchMany:
         assert result.size == 6  # bytes, not characters
         assert result.status == 200
         assert result.elapsed >= 0
+
+    async def test_non_text_charset_falls_back_to_utf8(self, crawler, fake_session):
+        fake_session.routes["http://a"] = FakeResponse(b"page", encoding="base64")
+        assert await crawler.fetch_url("http://a") == "page"
 
     async def test_unexpected_error_does_not_cancel_batch(self, crawler, fake_session):
         fake_session.latency = 0.01

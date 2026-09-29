@@ -80,9 +80,9 @@ batch. `CancelledError` is a `BaseException` and passes through.
 ## Timeouts
 
 - Without a timeout, a slow or dead server can hang a task forever.
-- `aiohttp.ClientTimeout` supports `total` (the whole request),
-  `sock_connect` (establishing a connection) and `sock_read` (the gap between
-  received chunks).
+- `aiohttp.ClientTimeout` supports `total` (the whole request), `connect`
+  (DNS, TCP/TLS handshake and waiting for a pooled connection), `sock_connect`
+  (the TCP handshake alone) and `sock_read` (the gap between received chunks).
 - Generic tools: `asyncio.timeout(seconds)` (3.11+) and `asyncio.wait_for`.
   Since 3.11, `asyncio.TimeoutError` is an alias of the built-in `TimeoutError`.
 
