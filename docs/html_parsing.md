@@ -72,7 +72,7 @@ BeautifulSoup is a tree API on top of a pluggable parser:
   (`loop.run_in_executor`). The cost: arguments and results are pickled
   between processes.
 
-## Robust extraction and partial results
+## Partial results instead of failures
 
 - Real pages are messy, so extraction must **degrade, not fail**. Run each
   extractor (text, links, tables...) separately. If one raises, log a warning

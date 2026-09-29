@@ -16,28 +16,9 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-# Content types that are parsed as HTML. A response without a Content-Type
-# header is parsed too.
-HTML_CONTENT_TYPES = frozenset({"text/html", "application/xhtml+xml"})
-
-# Elements whose text is never shown to the reader as page content.
+# Elements whose content is never shown to the reader as part of the page:
+# their text, links, images and other elements are left out.
 _NON_CONTENT_TAGS = frozenset({"script", "style", "noscript", "template", "head", "title"})
-_LIST_TAGS = frozenset({"ul", "ol"})
-# A list item's own text leaves out nested lists: they are reported separately.
-_LIST_ITEM_SKIP = _NON_CONTENT_TAGS | _LIST_TAGS
-_WHITESPACE = re.compile(r"\s+")
-_CANONICAL = re.compile(r"^canonical$", re.IGNORECASE)
-# Elements that start on a new line in a browser. Text on both sides of them
-# is separated by a space; text inside inline elements (<b>, <a>, ...) is
-# joined as is, so "<b>to</b>, go" stays "to, go".
-_BLOCK_TAGS = frozenset(
-    {
-        "address", "article", "aside", "blockquote", "br", "caption", "dd", "details", "div", "dl", "dt",
-        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
-        "hr", "li", "main", "nav", "ol", "option", "p", "pre", "section", "summary", "table", "td", "th",
-        "tr", "ul",
-    }
-)  # fmt: skip
 
 
 class Metadata(TypedDict):
@@ -72,8 +53,8 @@ class ItemList(TypedDict):
 class ParsedPage(TypedDict):
     """Structured data extracted from one page.
 
-    ``url`` is the requested URL, ``final_url`` the one after redirects;
-    relative links are resolved against the latter. ``errors`` lists problems
+    `url` is the requested URL, `final_url` the one after redirects;
+    relative links are resolved against the latter. `errors` lists problems
     met while parsing; the fields they affected keep their empty defaults.
     """
 
@@ -95,9 +76,11 @@ class HTMLParser:
 
     Parsing never raises: malformed markup is repaired by the parser, and if
     one extractor fails, the error is logged and recorded in
-    ``ParsedPage["errors"]`` while the other fields are still filled in.
+    `ParsedPage["errors"]` while the other fields are still filled in.
+    Content inside <noscript>, <template>, <script> and <style> is ignored
+    by every extractor.
 
-    With ``same_host_only=True``, links to other hosts are dropped.
+    With `same_host_only=True`, links to other hosts are dropped.
     """
 
     def __init__(self, *, same_host_only: bool = False) -> None:
@@ -133,8 +116,9 @@ class HTMLParser:
         page = _empty_page(url, final_url or url)
 
         # Media types are case-insensitive and may carry parameters
-        # ("text/html; charset=utf-8").
-        if content_type is not None and content_type.split(";")[0].strip().lower() not in HTML_CONTENT_TYPES:
+        # ("text/html; charset=utf-8"). A missing Content-Type is parsed as HTML.
+        html_types = ("text/html", "application/xhtml+xml")
+        if content_type is not None and content_type.split(";")[0].strip().lower() not in html_types:
             self._report(page, f"unsupported content type: {content_type}")
             return page
         if not html.strip():
@@ -146,11 +130,13 @@ class HTMLParser:
         if "<" not in html:
             self._report(page, "no HTML markup found")
 
-        base_url = self._extract(page, "base_url", _base_url, soup, page["final_url"], default=page["final_url"])
-        page["metadata"] = self._extract(
-            page, "metadata", self.extract_metadata, soup, base_url, default=page["metadata"]
-        )
-        page["title"] = page["metadata"]["title"]
+        base_url = self._extract(page, "<base href>", _base_url, soup, page["final_url"], default=page["final_url"])
+        metadata = self._extract(page, "metadata", self.extract_metadata, soup, base_url, default=None)
+        if metadata is not None:
+            page["metadata"] = metadata
+            page["title"] = metadata["title"]
+            if page["title"] is None:
+                logger.warning("No <title> on %s", url)
         page["text"] = self._extract(page, "text", self.extract_text, soup, default="")
         page["links"] = self._extract(page, "links", self.extract_links, soup, base_url, page["final_url"], default=[])
         page["headings"] = self._extract(page, "headings", self.extract_headings, soup, default=[])
@@ -158,8 +144,6 @@ class HTMLParser:
         page["tables"] = self._extract(page, "tables", self.extract_tables, soup, default=[])
         page["lists"] = self._extract(page, "lists", self.extract_lists, soup, default=[])
 
-        if page["title"] is None:
-            logger.warning("No <title> on %s", url)
         logger.info(
             "Parsed %s: text=%d chars, links=%d, images=%d, errors=%d, elapsed=%.3fs",
             url,
@@ -182,7 +166,7 @@ class HTMLParser:
         own_url = page_url or base_url
         links: dict[str, None] = {}  # an ordered set
         skipped = 0
-        for anchor in soup.find_all("a", href=True):
+        for anchor in _content_tags(soup, "a", href=True):
             link = resolve_url(_attr(anchor, "href"), base_url)
             if link is None or (self.same_host_only and not is_same_host(link, own_url)):
                 skipped += 1
@@ -231,7 +215,7 @@ class HTMLParser:
 
         canonical = None
         # rel values are case-insensitive: "Canonical" is valid too.
-        canonical_tag = soup.find("link", rel=_CANONICAL, href=True)
+        canonical_tag = soup.find("link", rel=re.compile("^canonical$", re.IGNORECASE), href=True)
         if canonical_tag is not None:
             href = _attr(canonical_tag, "href").strip()
             canonical = resolve_url(href, base_url) if base_url else (href or None)
@@ -258,7 +242,7 @@ class HTMLParser:
         "data:" placeholder). Images without a usable address are skipped.
         """
         images = []
-        for img in soup.find_all("img"):
+        for img in _content_tags(soup, "img"):
             src = None
             for attribute in ("src", "data-src"):
                 if src := resolve_url(_attr(img, attribute), base_url):
@@ -270,7 +254,7 @@ class HTMLParser:
     def extract_headings(self, soup: BeautifulSoup) -> list[Heading]:
         """Return non-empty h1-h3 headings in document order."""
         headings = []
-        for tag in soup.find_all(["h1", "h2", "h3"]):
+        for tag in _content_tags(soup, ["h1", "h2", "h3"]):
             if text := _visible_text(tag):
                 headings.append(Heading(level=int(tag.name[1]), text=text))
         return headings
@@ -285,7 +269,7 @@ class HTMLParser:
         expanded.
         """
         tables = []
-        for table in soup.find_all("table"):
+        for table in _content_tags(soup, "table"):
             head_rows: list[Tag] = []
             rows: list[Tag] = []
             for row in table.find_all("tr"):
@@ -312,14 +296,17 @@ class HTMLParser:
         in the parent item.
         """
         lists = []
-        for tag in soup.find_all(list(_LIST_TAGS)):
-            texts = (_visible_text(item, skip=_LIST_ITEM_SKIP) for item in tag.find_all("li", recursive=False))
+        # A list item's own text leaves out nested lists: they are reported separately.
+        item_skip = _NON_CONTENT_TAGS | {"ul", "ol"}
+        for tag in _content_tags(soup, ["ul", "ol"]):
+            texts = (_visible_text(item, skip=item_skip) for item in tag.find_all("li", recursive=False))
             items = [text for text in texts if text]
             if items:
                 lists.append(ItemList(type="ol" if tag.name == "ol" else "ul", items=items))
         return lists
 
-    def _make_soup(self, html: str, page: ParsedPage) -> BeautifulSoup | None:
+    @staticmethod
+    def _make_soup(html: str, page: ParsedPage) -> BeautifulSoup | None:
         # lxml is fast and lenient; the pure-Python parser is a fallback for
         # the rare input lxml itself cannot handle.
         for features in ("lxml", "html.parser"):
@@ -330,10 +317,10 @@ class HTMLParser:
                 page["errors"].append(f"{features} parser failed: {type(exc).__name__}: {exc}")
         return None
 
+    @staticmethod
     def _extract(
-        self,
         page: ParsedPage,
-        field: str,
+        step: str,
         extractor: Callable[..., T],
         *args: object,
         default: T,
@@ -342,8 +329,8 @@ class HTMLParser:
         try:
             return extractor(*args)
         except Exception as exc:
-            logger.warning("Failed to extract %s from %s", field, page["url"], exc_info=True)
-            page["errors"].append(f"{field}: {type(exc).__name__}: {exc}")
+            logger.warning("Failed to extract %s from %s", step, page["url"], exc_info=True)
+            page["errors"].append(f"{step}: {type(exc).__name__}: {exc}")
             return default
 
     @staticmethod
@@ -389,12 +376,26 @@ def _cells(row: Tag) -> list[Tag]:
     return row.find_all(["th", "td"], recursive=False)
 
 
+def _content_tags(soup: BeautifulSoup, name: str | list[str], **attrs: bool) -> list[Tag]:
+    """Find tags by name, leaving out those inside <noscript>, <template> and the like."""
+    return [tag for tag in soup.find_all(name, **attrs) if tag.find_parent(_NON_CONTENT_TAGS) is None]
+
+
 def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
     """Collect text under `root`, skipping elements named in `skip`.
 
     Iterative rather than recursive: broken HTML can nest thousands of
     unclosed tags, which would exceed Python's recursion limit.
     """
+    # Elements that start on a new line in a browser. Text on both sides of
+    # them is separated by a space; text inside inline elements (<b>, <a>, ...)
+    # is joined as is, so "<b>to</b>, go" stays "to, go".
+    block_tags = {
+        "address", "article", "aside", "blockquote", "br", "caption", "dd", "details", "div", "dl", "dt",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+        "hr", "li", "main", "nav", "ol", "option", "p", "pre", "section", "summary", "table", "td", "th",
+        "tr", "ul",
+    }  # fmt: skip
     parts: list[str] = []
     # None marks the end of a block element: a space is emitted there.
     stack: list[PageElement | None] = [root]
@@ -404,7 +405,7 @@ def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
             parts.append(" ")
         elif isinstance(node, Tag):
             if node is root or node.name not in skip:
-                if node.name in _BLOCK_TAGS:
+                if node.name in block_tags:
                     parts.append(" ")
                     stack.append(None)
                 stack.extend(reversed(node.contents))
@@ -423,4 +424,4 @@ def _attr(tag: Tag, name: str) -> str:
 
 
 def _clean(text: str) -> str:
-    return _WHITESPACE.sub(" ", text).strip()
+    return re.sub(r"\s+", " ", text).strip()

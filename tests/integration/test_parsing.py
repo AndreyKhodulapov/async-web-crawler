@@ -1,6 +1,7 @@
 """Integration tests: fetch and parse pages served by a local aiohttp server."""
 
 import pytest
+from conftest import ENCODING_PAGES
 
 from crawler import AsyncCrawler, HTMLParser, HTTPStatusError
 
@@ -53,12 +54,12 @@ async def test_page_charset_is_respected(crawler, server):
     assert page["text"] == "Crème brûlée"
 
 
-@pytest.mark.parametrize("path", ["/meta-charset", "/header-charset-wins", "/utf16-bom", "/bogus-meta-charset"])
-async def test_page_encoding(crawler, server, path):
-    # Priority: byte order mark, header charset, <meta>, then UTF-8. A <meta>
+@pytest.mark.parametrize("name", ENCODING_PAGES)
+async def test_page_encoding(crawler, server, name):
+    # Priority: byte order mark, header charset, <meta>, then UTF-8. A charset
     # naming a codec that cannot decode the page is ignored.
-    page = await crawler.fetch_and_parse(str(server.make_url(path)))
-    assert page["title"] == "Café"
+    page = await crawler.fetch_and_parse(str(server.make_url(f"/encoding/{name}")))
+    assert page["title"] == ENCODING_PAGES[name][2]
 
 
 async def test_http_error_is_raised(crawler, server):

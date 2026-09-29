@@ -1,7 +1,6 @@
 """Unit tests for AsyncCrawler with the HTTP session replaced by fakes."""
 
 import asyncio
-import codecs
 from unittest.mock import MagicMock
 
 import aiohttp
@@ -13,12 +12,10 @@ from crawler import (
     FetchResult,
     FetchTimeoutError,
     HTMLParser,
-    HTTPStatusError,
     InvalidURLError,
     NetworkError,
     UnexpectedError,
 )
-from crawler.client import _decode, _sniff_charset
 
 
 class FakeResponse:
@@ -252,9 +249,12 @@ class TestFetchMany:
         assert result.final_url == "https://a/home"
         assert result.content_type is None
 
-    async def test_non_text_charset_falls_back_to_utf8(self, crawler, fake_session):
-        fake_session.routes["http://a"] = FakeResponse(b"page", encoding="base64")
-        assert await crawler.fetch_url("http://a") == "page"
+    @pytest.mark.parametrize("encoding", ["base64", "idna", "undefined", "no-such-charset"])
+    async def test_unusable_charset_falls_back_to_utf8(self, crawler, fake_session, encoding):
+        # "undefined" raises UnicodeError, which _request maps to InvalidURLError
+        # for the IDNA step: decoding must handle it before that.
+        fake_session.routes["http://a"] = FakeResponse("pagé".encode(), encoding=encoding)
+        assert await crawler.fetch_url("http://a") == "pagé"
 
     async def test_unexpected_error_does_not_cancel_batch(self, crawler, fake_session):
         fake_session.latency = 0.01
@@ -289,30 +289,10 @@ class TestFetchAndParse:
         assert page["links"] == ["http://site/about"]
         assert page["errors"] == []
 
-    async def test_links_are_resolved_against_final_url(self, crawler, fake_session):
-        html = b"<a href='next'>next</a>"
-        fake_session.routes["http://site/docs"] = FakeResponse(html, url="https://site/docs/")
-        page = await crawler.fetch_and_parse("http://site/docs")
-        assert page["url"] == "http://site/docs"
-        assert page["final_url"] == "https://site/docs/"
-        assert page["links"] == ["https://site/docs/next"]
-
-    async def test_non_html_is_not_parsed(self, crawler, fake_session, caplog):
-        fake_session.routes["http://api"] = FakeResponse(b'{"a": "<b>"}', content_type="application/json")
-        page = await crawler.fetch_and_parse("http://api")
-        assert page["text"] == ""
-        assert page["errors"] == ["unsupported content type: application/json"]
-        assert "unsupported content type" in caplog.text
-
     async def test_missing_content_type_is_parsed_as_html(self, crawler, fake_session):
         fake_session.routes["http://a"] = FakeResponse(b"<h1>Hi</h1>", content_type=None)
         page = await crawler.fetch_and_parse("http://a")
         assert page["headings"] == [{"level": 1, "text": "Hi"}]
-
-    async def test_fetch_error_is_raised(self, crawler, fake_session):
-        fake_session.routes["http://a"] = FakeResponse(status=404)
-        with pytest.raises(HTTPStatusError):
-            await crawler.fetch_and_parse("http://a")
 
     async def test_uses_injected_parser(self, monkeypatch, fake_session):
         crawler = AsyncCrawler(parser=HTMLParser(same_host_only=True))
@@ -320,48 +300,3 @@ class TestFetchAndParse:
         fake_session.routes["http://a/"] = FakeResponse(b"<a href='/x'>in</a><a href='http://b/'>out</a>")
         page = await crawler.fetch_and_parse("http://a/")
         assert page["links"] == ["http://a/x"]
-
-
-class TestSniffCharset:
-    @pytest.mark.parametrize(
-        ("body", "expected"),
-        [
-            (b'<meta charset="windows-1252"><p>caf\xe9</p>', "windows-1252"),
-            (b'<meta http-equiv="Content-Type" content="text/html; charset=ISO-8859-2">', "iso-8859-2"),
-            (b'<meta charset="no-such-charset">', "utf-8"),
-            # Found in ASCII bytes, so they cannot really be UTF-16/32 (HTML spec).
-            (b'<meta charset="utf-16">', "utf-8"),
-            (b'<meta charset="utf-32">', "utf-8"),
-            # Codecs that exist but cannot decode a page.
-            (b'<meta charset="undefined">', "utf-8"),
-            (b'<meta charset="idna">', "utf-8"),
-            (b'<meta charset="punycode">', "utf-8"),
-            (b'<meta charset="base64">', "utf-8"),
-            (b'<meta charset="shift_jis">', "shift_jis"),
-            (b"<p>no declaration</p>", "utf-8"),
-            (b"\x89PNG\r\n", "utf-8"),
-        ],
-    )
-    def test_declared_charset(self, body, expected):
-        assert _sniff_charset(MagicMock(), body) == expected
-
-
-class TestDecode:
-    @pytest.mark.parametrize(
-        ("body", "declared"),
-        [
-            (codecs.BOM_UTF8 + "café".encode(), "windows-1252"),
-            (codecs.BOM_UTF16_LE + "café".encode("utf-16-le"), "utf-8"),
-            (codecs.BOM_UTF16_BE + "café".encode("utf-16-be"), "utf-8"),
-        ],
-    )
-    def test_byte_order_mark_wins_and_is_stripped(self, body, declared):
-        assert _decode(body, declared) == "café"
-
-    @pytest.mark.parametrize("encoding", ["undefined", "idna", "base64", "no-such-charset"])
-    def test_unusable_charset_falls_back_to_utf8(self, encoding):
-        assert _decode("café".encode(), encoding) == "café"
-
-    async def test_undefined_header_charset_is_not_an_invalid_url(self, crawler, fake_session):
-        fake_session.routes["http://a"] = FakeResponse(b"page", encoding="undefined")
-        assert await crawler.fetch_url("http://a") == "page"

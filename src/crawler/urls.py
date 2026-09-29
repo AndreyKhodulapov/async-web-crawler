@@ -4,16 +4,10 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import idna
 
-_DEFAULT_PORTS = {"http": 80, "https": 443}
-
 
 def is_valid_http_url(url: str) -> bool:
-    """Return True for an absolute http(s) URL with a host."""
-    try:
-        parts = urlsplit(url)
-        return parts.scheme in ("http", "https") and bool(parts.hostname)
-    except ValueError:  # e.g. an unclosed IPv6 bracket: "http://[::1"
-        return False
+    """Return True for an absolute http(s) URL with a valid host and port."""
+    return normalize_url(url) is not None
 
 
 def normalize_url(url: str) -> str | None:
@@ -26,11 +20,12 @@ def normalize_url(url: str) -> str | None:
     """
     try:
         parts = urlsplit(url.strip())
-        port = parts.port  # raises ValueError for a non-numeric port
-    except ValueError:
+        port = parts.port  # raises ValueError for a non-numeric or out-of-range port
+    except ValueError:  # also an unclosed IPv6 bracket: "http://[::1"
         return None
+    default_ports = {"http": 80, "https": 443}
     scheme = parts.scheme.lower()
-    if scheme not in _DEFAULT_PORTS or not parts.hostname:
+    if scheme not in default_ports or not parts.hostname:
         return None
     # "example.com." (a fully qualified name) is the same host as "example.com".
     host = _encode_host(parts.hostname.rstrip("."))
@@ -39,7 +34,7 @@ def normalize_url(url: str) -> str | None:
 
     # `hostname` is already lowercased but loses IPv6 brackets.
     netloc = f"[{host}]" if ":" in host else host
-    if port is not None and port != _DEFAULT_PORTS[scheme]:
+    if port is not None and port != default_ports[scheme]:
         netloc += f":{port}"
     if parts.username is not None:
         userinfo = parts.netloc.rpartition("@")[0]

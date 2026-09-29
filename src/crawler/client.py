@@ -27,13 +27,6 @@ from crawler.urls import is_valid_http_url
 
 logger = logging.getLogger(__name__)
 
-# Sites such as Wikipedia ask bots to identify themselves with a contact URL
-# and may block generic user agents.
-DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
-
-# Printable ASCII: a charset that decodes it unchanged can read the markup.
-_ASCII_PROBE = bytes(range(0x20, 0x7F)) + b"\t\n\r"
-
 
 class _Response(NamedTuple):
     status: int
@@ -57,6 +50,10 @@ class AsyncCrawler:
     requests that are already in flight: they finish on their own or hit
     `total_timeout`.
     """
+
+    # Sites such as Wikipedia ask bots to identify themselves with a contact
+    # URL and may block generic user agents.
+    DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
 
     def __init__(
         self,
@@ -87,7 +84,7 @@ class AsyncCrawler:
             sock_read=read_timeout,
         )
         self._user_agent = user_agent
-        self.parser = parser or HTMLParser()
+        self._parser = parser or HTMLParser()
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
@@ -124,7 +121,7 @@ class AsyncCrawler:
 
         Relative links are resolved against the URL reached after redirects.
         Parsing problems never raise: they are logged and listed in the
-        result's ``errors``, e.g. for a response that is not HTML.
+        result's `errors`, e.g. for a response that is not HTML.
 
         Raises:
             FetchError: a subclass describing why the download failed.
@@ -133,7 +130,7 @@ class AsyncCrawler:
         if result.error is not None:
             raise result.error
         assert result.content is not None
-        return await self.parser.parse_html(
+        return await self._parser.parse_html(
             result.content,
             url,
             final_url=result.final_url,
@@ -296,8 +293,10 @@ def _sniff_charset(response: aiohttp.ClientResponse, body: bytes) -> str:
 
 
 def _is_ascii_compatible(encoding: str) -> bool:
+    # A charset that decodes printable ASCII unchanged can read the markup.
+    probe = bytes(range(0x20, 0x7F)) + b"\t\n\r"
     try:
-        return _ASCII_PROBE.decode(encoding, errors="replace") == _ASCII_PROBE.decode("ascii")
+        return probe.decode(encoding, errors="replace") == probe.decode("ascii")
     except (LookupError, UnicodeError):
         return False
 
@@ -315,10 +314,10 @@ def _decode(body: bytes, encoding: str) -> str:
 
 
 def _validate_url(url: str) -> None:
-    """Reject URLs without an http(s) scheme or a host before sending them.
+    """Reject URLs without an http(s) scheme, a host or a valid port before sending them.
 
     aiohttp does not wrap every malformed URL: "//host" fails on an internal
     assert, so such input is caught here instead.
     """
     if not is_valid_http_url(url):
-        raise InvalidURLError(url, "expected an absolute http(s) URL")
+        raise InvalidURLError(url, "expected an absolute http(s) URL with a valid host and port")

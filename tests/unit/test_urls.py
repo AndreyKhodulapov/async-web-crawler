@@ -80,10 +80,13 @@ def test_normalize(url, expected):
     [
         ("https://example.com", True),
         ("http://127.0.0.1:8080/x", True),
+        ("http://bücher.de/", True),
         ("example.com", False),
         ("//example.com", False),
         ("ftp://example.com", False),
         ("http://[::1", False),
+        ("http://host:99999/", False),
+        ("http://host:abc/", False),
     ],
 )
 def test_is_valid_http_url(url, valid):

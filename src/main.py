@@ -14,31 +14,7 @@ import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from crawler import AsyncCrawler, FetchError, FetchResult, HTMLParser, HTTPStatusError, ParsedPage
-from crawler.urls import is_same_host
-
-# A mix of fast pages, slow endpoints and deliberate failures.
-BENCHMARK_URLS = [
-    "https://example.com",
-    "https://www.python.org",
-    "https://docs.aiohttp.org/en/stable/",
-    "https://httpbin.org/html",
-    "https://httpbin.org/delay/1",
-    "https://httpbin.org/delay/2",
-    "https://httpbin.org/status/404",
-    "https://httpbin.org/status/500",
-    "https://httpbin.org/delay/10",  # slower than the default --timeout
-    "https://nonexistent-domain.invalid",
-]
-
-# Real sites of different kinds.
-PARSE_URLS = [
-    "https://en.wikipedia.org/wiki/Main_Page",  # large server-rendered page
-    "https://apilearn.tukas.dev/",  # scraping sandbox; answers HTTP 429 to bursts
-    "https://apilearn.tukas.dev/exercises/",  # same site, a page with tables
-    "https://stepik.org/",  # JavaScript app: the HTML is only a shell
-    "https://www.ozon.ru/",  # anti-bot protection: HTTP 403
-]
+from crawler import AsyncCrawler, FetchError, FetchResult, HTMLParser, HTTPStatusError, ParsedPage, is_same_host
 
 
 def positive(number_type: type[int] | type[float]) -> Callable[[str], int | float]:
@@ -55,6 +31,28 @@ def positive(number_type: type[int] | type[float]) -> Callable[[str], int | floa
 
 
 def parse_args() -> argparse.Namespace:
+    # A mix of fast pages, slow endpoints and deliberate failures.
+    benchmark_urls = [
+        "https://example.com",
+        "https://www.python.org",
+        "https://docs.aiohttp.org/en/stable/",
+        "https://httpbin.org/html",
+        "https://httpbin.org/delay/1",
+        "https://httpbin.org/delay/2",
+        "https://httpbin.org/status/404",
+        "https://httpbin.org/status/500",
+        "https://httpbin.org/delay/10",  # slower than the default --timeout
+        "https://nonexistent-domain.invalid",
+    ]
+    # Real sites of different kinds.
+    parse_urls = [
+        "https://en.wikipedia.org/wiki/Main_Page",  # large server-rendered page
+        "https://apilearn.tukas.dev/",  # scraping sandbox; answers HTTP 429 to bursts
+        "https://apilearn.tukas.dev/exercises/",  # same site, a page with tables
+        "https://stepik.org/",  # JavaScript app: the HTML is only a shell
+        "https://www.ozon.ru/",  # anti-bot protection: HTTP 403
+    ]
+
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--concurrency", type=positive(int), default=10, help="max parallel requests")
     common.add_argument(
@@ -76,32 +74,35 @@ def parse_args() -> argparse.Namespace:
     benchmark = commands.add_parser(
         "benchmark", parents=[common], help="fetch URLs sequentially and concurrently, compare time"
     )
-    benchmark.add_argument("urls", nargs="*", default=BENCHMARK_URLS, help="URLs to fetch")
+    benchmark.add_argument("urls", nargs="*", default=benchmark_urls, help="URLs to fetch")
 
     parse = commands.add_parser("parse", parents=[common], help="fetch pages and extract structured data")
-    parse.add_argument("urls", nargs="*", default=PARSE_URLS, help="URLs to parse")
+    parse.add_argument("urls", nargs="*", default=parse_urls, help="URLs to parse")
     parse.add_argument("--same-host", action="store_true", help="keep only links to the page's own host")
     parse.add_argument("--preview", type=positive(int), default=5, help="links and headings shown per page")
     parse.add_argument("--json", type=Path, metavar="PATH", help="save full results to a JSON file")
     return parser.parse_args()
 
 
-def make_crawler(args: argparse.Namespace, parser: HTMLParser | None = None) -> AsyncCrawler:
+def make_crawler(concurrency: int, timeout: float, parser: HTMLParser | None = None) -> AsyncCrawler:
     return AsyncCrawler(
-        max_concurrent=args.concurrency,
-        total_timeout=args.timeout,
-        connect_timeout=args.timeout,
-        read_timeout=args.timeout,
+        max_concurrent=concurrency,
+        total_timeout=timeout,
+        connect_timeout=timeout,
+        read_timeout=timeout,
         parser=parser,
     )
 
 
 def describe_error(error: FetchError) -> str:
+    """Short form for table cells: the error class and, for HTTP errors, the status."""
     name = type(error).__name__
     return f"{name} {error.status}" if isinstance(error, HTTPStatusError) else name
 
 
-# --- benchmark -------------------------------------------------------------
+def error_record(url: str, error: FetchError) -> dict[str, object]:
+    """Full form for JSON output, in place of a parsed page."""
+    return {"url": url, "error": type(error).__name__, "message": error.message}
 
 
 async def run_sequential(crawler: AsyncCrawler, urls: list[str]) -> list[FetchResult]:
@@ -110,13 +111,15 @@ async def run_sequential(crawler: AsyncCrawler, urls: list[str]) -> list[FetchRe
 
 async def timed(
     runner: Callable[[AsyncCrawler, list[str]], Awaitable[list[FetchResult]]],
-    args: argparse.Namespace,
+    urls: list[str],
+    concurrency: int,
+    timeout: float,
 ) -> tuple[list[FetchResult], float]:
     # A fresh crawler per run, so the second run does not benefit from
     # connections and DNS entries already cached by the first one.
-    async with make_crawler(args) as crawler:
+    async with make_crawler(concurrency, timeout) as crawler:
         started = time.perf_counter()
-        results = await runner(crawler, args.urls)
+        results = await runner(crawler, urls)
         return results, time.perf_counter() - started
 
 
@@ -132,15 +135,12 @@ def print_benchmark_report(title: str, results: list[FetchResult], total: float)
 
 
 async def run_benchmark(args: argparse.Namespace) -> None:
-    sequential, sequential_time = await timed(run_sequential, args)
-    concurrent, concurrent_time = await timed(AsyncCrawler.fetch_many, args)
+    sequential, sequential_time = await timed(run_sequential, args.urls, args.concurrency, args.timeout)
+    concurrent, concurrent_time = await timed(AsyncCrawler.fetch_many, args.urls, args.concurrency, args.timeout)
 
     print_benchmark_report("Sequential", sequential, sequential_time)
     print_benchmark_report(f"Concurrent (max_concurrent={args.concurrency})", concurrent, concurrent_time)
     print(f"\nSpeedup: {sequential_time / concurrent_time:.1f}x")
-
-
-# --- parse -----------------------------------------------------------------
 
 
 async def parse_one(crawler: AsyncCrawler, url: str) -> ParsedPage | FetchError:
@@ -184,7 +184,7 @@ def print_parse_summary(urls: list[str], outcomes: list[ParsedPage | FetchError]
         if isinstance(outcome, FetchError):
             print(f"{url:<{url_width}}  {describe_error(outcome)}")
             continue
-        result = f"ok, {len(outcome['errors'])} warning(s)" if outcome["errors"] else "ok"
+        status = f"ok, {len(outcome['errors'])} warning(s)" if outcome["errors"] else "ok"
         counts = (
             len(outcome["text"]),
             len(outcome["links"]),
@@ -193,7 +193,7 @@ def print_parse_summary(urls: list[str], outcomes: list[ParsedPage | FetchError]
             len(outcome["tables"]),
             len(outcome["lists"]),
         )
-        print(f"{url:<{url_width}}  {result:<22}" + "".join(f"  {count:>8}" for count in counts))
+        print(f"{url:<{url_width}}  {status:<22}" + "".join(f"  {count:>8}" for count in counts))
 
     pages = [outcome for outcome in outcomes if not isinstance(outcome, FetchError)]
     print(
@@ -205,7 +205,7 @@ def print_parse_summary(urls: list[str], outcomes: list[ParsedPage | FetchError]
 
 def save_json(path: Path, urls: list[str], outcomes: list[ParsedPage | FetchError]) -> None:
     records = [
-        {"url": url, "error": str(outcome)} if isinstance(outcome, FetchError) else outcome
+        error_record(url, outcome) if isinstance(outcome, FetchError) else outcome
         for url, outcome in zip(urls, outcomes, strict=True)
     ]
     path.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -214,7 +214,8 @@ def save_json(path: Path, urls: list[str], outcomes: list[ParsedPage | FetchErro
 
 async def run_parse(args: argparse.Namespace) -> None:
     urls = list(dict.fromkeys(args.urls))
-    async with make_crawler(args, parser=HTMLParser(same_host_only=args.same_host)) as crawler:
+    parser = HTMLParser(same_host_only=args.same_host)
+    async with make_crawler(args.concurrency, args.timeout, parser) as crawler:
         started = time.perf_counter()
         async with asyncio.TaskGroup() as group:
             tasks = [group.create_task(parse_one(crawler, url)) for url in urls]
@@ -223,10 +224,7 @@ async def run_parse(args: argparse.Namespace) -> None:
 
     for url, outcome in zip(urls, outcomes, strict=True):
         print(f"\n=== {url} ===")
-        if isinstance(outcome, FetchError):
-            summary: dict[str, object] = {"url": url, "error": f"{type(outcome).__name__}: {outcome.message}"}
-        else:
-            summary = summarize(outcome, args.preview)
+        summary = error_record(url, outcome) if isinstance(outcome, FetchError) else summarize(outcome, args.preview)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     print_parse_summary(urls, outcomes, total)
@@ -241,7 +239,6 @@ async def main() -> None:
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
         datefmt="%H:%M:%S",
     )
-    args.urls = list(args.urls)
     if args.command == "benchmark":
         await run_benchmark(args)
     else:

@@ -4,7 +4,9 @@ import logging
 
 import pytest
 from bs4 import BeautifulSoup
+from conftest import fixture_html
 
+import crawler.parser as parser_module
 from crawler import HTMLParser
 
 PAGE_URL = "https://shop.example.com/catalog/tools/index.html"
@@ -16,8 +18,8 @@ def parser() -> HTMLParser:
 
 
 @pytest.fixture
-def valid_page(parser, read_fixture):
-    return parser.parse(read_fixture("valid_page.html"), PAGE_URL)
+def valid_page(parser):
+    return parser.parse(fixture_html("valid_page.html"), PAGE_URL)
 
 
 def soup(html: str) -> BeautifulSoup:
@@ -90,14 +92,14 @@ class TestValidPage:
             {"type": "ul", "items": ["Loosen soil", "Remove stones"]},
         ]
 
-    async def test_parse_html_matches_sync_parse(self, parser, read_fixture, valid_page):
-        page = await parser.parse_html(read_fixture("valid_page.html"), PAGE_URL)
+    async def test_parse_html_matches_sync_parse(self, parser, valid_page):
+        page = await parser.parse_html(fixture_html("valid_page.html"), PAGE_URL)
         assert page == valid_page
 
 
 class TestLinks:
-    def test_same_host_only_drops_external_links(self, read_fixture):
-        page = HTMLParser(same_host_only=True).parse(read_fixture("valid_page.html"), PAGE_URL)
+    def test_same_host_only_drops_external_links(self):
+        page = HTMLParser(same_host_only=True).parse(fixture_html("valid_page.html"), PAGE_URL)
         assert "https://partner.example.org/deals" not in page["links"]
         assert "https://cdn.example.com/catalog.pdf" not in page["links"]
         assert len(page["links"]) == 5
@@ -230,8 +232,8 @@ class TestMetadata:
 
 
 class TestBrokenHTML:
-    def test_broken_page_is_repaired(self, parser, read_fixture):
-        page = parser.parse(read_fixture("broken_page.html"), "https://example.com/")
+    def test_broken_page_is_repaired(self, parser):
+        page = parser.parse(fixture_html("broken_page.html"), "https://example.com/")
         assert page["errors"] == []
         assert page["title"] == "Broken <b>page"  # <title> content is plain text in HTML
         assert page["headings"] == [{"level": 2, "text": "Heading inside link"}]
@@ -240,8 +242,8 @@ class TestBrokenHTML:
         assert page["images"] == [{"src": "https://example.com/pic.png", "alt": "unquoted"}]
         assert "First paragraph never closed Second block" in page["text"]
 
-    def test_invalid_links_are_dropped(self, parser, read_fixture):
-        page = parser.parse(read_fixture("broken_page.html"), "https://example.com/")
+    def test_invalid_links_are_dropped(self, parser):
+        page = parser.parse(fixture_html("broken_page.html"), "https://example.com/")
         assert page["links"] == ["https://example.com/in-heading", "https://example.com/last"]
 
     def test_deep_nesting_does_not_overflow(self, parser):
@@ -263,12 +265,37 @@ class TestBrokenHTML:
     def test_binary_garbage(self, parser):
         garbage = bytes(range(256)).decode("latin-1") * 4
         page = parser.parse(garbage, "https://example.com/")
-        assert page["url"] == "https://example.com/"
+        assert page["errors"] == []
+        assert page["title"] is None
+        assert page["links"] == []
 
     def test_missing_title_is_logged(self, parser, caplog):
         with caplog.at_level(logging.WARNING):
             parser.parse("<p>no title</p>", "https://example.com/")
         assert "No <title> on https://example.com/" in caplog.text
+
+    def test_hidden_content_is_ignored_by_every_extractor(self, parser):
+        html = """
+            <body>
+              <p>Shown</p>
+              <noscript>
+                <img src="https://tracker.example/pixel.gif" alt="">
+                <h1>Enable JavaScript</h1>
+                <a href="/nojs">no-js version</a>
+                <ul><li>hidden item</li></ul>
+              </noscript>
+              <template>
+                <h2>Row template</h2>
+                <table><tr><td>cell</td></tr></table>
+              </template>
+            </body>"""
+        page = parser.parse(html, "https://example.com/")
+        assert page["text"] == "Shown"
+        assert page["images"] == []
+        assert page["headings"] == []
+        assert page["links"] == []
+        assert page["lists"] == []
+        assert page["tables"] == []
 
     @pytest.mark.parametrize("content_type", ["application/json", "image/png"])
     def test_unsupported_content_type(self, parser, content_type):
@@ -286,12 +313,12 @@ class TestBrokenHTML:
 
 
 class TestPartialResults:
-    def test_failing_extractor_keeps_other_fields(self, parser, read_fixture, monkeypatch, caplog):
+    def test_failing_extractor_keeps_other_fields(self, parser, monkeypatch, caplog):
         def broken(*args):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(parser, "extract_tables", broken)
-        page = parser.parse(read_fixture("valid_page.html"), PAGE_URL)
+        page = parser.parse(fixture_html("valid_page.html"), PAGE_URL)
 
         assert page["tables"] == []
         assert page["errors"] == ["tables: RuntimeError: boom"]
@@ -300,17 +327,16 @@ class TestPartialResults:
         assert "Failed to extract tables" in caplog.text
         assert "RuntimeError: boom" in caplog.text  # traceback is logged
 
-    def test_failing_metadata_leaves_empty_title(self, parser, monkeypatch):
+    def test_failing_metadata_leaves_empty_title(self, parser, monkeypatch, caplog):
         monkeypatch.setattr(parser, "extract_metadata", lambda *args: 1 / 0)
         page = parser.parse("<title>T</title><p>body</p>", "https://example.com/")
         assert page["title"] is None
         assert page["metadata"]["keywords"] == []
         assert page["text"] == "body"
         assert page["errors"] == ["metadata: ZeroDivisionError: division by zero"]
+        assert "No <title>" not in caplog.text  # the failure is already reported
 
     def test_falls_back_to_html_parser(self, parser, monkeypatch, caplog):
-        import crawler.parser as parser_module
-
         real = parser_module.BeautifulSoup
 
         def lxml_fails(markup, features):
@@ -324,8 +350,6 @@ class TestPartialResults:
         assert page["errors"] == ["lxml parser failed: ValueError: lxml is broken"]
 
     def test_all_parsers_fail(self, parser, monkeypatch):
-        import crawler.parser as parser_module
-
         def always_fails(markup, features):
             raise ValueError(features)
 
