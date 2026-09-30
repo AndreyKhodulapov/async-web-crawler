@@ -1,6 +1,7 @@
 """Unit tests for AsyncCrawler with the HTTP session replaced by fakes."""
 
 import asyncio
+import socket
 import ssl
 from unittest.mock import MagicMock
 
@@ -18,7 +19,10 @@ from crawler import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    ParseError,
+    PermanentError,
     RobotsDisallowedError,
+    TransientError,
     UnexpectedError,
 )
 
@@ -220,6 +224,26 @@ class TestLifecycle:
 
 
 class TestErrorMapping:
+    @pytest.mark.parametrize(
+        ("outcome", "kind"),
+        [
+            (FakeResponse(status=404), PermanentError),
+            (FakeResponse(status=403), PermanentError),
+            (FakeResponse(status=401), PermanentError),
+            (FakeResponse(status=429), TransientError),
+            (FakeResponse(status=503), TransientError),
+            (FakeResponse(status=500), TransientError),
+            (TimeoutError(), TransientError),
+            (aiohttp.ClientConnectorError(MagicMock(), ConnectionRefusedError("connection refused")), NetworkError),
+            (aiohttp.ClientConnectorError(MagicMock(), socket.gaierror("Name or service not known")), NetworkError),
+            (aiohttp.TooManyRedirects(MagicMock(), ()), PermanentError),
+        ],
+    )
+    async def test_failures_are_classified(self, crawler, fake_session, outcome, kind):
+        fake_session.routes["http://a"] = outcome
+        with pytest.raises(kind):
+            await crawler.fetch_url("http://a")
+
     async def test_server_timeout_is_a_timeout(self, crawler, fake_session):
         # aiohttp.ServerTimeoutError is also a ClientError: it must still be
         # reported as a timeout, not as a generic network error.
@@ -342,8 +366,8 @@ class TestFetchAndParse:
     async def test_non_html_body_is_not_downloaded(self, crawler, fake_session):
         archive = FakeResponse(b"PK\x03\x04", content_type="application/zip")
         fake_session.routes["http://a/file.zip"] = archive
-        page = await crawler.fetch_and_parse("http://a/file.zip")
-        assert page["errors"] == ["unsupported content type: application/zip"]
+        with pytest.raises(ParseError, match="unsupported content type: application/zip"):
+            await crawler.fetch_and_parse("http://a/file.zip")
         assert archive.read_count == 0
 
     async def test_plain_fetch_still_reads_non_html_body(self, crawler, fake_session):

@@ -2,11 +2,26 @@
 
 Low-level aiohttp/asyncio errors are translated into a small, stable hierarchy
 so that callers never have to depend on transport-specific exception types.
+
+Most errors fall into one of four kinds that decide whether a retry can help:
+
+- `TransientError`: the server or the path to it is overloaded for now
+  (a timeout, HTTP 429, 503); the same request may succeed later.
+- `NetworkError`: the request did not reach the server (DNS, a refused or
+  reset connection); worth retrying too.
+- `PermanentError`: the request is wrong or forbidden (HTTP 404, 403, a bad
+  certificate); every attempt would fail the same way.
+- `ParseError`: the page was downloaded but is not an HTML document.
+
+`CrawlerClosedError`, `RobotsUnreachableError` and `UnexpectedError` belong
+to none of them: they are not about the request itself, and none is retried.
 """
+
+from typing import ClassVar, Self
 
 
 class FetchError(Exception):
-    """Base class for every error that happens while fetching a URL."""
+    """Base class for every error the crawler reports for a URL."""
 
     def __init__(self, url: str, message: str) -> None:
         super().__init__(f"{url}: {message}")
@@ -14,12 +29,42 @@ class FetchError(Exception):
         self.message = message
 
 
+class TransientError(FetchError):
+    """A failure that may go away on its own, such as a timeout or HTTP 503."""
+
+
+class PermanentError(FetchError):
+    """A failure that would repeat on every attempt, such as HTTP 404."""
+
+
+class NetworkError(FetchError):
+    """The request failed at the network level (DNS, connection, payload)."""
+
+
+class ParseError(FetchError):
+    """The response is not an HTML document that can be parsed."""
+
+
 class HTTPStatusError(FetchError):
     """The server responded with a 4xx or 5xx status code.
 
     `retry_after` is the number of seconds the server asked to wait in a
     Retry-After header, if it sent one.
+
+    Creating an HTTPStatusError gives a `TransientHTTPError` for the
+    statuses in `TRANSIENT_STATUSES` and a `PermanentHTTPError` for any
+    other, so an HTTP error always has a kind.
     """
+
+    # Request Timeout, Too Many Requests and server errors that usually pass.
+    # 501 Not Implemented or 505 HTTP Version Not Supported never do.
+    TRANSIENT_STATUSES: ClassVar[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504})
+
+    def __new__(cls, url: str, status: int, reason: str, *, retry_after: float | None = None) -> Self:
+        kind = cls
+        if cls is HTTPStatusError:
+            kind = TransientHTTPError if status in cls.TRANSIENT_STATUSES else PermanentHTTPError
+        return super().__new__(kind)
 
     def __init__(self, url: str, status: int, reason: str, *, retry_after: float | None = None) -> None:
         super().__init__(url, f"HTTP {status} {reason}")
@@ -27,23 +72,27 @@ class HTTPStatusError(FetchError):
         self.retry_after = retry_after
 
 
-class NetworkError(FetchError):
-    """The request failed at the network level (DNS, connection, payload)."""
+class TransientHTTPError(HTTPStatusError, TransientError):
+    """HTTP 408, 429, 500, 502, 503 or 504."""
 
 
-class TooManyRedirectsError(NetworkError):
+class PermanentHTTPError(HTTPStatusError, PermanentError):
+    """Any other 4xx or 5xx status, such as 401, 403 or 404."""
+
+
+class TooManyRedirectsError(PermanentError):
     """The redirects did not end within the limit, e.g. a redirect loop."""
 
 
-class CertificateError(NetworkError):
+class CertificateError(PermanentError):
     """The server's TLS certificate failed verification."""
 
 
-class FetchTimeoutError(FetchError):
+class FetchTimeoutError(TransientError):
     """The request did not complete within the configured timeouts."""
 
 
-class InvalidURLError(FetchError):
+class InvalidURLError(PermanentError):
     """The URL is malformed or does not use the http(s) scheme."""
 
 
@@ -51,7 +100,7 @@ class CrawlerClosedError(FetchError):
     """The crawler was closed before the request could start."""
 
 
-class RobotsDisallowedError(FetchError):
+class RobotsDisallowedError(PermanentError):
     """robots.txt of the site does not allow this crawler to fetch the URL."""
 
 

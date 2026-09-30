@@ -5,26 +5,17 @@ import random
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import ClassVar
 
-from crawler.exceptions import (
-    CertificateError,
-    FetchError,
-    FetchTimeoutError,
-    HTTPStatusError,
-    NetworkError,
-    TooManyRedirectsError,
-)
+from crawler.exceptions import FetchError, HTTPStatusError, NetworkError, TransientError
 
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
     """Retries transient failures with exponential backoff.
 
-    Timeouts, network errors and the HTTP statuses in `RETRY_STATUSES` are
-    retried up to `max_retries` times. Other errors, such as 404, would fail
-    the same way again, and so would the network errors in `PERMANENT`: a
-    redirect loop or a certificate that fails verification.
+    Transient and network errors (a timeout, HTTP 503, a refused
+    connection) are retried up to `max_retries` times. Other errors, such as
+    HTTP 404 or a redirect loop, would fail the same way again.
 
     The n-th retry (from 0) waits `base_delay * 2**n` seconds, at most
     `max_delay`, with "equal jitter": a random half of it is added to a fixed
@@ -35,9 +26,6 @@ class RetryPolicy:
     `max_delay` is not retried at all: coming back early would only earn
     another refusal.
     """
-
-    RETRY_STATUSES: ClassVar[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504})
-    PERMANENT: ClassVar[tuple[type[FetchError], ...]] = (TooManyRedirectsError, CertificateError)
 
     max_retries: int = 2
     base_delay: float = 1.0
@@ -52,10 +40,9 @@ class RetryPolicy:
     def should_retry(self, error: FetchError, retries_done: int) -> bool:
         if retries_done >= self.max_retries:
             return False
-        if isinstance(error, HTTPStatusError):
-            too_long = error.retry_after is not None and error.retry_after > self.max_delay
-            return error.status in self.RETRY_STATUSES and not too_long
-        return isinstance(error, FetchTimeoutError | NetworkError) and not isinstance(error, self.PERMANENT)
+        if isinstance(error, HTTPStatusError) and error.retry_after is not None and error.retry_after > self.max_delay:
+            return False
+        return isinstance(error, TransientError | NetworkError)
 
     def delay(self, error: FetchError, retries_done: int) -> float:
         # 2**1024 does not fit a float; the cap is reached long before 2**64 anyway.

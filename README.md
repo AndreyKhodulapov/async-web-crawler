@@ -32,11 +32,13 @@ and backs off when a site struggles.
   same bot name
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
 - Separate connect, read and total timeouts
-- Clear error types: `HTTPStatusError`, `NetworkError` (with
-  `TooManyRedirectsError` and `CertificateError`), `FetchTimeoutError`,
-  `InvalidURLError`, `RobotsDisallowedError`, `RobotsUnreachableError`,
-  `CrawlerClosedError` and
-  `UnexpectedError`, all subclasses of `FetchError`
+- Clear error types, all subclasses of `FetchError`, grouped by whether a
+  retry can help: `TransientError` (timeouts, HTTP 408, 429, 500, 502, 503,
+  504), `NetworkError` (DNS, refused or reset connections), `PermanentError`
+  (other HTTP errors such as 401, 403, 404, redirect loops, bad
+  certificates, invalid URLs, pages disallowed by robots.txt) and
+  `ParseError` (a response that is not an HTML document); plus
+  `RobotsUnreachableError`, `CrawlerClosedError` and `UnexpectedError`
 - One failing URL never breaks a batch: even unforeseen exceptions are
   logged with a traceback and reported as `UnexpectedError`
 - Logging for every request: start, success (status, size, time) and failure
@@ -122,7 +124,7 @@ DEPTH  RESULT                                LINKS  URL
     1  blocked, disallowed by robots.txt            https://webscraper.io/test-sites/pagination?page=2
     1  FetchTimeoutError: request timed out         https://webscraper.io/blog
     1  ok                                       16  https://web-scraping.dev/
-    1  HTTPStatusError: HTTP 404 Not Found          https://web-scraping.dev/api/graphql
+    1  PermanentHTTPError: HTTP 404 Not Found       https://web-scraping.dev/api/graphql
 Crawled: 28 pages, failed: 2, skipped: 0, blocked: 29, unreachable: 0, left in queue: 232, speed: 1.1 pages/s
 
 === Requests by host (39 requests, 1.39 req/s) ===
@@ -188,7 +190,7 @@ URL                                      RESULT                      TEXT     LI
 https://en.wikipedia.org/wiki/Main_Page  ok                         11609       632        22        10         1        35
 https://apilearn.tukas.dev/              ok                         12235        28         2        12         0        14
 https://apilearn.tukas.dev/exercises/    ok                         35331        40         1         3         6         7
-https://httpbin.org/status/403           HTTPStatusError 403
+https://httpbin.org/status/403           PermanentHTTPError 403
 Parsed: 3/4 pages, links: 700, text: 59175 chars
 ```
 
@@ -221,7 +223,7 @@ Sample report (logs omitted):
 URL                                  STATUS                       SIZE    TIME
 https://example.com                  200                          713B   0.07s
 https://httpbin.org/delay/2          200                          416B   2.16s
-https://httpbin.org/status/404       HTTPStatusError 404            0B   0.16s
+https://httpbin.org/status/404       PermanentHTTPError 404         0B   0.16s
 https://httpbin.org/delay/10         FetchTimeoutError              0B   5.01s
 https://nonexistent-domain.invalid   RobotsUnreachableError         0B   0.00s
 ...
@@ -406,8 +408,9 @@ per-domain limits), `RateLimiter`, `RobotsParser` and `UrlFilter`.
 | `errors` | parsing problems; empty when everything went fine |
 
 Responses whose `Content-Type` is not HTML are not parsed, and their body is
-not even downloaded: the page comes back empty with the reason in `errors`.
-This keeps a crawl from pulling in archives or videos it finds links to. The parser can be used on its own:
+not even downloaded: `fetch_and_parse` fails with `ParseError`, and so does
+an empty document; a crawl lists such pages as failed. This keeps a crawl
+from pulling in archives or videos it finds links to. The parser can be used on its own:
 `HTMLParser().parse(html, url)`, or `await HTMLParser().parse_html(html, url)`
 in async code. Pass `AsyncCrawler(parser=HTMLParser(same_host_only=True))` to
 keep only links to the page's own host.

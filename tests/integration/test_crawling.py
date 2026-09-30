@@ -28,7 +28,7 @@ async def test_crawls_site_up_to_max_depth(url):
     }
     assert crawler.processed_urls[url("/site/moved")]["final_url"] == url("/site/c.html")
     assert set(crawler.failed_urls) == {url("/site/missing.html"), url("/site/files/manual.pdf")}
-    assert crawler.failed_urls[url("/site/missing.html")].startswith("HTTPStatusError: HTTP 404")
+    assert crawler.failed_urls[url("/site/missing.html")].startswith("PermanentHTTPError: HTTP 404")
     assert crawler.visited_urls == set(crawler.processed_urls) | set(crawler.failed_urls)
     # Links from depth 2 are not followed.
     assert url("/site/a/deepest.html") not in crawler.url_depths
@@ -40,6 +40,12 @@ async def test_max_depth_zero_fetches_start_urls_only(url, site):
     crawler = await crawl(url("/site/"), max_depth=0)
     assert list(crawler.processed_urls) == [url("/site/")]
     assert site.hits.total() == 1
+
+
+async def test_non_html_page_fails_with_parse_error(url):
+    crawler = await crawl(url("/data.json"), max_depth=0)
+    assert crawler.processed_urls == {}
+    assert crawler.failed_urls == {url("/data.json"): "ParseError: unsupported content type: application/json"}
 
 
 async def test_every_page_is_fetched_once(url, site):

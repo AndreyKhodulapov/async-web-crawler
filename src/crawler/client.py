@@ -22,6 +22,7 @@ from crawler.exceptions import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    ParseError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     TooManyRedirectsError,
@@ -221,12 +222,12 @@ class AsyncCrawler:
         """Download a page and extract structured data from it.
 
         Relative links are resolved against the URL reached after redirects.
-        Parsing problems never raise: they are logged and listed in the
-        result's `errors`, e.g. for a response that is not HTML. The body of
-        such a response is not downloaded at all.
+        Problems in parts of the page are logged and listed in the result's
+        `errors`. A response that is not HTML fails with `ParseError`, and
+        its body is not downloaded at all.
 
         Raises:
-            FetchError: a subclass describing why the download failed.
+            FetchError: a subclass describing why the download or parsing failed.
         """
         result = await self._fetch(url, html_only=True)
         if result.error is not None:
@@ -533,11 +534,9 @@ class AsyncCrawler:
         if result.error is not None:
             queue.mark_failed(url, f"{type(result.error).__name__}: {result.error.message}")
             return
-        page = await self._parse(result)
-
         if result.redirected:
             # Normalized like the links, so that patterns see the same form.
-            final_url = normalize_url(page["final_url"])
+            final_url = normalize_url(result.final_url or url)
             assert final_url is not None  # aiohttp has just fetched it
             # A later link to the redirect target must not fetch the page again.
             queue.mark_seen(final_url)
@@ -553,6 +552,12 @@ class AsyncCrawler:
                 queue.mark_skipped(url, f"redirected out of scope: {final_url}")
                 return
 
+        try:
+            page = await self._parse(result)
+        except ParseError as error:
+            logger.warning("Failed to parse %s: %s", url, error.message)
+            queue.mark_failed(url, f"ParseError: {error.message}")
+            return
         queued = 0
         if depth < self.max_depth:
             for link in page["links"]:
