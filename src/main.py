@@ -44,14 +44,20 @@ from demo_site import DemoSite
 MAX_RETRY_DELAY = 30.0
 
 
+def number(raw: str, number_type: type[int] | type[float] = float) -> int | float:
+    """`raw` as a finite number of `number_type`; the checks every numeric option shares."""
+    try:
+        value = number_type(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {raw}")
+    return value
+
+
 def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) -> Callable[[str], int | float]:
     def parse(raw: str) -> int | float:
-        try:
-            value = number_type(raw)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
-        if not math.isfinite(value):
-            raise argparse.ArgumentTypeError(f"must be a finite number, got {raw}")
+        value = number(raw, number_type)
         if value < 0 or (value == 0 and not allow_zero):
             raise argparse.ArgumentTypeError(f"must be {'non-negative' if allow_zero else 'positive'}, got {raw}")
         return value
@@ -60,21 +66,13 @@ def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) 
 
 
 def at_least_one(raw: str) -> float:
-    try:
-        value = float(raw)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
-    if not (math.isfinite(value) and value >= 1):
+    if (value := number(raw)) < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {raw}")
     return value
 
 
 def share(raw: str) -> float:
-    try:
-        value = float(raw)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
-    if not 0 < value <= 1:
+    if not 0 < (value := number(raw)) <= 1:
         raise argparse.ArgumentTypeError(f"must be in (0, 1], got {raw}")
     return value
 

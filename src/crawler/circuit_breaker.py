@@ -110,22 +110,23 @@ class CircuitBreaker:
         Changes nothing otherwise: it refuses a request early, before it
         waits for a rate limit or a free slot; `call` decides for good.
         """
-        host = get_host(url)
-        circuit = self._circuits.get(host) if self.enabled and host is not None else None
-        if circuit is not None and (message := self._verdict(host, circuit, None)) is not None:
+        if (found := self._lookup(url)) is None:
+            return
+        host, circuit = found
+        if (message := self._verdict(host, circuit, None)) is not None:
             self._reject(url, circuit, message)
 
     def refusal(self, url: str) -> str | None:
         """Why a request to `url` would be refused now, None if it would go through; not counted as refused."""
-        host = get_host(url)
-        circuit = self._circuits.get(host) if self.enabled and host is not None else None
-        return None if circuit is None else self._verdict(host, circuit, None)
+        found = self._lookup(url)
+        return None if found is None else self._verdict(*found, None)
 
     def probe_in(self, url: str) -> float:
         """Seconds until the circuit of the host of `url` lets a probe through; 0 unless it is open."""
-        host = get_host(url)
-        circuit = self._circuits.get(host) if self.enabled and host is not None else None
-        if circuit is None or self._state(circuit) is not CircuitState.OPEN:
+        if (found := self._lookup(url)) is None:
+            return 0.0
+        _, circuit = found
+        if self._state(circuit) is not CircuitState.OPEN:
             return 0.0
         return max(circuit.opened_at + self.cooldown - self._clock(), 0.0)
 
@@ -157,6 +158,12 @@ class CircuitBreaker:
         """Count `times_opened` and `rejected` from zero; the states are kept."""
         for circuit in self._circuits.values():
             circuit.times_opened = circuit.rejected = 0
+
+    def _lookup(self, url: str) -> tuple[str, _Circuit] | None:
+        """The host of `url` and its circuit; None when the breaker is off or the host has no circuit yet."""
+        host = get_host(url)
+        circuit = self._circuits.get(host) if self.enabled and host is not None else None
+        return None if circuit is None else (host, circuit)
 
     def _circuit(self, call: "BreakerCall") -> _Circuit | None:
         """The circuit of the host of `call`; none when the breaker is off or the URL has no host."""
