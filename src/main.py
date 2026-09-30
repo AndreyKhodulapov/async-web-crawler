@@ -61,7 +61,52 @@ def regex(raw: str) -> str:
     return raw
 
 
-def parse_args() -> argparse.Namespace:
+def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log_level: str = "INFO") -> None:
+    """Options every command has; the defaults that differ by command are arguments.
+
+    Each command gets its own copy: a parent parser shared through `parents=`
+    shares its option objects too, so `set_defaults` on one command would
+    change the default of all of them.
+    """
+    parser.add_argument("--concurrency", type=positive(int), default=10, help="max parallel requests")
+    parser.add_argument(
+        "--timeout",
+        type=positive(float),
+        default=5.0,
+        help="connect, read and total timeout per request, s",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=log_level,
+    )
+    politeness = parser.add_argument_group("politeness")
+    politeness.add_argument(
+        "--rps",
+        type=positive(float, allow_zero=True),
+        default=1.0,
+        help="max requests per second to one host, 0 = no limit (default: 1)",
+    )
+    politeness.add_argument(
+        "--min-delay", type=positive(float, allow_zero=True), default=0.0, help="min seconds between requests to a host"
+    )
+    politeness.add_argument(
+        "--jitter", type=positive(float, allow_zero=True), default=0.0, help="random extra delay up to this, s"
+    )
+    politeness.add_argument("--no-robots", action="store_true", help="do not check robots.txt")
+    politeness.add_argument(
+        "--retries", type=positive(int, allow_zero=True), default=retries, help="retries of timeouts, 429 and 5xx"
+    )
+    politeness.add_argument(
+        "--user-agent",
+        action="append",
+        metavar="STRING",
+        help="User-Agent; repeat to rotate several, all with the same bot name",
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # A mix of fast pages, slow endpoints and deliberate failures.
     benchmark_urls = [
         "https://example.com",
@@ -83,61 +128,22 @@ def parse_args() -> argparse.Namespace:
         "https://httpbin.org/status/403",  # an access denied response, as anti-bot protection gives
     ]
 
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--concurrency", type=positive(int), default=10, help="max parallel requests")
-    common.add_argument(
-        "--timeout",
-        type=positive(float),
-        default=5.0,
-        help="connect, read and total timeout per request, s",
-    )
-    common.add_argument(
-        "--log-level",
-        type=str.upper,
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-    )
-    politeness = common.add_argument_group("politeness")
-    politeness.add_argument(
-        "--rps",
-        type=positive(float, allow_zero=True),
-        default=1.0,
-        help="max requests per second to one host, 0 = no limit (default: 1)",
-    )
-    politeness.add_argument(
-        "--min-delay", type=positive(float, allow_zero=True), default=0.0, help="min seconds between requests to a host"
-    )
-    politeness.add_argument(
-        "--jitter", type=positive(float, allow_zero=True), default=0.0, help="random extra delay up to this, s"
-    )
-    politeness.add_argument("--no-robots", action="store_true", help="do not check robots.txt")
-    politeness.add_argument(
-        "--retries", type=positive(int, allow_zero=True), default=2, help="retries of timeouts, 429 and 5xx"
-    )
-    politeness.add_argument(
-        "--user-agent",
-        action="append",
-        metavar="STRING",
-        help="User-Agent; repeat to rotate several, all with the same bot name",
-    )
-
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
-    benchmark = commands.add_parser(
-        "benchmark", parents=[common], help="fetch URLs sequentially and concurrently, compare time"
-    )
+    benchmark = commands.add_parser("benchmark", help="fetch URLs sequentially and concurrently, compare time")
     benchmark.add_argument("urls", nargs="*", default=benchmark_urls, help="URLs to fetch")
     # Retries would blur the comparison: the list fails on purpose.
-    benchmark.set_defaults(retries=0)
+    add_common_options(benchmark, retries=0)
 
-    parse = commands.add_parser("parse", parents=[common], help="fetch pages and extract structured data")
+    parse = commands.add_parser("parse", help="fetch pages and extract structured data")
     parse.add_argument("urls", nargs="*", default=parse_urls, help="URLs to parse")
     parse.add_argument("--same-host", action="store_true", help="keep only links to the page's own host")
     parse.add_argument("--preview", type=positive(int), default=5, help="links and headings shown per page")
     parse.add_argument("--json", type=Path, metavar="PATH", help="save full results to a JSON file")
+    add_common_options(parse)
 
-    crawl = commands.add_parser("crawl", parents=[common], help="follow links from start pages, show live progress")
+    crawl = commands.add_parser("crawl", help="follow links from start pages, show live progress")
     # Sandboxes made for crawling practice whose robots.txt shows the rules
     # at work: the first disallows its pagination and product pages (with a
     # wildcard rule), the second sets Crawl-delay: 2.
@@ -155,9 +161,9 @@ def parse_args() -> argparse.Namespace:
     )
     crawl.add_argument("--json", type=Path, metavar="PATH", help="save pages, errors and stats to a JSON file")
     # A log line per request would bury the progress line; --log-level INFO shows them.
-    crawl.set_defaults(log_level="WARNING")
+    add_common_options(crawl, log_level="WARNING")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.user_agent and len({product_token(agent) for agent in args.user_agent}) > 1:
         parser.error("every --user-agent must start with the same bot name, e.g. MyBot/1.0 (...)")
     return args
