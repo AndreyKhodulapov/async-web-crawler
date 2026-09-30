@@ -62,11 +62,12 @@ class CircuitBreaker:
       circuit with an empty window, its failure opens it for another cooldown.
 
     Failures are the errors that say the host is in trouble: a
-    `TransientError` (a timeout, HTTP 429, 5xx) or a `NetworkError`. Any
-    response of the server, HTTP 404 included, is a success: the host is
-    up, and a site with broken links must not be blocked for them. Other
-    errors, such as a bad certificate, count neither way. Every attempt
-    counts, retries included.
+    `TransientError` (a timeout, HTTP 408, 429), a `NetworkError` or any
+    HTTP 5xx, even one not worth a retry, such as 501. Any other response
+    of the server, HTTP 404 included, is a success: the host is up, and a
+    site with broken links must not be blocked for them. Other errors, such
+    as a bad certificate, count neither way. Every attempt counts, retries
+    included.
 
     `failure_threshold=None` turns the breaker off: every request goes through.
     """
@@ -282,6 +283,8 @@ def _is_failure(error: FetchError | None) -> bool | None:
     """Whether an outcome counts as a failure of the host; None if it counts neither way."""
     if isinstance(error, TransientError | NetworkError):
         return True
-    if error is None or isinstance(error, HTTPStatusError):
+    if isinstance(error, HTTPStatusError):
+        return error.status >= 500
+    if error is None:
         return False
     return None

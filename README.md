@@ -25,9 +25,9 @@ and backs off when a site struggles.
   name, wildcards, longest-match precedence, Crawl-delay; one download per
   site, cached; disallowed URLs are logged and never requested; an
   unreachable robots.txt closes the site for a minute, then it is fetched again
-- Retries of timeouts, network errors, HTTP 429 and 5xx with exponential
-  backoff and jitter, honoring `Retry-After`; the whole host slows down
-  while a retry waits or after a Retry-After
+- Retries of timeouts, network errors, HTTP 408, 429 and 5xx that usually
+  pass, with exponential backoff and jitter, honoring `Retry-After`; the
+  whole host slows down while a retry waits or after a Retry-After
 - Circuit breaker per host: a host whose requests keep failing is left
   alone for a while, then tested with a single probe request
 - Configurable User-Agent, with optional rotation between variants of the
@@ -36,10 +36,10 @@ and backs off when a site struggles.
 - Separate connect, read and total timeouts that grow with every retry
 - Clear error types, all subclasses of `FetchError`, grouped by whether a
   retry can help: `TransientError` (timeouts, HTTP 408, 429, 500, 502, 503,
-  504), `NetworkError` (DNS, refused or reset connections), `PermanentError`
-  (other HTTP errors such as 401, 403, 404, redirect loops, bad
-  certificates, invalid URLs, pages disallowed by robots.txt) and
-  `ParseError` (a response that is not an HTML document); plus
+  504 and Cloudflare's 520-524), `NetworkError` (DNS, refused or reset
+  connections), `PermanentError` (other HTTP errors such as 401, 403, 404,
+  redirect loops, bad certificates, invalid URLs, pages disallowed by
+  robots.txt) and `ParseError` (a response that is not an HTML document); plus
   `RobotsUnreachableError`, `CircuitOpenError`, `CrawlerClosedError` and
   `UnexpectedError`
 - One failing URL never breaks a batch: even unforeseen exceptions are
@@ -88,9 +88,9 @@ politeness options:
 | `--min-delay` | 0 | min seconds between two requests to one host |
 | `--jitter` | 0 | random extra delay of up to this many seconds |
 | `--no-robots` | off | do not check robots.txt; `errors` does not check it unless given `--robots` |
-| `--retries` | 2 (0 for `benchmark`, 3 for `errors`) | retries of timeouts, network errors, 429 and 5xx |
+| `--retries` | 2 (0 for `benchmark`, 3 for `errors`) | retries of timeouts, network errors, 408, 429, 500, 502-504 and 520-524 |
 | `--retry-delay` | 1 (0.2 for `errors`) | seconds before the first retry, doubled for every next one up to 30 s, see [Retries](#retries) |
-| `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 429 or 5xx |
+| `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 408, 429 or 5xx |
 | `--breaker-cooldown` | 30 | seconds a blocked host is left alone before a probe request |
 | `--no-breaker` | off | never block a host |
 | `--user-agent` | `AsyncWebCrawler/0.1 (+repo URL)` | repeat to rotate several; all must share the bot name |
@@ -522,8 +522,9 @@ once with `CircuitOpenError`: they are not sent, not retried and not
 counted in `error_stats()`. After that one request goes through as a probe
 (half-open): its success closes the circuit, its failure opens it again.
 
-Failures are timeouts, network errors, HTTP 408, 429 and 5xx; any other
-response, a 404 too, is a success, so broken links do not block a site.
+Failures are timeouts, network errors, HTTP 408, 429 and any 5xx, even
+one that is not retried, such as 501; any other response, a 404 too, is a
+success, so broken links do not block a site.
 Every attempt counts, retries and robots.txt downloads included. The
 circuit is checked before a request waits for the rate limit, where a
 half-open one gives its probe to one request and refuses the rest, and once

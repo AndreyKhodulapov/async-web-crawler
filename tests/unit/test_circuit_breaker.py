@@ -69,8 +69,13 @@ class TestClosed:
         request(breaker, TIMEOUT)
         assert breaker.state("a.test") is CircuitState.OPEN
 
-    @pytest.mark.parametrize("status", [429, 500, 503])
+    @pytest.mark.parametrize("status", [408, 429, 500, 503, 522])
     def test_transient_http_errors_are_failures(self, breaker, status):
+        request(breaker, *[HTTPStatusError(URL, status, "Error")] * 4)
+        assert breaker.state("a.test") is CircuitState.OPEN
+
+    @pytest.mark.parametrize("status", [501, 505, 525])
+    def test_server_errors_not_worth_a_retry_are_failures_too(self, breaker, status):
         request(breaker, *[HTTPStatusError(URL, status, "Error")] * 4)
         assert breaker.state("a.test") is CircuitState.OPEN
 

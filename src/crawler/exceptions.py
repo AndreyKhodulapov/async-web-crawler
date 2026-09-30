@@ -57,9 +57,10 @@ class HTTPStatusError(FetchError):
     other, so an HTTP error always has a kind.
     """
 
-    # Request Timeout, Too Many Requests and server errors that usually pass.
+    # Request Timeout, Too Many Requests and server errors that usually pass,
+    # including Cloudflare's 520-524: its origin server is down or too slow.
     # 501 Not Implemented or 505 HTTP Version Not Supported never do.
-    TRANSIENT_STATUSES: ClassVar[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504})
+    TRANSIENT_STATUSES: ClassVar[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
 
     def __new__(cls, url: str, status: int, reason: str, *, retry_after: float | None = None) -> Self:
         kind = cls
@@ -74,7 +75,7 @@ class HTTPStatusError(FetchError):
 
 
 class TransientHTTPError(HTTPStatusError, TransientError):
-    """HTTP 408, 429, 500, 502, 503 or 504."""
+    """HTTP 408, 429, 500, 502, 503, 504 or 520-524."""
 
 
 class PermanentHTTPError(HTTPStatusError, PermanentError):

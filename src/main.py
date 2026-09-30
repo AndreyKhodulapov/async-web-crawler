@@ -169,7 +169,7 @@ def add_common_options(
         "--retries",
         type=positive(int, allow_zero=True),
         default=retries,
-        help="retries of timeouts, network errors, HTTP 408, 429 and 5xx",
+        help="retries of timeouts, network errors, HTTP 408, 429, 500, 502-504 and 520-524",
     )
     politeness.add_argument(
         "--retry-delay",
@@ -185,7 +185,7 @@ def add_common_options(
         default=0.5,
         metavar="SHARE",
         help="block a host once this share of its requests in the last minute (5 at least) "
-        "failed with a timeout, a network error, HTTP 429 or 5xx (default: %(default)g)",
+        "failed with a timeout, a network error, HTTP 408, 429 or 5xx (default: %(default)g)",
     )
     breaker.add_argument(
         "--breaker-cooldown",

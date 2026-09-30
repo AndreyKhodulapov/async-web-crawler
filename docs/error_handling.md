@@ -8,7 +8,7 @@ leaves a failing site alone.
 
 | Kind | Examples | Retry? |
 |------|----------|--------|
-| Transient | timeouts, HTTP 408, 429, 500, 502, 503, 504 | yes, with backoff |
+| Transient | timeouts, HTTP 408, 429, 500, 502, 503, 504, Cloudflare's 520-524 | yes, with backoff |
 | Network | DNS failure, connection refused or reset | yes |
 | Permanent | HTTP 401, 403, 404, 410, 501, a redirect loop, a bad certificate, an invalid URL | no |
 | Parse | the body is not an HTML document | no: the same bytes come back |
@@ -112,8 +112,9 @@ leaves a failing site alone.
   one failed request out of one is not a broken site. Hystrix used a rolling
   percentage; resilience4j offers count-based and time-based windows.
 - **What counts as a failure**: only what says the host is in trouble, i.e.
-  timeouts, network errors, 429 and 5xx. A 404 is a healthy server answering;
-  counting it would block a site for its broken links.
+  timeouts, network errors, 429 and any 5xx, even a 501 that is not
+  retried. A 404 is a healthy server answering; counting it would block a
+  site for its broken links.
 - **Per host**: one dead site must not stop the crawl of the others, and a
   host that is down fails all of its pages, so a circuit per URL learns too late.
 - **Retries under a breaker**: every attempt counts, retries included, so a

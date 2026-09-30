@@ -31,7 +31,7 @@ def kind_of(error: Exception) -> type[Exception] | None:
     return kinds[0] if kinds else None
 
 
-@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504])
+@pytest.mark.parametrize("status", [408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524])
 def test_temporary_http_statuses_are_transient(status):
     error = HTTPStatusError(URL, status, "Error", retry_after=5.0)
     assert type(error) is TransientHTTPError
@@ -39,7 +39,7 @@ def test_temporary_http_statuses_are_transient(status):
     assert (error.status, error.retry_after, error.message) == (status, 5.0, f"HTTP {status} Error")
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 501, 505])
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 501, 505, 507, 525])
 def test_other_http_statuses_are_permanent(status):
     error = HTTPStatusError(URL, status, "Error")
     assert type(error) is PermanentHTTPError
