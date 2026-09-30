@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from crawler.exceptions import CrawlerClosedError, FetchError, TooManyRedirectsError
+from crawler.exceptions import CircuitOpenError, CrawlerClosedError, FetchError, TooManyRedirectsError
 from crawler.urls import normalize_url, percent_encode
 
 logger = logging.getLogger(__name__)
@@ -186,6 +186,9 @@ class RobotsParser:
     Unlike the rules of a file that was read, which are kept for good, an
     unreachable robots.txt is fetched again after `UNREACHABLE_TTL`
     seconds, so one timeout does not close the site for the whole crawl.
+    A download the fetcher did not even start (`CrawlerClosedError`,
+    `CircuitOpenError`) is no answer from the site: the error is passed on
+    and nothing is cached.
     Files over 500 KiB are cut to that size, the minimum the RFC requires
     crawlers to read.
     """
@@ -219,6 +222,7 @@ class RobotsParser:
         Raises:
             ValueError: `base_url` is not a valid http(s) URL.
             CrawlerClosedError: the fetcher is closed; nothing is cached.
+            CircuitOpenError: the fetcher refused to request the site; nothing is cached.
         """
         return (await self._rules_for(base_url)).to_dict()
 
@@ -282,7 +286,7 @@ class RobotsParser:
         url = f"{origin}/robots.txt"
         try:
             status, text = await self._fetch(url)
-        except CrawlerClosedError:
+        except (CrawlerClosedError, CircuitOpenError):
             raise  # not an answer from the site: nothing to cache
         except TooManyRedirectsError as error:
             logger.info("robots.txt of %s: %s, everything is allowed", origin, error.message)

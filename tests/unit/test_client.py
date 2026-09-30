@@ -566,12 +566,14 @@ class TestCircuitBreaker:
         )
         fake_session.routes["http://a/1"] = FakeResponse(status=503)
 
-        # The third failed attempt opens the circuit, and the retry after it is refused.
+        # The third failed attempt opens the circuit: no retry after it.
         first = await crawler.fetch_result("http://a/1")
         second = await crawler.fetch_result("http://a/2")
         other_host = await crawler.fetch_result("http://b/")
 
-        assert isinstance(first.error, CircuitOpenError)
+        # The failure reported is that of the last request sent.
+        assert isinstance(first.error, HTTPStatusError)
+        assert first.error.status == 503
         assert isinstance(second.error, CircuitOpenError)
         assert second.error.message.startswith("circuit breaker of a is open (3 of 3 requests failed")
         assert other_host.ok
@@ -579,7 +581,24 @@ class TestCircuitBreaker:
         # Refused requests were not made: they are not errors of an attempt.
         stats = crawler.error_stats()
         assert (stats.total, stats.retries) == (3, 2)
-        assert crawler.circuit_breaker.get_stats()["a"].rejected == 2
+        assert crawler.circuit_breaker.get_stats()["a"].rejected == 1
+
+    async def test_retry_refused_after_its_wait_reports_the_last_error(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.05),
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2),
+        )
+        fake_session.latency = 0.02
+        fake_session.routes["http://a/1"] = fake_session.routes["http://a/2"] = FakeResponse(status=503)
+
+        # The first failure leaves the circuit closed, so its retry goes on to
+        # wait; the second one opens it, and the retry is refused after the wait.
+        results = await crawler.fetch_many(["http://a/1", "http://a/2"])
+
+        assert [result.status for result in results] == [503, 503]
+        assert all(isinstance(result.error, HTTPStatusError) for result in results)
+        assert sorted(fake_session.requested) == ["http://a/1", "http://a/2"]
+        assert crawler.circuit_breaker.get_stats()["a"].rejected == 1
 
     async def test_refused_after_waiting_for_the_rate_limit(self, make_crawler, fake_session):
         crawler = make_crawler(
@@ -606,6 +625,18 @@ class TestCircuitBreaker:
         with pytest.raises(RobotsUnreachableError):
             await crawler.fetch_url("http://a/page")
         assert crawler.circuit_breaker.state("a") is CircuitState.OPEN
+
+    async def test_refused_robots_txt_is_not_cached(self, make_crawler, fake_session):
+        crawler = make_crawler(respect_robots=True, circuit_breaker=CircuitBreaker(min_requests=2))
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=404)
+        fake_session.routes["http://a/down"] = aiohttp.ClientConnectionError("refused")
+        await crawler.fetch_many(["http://a/down", "http://a/down"])
+
+        # Another origin of the same host needs its own robots.txt.
+        with pytest.raises(CircuitOpenError):
+            await crawler.fetch_url("https://a/page")
+        with pytest.raises(LookupError):
+            crawler.robots.unreachable_reason("https://a/page")
 
     async def test_host_recovers_after_the_cooldown(self, make_crawler, fake_session):
         clock = FakeClock()

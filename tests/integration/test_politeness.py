@@ -198,7 +198,8 @@ class TestCircuitBreaker:
         assert site.hits["/flaky/3"] == 5
 
     async def test_crawl_fails_the_pages_of_a_blocked_host(self, url, site):
-        start_urls = [url(f"/flaky/100?page={page}") for page in range(6)]
+        blocked = [url(f"/flaky/100?page={page}") for page in range(5)]
+        other_host = url("/site/b.html", "localhost")
         options = {
             "max_concurrent": 1,
             "max_depth": 0,
@@ -206,13 +207,16 @@ class TestCircuitBreaker:
             "circuit_breaker": CircuitBreaker(min_requests=3),
         }
         async with polite(**options) as crawler:
-            await crawler.crawl(start_urls)
+            await crawler.crawl([*blocked, other_host], max_pages=2)
 
-        # The first page opens the circuit on its third attempt; its next retry is refused.
+        # The first page opens the circuit on its third attempt, with no retry after it.
         assert site.hits["/flaky/100"] == 3
-        assert list(crawler.failed_urls) == start_urls
-        assert crawler.failed_urls[start_urls[3]].startswith(
+        assert crawler.failed_urls[blocked[0]] == "TransientHTTPError: HTTP 503 Service Unavailable"
+        # The others are refused without a request and cost nothing of max_pages.
+        assert list(crawler.failed_urls) == blocked
+        assert crawler.failed_urls[blocked[1]].startswith(
             "CircuitOpenError: circuit breaker of 127.0.0.1 is open (3 of 3 requests failed in 60s)"
         )
-        assert (crawler.crawl_stats().requests, crawler.crawl_stats().retries) == (3, 2)
-        assert crawler.circuit_breaker.get_stats()["127.0.0.1"].rejected == 6
+        assert list(crawler.processed_urls) == [other_host]
+        assert (crawler.crawl_stats().requests, crawler.crawl_stats().retries) == (4, 2)
+        assert crawler.circuit_breaker.get_stats()["127.0.0.1"].rejected == 4

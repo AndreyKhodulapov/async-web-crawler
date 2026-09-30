@@ -191,6 +191,26 @@ class TestRetryStrategy:
         assert await strategy(waits).run(attempts, wait=other) == "page"
         assert (len(waits.delays), len(other.delays)) == (0, 1)
 
+    async def test_veto_stops_retries_before_the_wait(self, waits):
+        attempts = Attempts(http_error(503), http_error(502), "page")
+        vetoed: list[Exception] = []
+
+        def veto(error: Exception) -> str | None:
+            vetoed.append(error)
+            return "host is down" if len(vetoed) == 2 else None
+
+        with pytest.raises(HTTPStatusError) as failure:
+            await strategy(waits).run(attempts, veto=veto)
+        assert failure.value.status == 502
+        assert len(attempts.calls) == 2
+        assert len(waits.delays) == 1
+
+    async def test_veto_is_asked_only_about_retries(self, waits):
+        vetoed: list[Exception] = []
+        with pytest.raises(HTTPStatusError):
+            await strategy(waits).run(Attempts(http_error(404)), veto=vetoed.append)
+        assert vetoed == []
+
     async def test_default_wait_sleeps(self):
         attempts = Attempts(http_error(503), "page")
         retry = RetryStrategy(base_delay=0.02)
@@ -379,6 +399,13 @@ class TestRetryLogging:
         failure = self.messages(caplog, logging.WARNING)[-1]
         assert failure.startswith(f"Failed {URL} on attempt {attempt} after ")
         assert failure.endswith(f"s, {reason}")
+
+    async def test_vetoed_retry_is_logged_with_the_reason(self, waits, caplog):
+        with pytest.raises(HTTPStatusError):
+            await strategy(waits).run(Attempts(http_error(503)), target=URL, veto=lambda error: "host is down")
+        [failure] = self.messages(caplog, logging.WARNING)
+        assert failure.startswith(f"Failed {URL} on attempt 1/4 after ")
+        assert failure.endswith("s, host is down: TransientHTTPError: HTTP 503 Error")
 
     async def test_failure_level_applies_to_the_final_failure_only(self, waits, caplog):
         caplog.set_level(logging.DEBUG, logger="crawler.retry")

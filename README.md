@@ -410,7 +410,11 @@ response, a 404 too, is a success, so broken links do not block a site.
 Every attempt counts, retries and robots.txt downloads included. The
 circuit is checked before a request waits for the rate limit and once
 more when its turn comes, so the requests queued for a host stop as soon as
-it opens. In a crawl, the pages of a blocked host go to `failed_urls`.
+it opens. A retry the breaker would refuse is not made, so the request
+fails with the error of its last attempt, not with `CircuitOpenError`.
+robots.txt refused this way is not cached as unreachable. In a crawl, the
+pages of a blocked host go to `failed_urls` without counting toward
+`max_pages`.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|

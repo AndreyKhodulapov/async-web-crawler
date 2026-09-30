@@ -130,12 +130,15 @@ class RetryStrategy:
         wait: Waiter | None = None,
         target: str | None = None,
         failure_level: int = logging.WARNING,
+        veto: Callable[[Exception], str | None] | None = None,
     ) -> T:
         """Like `execute_with_retry`, with options for a single call.
 
         `wait` replaces the strategy's own wait. `target` names the call in
         the log, e.g. by its URL. `failure_level` is the log level of the
-        final failure; retries are always logged as warnings.
+        final failure; retries are always logged as warnings. `veto(error)`
+        can forbid a retry the strategy would make, before its wait: it
+        returns the reason, or None to let the retry go.
         """
         wait = wait or self._wait
         target = target or getattr(call, "__qualname__", repr(call))
@@ -149,6 +152,8 @@ class RetryStrategy:
             except Exception as error:
                 key, rule = self._rule_for(error)
                 refusal = self._refusal(error, key, rule, retries_by_rule[key], retries_by_rule.total())
+                if refusal is None and veto is not None:
+                    refusal = veto(error)
                 if refusal is not None:
                     logger.log(
                         failure_level,

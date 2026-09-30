@@ -106,12 +106,17 @@ class CircuitBreaker:
         Changes nothing otherwise. It refuses a request early, before it
         waits for a rate limit or a free slot; `call` decides for good.
         """
+        if (message := self.refusal(url)) is not None:
+            self._reject(url, message)
+
+    def refusal(self, url: str) -> str | None:
+        """Why a request to `url` would be refused now, None if it would go through; not counted as refused."""
         host, circuit = self._circuit(url)
         if circuit is None or self._state(circuit) is CircuitState.CLOSED:
-            return
+            return None
         if circuit.state is CircuitState.HALF_OPEN and circuit.probe is None:
-            return
-        self._refuse(url, host, circuit)
+            return None
+        return self._refusal_message(host, circuit)
 
     def call(self, url: str) -> "BreakerCall":
         """A request to `url`: entering it raises `CircuitOpenError` if the request is refused."""
@@ -157,15 +162,18 @@ class CircuitBreaker:
             circuit.probe = call
             logger.info("Circuit breaker of %s is half-open: probing it with %s", host, url)
             return
-        self._refuse(url, host, circuit)
+        self._reject(url, self._refusal_message(host, circuit))
 
-    def _refuse(self, url: str, host: str, circuit: _Circuit) -> None:
-        circuit.rejected += 1
+    def _refusal_message(self, host: str, circuit: _Circuit) -> str:
         if circuit.state is CircuitState.OPEN:
             left = circuit.opened_at + self.cooldown - self._clock()
-            message = f"circuit breaker of {host} is open ({circuit.reason}), next probe in {left:.1f}s"
-        else:
-            message = f"circuit breaker of {host} is half-open, waiting for the probe request"
+            return f"circuit breaker of {host} is open ({circuit.reason}), next probe in {left:.1f}s"
+        return f"circuit breaker of {host} is half-open, waiting for the probe request"
+
+    def _reject(self, url: str, message: str) -> None:
+        _, circuit = self._circuit(url)
+        assert circuit is not None
+        circuit.rejected += 1
         raise CircuitOpenError(url, message)
 
     def _record(self, url: str, call: "BreakerCall", error: FetchError | None) -> None:

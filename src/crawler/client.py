@@ -88,7 +88,10 @@ class AsyncCrawler:
       `circuit_breaker` says: by default once half of at least 5 requests
       in a minute have failed with a transient or network error, its
       requests fail with `CircuitOpenError` for 30 seconds without being
-      sent (see `CircuitBreaker`).
+      sent (see `CircuitBreaker`). A retry the breaker would refuse is not
+      made: the request fails with the error of its last attempt.
+      robots.txt that cannot be downloaded for this reason is not cached
+      as unreachable.
 
     Every request has a `connect_timeout` (DNS, TCP and TLS, waiting for a
     pooled connection), a `read_timeout` (for each chunk of the response)
@@ -302,6 +305,9 @@ class AsyncCrawler:
             return FetchResult.failure(url, CrawlerClosedError(url, "crawler is closed"), 0.0)
         if check_robots and (refusal := await self._check_robots(url)) is not None:
             return FetchResult.failure(url, refusal, 0.0)
+        # Refused at once, without waiting for the turn of the host.
+        if (refusal := self._check_circuit(url)) is not None:
+            return FetchResult.failure(url, refusal, 0.0)
         # The strategy needs an attempt that raises; the result of the last
         # one is kept to report a failure with its timing.
         last: FetchResult | None = None
@@ -312,10 +318,15 @@ class AsyncCrawler:
             nonlocal last, attempts, failed_at
             timeout = self._timeout_for(retries=attempts)
             attempts += 1
-            last = await self._fetch_once(url, html_only=html_only, timeout=timeout)
-            # A request the circuit breaker refused was not made.
-            if isinstance(last.error, CircuitOpenError):
+            result = await self._fetch_once(url, html_only=html_only, timeout=timeout)
+            if isinstance(result.error, CircuitOpenError):
+                # Not sent. A retry fails as the attempt before it did: the
+                # strategy sees the circuit open and stops, and the failure
+                # reported is that of a request that was sent.
+                last = last or result
+                assert last.error is not None
                 raise last.error
+            last = result
             if attempts > 1:
                 self._retries += 1
             if track_errors:
@@ -331,7 +342,12 @@ class AsyncCrawler:
 
         try:
             result = await self.retry_strategy.run(
-                attempt, wait=self._wait_before_retry, target=url, failure_level=failure_level
+                attempt,
+                wait=self._wait_before_retry,
+                target=url,
+                failure_level=failure_level,
+                # A retry the circuit breaker would refuse is not waited for.
+                veto=lambda error: self.circuit_breaker.refusal(url),
             )
         except FetchError as error:
             assert last is not None and last.error is error
@@ -380,7 +396,7 @@ class AsyncCrawler:
             return None  # an invalid URL fails in _request() with InvalidURLError
         try:
             allowed = await self.robots.is_allowed(url, self._user_agent)
-        except CrawlerClosedError as error:
+        except (CrawlerClosedError, CircuitOpenError) as error:
             return error
         crawl_delay = self.robots.get_crawl_delay(url, self._user_agent)
         if crawl_delay:
@@ -395,6 +411,15 @@ class AsyncCrawler:
             refusal = RobotsUnreachableError(url, f"robots.txt is unreachable ({unreachable})")
         logger.info("Blocked %s: %s", url, refusal.message)
         return refusal
+
+    def _check_circuit(self, url: str) -> CircuitOpenError | None:
+        """The error to fail `url` with if the circuit breaker of its host refuses it, None if it may be fetched."""
+        try:
+            self.circuit_breaker.check(url)
+        except CircuitOpenError as error:
+            logger.info("Refused %s: %s", url, error.message)
+            return error
+        return None
 
     async def _download_robots(self, url: str) -> tuple[int, str]:
         """Fetcher for RobotsParser: robots.txt goes through the same limits and retries as a page."""
@@ -414,16 +439,15 @@ class AsyncCrawler:
 
         @contextlib.asynccontextmanager
         async def gate() -> AsyncIterator[None]:
-            # The breaker is asked once more after the wait for the rate
-            # limit, as it may have opened meanwhile; a refused request does
-            # not wait for a slot and does not count as sent.
+            # The breaker decides after the wait for the rate limit, as it
+            # may have opened meanwhile (_fetch() refuses early only for an
+            # open one); a refused request does not wait for a slot and does
+            # not count as sent.
             with call:
                 async with self._limits.slot(url):
                     yield
 
         try:
-            # Refused at once, without waiting for the turn of the host.
-            self.circuit_breaker.check(url)
             # The rate limit is waited for before taking a concurrency slot,
             # so a request waiting for its host does not hold a slot another
             # host could use; inside the slot the interval is checked once more.
@@ -506,7 +530,9 @@ class AsyncCrawler:
         robots.txt disallows are not requested: they are listed in
         `blocked_urls` and do not count toward `max_pages`. Neither do pages
         of sites whose robots.txt cannot be read: they are listed in
-        `unreachable_urls`.
+        `unreachable_urls`. Pages that the circuit breaker refuses go to
+        `failed_urls` and do not count either, unless the circuit opened
+        while they were already waiting for their turn.
 
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
@@ -607,9 +633,9 @@ class AsyncCrawler:
     async def _crawl_worker(self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int) -> None:
         while (url := await queue.get_next()) is not None:
             try:
-                # robots.txt is checked before the page counts toward
-                # max_pages: a blocked page costs no request.
-                refusal = await self._check_robots(url)
+                # robots.txt and the circuit breaker are checked before the
+                # page counts toward max_pages: a refused page costs no request.
+                refusal = await self._check_robots(url) or self._check_circuit(url)
                 if refusal is not None:
                     if isinstance(refusal, RobotsDisallowedError):
                         queue.mark_blocked(url, refusal.message)
