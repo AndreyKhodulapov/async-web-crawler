@@ -50,10 +50,16 @@ sites it visits and follows their rules.
 - **Penalties** (HTTP 429, timeouts) move `next_start`, but requests that
   booked earlier already hold their times. Each one checks after its sleep:
   if a penalty came after its booking, it books again, behind the penalty.
+  Trade-off: it goes to the end of the host's queue. With hundreds of URLs
+  of one host booked at once (`fetch_many`), those requests move far back;
+  in `crawl()` the queue is no longer than the number of workers.
 - **Global limit with per-host rules**: a host's own Crawl-delay or penalty
   must not stop other hosts. The host's schedule is waited for first, then
   the shared one is booked: booking both at once would park a far-future
   time in the shared schedule, and every host would wait for it.
+  Trade-off: while the shared queue is long, a request may reach its slot
+  before its host's Crawl-delay has passed since the host's last request,
+  and it waits out the rest holding the slot.
 
 ## Delays
 
