@@ -11,6 +11,7 @@ from crawler import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    RetryStrategy,
     TooManyRedirectsError,
 )
 
@@ -86,3 +87,17 @@ async def test_concurrent_is_faster_than_sequential(server):
     # Requests overlap, so the batch takes about one delay instead of five.
     # A relative bound keeps the test stable on slow machines.
     assert concurrent < sequential / 2
+
+
+async def test_retry_strategy_wraps_fetch_url(crawler, url, site):
+    retry_strategy = RetryStrategy(max_retries=3, backoff_factor=2.0, base_delay=0.01)
+    html = await retry_strategy.execute_with_retry(crawler.fetch_url, url("/flaky/2"))
+    assert "Recovered" in html
+    assert site.hits["/flaky/2"] == 3
+
+
+async def test_retry_strategy_does_not_repeat_not_found(crawler, url, site):
+    retry_strategy = RetryStrategy(base_delay=0.01)
+    with pytest.raises(HTTPStatusError):
+        await retry_strategy.execute_with_retry(crawler.fetch_url, url("/site/missing.html"))
+    assert site.hits["/site/missing.html"] == 1
