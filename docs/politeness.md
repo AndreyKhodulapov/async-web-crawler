@@ -1,4 +1,4 @@
-# Politeness: rate limits, robots.txt and retries
+# Politeness: rate limits, robots.txt and backoff
 
 Short, interview-ready notes on how a crawler keeps from overloading the
 sites it visits and follows their rules.
@@ -126,26 +126,16 @@ sites it visits and follows their rules.
 - robots.txt is a convention, not access control: it tells polite crawlers
   what to skip, and it does not protect anything.
 
-## Retries and backoff
+## Backing off a struggling site
 
-- Retry only **transient** failures: timeouts, connection errors, 408, 429,
-  500, 502, 503, 504. A 404 or 403 fails the same way again. Retrying is safe
-  for idempotent requests such as GET.
-- Not every network error is transient: a redirect loop or a certificate
-  that fails verification is a property of the site. Retrying a redirect
-  loop is costly too: each attempt follows the whole chain (10 requests in
-  aiohttp) outside the rate limiter.
-- **Exponential backoff**: wait `base * 2**n`, capped. **Jitter** keeps
-  clients that failed together from retrying in lockstep. "Full jitter"
-  (0..delay) spreads retries best but can retry almost at once; "equal
-  jitter" (delay/2 + 0..delay/2) keeps a minimum pause.
-- Honor **Retry-After** (seconds or an HTTP date). When it asks for longer
-  than the backoff cap, do not retry: coming back early earns another 429.
+- Which errors to retry and how long to wait between retries is in
+  [error_handling.md](error_handling.md); this section is about the load on
+  the site.
 - A 429 or a timeout usually means the **whole site** is struggling:
   penalize the host in the rate limiter, so that every worker slows down,
   not only the one that failed. A Retry-After is a request to the whole
-  crawler: it holds back the host even when the failed URL is not retried. Scrapy's AutoThrottle adapts the delay to
-  latency the same way.
+  crawler: it holds back the host even when the failed URL is not retried.
+  Scrapy's AutoThrottle adapts the delay to latency the same way.
 
 ## User-Agent
 

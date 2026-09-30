@@ -4,7 +4,7 @@ import pytest
 from helpers import UNTHROTTLED
 from pages import ENCODING_PAGES
 
-from crawler import AsyncCrawler, HTTPStatusError
+from crawler import AsyncCrawler, HTTPStatusError, ParseError
 
 
 @pytest.fixture
@@ -37,9 +37,8 @@ async def test_links_are_resolved_after_redirect(crawler, server):
 
 
 async def test_json_response_is_not_parsed(crawler, server):
-    page = await crawler.fetch_and_parse(str(server.make_url("/data.json")))
-    assert page["errors"] == ["unsupported content type: application/json"]
-    assert page["text"] == ""
+    with pytest.raises(ParseError, match="unsupported content type: application/json"):
+        await crawler.fetch_and_parse(str(server.make_url("/data.json")))
 
 
 @pytest.mark.parametrize("name", ENCODING_PAGES)

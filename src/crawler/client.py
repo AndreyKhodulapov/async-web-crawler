@@ -1,12 +1,13 @@
 """Asynchronous HTTP client that downloads many pages concurrently."""
 
 import asyncio
-import functools
+import contextlib
 import itertools
 import logging
+import math
 import ssl
 import time
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from types import TracebackType
 from typing import NamedTuple, Self
 
@@ -14,25 +15,29 @@ import aiohttp
 import certifi
 from bs4.dammit import EncodingDetector
 
+from crawler.circuit_breaker import CircuitBreaker, CircuitState
+from crawler.error_stats import ErrorTracker
 from crawler.exceptions import (
     CertificateError,
+    CircuitOpenError,
     CrawlerClosedError,
     FetchError,
     FetchTimeoutError,
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    ParseError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     TooManyRedirectsError,
     UnexpectedError,
 )
 from crawler.filters import UrlFilter
-from crawler.models import CrawlStats, FetchResult, ParsedPage
+from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage
 from crawler.parser import HTMLParser, is_html_content_type
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
-from crawler.retry import RetryPolicy, parse_retry_after
+from crawler.retry import RetryStrategy, parse_retry_after
 from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
 from crawler.urls import get_host, is_valid_http_url, normalize_url
@@ -73,16 +78,37 @@ class AsyncCrawler:
       `RobotsDisallowedError`. While robots.txt of a site cannot be read,
       its URLs are not requested either and fail with
       `RobotsUnreachableError` (see `RobotsParser`).
-    - Timeouts, network errors and HTTP 408, 429 and 5xx are retried up to
-      `max_retries` times with exponential backoff from `backoff_base` up to
-      `max_backoff` seconds (see `RetryPolicy`). While a retry waits, the
-      whole host waits with it; so it does after a Retry-After header, even
-      when the request is not retried.
+    - Failed requests are retried as `retry_strategy` says: by default
+      transient and network errors, such as a timeout or HTTP 503, up to 3
+      times with exponential backoff (see `RetryStrategy`). The pause before
+      a retry is spent in the rate limiter: the whole host waits with it; so
+      it does after a Retry-After header, even when the request is not
+      retried.
+    - A host whose requests keep failing is left alone for a while, as
+      `circuit_breaker` says: by default once half of at least 5 requests
+      in a minute have failed with a transient or network error, its
+      requests fail with `CircuitOpenError` for 30 seconds without being
+      sent (see `CircuitBreaker`). A retry the breaker would refuse is not
+      made: the request fails with the error of its last attempt.
+      robots.txt that cannot be downloaded for this reason is not cached
+      as unreachable. In `crawl()`, the pages of such a host wait for it.
+
+    Every request has a `connect_timeout` (DNS, TCP and TLS, waiting for a
+    pooled connection), a `read_timeout` (for each chunk of the response)
+    and a `total_timeout` (the whole request). The n-th retry (from 1)
+    multiplies all three by `timeout_growth**n`, at most by
+    `MAX_TIMEOUT_GROWTH`: a server that is merely slow gets a chance to
+    answer, and a dead one is not waited for forever.
 
     `user_agent` identifies the crawler, and robots.txt rules are looked up
     by its name ("MyBot/1.0 (+url)" is "mybot"). `user_agents` rotates
     several User-Agent strings between requests; they must all carry that
     same name, so rotation cannot sidestep robots.txt.
+
+    `error_stats()` counts the errors of page requests and their retries
+    (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
+    counted there, and neither are the requests the circuit breaker refused
+    (see `circuit_breaker.get_stats()`).
 
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
     the same way as any other per-URL failure. Closing does not interrupt
@@ -93,6 +119,8 @@ class AsyncCrawler:
     # Sites such as Wikipedia ask bots to identify themselves with a contact
     # URL and may block generic user agents.
     DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
+    MAX_TIMEOUT_GROWTH = 4.0
+    MAX_CIRCUIT_OPENINGS = 3
 
     def __init__(
         self,
@@ -105,12 +133,12 @@ class AsyncCrawler:
         min_delay: float = 0.0,
         jitter: float = 0.0,
         respect_robots: bool = True,
-        max_retries: int = 2,
-        backoff_base: float = 1.0,
-        max_backoff: float = 30.0,
+        retry_strategy: RetryStrategy | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
         total_timeout: float = 30.0,
         connect_timeout: float = 10.0,
         read_timeout: float = 20.0,
+        timeout_growth: float = 1.5,
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
         parser: HTMLParser | None = None,
@@ -124,6 +152,8 @@ class AsyncCrawler:
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if not (math.isfinite(timeout_growth) and timeout_growth >= 1):
+            raise ValueError(f"timeout_growth must be a number >= 1, got {timeout_growth}")
         if isinstance(user_agents, str):
             raise TypeError(f"expected a list of user agents, got a string: {user_agents!r}")
         robots_name = product_token(user_agent)
@@ -136,7 +166,8 @@ class AsyncCrawler:
         # These validate their own arguments.
         self._limits = SemaphoreManager(max_concurrent, max_per_domain)
         self.rate_limiter = RateLimiter(requests_per_second, per_domain_rate, min_delay=min_delay, jitter=jitter)
-        self._retry = RetryPolicy(max_retries, backoff_base, max_backoff)
+        self.retry_strategy = retry_strategy or RetryStrategy()
+        self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.robots = RobotsParser(self._download_robots) if respect_robots else None
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -147,6 +178,7 @@ class AsyncCrawler:
             connect=connect_timeout,
             sock_read=read_timeout,
         )
+        self.timeout_growth = timeout_growth
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
         self._parser = parser or HTMLParser()
@@ -157,6 +189,7 @@ class AsyncCrawler:
         self.processed_urls: dict[str, ParsedPage] = {}
         self._pages_requested = 0
         self._retries = 0
+        self._errors = ErrorTracker()
         self._crawl_started: float | None = None
         self._crawl_finished: float | None = None
 
@@ -221,12 +254,12 @@ class AsyncCrawler:
         """Download a page and extract structured data from it.
 
         Relative links are resolved against the URL reached after redirects.
-        Parsing problems never raise: they are logged and listed in the
-        result's `errors`, e.g. for a response that is not HTML. The body of
-        such a response is not downloaded at all.
+        Problems in parts of the page are logged and listed in the result's
+        `errors`. A response that is not HTML fails with `ParseError`, and
+        its body is not downloaded at all.
 
         Raises:
-            FetchError: a subclass describing why the download failed.
+            FetchError: a subclass describing why the download or parsing failed.
         """
         result = await self._fetch(url, html_only=True)
         if result.error is not None:
@@ -261,36 +294,102 @@ class AsyncCrawler:
         html_only: bool = False,
         check_robots: bool = True,
         failure_level: int = logging.WARNING,
+        track_errors: bool = True,
     ) -> FetchResult:
-        """Download a page, checking robots.txt first and retrying transient failures."""
+        """Download a page, checking robots.txt first and retrying transient failures.
+
+        With `track_errors`, the attempts count in `error_stats()`.
+        """
         # Checked up front as well as in _request(): a closed crawler must
         # report itself even for a URL that robots.txt would block.
         if self._closed:
             return FetchResult.failure(url, CrawlerClosedError(url, "crawler is closed"), 0.0)
         if check_robots and (refusal := await self._check_robots(url)) is not None:
             return FetchResult.failure(url, refusal, 0.0)
-        retries = 0
-        while True:
-            result = await self._fetch_once(url, html_only=html_only, failure_level=failure_level)
-            error = result.error
-            if error is None:
-                return result
+        # Refused at once, without waiting for the turn of the host.
+        if (refusal := self._check_circuit(url)) is not None:
+            logger.info("Refused %s: %s", url, refusal.message)
+            return FetchResult.failure(url, refusal, 0.0)
+        # The strategy needs an attempt that raises; the result of the last
+        # one is kept to report a failure with its timing.
+        last: FetchResult | None = None
+        attempts = 0
+        failed_at: float | None = None  # when the previous attempt failed
+
+        async def attempt() -> FetchResult:
+            nonlocal last, attempts, failed_at
+            timeout = self._timeout_for(retries=attempts)
+            attempts += 1
+            result = await self._fetch_once(url, html_only=html_only, timeout=timeout)
+            if isinstance(result.error, CircuitOpenError):
+                # Not sent. A retry fails as the attempt before it did: the
+                # strategy sees the circuit open and stops, and the failure
+                # reported is that of a request that was sent.
+                last = last or result
+                assert last.error is not None
+                raise last.error
+            last = result
+            if attempts > 1:
+                self._retries += 1
+            if track_errors:
+                now = time.perf_counter()
+                if failed_at is not None:
+                    self._errors.record_retry(now - failed_at)
+                if last.error is not None:
+                    failed_at = now
+                    self._errors.record_error(last.error)
+            if last.error is not None:
+                raise last.error
+            return last
+
+        try:
+            result = await self.retry_strategy.run(
+                attempt,
+                wait=self._wait_before_retry,
+                target=url,
+                failure_level=failure_level,
+                # A retry the circuit breaker would refuse is not waited for.
+                veto=lambda error: self.circuit_breaker.refusal(url),
+            )
+        except FetchError as error:
+            assert last is not None and last.error is error
+            if track_errors:
+                self._errors.record_outcome(url, error, retried=attempts > 1)
             host = get_host(url)
-            if not self._retry.should_retry(error, retries):
-                # The server asked to wait: the other requests to the host
-                # wait even when this one is not retried, up to max_backoff.
-                if isinstance(error, HTTPStatusError) and error.retry_after and host is not None:
-                    self.rate_limiter.penalize(host, min(error.retry_after, self._retry.max_delay))
-                return result
-            delay = self._retry.delay(error, retries)
-            retries += 1
-            self._retries += 1
-            logger.warning("Retrying %s in %.1fs (retry %d of %d)", url, delay, retries, self._retry.max_retries)
-            assert host is not None  # an invalid URL fails with an error that is not retried
-            # The retry waits in the rate limiter, and so does every
-            # other request to the host: a timeout or HTTP 429 usually
-            # means the whole site is overloaded, not one page.
-            self.rate_limiter.penalize(host, delay)
+            # The server asked to wait: the other requests to the host wait
+            # even when this one is not retried, up to the longest retry pause.
+            if isinstance(error, HTTPStatusError) and error.retry_after and host is not None:
+                self.rate_limiter.penalize(host, min(error.retry_after, self.retry_strategy.max_delay))
+            return last
+        if track_errors:
+            self._errors.record_outcome(url, None, retried=attempts > 1)
+        return result
+
+    async def _wait_before_retry(self, error: Exception, delay: float) -> None:
+        """Hold back the host of the failed request instead of sleeping.
+
+        The retry then waits for its turn in the rate limiter, and so does
+        every other request to the host: a timeout or HTTP 429 usually means
+        the whole site is overloaded, not one page.
+        """
+        assert isinstance(error, FetchError)  # _fetch_once() reports every failure as one
+        host = get_host(error.url)
+        assert host is not None  # an invalid URL fails with an error that is not retried
+        self.rate_limiter.penalize(host, delay)
+
+    def _timeout_for(self, retries: int) -> aiohttp.ClientTimeout:
+        """Timeouts of a request after `retries` failed attempts."""
+        try:
+            growth = min(self.timeout_growth**retries, self.MAX_TIMEOUT_GROWTH)
+        except OverflowError:
+            growth = self.MAX_TIMEOUT_GROWTH
+        base = self._timeout
+        assert base.total is not None and base.connect is not None and base.sock_read is not None
+        return aiohttp.ClientTimeout(
+            total=base.total * growth,
+            connect=base.connect * growth,
+            sock_read=base.sock_read * growth,
+        )
 
     async def _check_robots(self, url: str) -> FetchError | None:
         """Return the error to fail `url` with if robots.txt does not allow it, None if it may be fetched."""
@@ -299,8 +398,9 @@ class AsyncCrawler:
             return None  # an invalid URL fails in _request() with InvalidURLError
         try:
             allowed = await self.robots.is_allowed(url, self._user_agent)
-        except CrawlerClosedError as error:
-            return error
+        except (CrawlerClosedError, CircuitOpenError) as error:
+            # Raised for the robots.txt URL; the page fails for the same reason under its own.
+            return type(error)(url, error.message)
         crawl_delay = self.robots.get_crawl_delay(url, self._user_agent)
         if crawl_delay:
             self.rate_limiter.set_delay(host, crawl_delay)
@@ -315,10 +415,18 @@ class AsyncCrawler:
         logger.info("Blocked %s: %s", url, refusal.message)
         return refusal
 
+    def _check_circuit(self, url: str) -> CircuitOpenError | None:
+        """The error to fail `url` with if the circuit breaker of its host refuses it, None if it may be fetched."""
+        try:
+            self.circuit_breaker.check(url)
+        except CircuitOpenError as error:
+            return error
+        return None
+
     async def _download_robots(self, url: str) -> tuple[int, str]:
         """Fetcher for RobotsParser: robots.txt goes through the same limits and retries as a page."""
         # Many sites have no robots.txt; RobotsParser logs the outcomes that matter.
-        result = await self._fetch(url, check_robots=False, failure_level=logging.INFO)
+        result = await self._fetch(url, check_robots=False, failure_level=logging.INFO, track_errors=False)
         if isinstance(result.error, HTTPStatusError):
             return result.error.status, ""
         if result.error is not None:
@@ -326,66 +434,87 @@ class AsyncCrawler:
         assert result.status is not None and result.content is not None
         return result.status, result.content
 
-    async def _fetch_once(self, url: str, *, html_only: bool, failure_level: int) -> FetchResult:
+    async def _fetch_once(self, url: str, *, html_only: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
+        """Make one request, unless the circuit breaker of the host refuses it."""
         host = get_host(url)
-        gate = functools.partial(self._limits.slot, url)
-        # The rate limit is waited for before taking a concurrency slot, so
-        # a request waiting for its host does not hold a slot another host
-        # could use; inside the slot the interval is checked once more.
-        async with gate() if host is None else self.rate_limiter.slot(host, gate):
-            logger.info("Fetching %s", url)
-            started = time.perf_counter()
-            try:
-                response = await self._request(url, html_only=html_only)
-            except FetchError as error:
-                elapsed = time.perf_counter() - started
-                logger.log(
-                    failure_level,
-                    "Failed %s after %.2fs: %s: %s",
-                    url,
-                    elapsed,
-                    type(error).__name__,
-                    error.message,
-                )
-                return FetchResult.failure(url, error, elapsed)
-            except Exception as exc:
-                # Last line of defense: a bug or an error type we did not
-                # anticipate fails only this URL instead of cancelling the
-                # whole batch. The traceback is logged so it stays visible.
-                elapsed = time.perf_counter() - started
-                logger.exception("Unexpected error for %s after %.2fs", url, elapsed)
-                error = UnexpectedError(url, f"{type(exc).__name__}: {exc}")
-                error.__cause__ = exc
-                return FetchResult.failure(url, error, elapsed)
+        call = self.circuit_breaker.call(url)
 
+        @contextlib.asynccontextmanager
+        async def gate() -> AsyncIterator[None]:
+            # Asked again after the wait for the rate limit, as the circuit
+            # may have opened meanwhile; a refused request does not wait for
+            # a slot and does not count as sent.
+            call.admit()
+            async with self._limits.slot(url):
+                yield
+
+        try:
+            # Admitted before the wait, so that of the requests to a
+            # half-open circuit only the probe waits for its turn.
+            with call:
+                # The rate limit is waited for before taking a concurrency slot,
+                # so a request waiting for its host does not hold a slot another
+                # host could use; inside the slot the interval is checked once more.
+                async with gate() if host is None else self.rate_limiter.slot(host, gate):
+                    result = await self._send(url, html_only=html_only, timeout=timeout)
+                    call.record(result.error)
+                    return result
+        except CircuitOpenError as error:
+            return FetchResult.failure(url, error, 0.0)
+
+    async def _send(self, url: str, *, html_only: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
+        """Send the request and report its outcome, whatever it is, as a FetchResult."""
+        logger.info("Fetching %s", url)
+        started = time.perf_counter()
+        try:
+            response = await self._request(url, html_only=html_only, timeout=timeout)
+        except FetchError as error:
             elapsed = time.perf_counter() - started
-            logger.info(
-                "Fetched %s: status=%d size=%dB elapsed=%.2fs",
-                url,
-                response.status,
-                response.size,
-                elapsed,
-            )
-            return FetchResult(
-                url=url,
-                elapsed=elapsed,
-                status=response.status,
-                content=response.content,
-                size=response.size,
-                final_url=response.final_url,
-                content_type=response.content_type,
-                redirected=response.redirected,
-            )
+            # RetryStrategy logs the failure along with what comes next.
+            logger.debug("Request to %s failed after %.2fs: %s: %s", url, elapsed, type(error).__name__, error.message)
+            return FetchResult.failure(url, error, elapsed)
+        except Exception as exc:
+            # Last line of defense: a bug or an error type we did not
+            # anticipate fails only this URL instead of cancelling the
+            # whole batch. The traceback is logged so it stays visible.
+            elapsed = time.perf_counter() - started
+            logger.exception("Unexpected error for %s after %.2fs", url, elapsed)
+            error = UnexpectedError(url, f"{type(exc).__name__}: {exc}")
+            error.__cause__ = exc
+            return FetchResult.failure(url, error, elapsed)
+
+        elapsed = time.perf_counter() - started
+        logger.info(
+            "Fetched %s: status=%d size=%dB elapsed=%.2fs",
+            url,
+            response.status,
+            response.size,
+            elapsed,
+        )
+        return FetchResult(
+            url=url,
+            elapsed=elapsed,
+            status=response.status,
+            content=response.content,
+            size=response.size,
+            final_url=response.final_url,
+            content_type=response.content_type,
+            redirected=response.redirected,
+        )
 
     async def _parse(self, result: FetchResult) -> ParsedPage:
-        """Parse a successful fetch result."""
+        """Parse a successful fetch result; a failure counts in `error_stats()`."""
         assert result.content is not None
-        return await self._parser.parse_html(
-            result.content,
-            result.url,
-            final_url=result.final_url,
-            content_type=result.content_type,
-        )
+        try:
+            return await self._parser.parse_html(
+                result.content,
+                result.url,
+                final_url=result.final_url,
+                content_type=result.content_type,
+            )
+        except ParseError as error:
+            self._errors.record_error(error)
+            raise
 
     async def crawl(
         self,
@@ -405,7 +534,13 @@ class AsyncCrawler:
         robots.txt disallows are not requested: they are listed in
         `blocked_urls` and do not count toward `max_pages`. Neither do pages
         of sites whose robots.txt cannot be read: they are listed in
-        `unreachable_urls`.
+        `unreachable_urls`. Pages that the circuit breaker refuses do not
+        count either: they are put off until their host may be probed and
+        tried again, and the crawl goes on with other pages meanwhile. Once
+        the circuit of a host has opened `MAX_CIRCUIT_OPENINGS` times in
+        the crawl, its refused pages go to `failed_urls` with
+        `CircuitOpenError`, so a host that stays down holds the crawl for
+        about two cooldowns of the breaker.
 
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
@@ -418,8 +553,9 @@ class AsyncCrawler:
         Failed pages do not stop the crawl: they are listed in `failed_urls`.
         The state of the crawl (`processed_urls`, `visited_urls`,
         `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `url_depths`,
-        `crawl_stats()`) is reset on every call and stays available after it
-        returns. The rate limits and the robots.txt cache carry over.
+        `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()`) is reset
+        on every call and stays available after it returns. The rate limits, the robots.txt
+        cache and the states of the circuit breaker carry over.
 
         Raises:
             TypeError: a single string is passed instead of a list of URLs or patterns.
@@ -446,7 +582,9 @@ class AsyncCrawler:
         self.processed_urls = {}
         self._pages_requested = 0
         self._retries = 0
+        self._errors = ErrorTracker()
         self.rate_limiter.reset_stats()
+        self.circuit_breaker.reset_stats()
         for url in start_urls:
             self._queue.add_url(url, priority=0, depth=0)
 
@@ -496,17 +634,23 @@ class AsyncCrawler:
             avg_wait=rate.avg_wait,
         )
 
+    def error_stats(self) -> ErrorStats:
+        """Errors of page requests since the latest crawl() started, or since the crawler was created."""
+        return self._errors.get_stats()
+
     async def _crawl_worker(self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int) -> None:
         while (url := await queue.get_next()) is not None:
             try:
-                # robots.txt is checked before the page counts toward
-                # max_pages: a blocked page costs no request.
-                refusal = await self._check_robots(url)
+                # robots.txt and the circuit breaker are checked before the
+                # page counts toward max_pages: a refused page costs no request.
+                refusal = await self._check_robots(url) or self._check_circuit(url) or self._check_probes_left(url)
                 if refusal is not None:
                     if isinstance(refusal, RobotsDisallowedError):
                         queue.mark_blocked(url, refusal.message)
                     elif isinstance(refusal, RobotsUnreachableError):
                         queue.mark_unreachable(url, refusal.message)
+                    elif isinstance(refusal, CircuitOpenError):
+                        self._defer_or_fail(url, queue, refusal)
                     else:
                         queue.mark_failed(url, f"{type(refusal).__name__}: {refusal.message}")
                     continue
@@ -530,14 +674,17 @@ class AsyncCrawler:
     async def _crawl_page(self, url: str, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
         depth = queue.depth(url)
         result = await self._fetch(url, html_only=True, check_robots=False)
+        if isinstance(result.error, CircuitOpenError):
+            # Not sent: the circuit opened while the page waited for its turn.
+            self._pages_requested -= 1
+            self._defer_or_fail(url, queue, result.error)
+            return
         if result.error is not None:
             queue.mark_failed(url, f"{type(result.error).__name__}: {result.error.message}")
             return
-        page = await self._parse(result)
-
         if result.redirected:
             # Normalized like the links, so that patterns see the same form.
-            final_url = normalize_url(page["final_url"])
+            final_url = normalize_url(result.final_url or url)
             assert final_url is not None  # aiohttp has just fetched it
             # A later link to the redirect target must not fetch the page again.
             queue.mark_seen(final_url)
@@ -553,6 +700,12 @@ class AsyncCrawler:
                 queue.mark_skipped(url, f"redirected out of scope: {final_url}")
                 return
 
+        try:
+            page = await self._parse(result)
+        except ParseError as error:
+            logger.warning("Failed to parse %s: %s", url, error.message)
+            queue.mark_failed(url, f"ParseError: {error.message}")
+            return
         queued = 0
         if depth < self.max_depth:
             for link in page["links"]:
@@ -561,6 +714,31 @@ class AsyncCrawler:
         self.processed_urls[url] = page
         queue.mark_processed(url)
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
+
+    def _check_probes_left(self, url: str) -> CircuitOpenError | None:
+        """In a crawl, a host whose circuit has opened `MAX_CIRCUIT_OPENINGS` times gets no more probes."""
+        host = get_host(url)
+        if host is None or self.circuit_breaker.state(host) is CircuitState.CLOSED:
+            return None
+        opened = self.circuit_breaker.times_opened(host)
+        if opened < self.MAX_CIRCUIT_OPENINGS:
+            return None
+        return CircuitOpenError(url, f"circuit breaker of {host} opened {opened} times, no more probes in this crawl")
+
+    def _defer_or_fail(self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError) -> None:
+        """Put off a page the circuit breaker refused until its host may be probed, or give up on it."""
+        host = get_host(url)
+        assert host is not None  # a URL without a host has no circuit
+        opened = self.circuit_breaker.times_opened(host)
+        if opened >= self.MAX_CIRCUIT_OPENINGS:
+            logger.info("Gave up on %s: circuit breaker of %s opened %d times", url, host, opened)
+            queue.mark_failed(url, f"CircuitOpenError: {refusal.message}")
+            return
+        # Back when the probe may go; a page refused while the probe is in
+        # flight comes back a second later.
+        delay = self.circuit_breaker.probe_in(url) or 1.0
+        logger.info("Deferred %s for %.1fs: %s", url, delay, refusal.message)
+        queue.defer(url, delay, priority=queue.depth(url))
 
     async def close(self) -> None:
         """Close the underlying session. Safe to call more than once."""
@@ -591,7 +769,7 @@ class AsyncCrawler:
             fallback_charset_resolver=_sniff_charset,
         )
 
-    async def _request(self, url: str, *, html_only: bool = False) -> _Response:
+    async def _request(self, url: str, *, html_only: bool, timeout: aiohttp.ClientTimeout) -> _Response:
         """Perform the GET request and read the whole body.
 
         With `html_only`, the body of a response whose Content-Type is not
@@ -608,7 +786,7 @@ class AsyncCrawler:
         session = self._get_session()
         headers = None if self._rotated_agents is None else {"User-Agent": next(self._rotated_agents)}
         try:
-            async with session.get(url, headers=headers) as response:
+            async with session.get(url, headers=headers, timeout=timeout) as response:
                 response.raise_for_status()
                 # aiohttp reports "application/octet-stream" when the header
                 # is missing; None lets callers tell the two cases apart.
@@ -644,7 +822,7 @@ class AsyncCrawler:
             retry_after = parse_retry_after(exc.headers.get(aiohttp.hdrs.RETRY_AFTER) if exc.headers else None)
             raise HTTPStatusError(url, exc.status, exc.message, retry_after=retry_after) from exc
         except TimeoutError as exc:
-            raise FetchTimeoutError(url, "request timed out") from exc
+            raise FetchTimeoutError(url, _describe_timeout(exc, timeout)) from exc
         # UnicodeError comes from IDNA encoding of the host, e.g. a domain
         # label longer than 63 characters; aiohttp does not wrap it.
         except (aiohttp.InvalidURL, UnicodeError) as exc:
@@ -653,6 +831,16 @@ class AsyncCrawler:
             raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
+
+
+def _describe_timeout(exc: TimeoutError, timeout: aiohttp.ClientTimeout) -> str:
+    # aiohttp raises its own subclasses for the connect and read timeouts
+    # and a plain TimeoutError for the total one.
+    if isinstance(exc, aiohttp.ConnectionTimeoutError):
+        return f"connect timeout ({timeout.connect:.1f}s)"
+    if isinstance(exc, aiohttp.SocketTimeoutError):
+        return f"read timeout ({timeout.sock_read:.1f}s)"
+    return f"total timeout ({timeout.total:.1f}s)"
 
 
 def _sniff_charset(response: aiohttp.ClientResponse, body: bytes) -> str:

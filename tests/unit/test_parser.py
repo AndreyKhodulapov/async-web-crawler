@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from pages import fixture_html
 
 import crawler.parser as parser_module
-from crawler import HTMLParser
+from crawler import HTMLParser, ParseError
 
 PAGE_URL = "https://shop.example.com/catalog/tools/index.html"
 
@@ -273,11 +273,9 @@ class TestBrokenHTML:
         assert page["text"] == "deep"
 
     @pytest.mark.parametrize("html", ["", "   \n\t"])
-    def test_empty_document(self, parser, html, caplog):
-        page = parser.parse(html, "https://example.com/")
-        assert page["errors"] == ["empty document"]
-        assert page["text"] == ""
-        assert "empty document" in caplog.text
+    def test_empty_document(self, parser, html):
+        with pytest.raises(ParseError, match="empty document"):
+            parser.parse(html, "https://example.com/")
 
     def test_plain_text_is_reported_but_kept(self, parser):
         page = parser.parse("just some text", "https://example.com/")
@@ -330,9 +328,8 @@ class TestBrokenHTML:
 
     @pytest.mark.parametrize("content_type", ["application/json", "image/png"])
     def test_unsupported_content_type(self, parser, content_type):
-        page = parser.parse("<p>looks like html</p>", "https://example.com/", content_type=content_type)
-        assert page["errors"] == [f"unsupported content type: {content_type}"]
-        assert page["text"] == ""
+        with pytest.raises(ParseError, match=f"unsupported content type: {content_type}"):
+            parser.parse("<p>looks like html</p>", "https://example.com/", content_type=content_type)
 
     @pytest.mark.parametrize(
         "content_type",
@@ -385,6 +382,5 @@ class TestPartialResults:
             raise ValueError(features)
 
         monkeypatch.setattr(parser_module, "BeautifulSoup", always_fails)
-        page = parser.parse("<p>body</p>", "https://example.com/")
-        assert page["text"] == ""
-        assert len(page["errors"]) == 2
+        with pytest.raises(ParseError, match="lxml parser failed: ValueError: lxml; html.parser parser failed"):
+            parser.parse("<p>body</p>", "https://example.com/")

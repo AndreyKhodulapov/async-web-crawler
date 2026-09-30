@@ -6,7 +6,15 @@ import time
 import pytest
 from helpers import BOT, FakeClock
 
-from crawler import CrawlerClosedError, NetworkError, RobotsParser, RobotsRules, TooManyRedirectsError, product_token
+from crawler import (
+    CircuitOpenError,
+    CrawlerClosedError,
+    NetworkError,
+    RobotsParser,
+    RobotsRules,
+    TooManyRedirectsError,
+    product_token,
+)
 
 
 def allowed(robots_txt: str, path: str, user_agent: str = BOT) -> bool:
@@ -324,10 +332,17 @@ class TestRobotsParser:
         assert await asyncio.gather(*downloads) == [True, True]
         assert len(fetch.requested) == 2  # the two callers shared one download
 
-    async def test_closed_fetcher_is_reported_and_not_cached(self):
-        fetch = FakeFetcher(CrawlerClosedError("https://site/robots.txt", "crawler is closed"))
+    @pytest.mark.parametrize(
+        "error",
+        [
+            CrawlerClosedError("https://site/robots.txt", "crawler is closed"),
+            CircuitOpenError("https://site/robots.txt", "circuit breaker of site is open"),
+        ],
+    )
+    async def test_request_not_sent_is_reported_and_not_cached(self, error):
+        fetch = FakeFetcher(error)
         robots = RobotsParser(fetch)
-        with pytest.raises(CrawlerClosedError):
+        with pytest.raises(type(error)):
             await robots.is_allowed("https://site/page", BOT)
 
         fetch.answer = (200, "")

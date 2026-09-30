@@ -11,6 +11,7 @@ from crawler import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    RetryStrategy,
     TooManyRedirectsError,
 )
 
@@ -46,7 +47,7 @@ async def test_idna_error_is_an_invalid_url(crawler):
 
 
 async def test_redirect_loop_is_not_retried(server):
-    async with AsyncCrawler(**{**UNTHROTTLED, "max_retries": 2}) as crawler:
+    async with AsyncCrawler(**{**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=2)}) as crawler:
         with pytest.raises(TooManyRedirectsError, match="too many redirects"):
             await crawler.fetch_url(str(server.make_url("/redirect-loop")))
         assert crawler.rate_limiter.get_stats().requests == 1  # one attempt, no retries
@@ -86,3 +87,61 @@ async def test_concurrent_is_faster_than_sequential(server):
     # Requests overlap, so the batch takes about one delay instead of five.
     # A relative bound keeps the test stable on slow machines.
     assert concurrent < sequential / 2
+
+
+async def test_retry_strategy_wraps_fetch_url(crawler, url, site):
+    retry_strategy = RetryStrategy(max_retries=3, backoff_factor=2.0, base_delay=0.01)
+    html = await retry_strategy.execute_with_retry(crawler.fetch_url, url("/flaky/2"))
+    assert "Recovered" in html
+    assert site.hits["/flaky/2"] == 3
+
+
+async def test_retry_strategy_does_not_repeat_not_found(crawler, url, site):
+    retry_strategy = RetryStrategy(base_delay=0.01)
+    with pytest.raises(HTTPStatusError):
+        await retry_strategy.execute_with_retry(crawler.fetch_url, url("/site/missing.html"))
+    assert site.hits["/site/missing.html"] == 1
+
+
+@pytest.fixture
+async def retrying_crawler():
+    options = {**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=3, base_delay=0.01)}
+    async with AsyncCrawler(**options) as crawler:
+        yield crawler
+
+
+async def test_crawler_retries_service_unavailable(retrying_crawler, url, site):
+    assert "Recovered" in await retrying_crawler.fetch_url(url("/flaky/2"))
+    assert site.hits["/flaky/2"] == 3
+
+
+@pytest.mark.parametrize(("path", "requests"), [("/status/404", 1), ("/status/403", 1), ("/status/500", 2)])
+async def test_crawler_retries_by_status(retrying_crawler, server, path, requests):
+    with pytest.raises(HTTPStatusError):
+        await retrying_crawler.fetch_url(str(server.make_url(path)))
+    assert retrying_crawler.rate_limiter.get_stats().requests == requests
+
+
+async def test_crawler_retries_timeouts(server):
+    options = {**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=2, base_delay=0.01)}
+    async with AsyncCrawler(read_timeout=0.1, **options) as crawler:
+        with pytest.raises(FetchTimeoutError):
+            await crawler.fetch_url(str(server.make_url("/delay/1")))
+        assert crawler.rate_limiter.get_stats().requests == 3
+
+
+async def test_growing_timeout_lets_a_slow_page_through(server):
+    # The page answers in 0.5s: the first attempt times out after 0.3s, the
+    # retry waits up to 0.9s and gets the page.
+    options = {**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=1, base_delay=0.01)}
+    async with AsyncCrawler(read_timeout=0.3, timeout_growth=3, **options) as crawler:
+        assert await crawler.fetch_url(str(server.make_url("/delay/0.5"))) == "done"
+        assert crawler.rate_limiter.get_stats().requests == 2
+
+
+async def test_fixed_timeout_keeps_failing_a_slow_page(server):
+    options = {**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=1, base_delay=0.01)}
+    async with AsyncCrawler(read_timeout=0.3, timeout_growth=1, **options) as crawler:
+        with pytest.raises(FetchTimeoutError, match=r"read timeout \(0\.3s\)"):
+            await crawler.fetch_url(str(server.make_url("/delay/0.5")))
+        assert crawler.rate_limiter.get_stats().requests == 2

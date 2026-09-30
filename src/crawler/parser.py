@@ -10,6 +10,7 @@ from typing import TypeVar
 from bs4 import BeautifulSoup
 from bs4.element import Comment, Declaration, Doctype, NavigableString, PageElement, ProcessingInstruction, Tag
 
+from crawler.exceptions import ParseError
 from crawler.models import Heading, Image, ItemList, Metadata, ParsedPage, Table
 from crawler.urls import is_same_host, resolve_url
 
@@ -28,9 +29,10 @@ _NON_CONTENT_TAGS = _HIDDEN_TAGS | {"head", "title"}
 class HTMLParser:
     """Extracts text, links, metadata and structured elements from HTML.
 
-    Parsing never raises: malformed markup is repaired by the parser, and if
-    one extractor fails, the error is logged and recorded in
-    `ParsedPage["errors"]` while the other fields are still filled in.
+    Malformed markup is repaired by the parser, and if one extractor fails,
+    the error is logged and recorded in `ParsedPage["errors"]` while the
+    other fields are still filled in. Only input that is not an HTML
+    document at all raises `ParseError`.
     Content inside <noscript>, <template>, <script> and <style> is ignored
     by every extractor.
 
@@ -54,6 +56,10 @@ class HTMLParser:
         of milliseconds, and running it on the loop would stall every other
         request. A worker thread keeps the loop responsive. Because of the GIL
         it gives no parallel speedup; that would need a process pool.
+
+        Raises:
+            ParseError: the content type is not HTML, the document is empty,
+                or no parser could read it.
         """
         return await asyncio.to_thread(self.parse, html, url, final_url=final_url, content_type=content_type)
 
@@ -70,14 +76,10 @@ class HTMLParser:
         page = _empty_page(url, final_url or url)
 
         if not is_html_content_type(content_type):
-            self._report(page, f"unsupported content type: {content_type}")
-            return page
+            raise ParseError(url, f"unsupported content type: {content_type}")
         if not html.strip():
-            self._report(page, "empty document")
-            return page
+            raise ParseError(url, "empty document")
         soup = self._make_soup(html, page)
-        if soup is None:
-            return page
         if "<" not in html:
             self._report(page, "no HTML markup found")
 
@@ -262,7 +264,7 @@ class HTMLParser:
         return lists
 
     @staticmethod
-    def _make_soup(html: str, page: ParsedPage) -> BeautifulSoup | None:
+    def _make_soup(html: str, page: ParsedPage) -> BeautifulSoup:
         # lxml is fast and lenient; the pure-Python parser is a fallback for
         # the rare input lxml itself cannot handle.
         for features in ("lxml", "html.parser"):
@@ -271,7 +273,7 @@ class HTMLParser:
             except Exception as exc:
                 logger.warning("%s parser failed on %s", features, page["url"], exc_info=True)
                 page["errors"].append(f"{features} parser failed: {type(exc).__name__}: {exc}")
-        return None
+        raise ParseError(page["url"], "; ".join(page["errors"]))
 
     @staticmethod
     def _extract(

@@ -4,10 +4,12 @@ Usage:
     python src/main.py benchmark [options] [URL ...]   # sequential vs concurrent fetching
     python src/main.py parse [options] [URL ...]       # fetch pages and extract data
     python src/main.py crawl [options] [URL ...]       # follow links from start pages
+    python src/main.py errors [options] [URL ...]      # crawl a local site that fails on purpose
 """
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -16,38 +18,63 @@ import sys
 import textwrap
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
 from crawler import (
     AsyncCrawler,
+    CircuitBreaker,
+    CircuitState,
     CrawlStats,
     FetchError,
     FetchResult,
     HTMLParser,
     HTTPStatusError,
     ParsedPage,
+    RetryStrategy,
     get_host,
     is_same_host,
     is_valid_http_url,
     product_token,
 )
+from demo_site import DemoSite
+
+# The longest pause between retries; a longer --retry-delay would not be doubled.
+MAX_RETRY_DELAY = 30.0
+
+
+def number(raw: str, number_type: type[int] | type[float] = float) -> int | float:
+    """`raw` as a finite number of `number_type`; the checks every numeric option shares."""
+    try:
+        value = number_type(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"must be a finite number, got {raw}")
+    return value
 
 
 def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) -> Callable[[str], int | float]:
     def parse(raw: str) -> int | float:
-        try:
-            value = number_type(raw)
-        except ValueError:
-            raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
-        if not math.isfinite(value):
-            raise argparse.ArgumentTypeError(f"must be a finite number, got {raw}")
+        value = number(raw, number_type)
         if value < 0 or (value == 0 and not allow_zero):
             raise argparse.ArgumentTypeError(f"must be {'non-negative' if allow_zero else 'positive'}, got {raw}")
         return value
 
     return parse
+
+
+def at_least_one(raw: str) -> float:
+    if (value := number(raw)) < 1:
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {raw}")
+    return value
+
+
+def share(raw: str) -> float:
+    if not 0 < (value := number(raw)) <= 1:
+        raise argparse.ArgumentTypeError(f"must be in (0, 1], got {raw}")
+    return value
 
 
 def http_url(raw: str) -> str:
@@ -64,19 +91,52 @@ def regex(raw: str) -> str:
     return raw
 
 
-def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log_level: str = "INFO") -> None:
+def add_common_options(
+    parser: argparse.ArgumentParser,
+    *,
+    retries: int = 2,
+    retry_delay: float = 1.0,
+    log_level: str = "INFO",
+    robots: bool = True,
+) -> None:
     """Options every command has; the defaults that differ by command are arguments.
+
+    With `robots=False`, the command does not check robots.txt unless given
+    `--robots`, in place of `--no-robots`.
 
     Each command gets its own copy: a parent parser shared through `parents=`
     shares its option objects too, so `set_defaults` on one command would
     change the default of all of them.
     """
     parser.add_argument("--concurrency", type=positive(int), default=10, help="max parallel requests")
-    parser.add_argument(
-        "--timeout",
+    timeouts = parser.add_argument_group("timeouts")
+    timeouts.add_argument(
+        "--connect-timeout",
         type=positive(float),
         default=5.0,
-        help="connect, read and total timeout per request, s",
+        metavar="S",
+        help="DNS, TCP and TLS, s (default: %(default)g)",
+    )
+    timeouts.add_argument(
+        "--read-timeout",
+        type=positive(float),
+        default=5.0,
+        metavar="S",
+        help="each chunk of the response, s (default: %(default)g)",
+    )
+    timeouts.add_argument(
+        "--total-timeout",
+        type=positive(float),
+        default=10.0,
+        metavar="S",
+        help="whole request, s (default: %(default)g)",
+    )
+    timeouts.add_argument(
+        "--timeout-growth",
+        type=at_least_one,
+        default=1.5,
+        metavar="X",
+        help=f"multiply the timeouts by X on every retry, at most {AsyncCrawler.MAX_TIMEOUT_GROWTH:g}x (default: %(default)g)",
     )
     parser.add_argument(
         "--log-level",
@@ -89,7 +149,7 @@ def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log
         "--rps",
         type=positive(float, allow_zero=True),
         default=1.0,
-        help="max requests per second to one host, 0 = no limit (default: 1)",
+        help="max requests per second to one host, 0 = no limit (default: %(default)g)",
     )
     politeness.add_argument(
         "--min-delay", type=positive(float, allow_zero=True), default=0.0, help="min seconds between requests to a host"
@@ -97,10 +157,42 @@ def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log
     politeness.add_argument(
         "--jitter", type=positive(float, allow_zero=True), default=0.0, help="random extra delay up to this, s"
     )
-    politeness.add_argument("--no-robots", action="store_true", help="do not check robots.txt")
+    if robots:
+        politeness.add_argument("--no-robots", action="store_true", help="do not check robots.txt")
+    else:
+        politeness.add_argument(
+            "--robots", action="store_false", dest="no_robots", help="check robots.txt; for real URLs, add --rps 1"
+        )
     politeness.add_argument(
-        "--retries", type=positive(int, allow_zero=True), default=retries, help="retries of timeouts, 429 and 5xx"
+        "--retries",
+        type=positive(int, allow_zero=True),
+        default=retries,
+        help="retries of timeouts, network errors, HTTP 408, 429, 500, 502-504 and 520-524",
     )
+    politeness.add_argument(
+        "--retry-delay",
+        type=positive(float),
+        default=retry_delay,
+        metavar="S",
+        help=f"seconds before the first retry, doubled for every next one up to {MAX_RETRY_DELAY:g} (default: %(default)g)",
+    )
+    breaker = parser.add_argument_group("circuit breaker")
+    breaker.add_argument(
+        "--breaker-threshold",
+        type=share,
+        default=0.5,
+        metavar="SHARE",
+        help="block a host once this share of its requests in the last minute (5 at least) "
+        "failed with a timeout, a network error, HTTP 408, 429 or 5xx (default: %(default)g)",
+    )
+    breaker.add_argument(
+        "--breaker-cooldown",
+        type=positive(float, allow_zero=True),
+        default=30.0,
+        metavar="S",
+        help="how long a blocked host is left alone before a probe request, s (default: %(default)g)",
+    )
+    breaker.add_argument("--no-breaker", action="store_true", help="never block a host")
     politeness.add_argument(
         "--user-agent",
         action="append",
@@ -120,7 +212,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "https://httpbin.org/delay/2",
         "https://httpbin.org/status/404",
         "https://httpbin.org/status/500",
-        "https://httpbin.org/delay/10",  # slower than the default --timeout
+        "https://httpbin.org/delay/10",  # slower than the default --read-timeout
         "https://nonexistent-domain.invalid",
     ]
     # Real sites of different kinds.
@@ -166,7 +258,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # A log line per request would bury the progress line; --log-level INFO shows them.
     add_common_options(crawl, log_level="WARNING")
 
+    errors = commands.add_parser(
+        "errors", help="crawl a local site that fails in every way, show retries and error statistics"
+    )
+    errors.add_argument(
+        "urls",
+        nargs="*",
+        type=http_url,
+        help="real URLs to fetch along with the local site; ones on localhost or 127.0.0.1 "
+        "share the circuit breaker with the site's hosts",
+    )
+    errors.add_argument(
+        "--json",
+        type=Path,
+        default=Path("error_report.json"),
+        metavar="PATH",
+        help="where to save the error report (default: %(default)s)",
+    )
+    # Fast retries, a short read timeout and a short cooldown of the breaker
+    # (the crawl waits for the probes of the server that is down) keep the
+    # demo within seconds; the site is local, so no rate limit or robots.txt.
+    add_common_options(errors, retries=3, retry_delay=0.2, robots=False)
+    errors.set_defaults(read_timeout=1.0, rps=0.0, breaker_cooldown=1.0)
+
     args = parser.parse_args(argv)
+    if args.retry_delay > MAX_RETRY_DELAY:
+        parser.error(f"--retry-delay must be at most {MAX_RETRY_DELAY:g}, got {args.retry_delay:g}")
     if args.user_agent and len({product_token(agent) for agent in args.user_agent}) > 1:
         parser.error("every --user-agent must start with the same bot name, e.g. MyBot/1.0 (...)")
     return args
@@ -179,14 +296,18 @@ def make_crawler(args: argparse.Namespace, parser: HTMLParser | None = None, **o
         options |= {"user_agent": args.user_agent[0], "user_agents": args.user_agent}
     return AsyncCrawler(
         max_concurrent=args.concurrency,
-        total_timeout=args.timeout,
-        connect_timeout=args.timeout,
-        read_timeout=args.timeout,
+        total_timeout=args.total_timeout,
+        connect_timeout=args.connect_timeout,
+        read_timeout=args.read_timeout,
+        timeout_growth=args.timeout_growth,
         requests_per_second=args.rps or None,
         min_delay=args.min_delay,
         jitter=args.jitter,
         respect_robots=not args.no_robots,
-        max_retries=args.retries,
+        retry_strategy=RetryStrategy(max_retries=args.retries, base_delay=args.retry_delay, max_delay=MAX_RETRY_DELAY),
+        circuit_breaker=CircuitBreaker(
+            None if args.no_breaker else args.breaker_threshold, cooldown=args.breaker_cooldown
+        ),
         parser=parser,
         **options,
     )
@@ -416,9 +537,66 @@ def print_politeness_report(crawler: AsyncCrawler) -> None:
     print(
         f"Average gap between requests to a host: {stats.avg_delay:.2f}s, "
         f"average wait for the rate limit: {stats.avg_wait:.2f}s, "
-        f"retries: {stats.retries}, blocked by robots.txt: {stats.blocked}, "
+        f"retries (robots.txt included): {stats.retries}, blocked by robots.txt: {stats.blocked}, "
         f"not fetched as robots.txt was unreachable: {stats.unreachable}"
     )
+
+
+def error_report(crawler: AsyncCrawler) -> dict[str, object]:
+    """Error statistics and the circuit breaker of every host, for JSON output."""
+    errors = crawler.error_stats()
+    return {
+        "errors": {
+            "total": errors.total,
+            "by_kind": dict(errors.by_kind),
+            "by_class": dict(errors.by_class),
+            "retries": errors.retries,
+            "successful_retries": errors.successful_retries,
+            "avg_retry_time": round(errors.avg_retry_time, 3),
+            "permanent_errors": dict(errors.permanent_errors),
+        },
+        "circuit_breaker": {
+            host: dataclasses.asdict(circuit) for host, circuit in crawler.circuit_breaker.get_stats().items()
+        },
+    }
+
+
+def format_counts(counts: Mapping[str, int]) -> str:
+    return ", ".join(f"{name} {count}" for name, count in counts.items()) or "none"
+
+
+def print_error_report(crawler: AsyncCrawler) -> None:
+    errors = crawler.error_stats()
+    print(f"\n=== Errors ({errors.total} failed attempts) ===")
+    print(f"By kind:  {format_counts(errors.by_kind)}")
+    by_class = dict(sorted(errors.by_class.items(), key=lambda item: -item[1]))
+    print(f"By class: {format_counts(by_class)}")
+    print(
+        f"Retries: {errors.retries}, pages recovered by a retry: {errors.successful_retries}, "
+        f"average time per retry: {errors.avg_retry_time:.2f}s"
+    )
+    if errors.permanent_errors:
+        print(f"Permanent errors ({len(errors.permanent_errors)}):")
+        for url, error in errors.permanent_errors.items():
+            print(f"  {url}  {error}")
+
+    breaker = crawler.circuit_breaker
+    if not breaker.enabled:
+        print("\nCircuit breaker: off")
+        return
+    circuits = breaker.get_stats()
+    host_width = max([len("HOST")] + [len(host) for host in circuits])
+    states = Counter(circuit.state for circuit in circuits.values())
+    print(
+        f"\n=== Circuit breaker ({len(circuits)} hosts: {states[CircuitState.OPEN]} open, "
+        f"{states[CircuitState.HALF_OPEN]} half-open) ==="
+    )
+    print(f"{'HOST':<{host_width}}  {'STATE':<9}  {'REQUESTS':>8}  {'FAILURES':>8}  {'OPENED':>6}  {'REJECTED':>8}")
+    for host, circuit in circuits.items():
+        print(
+            f"{host:<{host_width}}  {circuit.state:<9}  {circuit.requests:>8}  {circuit.failures:>8}  "
+            f"{circuit.times_opened:>6}  {circuit.rejected:>8}"
+        )
 
 
 def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
@@ -441,6 +619,7 @@ def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
             "avg_wait": round(stats.avg_wait, 3),
         },
         "hosts": host_stats(crawler),
+        **error_report(crawler),
         "pages": [{"depth": depths[url], **page} for url, page in crawler.processed_urls.items()],
         "failed": [{"url": url, "depth": depths[url], "error": error} for url, error in crawler.failed_urls.items()],
         "skipped": [
@@ -474,8 +653,33 @@ async def run_crawl(args: argparse.Namespace) -> None:
 
     print_crawl_report(crawler)
     print_politeness_report(crawler)
+    print_error_report(crawler)
     if args.json is not None:
         save_crawl_json(args.json, crawler)
+
+
+def save_error_report(path: Path, crawler: AsyncCrawler) -> None:
+    report = {
+        **error_report(crawler),
+        "failed": [{"url": url, "error": error} for url, error in crawler.failed_urls.items()],
+        "fetched": list(crawler.processed_urls),
+    }
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nError report saved to {path}")
+
+
+async def run_errors(args: argparse.Namespace) -> None:
+    async with DemoSite(extra_links=args.urls) as site:
+        print(f"Crawling {site.url}: ordinary pages, HTTP 503, 429, 500, 404 and 403, a slow page,", file=sys.stderr)
+        print("a JSON file, a server that is down and a domain that does not exist\n", file=sys.stderr)
+        # Depth 1: the start page and its links, none of theirs. Two requests
+        # to a host at a time keep the pages in the order of the links.
+        async with make_crawler(args, max_depth=1, max_per_domain=2) as crawler:
+            await crawler.crawl([site.url], max_pages=len(site.links()) + 1)
+
+    print_crawl_report(crawler)
+    print_error_report(crawler)
+    save_error_report(args.json, crawler)
 
 
 class ProgressAwareHandler(logging.StreamHandler):
@@ -509,7 +713,7 @@ async def main() -> None:
         datefmt="%H:%M:%S",
         handlers=[ProgressAwareHandler()],
     )
-    commands = {"benchmark": run_benchmark, "parse": run_parse, "crawl": run_crawl}
+    commands = {"benchmark": run_benchmark, "parse": run_parse, "crawl": run_crawl, "errors": run_errors}
     await commands[args.command](args)
 
 
