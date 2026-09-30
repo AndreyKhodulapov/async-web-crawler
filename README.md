@@ -524,15 +524,19 @@ counted in `error_stats()`. After that one request goes through as a probe
 
 Failures are timeouts, network errors, HTTP 408, 429 and any 5xx, even
 one that is not retried, such as 501; any other response, a 404 too, is a
-success, so broken links do not block a site.
-Every attempt counts, retries and robots.txt downloads included. The
-circuit is checked before a request waits for the rate limit, where a
-half-open one gives its probe to one request and refuses the rest, and once
-more when its turn comes, so the requests queued for a host stop as soon as
-it opens. A retry the breaker would refuse is not made, so the request
-fails with the error of its last attempt, not with `CircuitOpenError`.
-robots.txt refused this way is not cached as unreachable. In a crawl, the
-pages of a blocked host go to `failed_urls` without counting toward
+success, so broken links do not block a site. Every attempt counts,
+retries and robots.txt downloads included. An outcome counts for the host
+of the requested URL: the HTTP client follows redirects on its own, so a
+link that redirects to a failing host counts against the host of the link.
+The circuit is checked before a request waits for the rate limit, where a
+half-open one gives its probe to one request and refuses the rest, and
+once more when its turn comes: a request that was already waiting when the
+circuit opened is not sent, but it is refused only when its turn comes. A
+retry the breaker would refuse is not made, so the request fails with the
+error of its last attempt, not with `CircuitOpenError`. When the breaker
+refuses the download of robots.txt, the page fails with `CircuitOpenError`
+under its own URL, and robots.txt is not cached as unreachable. In a crawl,
+the pages of a blocked host go to `failed_urls` without counting toward
 `max_pages`.
 
 | Parameter | Default | Meaning |

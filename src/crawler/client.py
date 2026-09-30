@@ -397,7 +397,8 @@ class AsyncCrawler:
         try:
             allowed = await self.robots.is_allowed(url, self._user_agent)
         except (CrawlerClosedError, CircuitOpenError) as error:
-            return error
+            # Raised for the robots.txt URL; the page fails for the same reason under its own.
+            return type(error)(url, error.message)
         crawl_delay = self.robots.get_crawl_delay(url, self._user_agent)
         if crawl_delay:
             self.rate_limiter.set_delay(host, crawl_delay)

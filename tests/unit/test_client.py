@@ -658,6 +658,17 @@ class TestCircuitBreaker:
         with pytest.raises(LookupError):
             crawler.robots.unreachable_reason("https://a/page")
 
+    async def test_refused_robots_txt_fails_the_page_under_its_own_url(self, make_crawler, fake_session):
+        crawler = make_crawler(respect_robots=True, circuit_breaker=CircuitBreaker(min_requests=2))
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=404)
+        fake_session.routes["http://a/down"] = aiohttp.ClientConnectionError("refused")
+        await crawler.fetch_many(["http://a/down", "http://a/down"])
+
+        result = await crawler.fetch_result("https://a/page")
+        assert isinstance(result.error, CircuitOpenError)
+        assert result.error.url == "https://a/page"
+        assert str(result.error).startswith("https://a/page: circuit breaker of a is open")
+
     async def test_host_recovers_after_the_cooldown(self, make_crawler, fake_session):
         clock = FakeClock()
         crawler = make_crawler(circuit_breaker=CircuitBreaker(min_requests=2, cooldown=10, clock=clock))
