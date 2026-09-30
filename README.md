@@ -124,7 +124,7 @@ DEPTH  RESULT                                LINKS  URL
     ...
     1  blocked, disallowed by robots.txt            https://webscraper.io/test-sites/pagination/BMW
     1  blocked, disallowed by robots.txt            https://webscraper.io/test-sites/pagination?page=2
-    1  FetchTimeoutError: request timed out         https://webscraper.io/blog
+    1  FetchTimeoutError: read timeout (5.0s)       https://webscraper.io/blog
     1  ok                                       16  https://web-scraping.dev/
     1  PermanentHTTPError: HTTP 404 Not Found       https://web-scraping.dev/api/graphql
 Crawled: 28 pages, failed: 2, skipped: 0, blocked: 29, unreachable: 0, left in queue: 232, speed: 1.1 pages/s
@@ -350,6 +350,18 @@ async with AsyncCrawler(retry_strategy=retry_strategy) as crawler:
 
 # Any coroutine function can be retried on its own.
 html = await retry_strategy.execute_with_retry(fetch_page, "https://example.com")
+```
+
+Every failed attempt is logged as a warning with the error, the attempt
+number and the pause before the next one, and so is the final failure,
+with the reason it was not retried; a success after retries is logged at
+the INFO level:
+
+```
+WARNING | crawler.retry | Attempt 1/3 for https://httpbin.org/status/503 failed: TransientHTTPError: HTTP 503 SERVICE UNAVAILABLE; retrying in 0.9s
+WARNING | crawler.retry | Attempt 2/3 for https://httpbin.org/status/503 failed: TransientHTTPError: HTTP 503 SERVICE UNAVAILABLE; retrying in 1.6s
+WARNING | crawler.retry | Failed https://httpbin.org/status/503 on attempt 3/3 after 4.46s, no retries left: TransientHTTPError: HTTP 503 SERVICE UNAVAILABLE
+WARNING | crawler.retry | Failed https://httpbin.org/status/404 on attempt 1/3 after 0.82s, permanent error: PermanentHTTPError: HTTP 404 NOT FOUND
 ```
 
 The building blocks work on their own too:

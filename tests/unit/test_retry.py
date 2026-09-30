@@ -1,6 +1,7 @@
 """Unit tests for RetryStrategy and Retry-After parsing."""
 
 import asyncio
+import logging
 import random
 import time
 from datetime import UTC, datetime, timedelta
@@ -317,3 +318,90 @@ def test_retry_on_must_list_exception_classes(retry_on):
 def test_rule_rejects_invalid_options(options):
     with pytest.raises(ValueError):
         RetryRule(**options)
+
+
+class TestRetryLogging:
+    """Every attempt and the outcome are logged with what went wrong and what comes next."""
+
+    @staticmethod
+    def messages(caplog, level: int) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.name == "crawler.retry" and r.levelno == level]
+
+    async def test_failed_attempts_and_success_are_logged(self, waits, no_jitter, caplog):
+        caplog.set_level(logging.DEBUG, logger="crawler.retry")
+        attempts = Attempts(http_error(503), FetchTimeoutError(URL, "read timeout (20.0s)"), "page")
+        await strategy(waits, max_retries=3).run(attempts, target=URL)
+
+        assert self.messages(caplog, logging.WARNING) == [
+            f"Attempt 1/4 for {URL} failed: TransientHTTPError: HTTP 503 Error; retrying in 1.0s",
+            f"Attempt 2/4 for {URL} failed: FetchTimeoutError: read timeout (20.0s); retrying in 2.0s",
+        ]
+        [success] = self.messages(caplog, logging.INFO)
+        assert success.startswith(f"Succeeded {URL} on attempt 3/4 after ")
+
+    async def test_success_on_the_first_attempt_is_a_debug_message(self, waits, caplog):
+        caplog.set_level(logging.DEBUG, logger="crawler.retry")
+        await strategy(waits).run(Attempts("page"), target=URL)
+        [success] = self.messages(caplog, logging.DEBUG)
+        assert success.startswith(f"Succeeded {URL} on attempt 1/4 after ")
+        assert self.messages(caplog, logging.INFO) == self.messages(caplog, logging.WARNING) == []
+
+    @pytest.mark.parametrize(
+        ("options", "errors", "attempt", "reason"),
+        [
+            ({}, [http_error(404)], "1/4", "permanent error: PermanentHTTPError: HTTP 404 Error"),
+            (
+                {"retry_on": [NetworkError]},
+                [http_error(503)],
+                "1/4",
+                "not a retried error type: TransientHTTPError: HTTP 503 Error",
+            ),
+            ({"max_retries": 1}, [http_error(503)] * 2, "2/2", "no retries left: TransientHTTPError: HTTP 503 Error"),
+            ({}, [http_error(500)] * 2, "2/4", "no retries left for HTTP 500: TransientHTTPError: HTTP 500 Error"),
+            (
+                {"rules": {NetworkError: RetryRule(max_retries=0)}},
+                [NetworkError(URL, "connection reset")],
+                "1/4",
+                "no retries left for NetworkError: NetworkError: connection reset",
+            ),
+            (
+                {"max_delay": 30.0},
+                [http_error(429, retry_after=120)],
+                "1/4",
+                "Retry-After of 120s is longer than max_delay of 30s: TransientHTTPError: HTTP 429 Error",
+            ),
+        ],
+    )
+    async def test_final_failure_says_why_it_is_not_retried(self, waits, caplog, options, errors, attempt, reason):
+        attempts = Attempts(*errors)
+        with pytest.raises(FetchError):
+            await strategy(waits, **options).run(attempts, target=URL)
+        failure = self.messages(caplog, logging.WARNING)[-1]
+        assert failure.startswith(f"Failed {URL} on attempt {attempt} after ")
+        assert failure.endswith(f"s, {reason}")
+
+    async def test_failure_level_applies_to_the_final_failure_only(self, waits, caplog):
+        caplog.set_level(logging.DEBUG, logger="crawler.retry")
+        with pytest.raises(HTTPStatusError):
+            await strategy(waits, max_retries=1).run(Attempts(http_error(503)), target=URL, failure_level=logging.INFO)
+        [retry] = self.messages(caplog, logging.WARNING)
+        [failure] = self.messages(caplog, logging.INFO)
+        assert retry.startswith("Attempt 1/2")
+        assert failure.startswith("Failed")
+
+    async def test_execute_with_retry_names_the_call(self, waits, caplog):
+        attempts = Attempts(http_error(503), "page")
+
+        async def fetch_page(url: str, *, html_only: bool = False) -> object:
+            return await attempts(url)
+
+        await strategy(waits).execute_with_retry(fetch_page, URL, html_only=True)
+        [retry] = self.messages(caplog, logging.WARNING)
+        assert f"for fetch_page('{URL}', html_only=True) failed" in retry
+
+    async def test_other_exceptions_are_logged_with_their_text(self, waits, caplog):
+        with pytest.raises(KeyError):
+            await strategy(waits, retry_on=[OSError]).run(Attempts(ConnectionResetError("reset"), KeyError("x")))
+        retry, failure = self.messages(caplog, logging.WARNING)
+        assert "failed: ConnectionResetError: reset; retrying" in retry
+        assert failure.endswith("not a retried error type: KeyError: 'x'")

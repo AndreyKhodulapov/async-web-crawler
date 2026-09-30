@@ -2,8 +2,11 @@
 
 import asyncio
 import functools
+import logging
 import math
 import random
+import reprlib
+import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -11,7 +14,12 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import ClassVar, ParamSpec, TypeVar
 
-from crawler.exceptions import HTTPStatusError, NetworkError, PermanentError, TransientError
+from crawler.exceptions import FetchError, HTTPStatusError, NetworkError, PermanentError, TransientError
+
+logger = logging.getLogger(__name__)
+# Shortens arguments in the log, but keeps a URL whole.
+_short_repr = reprlib.Repr()
+_short_repr.maxstring = _short_repr.maxother = 200
 
 P = ParamSpec("P")
 T = TypeVar("T")
@@ -68,6 +76,10 @@ class RetryStrategy:
 
     `wait(error, delay)` waits before a retry; by default it sleeps. `run`
     takes another one for a single call, e.g. to wait in a rate limiter.
+
+    Every failed attempt is logged with the error, the attempt number and
+    the delay before the next one; so is the outcome: a failure with the
+    reason it was not retried, or a success that took retries.
     """
 
     DEFAULT_RULES: ClassVar[Mapping[int | type[Exception], RetryRule]] = {
@@ -109,22 +121,67 @@ class RetryStrategy:
         Raises:
             Exception: the error of the last attempt.
         """
-        return await self.run(functools.partial(coro, *args, **kwargs))
+        return await self.run(functools.partial(coro, *args, **kwargs), target=_describe_call(coro, args, kwargs))
 
-    async def run(self, call: Callable[[], Awaitable[T]], *, wait: Waiter | None = None) -> T:
-        """Like `execute_with_retry`, waiting before a retry with `wait` instead of the strategy's own."""
+    async def run(
+        self,
+        call: Callable[[], Awaitable[T]],
+        *,
+        wait: Waiter | None = None,
+        target: str | None = None,
+        failure_level: int = logging.WARNING,
+    ) -> T:
+        """Like `execute_with_retry`, with options for a single call.
+
+        `wait` replaces the strategy's own wait. `target` names the call in
+        the log, e.g. by its URL. `failure_level` is the log level of the
+        final failure; retries are always logged as warnings.
+        """
         wait = wait or self._wait
+        target = target or getattr(call, "__qualname__", repr(call))
+        max_attempts = self.max_retries + 1
         retries_by_rule: Counter[int | type[Exception] | None] = Counter()
+        started = time.perf_counter()
         while True:
+            attempt = retries_by_rule.total() + 1
             try:
-                return await call()
+                result = await call()
             except Exception as error:
                 key, rule = self._rule_for(error)
-                if not self._should_retry(error, rule, retries_by_rule[key], retries_by_rule.total()):
+                refusal = self._refusal(error, key, rule, retries_by_rule[key], retries_by_rule.total())
+                if refusal is not None:
+                    logger.log(
+                        failure_level,
+                        "Failed %s on attempt %d/%d after %.2fs, %s: %s",
+                        target,
+                        attempt,
+                        max_attempts,
+                        time.perf_counter() - started,
+                        refusal,
+                        _describe_error(error),
+                    )
                     raise
                 delay = self._delay(error, rule, retries_by_rule.total())
+                logger.warning(
+                    "Attempt %d/%d for %s failed: %s; retrying in %.1fs",
+                    attempt,
+                    max_attempts,
+                    target,
+                    _describe_error(error),
+                    delay,
+                )
                 retries_by_rule[key] += 1
                 await wait(error, delay)
+            else:
+                logger.log(
+                    logging.INFO if attempt > 1 else logging.DEBUG,
+                    "Succeeded %s on attempt %d/%d after %.2fs",
+                    target,
+                    attempt,
+                    max_attempts,
+                    time.perf_counter() - started,
+                )
+                return result
 
     def _rule_for(self, error: Exception) -> tuple[int | type[Exception] | None, RetryRule]:
         if isinstance(error, HTTPStatusError) and error.status in self.rules:
@@ -134,13 +191,28 @@ class RetryStrategy:
                 return cls, self.rules[cls]
         return None, RetryRule()
 
-    def _should_retry(self, error: Exception, rule: RetryRule, rule_retries: int, retries: int) -> bool:
-        if isinstance(error, PermanentError) or not isinstance(error, self.retry_on):
-            return False
-        if retries >= self.max_retries or (rule.max_retries is not None and rule_retries >= rule.max_retries):
-            return False
+    def _refusal(
+        self,
+        error: Exception,
+        key: int | type[Exception] | None,
+        rule: RetryRule,
+        rule_retries: int,
+        retries: int,
+    ) -> str | None:
+        """Why `error` is not retried, or None if it is."""
+        if isinstance(error, PermanentError):
+            return "permanent error"
+        if not isinstance(error, self.retry_on):
+            return "not a retried error type"
+        if retries >= self.max_retries:
+            return "no retries left"
+        if rule.max_retries is not None and rule_retries >= rule.max_retries:
+            kind = f"HTTP {key}" if isinstance(key, int) else getattr(key, "__name__", "this error")
+            return f"no retries left for {kind}"
         retry_after = error.retry_after if isinstance(error, HTTPStatusError) else None
-        return retry_after is None or retry_after <= self.max_delay
+        if retry_after is not None and retry_after > self.max_delay:
+            return f"Retry-After of {retry_after:g}s is longer than max_delay of {self.max_delay:g}s"
+        return None
 
     def _delay(self, error: Exception, rule: RetryRule, retries: int) -> float:
         try:
@@ -151,6 +223,20 @@ class RetryStrategy:
         if isinstance(error, HTTPStatusError) and error.retry_after is not None:
             backoff = max(backoff, error.retry_after)
         return min(backoff, self.max_delay)
+
+
+def _describe_call(coro: Callable[..., object], args: tuple[object, ...], kwargs: dict[str, object]) -> str:
+    """A short form of a call for the log, e.g. fetch_url('https://example.com')."""
+    name = getattr(coro, "__name__", None) or repr(coro)
+    arguments = [_short_repr.repr(arg) for arg in args]
+    arguments += [f"{key}={_short_repr.repr(value)}" for key, value in kwargs.items()]
+    return f"{name}({', '.join(arguments)})"
+
+
+def _describe_error(error: Exception) -> str:
+    # A FetchError repeats its URL in str(), and the log line already names the target.
+    message = error.message if isinstance(error, FetchError) else str(error)
+    return f"{type(error).__name__}: {message}" if message else type(error).__name__
 
 
 def parse_retry_after(value: str | None) -> float | None:

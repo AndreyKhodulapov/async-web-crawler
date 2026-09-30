@@ -1,6 +1,7 @@
 """Unit tests for AsyncCrawler with the HTTP session replaced by fakes."""
 
 import asyncio
+import logging
 import socket
 import ssl
 from unittest.mock import MagicMock
@@ -480,6 +481,36 @@ class TestRetries:
         assert crawler.rate_limiter.reserve("a") > 0  # other pages of the host wait too
         assert crawler.rate_limiter.reserve("b") == 0
         await retrying
+
+
+class TestRetryLogging:
+    @staticmethod
+    def warnings(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+    async def test_every_attempt_is_logged_once(self, make_crawler, fake_session, caplog):
+        caplog.set_level(logging.INFO)
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=2, base_delay=0.001))
+        fake_session.routes["http://a/"] = [FakeResponse(status=503), FakeResponse(b"ok")]
+        await crawler.fetch_url("http://a/")
+
+        [retry] = self.warnings(caplog)
+        assert retry.startswith("Attempt 1/3 for http://a/ failed: TransientHTTPError: HTTP 503 Error; retrying in ")
+        assert any(r.getMessage().startswith("Succeeded http://a/ on attempt 2/3") for r in caplog.records)
+
+    async def test_final_failure_is_a_warning(self, crawler, fake_session, caplog):
+        fake_session.routes["http://a/"] = FakeResponse(status=404)
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_url("http://a/")
+        [failure] = self.warnings(caplog)
+        assert failure.startswith("Failed http://a/ on attempt 1/1 after ")
+        assert failure.endswith("permanent error: PermanentHTTPError: HTTP 404 Error")
+
+    async def test_missing_robots_txt_is_not_a_warning(self, make_crawler, fake_session, caplog):
+        crawler = make_crawler(respect_robots=True)
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=404)
+        assert await crawler.fetch_url("http://a/page") == "page"
+        assert self.warnings(caplog) == []
 
 
 class TestUserAgents:

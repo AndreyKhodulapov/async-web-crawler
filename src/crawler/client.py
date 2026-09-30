@@ -291,13 +291,15 @@ class AsyncCrawler:
             nonlocal last, attempts
             timeout = self._timeout_for(retries=attempts)
             attempts += 1
-            last = await self._fetch_once(url, html_only=html_only, failure_level=failure_level, timeout=timeout)
+            last = await self._fetch_once(url, html_only=html_only, timeout=timeout)
             if last.error is not None:
                 raise last.error
             return last
 
         try:
-            return await self.retry_strategy.run(attempt, wait=self._wait_before_retry)
+            return await self.retry_strategy.run(
+                attempt, wait=self._wait_before_retry, target=url, failure_level=failure_level
+            )
         except FetchError as error:
             assert last is not None and last.error is error
             host = get_host(url)
@@ -318,7 +320,6 @@ class AsyncCrawler:
         host = get_host(error.url)
         assert host is not None  # an invalid URL fails with an error that is not retried
         self._retries += 1
-        logger.warning("Retrying %s in %.1fs after %s: %s", error.url, delay, type(error).__name__, error.message)
         self.rate_limiter.penalize(host, delay)
 
     def _timeout_for(self, retries: int) -> aiohttp.ClientTimeout:
@@ -369,9 +370,7 @@ class AsyncCrawler:
         assert result.status is not None and result.content is not None
         return result.status, result.content
 
-    async def _fetch_once(
-        self, url: str, *, html_only: bool, failure_level: int, timeout: aiohttp.ClientTimeout
-    ) -> FetchResult:
+    async def _fetch_once(self, url: str, *, html_only: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
         host = get_host(url)
         gate = functools.partial(self._limits.slot, url)
         # The rate limit is waited for before taking a concurrency slot, so
@@ -384,13 +383,9 @@ class AsyncCrawler:
                 response = await self._request(url, html_only=html_only, timeout=timeout)
             except FetchError as error:
                 elapsed = time.perf_counter() - started
-                logger.log(
-                    failure_level,
-                    "Failed %s after %.2fs: %s: %s",
-                    url,
-                    elapsed,
-                    type(error).__name__,
-                    error.message,
+                # RetryStrategy logs the failure along with what comes next.
+                logger.debug(
+                    "Request to %s failed after %.2fs: %s: %s", url, elapsed, type(error).__name__, error.message
                 )
                 return FetchResult.failure(url, error, elapsed)
             except Exception as exc:
