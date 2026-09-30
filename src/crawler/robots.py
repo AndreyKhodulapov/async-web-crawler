@@ -37,8 +37,18 @@ class _Rule:
         # "*" matches any sequence of characters, "$" at the end anchors the
         # pattern to the end of the URL; everything else is literal.
         anchored = path.endswith("$")
-        body = path[:-1] if anchored else path
-        regex = ".*".join(re.escape(part) for part in body.split("*"))
+        first, *rest = (path[:-1] if anchored else path).split("*")
+        regex = re.escape(first)
+        if rest:
+            # A plain ".*" per "*" backtracks through every split of the URL
+            # between them: a few wildcards in a site's robots.txt would
+            # freeze the crawl. Each "*" here takes the leftmost occurrence
+            # of the part after it, in an atomic group that is never
+            # re-entered; the leftmost one leaves the most room for the
+            # parts that follow, so the answer is the same.
+            *middle, last = rest
+            regex += "".join(f"(?>.*?{re.escape(part)})" for part in middle)
+            regex += f".*{re.escape(last)}" if anchored else f"(?>.*?{re.escape(last)})"
         return cls(allow, path, re.compile(regex + (r"\Z" if anchored else "")))
 
 

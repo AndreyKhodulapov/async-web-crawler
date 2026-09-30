@@ -58,7 +58,8 @@ class RetryPolicy:
         return isinstance(error, FetchTimeoutError | NetworkError) and not isinstance(error, self.PERMANENT)
 
     def delay(self, error: FetchError, retries_done: int) -> float:
-        backoff = min(self.max_delay, self.base_delay * 2**retries_done)
+        # 2**1024 does not fit a float; the cap is reached long before 2**64 anyway.
+        backoff = min(self.max_delay, self.base_delay * 2 ** min(retries_done, 64))
         backoff = backoff / 2 + random.uniform(0, backoff / 2)
         if isinstance(error, HTTPStatusError) and error.retry_after is not None:
             backoff = max(backoff, error.retry_after)

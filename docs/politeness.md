@@ -48,7 +48,9 @@ sites it visits and follows their rules.
   sleeps inside the slot: a request that finds the interval not yet passed
   lets the slot go and books again. Sleeping there would hold a slot, and a
   request waking inside it would race the ones waking outside for the same
-  moment and could lose again and again. The
+  moment and could lose again and again. Trade-off: a request sent back
+  books a new time, so later ones may overtake it; the rate still holds,
+  only the start order is not strict. The
   server sees arrival times, which also carry network jitter, e.g. the first
   request also opens the connection.
 - **Penalties** (HTTP 429, timeouts) move `next_start`, but requests that
@@ -90,7 +92,14 @@ sites it visits and follows their rules.
   lines does not matter. `*` matches any characters, `$` anchors the end.
   Paths are compared percent-encoded, query string included; an escaped
   unreserved character is the character itself (`%7E` is `~`), or
-  `Disallow: /~joe/` would let `/%7Ejoe/` through.
+  `Disallow: /~joe/` would let `/%7Ejoe/` through. Resolve dot segments
+  too: the HTTP client sends `/x/../private` as `/private`.
+- **Wildcards without backtracking**: turning each `*` into `.*` makes a
+  regex that tries every way to split the URL between the wildcards, so a
+  few of them in a site's robots.txt can freeze the event loop for
+  minutes. Matching each part at its leftmost occurrence and never
+  backtracking gives the same answer in linear time (here atomic groups
+  `(?>.*?part)`; Google's matcher uses dynamic programming).
 - **Status codes**: 2xx means parse; 4xx means there are no rules, so
   everything is allowed, and so may a redirect loop (the RFC counts too
   many redirects as unavailable); 5xx or no answer means unreachable, so

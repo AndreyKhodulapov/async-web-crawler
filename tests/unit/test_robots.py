@@ -1,6 +1,7 @@
 """Unit tests for robots.txt parsing (RobotsRules) and fetching with a cache (RobotsParser)."""
 
 import asyncio
+import time
 
 import pytest
 from helpers import BOT, FakeClock
@@ -133,6 +134,18 @@ class TestMatching:
         robots = "User-agent: *\nDisallow: /a%2Ab$"
         assert not allowed(robots, "/a%2Ab")
         assert allowed(robots, "/axb")
+
+    @pytest.mark.parametrize("end", ["", "$"])
+    def test_many_wildcards_on_a_long_url_answer_at_once(self, end):
+        robots = "User-agent: *\nDisallow: /" + "*a" * 20 + "X" + end
+        began = time.monotonic()
+        assert allowed(robots, "/" + "a" * 5000)
+        assert time.monotonic() - began < 0.1
+
+    @pytest.mark.parametrize("path", ["/x/../private", "/./private/page", "/x/%2E%2E/private"])
+    def test_dot_segments_do_not_get_around_a_rule(self, path):
+        # The HTTP client resolves them and sends "/private...".
+        assert not allowed("User-agent: *\nDisallow: /private", path)
 
     def test_robots_txt_itself_is_always_allowed(self):
         assert allowed("User-agent: *\nDisallow: /", "/robots.txt")

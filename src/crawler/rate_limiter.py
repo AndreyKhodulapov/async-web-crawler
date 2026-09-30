@@ -48,6 +48,9 @@ class RateLimiter:
     moves it forward by one interval and sleeps until the booked time. The
     booking has no `await` inside, so it is atomic on the event loop and
     needs no lock, and waiting requests start in the order they arrived.
+    With a gate (`slot`) the order is looser: a request that gets the gate
+    too soon after another one started lets it go and books a new time,
+    so later requests may overtake it.
     A task cancelled while it sleeps does not give its time back: the
     schedule only ever errs on the slow side. A request whose domain was
     penalized while it slept books a new time after the penalty.
