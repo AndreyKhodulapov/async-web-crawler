@@ -305,8 +305,7 @@ fails with `RobotsUnreachableError`.
 | `min_delay` | `0.0` | min seconds between two requests to one host |
 | `jitter` | `0.0` | random extra delay of up to this many seconds after each request |
 | `respect_robots` | `True` | check robots.txt before every request |
-| `max_retries` | `2` | retries of timeouts, network errors (not redirect loops or bad certificates), HTTP 408, 429 and 5xx |
-| `backoff_base`, `max_backoff` | `1.0`, `30.0` | retry n waits about `backoff_base * 2**n` seconds, at most `max_backoff` |
+| `retry_strategy` | `RetryStrategy()` | which failures to retry, how many times and how long to wait, see below |
 | `user_agent` | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name |
 | `user_agents` | `()` | strings to rotate between requests; all must share the name of `user_agent` |
 
@@ -323,8 +322,33 @@ HTTP client follows redirects on its own, so a redirect can still lead to a
 disallowed page, and the rate limit of the host it leads to does not apply. Crawl-delay is capped at 30 seconds. While
 a retry waits, the whole host waits with it, since a timeout or a 429 usually
 means the site is overloaded. A Retry-After header holds back the host even
-when the request is not retried, for at most `max_backoff` seconds; a
-request whose Retry-After is longer than that is not retried.
+when the request is not retried, for at most `max_delay` seconds of the
+retry strategy; a request whose Retry-After is longer than that is not retried.
+
+### Retries
+
+`RetryStrategy` retries a failed call with exponential backoff and jitter:
+retry n waits about `base_delay * backoff_factor**n` seconds, at most
+`max_delay`, or longer if the server sends Retry-After. It retries the error
+classes in `retry_on` and never a `PermanentError`. `RetryRule`s tune kinds
+of errors, keyed by an HTTP status or an exception class.
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `max_retries` | `3` | retries in total |
+| `backoff_factor` | `2.0` | how much each pause grows |
+| `retry_on` | `[TransientError, NetworkError]` | error classes to retry |
+| `base_delay`, `max_delay` | `1.0`, `30.0` | the first pause and the longest one, in seconds |
+| `rules` | HTTP 500: 1 retry; HTTP 429: 4x longer pauses | per-status or per-class `RetryRule(max_retries, delay_multiplier)`; replaces the defaults |
+
+```python
+retry_strategy = RetryStrategy(max_retries=3, backoff_factor=2.0, retry_on=[TransientError, NetworkError])
+async with AsyncCrawler(retry_strategy=retry_strategy) as crawler:
+    html = await crawler.fetch_url("https://example.com")      # retried inside
+
+# Any coroutine function can be retried on its own.
+html = await retry_strategy.execute_with_retry(fetch_page, "https://example.com")
+```
 
 The building blocks work on their own too:
 
@@ -440,7 +464,7 @@ src/
     ├── semaphores.py       # SemaphoreManager: global and per-domain limits
     ├── rate_limiter.py     # RateLimiter: requests per second, delays, jitter, rate stats
     ├── robots.py           # RobotsParser, RobotsRules: robots.txt per RFC 9309
-    ├── retry.py            # RetryPolicy: which errors to retry, backoff, Retry-After
+    ├── retry.py            # RetryStrategy: which errors to retry, backoff, Retry-After
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution

@@ -1,4 +1,4 @@
-"""Unit tests for RetryPolicy, RetryStrategy and Retry-After parsing."""
+"""Unit tests for RetryStrategy and Retry-After parsing."""
 
 import asyncio
 import random
@@ -18,7 +18,6 @@ from crawler import (
     NetworkError,
     ParseError,
     PermanentError,
-    RetryPolicy,
     RetryRule,
     RetryStrategy,
     RobotsDisallowedError,
@@ -33,84 +32,6 @@ URL = "https://site/page"
 
 def http_error(status: int, retry_after: float | None = None) -> HTTPStatusError:
     return HTTPStatusError(URL, status, "Error", retry_after=retry_after)
-
-
-@pytest.mark.parametrize(
-    ("error", "expected"),
-    [
-        (http_error(429), True),
-        (http_error(503), True),
-        (http_error(500), True),
-        (http_error(408), True),
-        (http_error(404), False),
-        (http_error(403), False),
-        (FetchTimeoutError(URL, "request timed out"), True),
-        (NetworkError(URL, "connection reset"), True),
-        (TooManyRedirectsError(URL, "too many redirects (10)"), False),
-        (CertificateError(URL, "certificate has expired"), False),
-        (InvalidURLError(URL, "bad port"), False),
-        (RobotsDisallowedError(URL, "disallowed by robots.txt"), False),
-        (CrawlerClosedError(URL, "crawler is closed"), False),
-        (UnexpectedError(URL, "KeyError: 'x'"), False),
-    ],
-)
-def test_only_transient_errors_are_retried(error, expected):
-    assert RetryPolicy().should_retry(error, 0) is expected
-
-
-def test_retry_after_longer_than_max_delay_is_not_retried():
-    policy = RetryPolicy(max_delay=30.0)
-    assert policy.should_retry(http_error(429, retry_after=30), 0)
-    assert not policy.should_retry(http_error(429, retry_after=31), 0)
-
-
-def test_retries_stop_at_the_limit():
-    policy = RetryPolicy(max_retries=2)
-    assert [policy.should_retry(http_error(503), done) for done in range(4)] == [True, True, False, False]
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"max_retries": -1},
-        {"base_delay": 0},
-        {"max_delay": -1},
-        {"base_delay": float("nan")},
-        {"max_delay": float("inf")},
-    ],
-)
-def test_rejects_invalid_options(options):
-    with pytest.raises(ValueError):
-        RetryPolicy(**options)
-
-
-class TestDelay:
-    def test_backoff_doubles_with_jitter_in_its_upper_half(self):
-        policy = RetryPolicy(base_delay=1.0, max_delay=100.0)
-        for retries_done in range(5):
-            full = 2.0**retries_done
-            delays = [policy.delay(http_error(503), retries_done) for _ in range(20)]
-            assert all(full / 2 <= delay <= full for delay in delays)
-
-    def test_backoff_is_capped(self):
-        policy = RetryPolicy(base_delay=1.0, max_delay=5.0)
-        assert all(policy.delay(http_error(503), 10) <= 5.0 for _ in range(20))
-
-    def test_backoff_is_capped_after_any_number_of_retries(self):
-        policy = RetryPolicy(max_retries=5000, base_delay=1.0, max_delay=5.0)
-        assert 2.5 <= policy.delay(http_error(503), 2000) <= 5.0
-
-    def test_longer_retry_after_is_honored(self):
-        policy = RetryPolicy(base_delay=0.1, max_delay=30.0)
-        assert policy.delay(http_error(429, retry_after=7), 0) == 7
-
-    def test_shorter_retry_after_does_not_shorten_the_backoff(self):
-        policy = RetryPolicy(base_delay=4.0, max_delay=30.0)
-        assert policy.delay(http_error(429, retry_after=0), 0) >= 2.0
-
-    def test_retry_after_is_capped(self):
-        policy = RetryPolicy(max_delay=30.0)
-        assert policy.delay(http_error(429, retry_after=3600), 0) == 30.0
 
 
 class TestParseRetryAfter:
@@ -190,6 +111,35 @@ class TestRetryStrategy:
         assert len(attempts.calls) == 1
         assert waits.delays == []
 
+    @pytest.mark.parametrize(
+        ("error", "retried"),
+        [
+            (http_error(429), True),
+            (http_error(503), True),
+            (http_error(500), True),
+            (http_error(408), True),
+            (http_error(404), False),
+            (http_error(403), False),
+            (FetchTimeoutError(URL, "request timed out"), True),
+            (NetworkError(URL, "connection reset"), True),
+            (TooManyRedirectsError(URL, "too many redirects (10)"), False),
+            (CertificateError(URL, "certificate has expired"), False),
+            (InvalidURLError(URL, "bad port"), False),
+            (RobotsDisallowedError(URL, "disallowed by robots.txt"), False),
+            (ParseError(URL, "empty document"), False),
+            (CrawlerClosedError(URL, "crawler is closed"), False),
+            (UnexpectedError(URL, "KeyError: 'x'"), False),
+        ],
+    )
+    async def test_only_transient_and_network_errors_are_retried(self, waits, error, retried):
+        attempts = Attempts(error, "page")
+        if retried:
+            assert await strategy(waits).execute_with_retry(attempts) == "page"
+        else:
+            with pytest.raises(type(error)):
+                await strategy(waits).execute_with_retry(attempts)
+        assert len(attempts.calls) == (2 if retried else 1)
+
     async def test_permanent_errors_are_not_retried_whatever_retry_on_says(self, waits):
         attempts = Attempts(TooManyRedirectsError(URL, "too many redirects (10)"), "page")
         with pytest.raises(TooManyRedirectsError):
@@ -207,12 +157,6 @@ class TestRetryStrategy:
         with pytest.raises(KeyError):
             await strategy(waits, retry_on=[OSError]).execute_with_retry(attempts)
         assert len(attempts.calls) == 2
-
-    async def test_parse_errors_are_not_retried_by_default(self, waits):
-        attempts = Attempts(ParseError(URL, "empty document"), "page")
-        with pytest.raises(ParseError):
-            await strategy(waits).execute_with_retry(attempts)
-        assert len(attempts.calls) == 1
 
     async def test_last_error_is_raised_after_max_retries(self, waits):
         last = http_error(504)
@@ -239,6 +183,12 @@ class TestRetryStrategy:
         with pytest.raises(asyncio.CancelledError):
             await strategy(waits).execute_with_retry(attempts)
         assert len(attempts.calls) == 1
+
+    async def test_run_waits_with_the_given_waiter(self, waits):
+        attempts = Attempts(http_error(503), "page")
+        other = Waits()
+        assert await strategy(waits).run(attempts, wait=other) == "page"
+        assert (len(waits.delays), len(other.delays)) == (0, 1)
 
     async def test_default_wait_sleeps(self):
         attempts = Attempts(http_error(503), "page")

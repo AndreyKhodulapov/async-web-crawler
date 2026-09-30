@@ -28,6 +28,7 @@ from crawler import (
     HTMLParser,
     HTTPStatusError,
     ParsedPage,
+    RetryStrategy,
     get_host,
     is_same_host,
     is_valid_http_url,
@@ -99,7 +100,10 @@ def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log
     )
     politeness.add_argument("--no-robots", action="store_true", help="do not check robots.txt")
     politeness.add_argument(
-        "--retries", type=positive(int, allow_zero=True), default=retries, help="retries of timeouts, 429 and 5xx"
+        "--retries",
+        type=positive(int, allow_zero=True),
+        default=retries,
+        help="retries of timeouts, network errors, HTTP 408, 429 and 5xx",
     )
     politeness.add_argument(
         "--user-agent",
@@ -186,7 +190,7 @@ def make_crawler(args: argparse.Namespace, parser: HTMLParser | None = None, **o
         min_delay=args.min_delay,
         jitter=args.jitter,
         respect_robots=not args.no_robots,
-        max_retries=args.retries,
+        retry_strategy=RetryStrategy(max_retries=args.retries),
         parser=parser,
         **options,
     )

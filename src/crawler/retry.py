@@ -1,6 +1,7 @@
 """When to retry a failed request and how long to wait before it."""
 
 import asyncio
+import functools
 import math
 import random
 from collections import Counter
@@ -10,54 +11,12 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import ClassVar, ParamSpec, TypeVar
 
-from crawler.exceptions import FetchError, HTTPStatusError, NetworkError, PermanentError, TransientError
+from crawler.exceptions import HTTPStatusError, NetworkError, PermanentError, TransientError
 
 P = ParamSpec("P")
 T = TypeVar("T")
-
-
-@dataclass(frozen=True, slots=True)
-class RetryPolicy:
-    """Retries transient failures with exponential backoff.
-
-    Transient and network errors (a timeout, HTTP 503, a refused
-    connection) are retried up to `max_retries` times. Other errors, such as
-    HTTP 404 or a redirect loop, would fail the same way again.
-
-    The n-th retry (from 0) waits `base_delay * 2**n` seconds, at most
-    `max_delay`, with "equal jitter": a random half of it is added to a fixed
-    half. Jitter keeps many clients that failed together from retrying in
-    lockstep; the fixed half keeps a retry from coming right back, as "full
-    jitter" (0..delay) can. A Retry-After header from the server is honored
-    when it asks for longer. A server that asks to wait longer than
-    `max_delay` is not retried at all: coming back early would only earn
-    another refusal.
-    """
-
-    max_retries: int = 2
-    base_delay: float = 1.0
-    max_delay: float = 30.0
-
-    def __post_init__(self) -> None:
-        if self.max_retries < 0:
-            raise ValueError(f"max_retries must be >= 0, got {self.max_retries}")
-        if not all(math.isfinite(delay) and delay > 0 for delay in (self.base_delay, self.max_delay)):
-            raise ValueError(f"backoff delays must be positive numbers, got {self.base_delay} and {self.max_delay}")
-
-    def should_retry(self, error: FetchError, retries_done: int) -> bool:
-        if retries_done >= self.max_retries:
-            return False
-        if isinstance(error, HTTPStatusError) and error.retry_after is not None and error.retry_after > self.max_delay:
-            return False
-        return isinstance(error, TransientError | NetworkError)
-
-    def delay(self, error: FetchError, retries_done: int) -> float:
-        # 2**1024 does not fit a float; the cap is reached long before 2**64 anyway.
-        backoff = min(self.max_delay, self.base_delay * 2 ** min(retries_done, 64))
-        backoff = backoff / 2 + random.uniform(0, backoff / 2)
-        if isinstance(error, HTTPStatusError) and error.retry_after is not None:
-            backoff = max(backoff, error.retry_after)
-        return min(backoff, self.max_delay)
+# Waits before a retry, given the error that caused it and the delay.
+Waiter = Callable[[Exception, float], Awaitable[None]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,7 +66,8 @@ class RetryStrategy:
     HTTP 429, when the server says it gets too many requests. Passing
     `rules` replaces the defaults.
 
-    `wait(error, delay)` waits before a retry; by default it sleeps.
+    `wait(error, delay)` waits before a retry; by default it sleeps. `run`
+    takes another one for a single call, e.g. to wait in a rate limiter.
     """
 
     DEFAULT_RULES: ClassVar[Mapping[int | type[Exception], RetryRule]] = {
@@ -124,7 +84,7 @@ class RetryStrategy:
         base_delay: float = 1.0,
         max_delay: float = 30.0,
         rules: Mapping[int | type[Exception], RetryRule] | None = None,
-        wait: Callable[[Exception, float], Awaitable[None]] = _sleep,
+        wait: Waiter = _sleep,
     ) -> None:
         if max_retries < 0:
             raise ValueError(f"max_retries must be >= 0, got {max_retries}")
@@ -149,17 +109,22 @@ class RetryStrategy:
         Raises:
             Exception: the error of the last attempt.
         """
+        return await self.run(functools.partial(coro, *args, **kwargs))
+
+    async def run(self, call: Callable[[], Awaitable[T]], *, wait: Waiter | None = None) -> T:
+        """Like `execute_with_retry`, waiting before a retry with `wait` instead of the strategy's own."""
+        wait = wait or self._wait
         retries_by_rule: Counter[int | type[Exception] | None] = Counter()
         while True:
             try:
-                return await coro(*args, **kwargs)
+                return await call()
             except Exception as error:
                 key, rule = self._rule_for(error)
                 if not self._should_retry(error, rule, retries_by_rule[key], retries_by_rule.total()):
                     raise
                 delay = self._delay(error, rule, retries_by_rule.total())
                 retries_by_rule[key] += 1
-                await self._wait(error, delay)
+                await wait(error, delay)
 
     def _rule_for(self, error: Exception) -> tuple[int | type[Exception] | None, RetryRule]:
         if isinstance(error, HTTPStatusError) and error.status in self.rules:

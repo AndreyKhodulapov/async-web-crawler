@@ -6,7 +6,7 @@ import itertools
 import pytest
 from helpers import BOT, UNTHROTTLED
 
-from crawler import AsyncCrawler, RobotsDisallowedError, RobotsUnreachableError
+from crawler import AsyncCrawler, RetryStrategy, RobotsDisallowedError, RobotsUnreachableError
 
 # Gaps are measured where requests arrive, while the limiter controls when
 # they are sent; opening a connection shifts an arrival by a millisecond or so.
@@ -149,7 +149,7 @@ class TestRobots:
 
 class TestRetries:
     async def test_crawl_counts_retries(self, url):
-        async with polite(max_retries=2, backoff_base=0.01) as crawler:
+        async with polite(retry_strategy=RetryStrategy(max_retries=2, base_delay=0.01)) as crawler:
             pages = await crawler.crawl([url("/flaky/1")])
         stats = crawler.crawl_stats()
 
@@ -160,7 +160,9 @@ class TestRetries:
     async def test_backoff_holds_back_requests_already_waiting(self, url, site):
         # The retry of /flaky/1 waits 0.2..0.4 s; the pages had booked their
         # turns before the failure, and they wait for the retry too.
-        async with polite(requests_per_second=10, max_retries=1, backoff_base=0.4, max_backoff=0.4) as crawler:
+        async with polite(
+            requests_per_second=10, retry_strategy=RetryStrategy(max_retries=1, base_delay=0.4, max_delay=0.4)
+        ) as crawler:
             await open_session(crawler, url, site)
             await crawler.fetch_many([url("/flaky/1"), url("/site/"), url("/site/a.html"), url("/site/b.html")])
 

@@ -33,7 +33,7 @@ from crawler.models import CrawlStats, FetchResult, ParsedPage
 from crawler.parser import HTMLParser, is_html_content_type
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
-from crawler.retry import RetryPolicy, parse_retry_after
+from crawler.retry import RetryStrategy, parse_retry_after
 from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
 from crawler.urls import get_host, is_valid_http_url, normalize_url
@@ -74,11 +74,12 @@ class AsyncCrawler:
       `RobotsDisallowedError`. While robots.txt of a site cannot be read,
       its URLs are not requested either and fail with
       `RobotsUnreachableError` (see `RobotsParser`).
-    - Timeouts, network errors and HTTP 408, 429 and 5xx are retried up to
-      `max_retries` times with exponential backoff from `backoff_base` up to
-      `max_backoff` seconds (see `RetryPolicy`). While a retry waits, the
-      whole host waits with it; so it does after a Retry-After header, even
-      when the request is not retried.
+    - Failed requests are retried as `retry_strategy` says: by default
+      transient and network errors, such as a timeout or HTTP 503, up to 3
+      times with exponential backoff (see `RetryStrategy`). The pause before
+      a retry is spent in the rate limiter: the whole host waits with it; so
+      it does after a Retry-After header, even when the request is not
+      retried.
 
     `user_agent` identifies the crawler, and robots.txt rules are looked up
     by its name ("MyBot/1.0 (+url)" is "mybot"). `user_agents` rotates
@@ -106,9 +107,7 @@ class AsyncCrawler:
         min_delay: float = 0.0,
         jitter: float = 0.0,
         respect_robots: bool = True,
-        max_retries: int = 2,
-        backoff_base: float = 1.0,
-        max_backoff: float = 30.0,
+        retry_strategy: RetryStrategy | None = None,
         total_timeout: float = 30.0,
         connect_timeout: float = 10.0,
         read_timeout: float = 20.0,
@@ -137,7 +136,7 @@ class AsyncCrawler:
         # These validate their own arguments.
         self._limits = SemaphoreManager(max_concurrent, max_per_domain)
         self.rate_limiter = RateLimiter(requests_per_second, per_domain_rate, min_delay=min_delay, jitter=jitter)
-        self._retry = RetryPolicy(max_retries, backoff_base, max_backoff)
+        self.retry_strategy = retry_strategy or RetryStrategy()
         self.robots = RobotsParser(self._download_robots) if respect_robots else None
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -270,28 +269,41 @@ class AsyncCrawler:
             return FetchResult.failure(url, CrawlerClosedError(url, "crawler is closed"), 0.0)
         if check_robots and (refusal := await self._check_robots(url)) is not None:
             return FetchResult.failure(url, refusal, 0.0)
-        retries = 0
-        while True:
-            result = await self._fetch_once(url, html_only=html_only, failure_level=failure_level)
-            error = result.error
-            if error is None:
-                return result
+        # The strategy needs an attempt that raises; the result of the last
+        # one is kept to report a failure with its timing.
+        last: FetchResult | None = None
+
+        async def attempt() -> FetchResult:
+            nonlocal last
+            last = await self._fetch_once(url, html_only=html_only, failure_level=failure_level)
+            if last.error is not None:
+                raise last.error
+            return last
+
+        try:
+            return await self.retry_strategy.run(attempt, wait=self._wait_before_retry)
+        except FetchError as error:
+            assert last is not None and last.error is error
             host = get_host(url)
-            if not self._retry.should_retry(error, retries):
-                # The server asked to wait: the other requests to the host
-                # wait even when this one is not retried, up to max_backoff.
-                if isinstance(error, HTTPStatusError) and error.retry_after and host is not None:
-                    self.rate_limiter.penalize(host, min(error.retry_after, self._retry.max_delay))
-                return result
-            delay = self._retry.delay(error, retries)
-            retries += 1
-            self._retries += 1
-            logger.warning("Retrying %s in %.1fs (retry %d of %d)", url, delay, retries, self._retry.max_retries)
-            assert host is not None  # an invalid URL fails with an error that is not retried
-            # The retry waits in the rate limiter, and so does every
-            # other request to the host: a timeout or HTTP 429 usually
-            # means the whole site is overloaded, not one page.
-            self.rate_limiter.penalize(host, delay)
+            # The server asked to wait: the other requests to the host wait
+            # even when this one is not retried, up to the longest retry pause.
+            if isinstance(error, HTTPStatusError) and error.retry_after and host is not None:
+                self.rate_limiter.penalize(host, min(error.retry_after, self.retry_strategy.max_delay))
+            return last
+
+    async def _wait_before_retry(self, error: Exception, delay: float) -> None:
+        """Hold back the host of the failed request instead of sleeping.
+
+        The retry then waits for its turn in the rate limiter, and so does
+        every other request to the host: a timeout or HTTP 429 usually means
+        the whole site is overloaded, not one page.
+        """
+        assert isinstance(error, FetchError)  # _fetch_once() reports every failure as one
+        host = get_host(error.url)
+        assert host is not None  # an invalid URL fails with an error that is not retried
+        self._retries += 1
+        logger.warning("Retrying %s in %.1fs after %s: %s", error.url, delay, type(error).__name__, error.message)
+        self.rate_limiter.penalize(host, delay)
 
     async def _check_robots(self, url: str) -> FetchError | None:
         """Return the error to fail `url` with if robots.txt does not allow it, None if it may be fetched."""

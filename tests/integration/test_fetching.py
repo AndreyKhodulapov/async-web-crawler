@@ -47,7 +47,7 @@ async def test_idna_error_is_an_invalid_url(crawler):
 
 
 async def test_redirect_loop_is_not_retried(server):
-    async with AsyncCrawler(**{**UNTHROTTLED, "max_retries": 2}) as crawler:
+    async with AsyncCrawler(**{**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=2)}) as crawler:
         with pytest.raises(TooManyRedirectsError, match="too many redirects"):
             await crawler.fetch_url(str(server.make_url("/redirect-loop")))
         assert crawler.rate_limiter.get_stats().requests == 1  # one attempt, no retries
@@ -101,3 +101,30 @@ async def test_retry_strategy_does_not_repeat_not_found(crawler, url, site):
     with pytest.raises(HTTPStatusError):
         await retry_strategy.execute_with_retry(crawler.fetch_url, url("/site/missing.html"))
     assert site.hits["/site/missing.html"] == 1
+
+
+@pytest.fixture
+async def retrying_crawler():
+    options = {**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=3, base_delay=0.01)}
+    async with AsyncCrawler(**options) as crawler:
+        yield crawler
+
+
+async def test_crawler_retries_service_unavailable(retrying_crawler, url, site):
+    assert "Recovered" in await retrying_crawler.fetch_url(url("/flaky/2"))
+    assert site.hits["/flaky/2"] == 3
+
+
+@pytest.mark.parametrize(("path", "requests"), [("/status/404", 1), ("/status/403", 1), ("/status/500", 2)])
+async def test_crawler_retries_by_status(retrying_crawler, server, path, requests):
+    with pytest.raises(HTTPStatusError):
+        await retrying_crawler.fetch_url(str(server.make_url(path)))
+    assert retrying_crawler.rate_limiter.get_stats().requests == requests
+
+
+async def test_crawler_retries_timeouts(server):
+    options = {**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=2, base_delay=0.01)}
+    async with AsyncCrawler(read_timeout=0.1, **options) as crawler:
+        with pytest.raises(FetchTimeoutError):
+            await crawler.fetch_url(str(server.make_url("/delay/1")))
+        assert crawler.rate_limiter.get_stats().requests == 3

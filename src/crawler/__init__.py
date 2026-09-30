@@ -24,7 +24,7 @@ from crawler.models import CrawlStats, DomainRate, FetchResult, ParsedPage, Rate
 from crawler.parser import HTMLParser
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
-from crawler.retry import RetryPolicy, RetryRule, RetryStrategy
+from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
 from crawler.urls import get_host, is_same_host, is_valid_http_url
@@ -49,7 +49,6 @@ __all__ = [
     "PermanentHTTPError",
     "RateLimiter",
     "RateStats",
-    "RetryPolicy",
     "RetryRule",
     "RetryStrategy",
     "RobotsDisallowedError",

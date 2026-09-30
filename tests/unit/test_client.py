@@ -21,6 +21,7 @@ from crawler import (
     NetworkError,
     ParseError,
     PermanentError,
+    RetryStrategy,
     RobotsDisallowedError,
     TransientError,
     UnexpectedError,
@@ -258,7 +259,7 @@ class TestErrorMapping:
         assert isinstance(exc_info.value.__cause__, aiohttp.ClientConnectionError)
 
     async def test_certificate_error_is_not_retried(self, make_crawler, fake_session):
-        crawler = make_crawler(max_retries=2, backoff_base=0.001)
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=2, base_delay=0.001))
         fake_session.routes["http://a"] = aiohttp.ClientConnectorCertificateError(
             MagicMock(), ssl.SSLCertVerificationError("certificate has expired")
         )
@@ -267,7 +268,7 @@ class TestErrorMapping:
         assert fake_session.requested == ["http://a"]
 
     async def test_non_ascii_retry_after_is_ignored(self, make_crawler, fake_session):
-        crawler = make_crawler(max_retries=1, backoff_base=0.001)
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001))
         fake_session.routes["http://a"] = [FakeResponse(status=429, retry_after="²"), FakeResponse(b"ok")]
         assert await crawler.fetch_url("http://a") == "ok"
 
@@ -383,13 +384,13 @@ class TestFetchAndParse:
 
 class TestRetries:
     async def test_transient_failure_is_retried(self, make_crawler, fake_session):
-        crawler = make_crawler(max_retries=2, backoff_base=0.001)
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=2, base_delay=0.001))
         fake_session.routes["http://a"] = [FakeResponse(status=503), aiohttp.ServerTimeoutError(), FakeResponse(b"ok")]
         assert await crawler.fetch_url("http://a") == "ok"
         assert fake_session.requested == ["http://a"] * 3
 
     async def test_gives_up_after_max_retries(self, make_crawler, fake_session):
-        crawler = make_crawler(max_retries=2, backoff_base=0.001)
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=2, base_delay=0.001))
         fake_session.routes["http://a"] = FakeResponse(status=503)
         with pytest.raises(HTTPStatusError):
             await crawler.fetch_url("http://a")
@@ -402,7 +403,7 @@ class TestRetries:
         assert exc_info.value.retry_after == 120
 
     async def test_retry_after_holds_back_the_host_without_a_retry(self, make_crawler, fake_session):
-        crawler = make_crawler(max_retries=0, max_backoff=5.0)
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=0, max_delay=5.0))
         fake_session.routes["http://a"] = FakeResponse(status=429, retry_after="2")
         with pytest.raises(HTTPStatusError):
             await crawler.fetch_url("http://a")
@@ -410,8 +411,8 @@ class TestRetries:
         assert crawler.rate_limiter.reserve("a") == pytest.approx(2.0, abs=0.1)
         assert crawler.rate_limiter.reserve("b") == 0
 
-    async def test_retry_after_beyond_max_backoff_is_not_retried(self, make_crawler, fake_session):
-        crawler = make_crawler(max_retries=2, max_backoff=5.0)
+    async def test_retry_after_beyond_max_delay_is_not_retried(self, make_crawler, fake_session):
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=2, max_delay=5.0))
         fake_session.routes["http://a"] = [FakeResponse(status=429, retry_after="120"), FakeResponse(b"ok")]
         with pytest.raises(HTTPStatusError):
             await crawler.fetch_url("http://a")
@@ -421,7 +422,7 @@ class TestRetries:
         assert crawler.rate_limiter.reserve("a") == pytest.approx(5.0, abs=0.1)
 
     async def test_backoff_holds_back_the_whole_host(self, make_crawler, fake_session):
-        crawler = make_crawler(max_retries=1, backoff_base=0.2)
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=1, base_delay=0.2))
         fake_session.routes["http://a/slow"] = [FakeResponse(status=503), FakeResponse()]
         retrying = asyncio.create_task(crawler.fetch_url("http://a/slow"))
         await asyncio.sleep(0.01)  # the first attempt has failed, the retry waits
