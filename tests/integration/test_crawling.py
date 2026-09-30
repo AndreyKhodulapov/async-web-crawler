@@ -3,22 +3,15 @@
 import asyncio
 
 import pytest
+from helpers import UNTHROTTLED
 
 from crawler import AsyncCrawler
-
-
-@pytest.fixture
-def url(server):
-    def make(path: str) -> str:
-        return str(server.make_url(path))
-
-    return make
 
 
 async def crawl(start_url: str, *, max_concurrent: int = 5, max_depth: int = 2, **options) -> AsyncCrawler:
     """Run a crawl and return the closed crawler with its state."""
     options.setdefault("same_domain_only", True)
-    async with AsyncCrawler(max_concurrent=max_concurrent, max_depth=max_depth) as crawler:
+    async with AsyncCrawler(max_concurrent=max_concurrent, max_depth=max_depth, **UNTHROTTLED) as crawler:
         await crawler.crawl([start_url], **options)
     return crawler
 
@@ -152,7 +145,7 @@ async def test_per_domain_limit(url, site):
     assert site.peak_in_flight > 1
 
     site.peak_in_flight = 0
-    async with AsyncCrawler(max_concurrent=5, max_per_domain=1) as crawler:
+    async with AsyncCrawler(max_concurrent=5, max_per_domain=1, **UNTHROTTLED) as crawler:
         await crawler.crawl([url("/site/")], same_domain_only=True)
     assert site.peak_in_flight == 1
 
@@ -171,7 +164,7 @@ async def test_stats_after_crawl(url):
 
 
 async def test_state_is_reset_between_crawls(url):
-    async with AsyncCrawler(max_depth=1) as crawler:
+    async with AsyncCrawler(max_depth=1, **UNTHROTTLED) as crawler:
         first = await crawler.crawl([url("/site/")], same_domain_only=True)
         second = await crawler.crawl([url("/site/b.html")], max_pages=1)
 
@@ -193,7 +186,7 @@ async def test_invalid_start_urls_are_rejected():
 
 async def test_second_concurrent_crawl_is_rejected(url, site):
     site.latency = 0.05
-    async with AsyncCrawler() as crawler:
+    async with AsyncCrawler(**UNTHROTTLED) as crawler:
         running = asyncio.create_task(crawler.crawl([url("/site/")], max_pages=1))
         await asyncio.sleep(0.01)
         with pytest.raises(RuntimeError, match="already running"):

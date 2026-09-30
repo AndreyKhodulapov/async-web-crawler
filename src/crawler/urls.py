@@ -19,7 +19,9 @@ def normalize_url(url: str) -> str | None:
     host is converted to punycode, a trailing dot in the host, the default
     port and the fragment are dropped, and an empty path becomes "/".
     The path and query are percent-encoded the way an HTTP client sends
-    them: "/café" and "/caf%C3%A9" are the same address.
+    them: "/café" and "/caf%C3%A9" are the same address, and so are
+    "/~joe" and "/%7Ejoe". Dot segments are resolved as the client does
+    before sending: "/a/../b" and "/a/%2E%2E/b" are "/b".
     """
     try:
         parts = urlsplit(url.strip())
@@ -42,10 +44,10 @@ def normalize_url(url: str) -> str | None:
     if parts.username is not None:
         userinfo = parts.netloc.rpartition("@")[0]
         netloc = f"{userinfo}@{netloc}"
-    path, query = _percent_encode(parts.path or "/"), _percent_encode(parts.query)
+    path, query = percent_encode(parts.path or "/"), percent_encode(parts.query)
     if path is None or query is None:
         return None
-    return urlunsplit((scheme, netloc, path, query, ""))
+    return urlunsplit((scheme, netloc, _remove_dot_segments(path), query, ""))
 
 
 def resolve_url(href: str, base_url: str) -> str | None:
@@ -80,18 +82,45 @@ def is_same_host(url: str, other: str) -> bool:
     return host is not None and host == get_host(other)
 
 
-def _percent_encode(component: str) -> str | None:
+def percent_encode(component: str) -> str | None:
     """Percent-encode non-ASCII characters, spaces and the like; None if impossible.
 
     Characters that RFC 3986 allows in a path or query are kept, and so are
     existing escapes, whose hex digits are uppercased: "%d0" and "%D0" are
-    the same byte. A lone surrogate cannot be encoded as UTF-8.
+    the same byte. An escaped unreserved character (letter, digit, "-",
+    ".", "_", "~") is decoded, as RFC 3986 says it means the same:
+    "%7E" is "~". Other escapes, such as "%2F" or "%2A", keep their meaning
+    apart from the character. A lone surrogate cannot be encoded as UTF-8.
     """
     try:
         encoded = quote(component, safe="/?:@!$&'()*+,;=-._~%")
     except UnicodeEncodeError:
         return None
-    return re.sub(r"%[0-9a-fA-F]{2}", lambda escape: escape.group().upper(), encoded)
+    return re.sub(r"%[0-9a-fA-F]{2}", _normalize_escape, encoded)
+
+
+def _normalize_escape(escape: re.Match[str]) -> str:
+    char = chr(int(escape.group()[1:], 16))
+    return char if char.isascii() and (char.isalnum() or char in "-._~") else escape.group().upper()
+
+
+def _remove_dot_segments(path: str) -> str:
+    """Resolve "." and ".." in an absolute path (RFC 3986 5.2.4): "/a/./b/../c" gives "/a/c".
+
+    A path that ends in a dot segment keeps its trailing slash: "/a/b/.." is
+    "/a/". ".." never goes above the root.
+    """
+    segments = path.split("/")[1:]
+    output: list[str] = []
+    for index, segment in enumerate(segments):
+        if segment in (".", ".."):
+            if segment == ".." and output:
+                output.pop()
+            if index == len(segments) - 1:
+                output.append("")
+        else:
+            output.append(segment)
+    return "/" + "/".join(output)
 
 
 def _encode_host(host: str) -> str | None:

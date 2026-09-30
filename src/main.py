@@ -10,12 +10,15 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import re
 import sys
 import textwrap
 import time
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 from crawler import (
     AsyncCrawler,
@@ -25,8 +28,10 @@ from crawler import (
     HTMLParser,
     HTTPStatusError,
     ParsedPage,
+    get_host,
     is_same_host,
     is_valid_http_url,
+    product_token,
 )
 
 
@@ -36,6 +41,8 @@ def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) 
             value = number_type(raw)
         except ValueError:
             raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+        if not math.isfinite(value):
+            raise argparse.ArgumentTypeError(f"must be a finite number, got {raw}")
         if value < 0 or (value == 0 and not allow_zero):
             raise argparse.ArgumentTypeError(f"must be {'non-negative' if allow_zero else 'positive'}, got {raw}")
         return value
@@ -57,7 +64,52 @@ def regex(raw: str) -> str:
     return raw
 
 
-def parse_args() -> argparse.Namespace:
+def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log_level: str = "INFO") -> None:
+    """Options every command has; the defaults that differ by command are arguments.
+
+    Each command gets its own copy: a parent parser shared through `parents=`
+    shares its option objects too, so `set_defaults` on one command would
+    change the default of all of them.
+    """
+    parser.add_argument("--concurrency", type=positive(int), default=10, help="max parallel requests")
+    parser.add_argument(
+        "--timeout",
+        type=positive(float),
+        default=5.0,
+        help="connect, read and total timeout per request, s",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=log_level,
+    )
+    politeness = parser.add_argument_group("politeness")
+    politeness.add_argument(
+        "--rps",
+        type=positive(float, allow_zero=True),
+        default=1.0,
+        help="max requests per second to one host, 0 = no limit (default: 1)",
+    )
+    politeness.add_argument(
+        "--min-delay", type=positive(float, allow_zero=True), default=0.0, help="min seconds between requests to a host"
+    )
+    politeness.add_argument(
+        "--jitter", type=positive(float, allow_zero=True), default=0.0, help="random extra delay up to this, s"
+    )
+    politeness.add_argument("--no-robots", action="store_true", help="do not check robots.txt")
+    politeness.add_argument(
+        "--retries", type=positive(int, allow_zero=True), default=retries, help="retries of timeouts, 429 and 5xx"
+    )
+    politeness.add_argument(
+        "--user-agent",
+        action="append",
+        metavar="STRING",
+        help="User-Agent; repeat to rotate several, all with the same bot name",
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # A mix of fast pages, slow endpoints and deliberate failures.
     benchmark_urls = [
         "https://example.com",
@@ -79,41 +131,29 @@ def parse_args() -> argparse.Namespace:
         "https://httpbin.org/status/403",  # an access denied response, as anti-bot protection gives
     ]
 
-    common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--concurrency", type=positive(int), default=10, help="max parallel requests")
-    common.add_argument(
-        "--timeout",
-        type=positive(float),
-        default=5.0,
-        help="connect, read and total timeout per request, s",
-    )
-    common.add_argument(
-        "--log-level",
-        type=str.upper,
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-    )
-
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
-    benchmark = commands.add_parser(
-        "benchmark", parents=[common], help="fetch URLs sequentially and concurrently, compare time"
-    )
+    benchmark = commands.add_parser("benchmark", help="fetch URLs sequentially and concurrently, compare time")
     benchmark.add_argument("urls", nargs="*", default=benchmark_urls, help="URLs to fetch")
+    # Retries would blur the comparison: the list fails on purpose.
+    add_common_options(benchmark, retries=0)
 
-    parse = commands.add_parser("parse", parents=[common], help="fetch pages and extract structured data")
+    parse = commands.add_parser("parse", help="fetch pages and extract structured data")
     parse.add_argument("urls", nargs="*", default=parse_urls, help="URLs to parse")
     parse.add_argument("--same-host", action="store_true", help="keep only links to the page's own host")
     parse.add_argument("--preview", type=positive(int), default=5, help="links and headings shown per page")
     parse.add_argument("--json", type=Path, metavar="PATH", help="save full results to a JSON file")
+    add_common_options(parse)
 
-    crawl = commands.add_parser("crawl", parents=[common], help="follow links from start pages, show live progress")
-    # A sandbox made for crawling practice. robots.txt is not checked yet,
-    # so the default must be a site that welcomes crawlers.
-    crawl.add_argument("urls", nargs="*", type=http_url, default=["https://books.toscrape.com/"], help="start URLs")
+    crawl = commands.add_parser("crawl", help="follow links from start pages, show live progress")
+    # Sandboxes made for crawling practice whose robots.txt shows the rules
+    # at work: the first disallows its pagination and product pages (with a
+    # wildcard rule), the second sets Crawl-delay: 2.
+    crawl_urls = ["https://webscraper.io/test-sites/pagination", "https://web-scraping.dev/products"]
+    crawl.add_argument("urls", nargs="*", type=http_url, default=crawl_urls, help="start URLs")
     crawl.add_argument("--max-depth", type=positive(int, allow_zero=True), default=2, help="0 = start pages only")
-    crawl.add_argument("--max-pages", type=positive(int), default=50, help="pages to fetch, failed ones included")
+    crawl.add_argument("--max-pages", type=positive(int), default=30, help="pages to fetch, failed ones included")
     crawl.add_argument("--per-domain", type=positive(int), default=2, help="max parallel requests to one host")
     crawl.add_argument("--same-domain", action="store_true", help="follow links on the start hosts only")
     crawl.add_argument(
@@ -124,26 +164,31 @@ def parse_args() -> argparse.Namespace:
     )
     crawl.add_argument("--json", type=Path, metavar="PATH", help="save pages, errors and stats to a JSON file")
     # A log line per request would bury the progress line; --log-level INFO shows them.
-    crawl.set_defaults(log_level="WARNING")
-    return parser.parse_args()
+    add_common_options(crawl, log_level="WARNING")
+
+    args = parser.parse_args(argv)
+    if args.user_agent and len({product_token(agent) for agent in args.user_agent}) > 1:
+        parser.error("every --user-agent must start with the same bot name, e.g. MyBot/1.0 (...)")
+    return args
 
 
-def make_crawler(
-    concurrency: int,
-    timeout: float,
-    parser: HTMLParser | None = None,
-    *,
-    max_depth: int = 2,
-    max_per_domain: int | None = None,
-) -> AsyncCrawler:
+def make_crawler(args: argparse.Namespace, parser: HTMLParser | None = None, **options: Any) -> AsyncCrawler:
+    """A crawler configured by the command-line options; `options` adds crawl limits."""
+    if args.user_agent:
+        # The first one names the bot for robots.txt; all of them rotate.
+        options |= {"user_agent": args.user_agent[0], "user_agents": args.user_agent}
     return AsyncCrawler(
-        max_concurrent=concurrency,
-        max_depth=max_depth,
-        max_per_domain=max_per_domain,
-        total_timeout=timeout,
-        connect_timeout=timeout,
-        read_timeout=timeout,
+        max_concurrent=args.concurrency,
+        total_timeout=args.timeout,
+        connect_timeout=args.timeout,
+        read_timeout=args.timeout,
+        requests_per_second=args.rps or None,
+        min_delay=args.min_delay,
+        jitter=args.jitter,
+        respect_robots=not args.no_robots,
+        max_retries=args.retries,
         parser=parser,
+        **options,
     )
 
 
@@ -164,15 +209,13 @@ async def run_sequential(crawler: AsyncCrawler, urls: list[str]) -> list[FetchRe
 
 async def timed(
     runner: Callable[[AsyncCrawler, list[str]], Awaitable[list[FetchResult]]],
-    urls: list[str],
-    concurrency: int,
-    timeout: float,
+    args: argparse.Namespace,
 ) -> tuple[list[FetchResult], float]:
     # A fresh crawler per run, so the second run does not benefit from
-    # connections and DNS entries already cached by the first one.
-    async with make_crawler(concurrency, timeout) as crawler:
+    # connections, DNS entries and robots.txt already cached by the first one.
+    async with make_crawler(args) as crawler:
         started = time.perf_counter()
-        results = await runner(crawler, urls)
+        results = await runner(crawler, args.urls)
         return results, time.perf_counter() - started
 
 
@@ -188,8 +231,8 @@ def print_benchmark_report(title: str, results: list[FetchResult], total: float)
 
 
 async def run_benchmark(args: argparse.Namespace) -> None:
-    sequential, sequential_time = await timed(run_sequential, args.urls, args.concurrency, args.timeout)
-    concurrent, concurrent_time = await timed(AsyncCrawler.fetch_many, args.urls, args.concurrency, args.timeout)
+    sequential, sequential_time = await timed(run_sequential, args)
+    concurrent, concurrent_time = await timed(AsyncCrawler.fetch_many, args)
 
     print_benchmark_report("Sequential", sequential, sequential_time)
     print_benchmark_report(f"Concurrent (max_concurrent={args.concurrency})", concurrent, concurrent_time)
@@ -268,7 +311,7 @@ def save_json(path: Path, urls: list[str], outcomes: list[ParsedPage | FetchErro
 async def run_parse(args: argparse.Namespace) -> None:
     urls = list(dict.fromkeys(args.urls))
     parser = HTMLParser(same_host_only=args.same_host)
-    async with make_crawler(args.concurrency, args.timeout, parser) as crawler:
+    async with make_crawler(args, parser) as crawler:
         started = time.perf_counter()
         async with asyncio.TaskGroup() as group:
             tasks = [group.create_task(parse_one(crawler, url)) for url in urls]
@@ -287,9 +330,9 @@ async def run_parse(args: argparse.Namespace) -> None:
 
 def format_progress(stats: CrawlStats) -> str:
     return (
-        f"pages {stats.processed} | failed {stats.failed} | skipped {stats.skipped} | queued {stats.queued} | "
-        f"in progress {stats.in_progress} | requests {stats.active_requests} | "
-        f"{stats.pages_per_second:.1f} pages/s | {stats.elapsed:.1f}s"
+        f"pages {stats.processed} | failed {stats.failed} | skipped {stats.skipped} | blocked {stats.blocked} | "
+        f"unreachable {stats.unreachable} | queued {stats.queued} | in progress {stats.in_progress} | in flight {stats.active_requests} | "
+        f"{stats.current_rps:.1f} req/s | gap {stats.avg_delay:.2f}s | {stats.elapsed:.1f}s"
     )
 
 
@@ -319,13 +362,62 @@ def print_crawl_report(crawler: AsyncCrawler) -> None:
             page = crawler.processed_urls[url]
             result = f"ok, {len(page['errors'])} warning(s)" if page["errors"] else "ok"
             print(f"{depth:>5}  {result:<36}  {len(page['links']):>5}  {url}")
-        elif url in crawler.failed_urls or url in crawler.skipped_urls:
-            reason = crawler.failed_urls.get(url) or f"skipped, {crawler.skipped_urls[url]}"
-            result = textwrap.shorten(reason, width=36, placeholder="...")
-            print(f"{depth:>5}  {result:<36}  {'':>5}  {url}")
+            continue
+        if url in crawler.failed_urls:
+            reason = crawler.failed_urls[url]
+        elif url in crawler.skipped_urls:
+            reason = f"skipped, {crawler.skipped_urls[url]}"
+        elif url in crawler.blocked_urls:
+            reason = f"blocked, {crawler.blocked_urls[url]}"
+        elif url in crawler.unreachable_urls:
+            reason = crawler.unreachable_urls[url]
+        else:
+            continue  # still in the queue
+        result = textwrap.shorten(reason, width=36, placeholder="...")
+        print(f"{depth:>5}  {result:<36}  {'':>5}  {url}")
     print(
         f"Crawled: {stats.processed} pages, failed: {stats.failed}, skipped: {stats.skipped}, "
-        f"left in queue: {stats.queued}, speed: {stats.pages_per_second:.1f} pages/s"
+        f"blocked: {stats.blocked}, unreachable: {stats.unreachable}, left in queue: {stats.queued}, speed: {stats.pages_per_second:.1f} pages/s"
+    )
+
+
+def host_stats(crawler: AsyncCrawler) -> list[dict[str, object]]:
+    """Requests, enforced interval, average gap, blocked and unreachable pages per host, busiest first."""
+    blocked = Counter(get_host(url) for url in crawler.blocked_urls)
+    unreachable = Counter(get_host(url) for url in crawler.unreachable_urls)
+    domains = crawler.rate_limiter.get_stats().domains
+    return [
+        {
+            "host": host,
+            "requests": rate.requests,
+            "interval": round(rate.interval, 3),
+            "avg_gap": None if rate.avg_gap is None else round(rate.avg_gap, 3),
+            "blocked": blocked[host],
+            "unreachable": unreachable[host],
+        }
+        for host, rate in sorted(domains.items(), key=lambda item: -item[1].requests)
+    ]
+
+
+def print_politeness_report(crawler: AsyncCrawler) -> None:
+    stats = crawler.crawl_stats()
+    rows = host_stats(crawler)
+    host_width = max([len("HOST")] + [len(str(row["host"])) for row in rows])
+    print(f"\n=== Requests by host ({stats.requests} requests, {stats.requests_per_second:.2f} req/s) ===")
+    print(
+        f"{'HOST':<{host_width}}  {'REQUESTS':>8}  {'INTERVAL':>8}  {'AVG GAP':>8}  {'BLOCKED':>7}  {'UNREACHABLE':>11}"
+    )
+    for row in rows:
+        avg_gap = "-" if row["avg_gap"] is None else f"{row['avg_gap']:.2f}s"
+        print(
+            f"{row['host']:<{host_width}}  {row['requests']:>8}  {row['interval']:>7.2f}s  "
+            f"{avg_gap:>8}  {row['blocked']:>7}  {row['unreachable']:>11}"
+        )
+    print(
+        f"Average gap between requests to a host: {stats.avg_delay:.2f}s, "
+        f"average wait for the rate limit: {stats.avg_wait:.2f}s, "
+        f"retries: {stats.retries}, blocked by robots.txt: {stats.blocked}, "
+        f"not fetched as robots.txt was unreachable: {stats.unreachable}"
     )
 
 
@@ -337,14 +429,28 @@ def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
             "processed": stats.processed,
             "failed": stats.failed,
             "skipped": stats.skipped,
+            "blocked": stats.blocked,
+            "unreachable": stats.unreachable,
             "queued": stats.queued,
             "elapsed": round(stats.elapsed, 3),
             "pages_per_second": round(stats.pages_per_second, 2),
+            "requests": stats.requests,
+            "requests_per_second": round(stats.requests_per_second, 2),
+            "retries": stats.retries,
+            "avg_delay": round(stats.avg_delay, 3),
+            "avg_wait": round(stats.avg_wait, 3),
         },
+        "hosts": host_stats(crawler),
         "pages": [{"depth": depths[url], **page} for url, page in crawler.processed_urls.items()],
         "failed": [{"url": url, "depth": depths[url], "error": error} for url, error in crawler.failed_urls.items()],
         "skipped": [
             {"url": url, "depth": depths[url], "reason": reason} for url, reason in crawler.skipped_urls.items()
+        ],
+        "blocked": [
+            {"url": url, "depth": depths[url], "reason": reason} for url, reason in crawler.blocked_urls.items()
+        ],
+        "unreachable": [
+            {"url": url, "depth": depths[url], "reason": reason} for url, reason in crawler.unreachable_urls.items()
         ],
     }
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -352,7 +458,7 @@ def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
 
 
 async def run_crawl(args: argparse.Namespace) -> None:
-    crawler = make_crawler(args.concurrency, args.timeout, max_depth=args.max_depth, max_per_domain=args.per_domain)
+    crawler = make_crawler(args, max_depth=args.max_depth, max_per_domain=args.per_domain)
     async with crawler:
         crawl_task = asyncio.create_task(
             crawler.crawl(
@@ -367,6 +473,7 @@ async def run_crawl(args: argparse.Namespace) -> None:
         await crawl_task
 
     print_crawl_report(crawler)
+    print_politeness_report(crawler)
     if args.json is not None:
         save_crawl_json(args.json, crawler)
 

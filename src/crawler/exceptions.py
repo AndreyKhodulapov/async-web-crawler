@@ -15,15 +15,28 @@ class FetchError(Exception):
 
 
 class HTTPStatusError(FetchError):
-    """The server responded with a 4xx or 5xx status code."""
+    """The server responded with a 4xx or 5xx status code.
 
-    def __init__(self, url: str, status: int, reason: str) -> None:
+    `retry_after` is the number of seconds the server asked to wait in a
+    Retry-After header, if it sent one.
+    """
+
+    def __init__(self, url: str, status: int, reason: str, *, retry_after: float | None = None) -> None:
         super().__init__(url, f"HTTP {status} {reason}")
         self.status = status
+        self.retry_after = retry_after
 
 
 class NetworkError(FetchError):
     """The request failed at the network level (DNS, connection, payload)."""
+
+
+class TooManyRedirectsError(NetworkError):
+    """The redirects did not end within the limit, e.g. a redirect loop."""
+
+
+class CertificateError(NetworkError):
+    """The server's TLS certificate failed verification."""
 
 
 class FetchTimeoutError(FetchError):
@@ -36,6 +49,14 @@ class InvalidURLError(FetchError):
 
 class CrawlerClosedError(FetchError):
     """The crawler was closed before the request could start."""
+
+
+class RobotsDisallowedError(FetchError):
+    """robots.txt of the site does not allow this crawler to fetch the URL."""
+
+
+class RobotsUnreachableError(FetchError):
+    """robots.txt of the site could not be read, so no URL of the site may be fetched for now."""
 
 
 class UnexpectedError(FetchError):
