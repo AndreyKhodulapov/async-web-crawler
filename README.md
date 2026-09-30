@@ -150,9 +150,31 @@ Average gap between requests to a host: 1.54s, average wait for the rate limit: 
 `INTERVAL` is the minimum gap the crawler keeps for the host: the larger of
 `1 / --rps`, `--min-delay` and the site's Crawl-delay. Requests include
 robots.txt and retries. `UNREACHABLE` counts pages not requested because
-the site's robots.txt could not be read. With `--json`, the parsed pages (with
-their depth), the failed, skipped, blocked and unreachable URLs with the reasons, the statistics and
-the per-host table are saved to a file.
+the site's robots.txt could not be read.
+
+Then come the [error statistics](#error-statistics) and the state of the
+[circuit breaker](#circuit-breaker) of every host, here for a crawl of
+`httpbin.org/status/503`, `httpbin.org/status/404` and `example.com` with `--retries 1`:
+
+```
+=== Errors (3 failed attempts) ===
+By kind:  TransientError 2, PermanentError 1, NetworkError 0, ParseError 0, other 0
+By class: TransientHTTPError 2, PermanentHTTPError 1
+Retries: 1, pages recovered by a retry: 0, average time per retry: 1.08s
+Permanent errors (1):
+  https://httpbin.org/status/404  PermanentHTTPError: HTTP 404 NOT FOUND
+
+=== Circuit breaker (0 of 2 hosts blocked) ===
+HOST         STATE      REQUESTS  FAILURES  OPENED  REJECTED
+httpbin.org  closed            5         2       0         0
+example.com  closed            2         0       0         0
+```
+
+`REQUESTS` and `FAILURES` are counted over the breaker's window of the last
+minute and include robots.txt; `OPENED` and `REJECTED` count since the crawl
+started. With `--json`, the parsed pages (with their depth), the failed,
+skipped, blocked and unreachable URLs with the reasons, the statistics, the
+per-host table, the error statistics and the circuit breakers are saved to a file.
 
 ### parse
 

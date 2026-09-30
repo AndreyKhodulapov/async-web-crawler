@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import math
@@ -16,7 +17,7 @@ import sys
 import textwrap
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -482,6 +483,60 @@ def print_politeness_report(crawler: AsyncCrawler) -> None:
     )
 
 
+def error_report(crawler: AsyncCrawler) -> dict[str, object]:
+    """Error statistics and the circuit breaker of every host, for JSON output."""
+    errors = crawler.error_stats()
+    return {
+        "errors": {
+            "total": errors.total,
+            "by_kind": dict(errors.by_kind),
+            "by_class": dict(errors.by_class),
+            "retries": errors.retries,
+            "successful_retries": errors.successful_retries,
+            "avg_retry_time": round(errors.avg_retry_time, 3),
+            "permanent_errors": dict(errors.permanent_errors),
+        },
+        "circuit_breaker": {
+            host: dataclasses.asdict(circuit) for host, circuit in crawler.circuit_breaker.get_stats().items()
+        },
+    }
+
+
+def format_counts(counts: Mapping[str, int]) -> str:
+    return ", ".join(f"{name} {count}" for name, count in counts.items()) or "none"
+
+
+def print_error_report(crawler: AsyncCrawler) -> None:
+    errors = crawler.error_stats()
+    print(f"\n=== Errors ({errors.total} failed attempts) ===")
+    print(f"By kind:  {format_counts(errors.by_kind)}")
+    by_class = dict(sorted(errors.by_class.items(), key=lambda item: -item[1]))
+    print(f"By class: {format_counts(by_class)}")
+    print(
+        f"Retries: {errors.retries}, pages recovered by a retry: {errors.successful_retries}, "
+        f"average time per retry: {errors.avg_retry_time:.2f}s"
+    )
+    if errors.permanent_errors:
+        print(f"Permanent errors ({len(errors.permanent_errors)}):")
+        for url, error in errors.permanent_errors.items():
+            print(f"  {url}  {error}")
+
+    breaker = crawler.circuit_breaker
+    if not breaker.enabled:
+        print("\nCircuit breaker: off")
+        return
+    circuits = breaker.get_stats()
+    host_width = max([len("HOST")] + [len(host) for host in circuits])
+    opened = sum(circuit.state != "closed" for circuit in circuits.values())
+    print(f"\n=== Circuit breaker ({opened} of {len(circuits)} hosts blocked) ===")
+    print(f"{'HOST':<{host_width}}  {'STATE':<9}  {'REQUESTS':>8}  {'FAILURES':>8}  {'OPENED':>6}  {'REJECTED':>8}")
+    for host, circuit in circuits.items():
+        print(
+            f"{host:<{host_width}}  {circuit.state:<9}  {circuit.requests:>8}  {circuit.failures:>8}  "
+            f"{circuit.times_opened:>6}  {circuit.rejected:>8}"
+        )
+
+
 def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
     stats = crawler.crawl_stats()
     depths = crawler.url_depths
@@ -502,6 +557,7 @@ def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
             "avg_wait": round(stats.avg_wait, 3),
         },
         "hosts": host_stats(crawler),
+        **error_report(crawler),
         "pages": [{"depth": depths[url], **page} for url, page in crawler.processed_urls.items()],
         "failed": [{"url": url, "depth": depths[url], "error": error} for url, error in crawler.failed_urls.items()],
         "skipped": [
@@ -535,6 +591,7 @@ async def run_crawl(args: argparse.Namespace) -> None:
 
     print_crawl_report(crawler)
     print_politeness_report(crawler)
+    print_error_report(crawler)
     if args.json is not None:
         save_crawl_json(args.json, crawler)
 
