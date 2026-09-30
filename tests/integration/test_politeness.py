@@ -1,11 +1,12 @@
 """Integration tests: rate limits, robots.txt and retries against a local aiohttp server."""
 
+import asyncio
 import itertools
 
 import pytest
 from helpers import BOT, UNTHROTTLED
 
-from crawler import AsyncCrawler, RobotsDisallowedError
+from crawler import AsyncCrawler, RobotsDisallowedError, RobotsUnreachableError
 
 # Gaps are measured where requests arrive, while the limiter controls when
 # they are sent; opening a connection shifts an arrival by a millisecond or so.
@@ -87,12 +88,39 @@ class TestRobots:
         async with polite(respect_robots=True, user_agent="OtherBot/2.0") as crawler:
             assert await crawler.fetch_url(url("/site/"))
 
-    async def test_unreachable_robots_txt_blocks_the_site(self, url, site):
+    async def test_unreachable_robots_txt_keeps_the_site_unfetched(self, url, site):
         site.robots, site.robots_status = "", 503
         async with polite(respect_robots=True) as crawler:
-            with pytest.raises(RobotsDisallowedError, match=r"robots.txt is unreachable \(HTTP 503\)"):
+            with pytest.raises(RobotsUnreachableError, match=r"robots.txt is unreachable \(HTTP 503\)"):
                 await crawler.fetch_url(url("/site/"))
         assert site.hits["/site/"] == 0
+
+    async def test_site_is_fetched_once_robots_txt_is_back(self, url, site):
+        site.robots, site.robots_status = "", 503
+        async with polite(respect_robots=True) as crawler:
+            crawler.robots.UNREACHABLE_TTL = 0.05
+            with pytest.raises(RobotsUnreachableError):
+                await crawler.fetch_url(url("/site/"))
+            site.robots_status = 200
+            with pytest.raises(RobotsUnreachableError):
+                await crawler.fetch_url(url("/site/"))  # still cached
+
+            await asyncio.sleep(0.05)
+            assert await crawler.fetch_url(url("/site/"))
+        assert site.hits["/robots.txt"] == 2
+
+    async def test_unreachable_pages_are_not_blocked_and_do_not_count_toward_max_pages(
+        self, url, site, closed_port_url
+    ):
+        # One worker takes the page of the unreachable site first.
+        async with polite(respect_robots=True, max_concurrent=1) as crawler:
+            pages = await crawler.crawl([f"{closed_port_url}page", url("/site/")], max_pages=1)
+        stats = crawler.crawl_stats()
+
+        assert list(crawler.unreachable_urls) == [f"{closed_port_url}page"]
+        assert crawler.unreachable_urls[f"{closed_port_url}page"].startswith("robots.txt is unreachable (NetworkError")
+        assert (stats.unreachable, stats.blocked, stats.failed) == (1, 0, 0)
+        assert list(pages) == [url("/site/")]
 
     async def test_blocked_pages_do_not_count_toward_max_pages(self, url, site):
         # One worker, breadth-first: /site/, a.html, b.html (blocked), missing.html.

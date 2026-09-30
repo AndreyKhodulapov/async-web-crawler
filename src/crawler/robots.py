@@ -5,6 +5,7 @@ import functools
 import logging
 import math
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -170,20 +171,34 @@ class RobotsParser:
     5xx, 429 and network errors mean the site is unreachable and
     everything is disallowed. 429 is treated as a server error, as major
     search engines do: the site is asking crawlers to back off.
+    Unlike the rules of a file that was read, which are kept for good, an
+    unreachable robots.txt is fetched again after `UNREACHABLE_TTL`
+    seconds, so one timeout does not close the site for the whole crawl.
     Files over 500 KiB are cut to that size, the minimum the RFC requires
     crawlers to read.
     """
 
     MAX_SIZE = 500 * 1024
     MAX_CRAWL_DELAY = 30.0
+    UNREACHABLE_TTL = 60.0
 
-    def __init__(self, fetch: Callable[[str], Awaitable[tuple[int, str]]]) -> None:
+    def __init__(
+        self,
+        fetch: Callable[[str], Awaitable[tuple[int, str]]],
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._fetch = fetch
+        self._clock = clock
         self._rules: dict[str, RobotsRules] = {}
+        self._expires: dict[str, float] = {}  # origin -> when its unreachable robots.txt is fetched again
         self._downloads: dict[str, asyncio.Task[RobotsRules]] = {}
 
     async def fetch_robots(self, base_url: str) -> dict[str, Any]:
         """Download (or take from the cache) robots.txt of the site of `base_url`.
+
+        An unreachable robots.txt is taken from the cache only for
+        `UNREACHABLE_TTL` seconds, then it is downloaded again.
 
         Returns the parsed rules as a dict: "groups" (user agents, allow and
         disallow paths, crawl delay) and "unreachable" (why robots.txt could
@@ -201,6 +216,9 @@ class RobotsParser:
 
     def can_fetch(self, url: str, user_agent: str = "*") -> bool:
         """Whether `user_agent` may fetch `url`. The site's rules must have been fetched.
+
+        Answers from the cache as it is, even when the rules of an
+        unreachable robots.txt are due to be fetched again.
 
         Raises:
             LookupError: robots.txt of this site has not been fetched yet.
@@ -228,7 +246,9 @@ class RobotsParser:
 
     async def _rules_for(self, url: str) -> RobotsRules:
         origin = _origin(url)
-        if origin in self._rules:
+        # The rules of an unreachable robots.txt stay in the cache while it
+        # is downloaded again: the synchronous methods keep answering.
+        if origin in self._rules and self._clock() < self._expires.get(origin, math.inf):
             return self._rules[origin]
         download = self._downloads.get(origin)
         if download is None:
@@ -262,8 +282,16 @@ class RobotsParser:
             else:
                 logger.info("robots.txt of %s answered HTTP %d, everything is allowed", origin, status)
                 rules = RobotsRules.allow_all()
-        if rules.unreachable is not None:
-            logger.warning("robots.txt of %s is unreachable, the site is disallowed: %s", origin, rules.unreachable)
+        if rules.unreachable is None:
+            self._expires.pop(origin, None)
+        else:
+            logger.warning(
+                "robots.txt of %s is unreachable, the site is disallowed for %gs: %s",
+                origin,
+                self.UNREACHABLE_TTL,
+                rules.unreachable,
+            )
+            self._expires[origin] = self._clock() + self.UNREACHABLE_TTL
         self._rules[origin] = rules
         return rules
 

@@ -85,6 +85,10 @@ sites it visits and follows their rules.
 - **Status codes**: 2xx means parse; 4xx means there are no rules, so
   everything is allowed; 5xx or no answer means unreachable, so everything
   is disallowed. 429 is best treated like 5xx: the site asks crawlers to back off.
+- An **unreachable** robots.txt is an outage, not a rule: cache it briefly
+  (here 60 seconds) and fetch it again, or one timeout closes the site for
+  the whole crawl. Count such pages apart from the disallowed ones, so the
+  report does not blame robots.txt for a network failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
   origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB.
 - **Single flight**: when many workers reach a new site at once, they must
@@ -129,6 +133,7 @@ sites it visits and follows their rules.
 
 - Current requests per second over a sliding window (the last 5 seconds),
   average gap between requests to one host, average wait in the limiter,
-  retries and URLs blocked by robots.txt.
+  retries, URLs blocked by robots.txt and URLs left unfetched because
+  robots.txt was unreachable.
 - An average gap close to the configured interval means the limiter, not the
   site's speed, sets the pace.

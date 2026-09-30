@@ -6,16 +6,9 @@ import random
 import time
 
 import pytest
+from helpers import FakeClock
 
 from crawler import DomainRate, RateLimiter
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 100.0
-
-    def __call__(self) -> float:
-        return self.now
 
 
 @pytest.fixture

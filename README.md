@@ -17,13 +17,14 @@ and backs off when a site struggles.
 - Site crawling with a priority queue of URLs (`CrawlerQueue`), a pool of
   workers, depth and page limits, deduplication of normalized URLs, and
   filters: same domain only, include and exclude regular expressions
-- Live crawl statistics: pages done, queued, failed, blocked, requests in
-  flight, requests per second, average gap between requests to a host
+- Live crawl statistics: pages done, queued, failed, blocked, unreachable,
+  requests in flight, requests per second, average gap between requests to a host
 - Rate limiting per host or overall (`RateLimiter`, GCRA): requests per
   second, a minimum delay between requests and random jitter
 - robots.txt support (`RobotsParser`, RFC 9309): rules for the crawler's own
   name, wildcards, longest-match precedence, Crawl-delay; one download per
-  site, cached; disallowed URLs are logged and never requested
+  site, cached; disallowed URLs are logged and never requested; an
+  unreachable robots.txt closes the site for a minute, then it is fetched again
 - Retries of timeouts, network errors, HTTP 429 and 5xx with exponential
   backoff and jitter, honoring `Retry-After`; the whole host slows down
   while a retry waits
@@ -33,7 +34,8 @@ and backs off when a site struggles.
 - Separate connect, read and total timeouts
 - Clear error types: `HTTPStatusError`, `NetworkError` (with
   `TooManyRedirectsError` and `CertificateError`), `FetchTimeoutError`,
-  `InvalidURLError`, `RobotsDisallowedError`, `CrawlerClosedError` and
+  `InvalidURLError`, `RobotsDisallowedError`, `RobotsUnreachableError`,
+  `CrawlerClosedError` and
   `UnexpectedError`, all subclasses of `FetchError`
 - One failing URL never breaks a batch: even unforeseen exceptions are
   logged with a traceback and reported as `UnexpectedError`
@@ -98,7 +100,7 @@ and web-scraping.dev sets `Crawl-delay: 2`.
 While it runs, a progress line is updated every second:
 
 ```
-pages 9 | failed 0 | skipped 0 | blocked 0 | queued 88 | in progress 6 | in flight 2 | 1.6 req/s | gap 1.09s | 7.0s
+pages 9 | failed 0 | skipped 0 | blocked 0 | unreachable 0 | queued 88 | in progress 6 | in flight 2 | 1.6 req/s | gap 1.09s | 7.0s
 ```
 
 `in progress` counts pages taken by workers; `in flight` counts those actually
@@ -121,21 +123,22 @@ DEPTH  RESULT                                LINKS  URL
     1  FetchTimeoutError: request timed out         https://webscraper.io/blog
     1  ok                                       16  https://web-scraping.dev/
     1  HTTPStatusError: HTTP 404 Not Found          https://web-scraping.dev/api/graphql
-Crawled: 28 pages, failed: 2, skipped: 0, blocked: 29, left in queue: 232, speed: 1.1 pages/s
+Crawled: 28 pages, failed: 2, skipped: 0, blocked: 29, unreachable: 0, left in queue: 232, speed: 1.1 pages/s
 
 === Requests by host (39 requests, 1.39 req/s) ===
-HOST                       REQUESTS  INTERVAL   AVG GAP  BLOCKED
-webscraper.io                    24     1.00s     1.00s       25
-web-scraping.dev                  5     2.00s     5.05s        0
-cloud.webscraper.io               3     1.00s     1.00s        0
+HOST                       REQUESTS  INTERVAL   AVG GAP  BLOCKED  UNREACHABLE
+webscraper.io                    24     1.00s     1.00s       25            0
+web-scraping.dev                  5     2.00s     5.05s        0            0
+cloud.webscraper.io               3     1.00s     1.00s        0            0
 ...
-Average gap between requests to a host: 1.54s, average wait for the rate limit: 1.12s, retries: 0, blocked by robots.txt: 29
+Average gap between requests to a host: 1.54s, average wait for the rate limit: 1.12s, retries: 0, blocked by robots.txt: 29, not fetched as robots.txt was unreachable: 0
 ```
 
 `INTERVAL` is the minimum gap the crawler keeps for the host: the larger of
 `1 / --rps`, `--min-delay` and the site's Crawl-delay. Requests include
-robots.txt and retries. With `--json`, the parsed pages (with their depth),
-the failed, skipped and blocked URLs with the reasons, the statistics and
+robots.txt and retries. `UNREACHABLE` counts pages not requested because
+the site's robots.txt could not be read. With `--json`, the parsed pages (with
+their depth), the failed, skipped, blocked and unreachable URLs with the reasons, the statistics and
 the per-host table are saved to a file.
 
 ### parse
@@ -201,8 +204,8 @@ request that exceeds the timeout and a non-existent domain. For each run it
 prints the status, size and time of every request, the total time and the
 speedup. Retries are off here, since the list fails on purpose; the rate
 limit still applies, so the six httpbin.org requests start a second apart.
-The non-existent domain fails with `RobotsDisallowedError`: its robots.txt
-cannot be fetched, and an unreachable robots.txt disallows the whole site.
+The non-existent domain fails with `RobotsUnreachableError`: its robots.txt
+cannot be fetched, and while robots.txt is unreachable the site is not requested.
 Pass `--no-robots` to see the `NetworkError` itself.
 
 ```bash
@@ -220,7 +223,7 @@ https://example.com                  200                          713B   0.07s
 https://httpbin.org/delay/2          200                          416B   2.16s
 https://httpbin.org/status/404       HTTPStatusError 404            0B   0.16s
 https://httpbin.org/delay/10         FetchTimeoutError              0B   5.01s
-https://nonexistent-domain.invalid   RobotsDisallowedError          0B   0.00s
+https://nonexistent-domain.invalid   RobotsUnreachableError         0B   0.00s
 ...
 Succeeded: 6/10, total time: 15.78s
 
@@ -288,7 +291,8 @@ asyncio.run(main())
 
 Every method checks robots.txt, waits for the rate limit and retries transient
 failures; a URL that robots.txt disallows fails with `RobotsDisallowedError`
-without being requested.
+without being requested, and a URL of a site whose robots.txt cannot be read
+fails with `RobotsUnreachableError`.
 
 ### Politeness
 
@@ -309,7 +313,9 @@ Crawl-delay)` seconds apart; with several sites (ports) on one host, the
 longest Crawl-delay counts. robots.txt is fetched once per site (scheme,
 host and port) and cached for the crawler's lifetime. A missing robots.txt
 (HTTP 4xx) allows everything; an unreachable one (HTTP 5xx, 429, network
-errors) disallows the whole site. Only the requested URL is checked: the
+errors, after the retries) disallows the whole site for 60 seconds, then it
+is fetched again. Such pages are counted as unreachable, not as blocked:
+the site did not forbid them. Only the requested URL is checked: the
 HTTP client follows redirects on its own, so a redirect can still lead to a
 disallowed page. Crawl-delay is capped at 30 seconds. While
 a retry waits, the whole host waits with it, since a timeout or a 429 usually
@@ -369,9 +375,10 @@ during one, the crawler exposes its state:
 | `failed_urls` | `{url: "ErrorType: message"}` |
 | `skipped_urls` | `{url: reason}` for pages fetched but left out, e.g. redirected out of scope |
 | `blocked_urls` | `{url: reason}` for pages robots.txt did not allow to fetch |
+| `unreachable_urls` | `{url: reason}` for pages not fetched because robots.txt of their site was unreachable |
 | `visited_urls` | every URL taken for fetching, successful or not |
 | `url_depths` | depth of every URL accepted into the queue |
-| `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit |
+| `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
 
 The building blocks can be used on their own: `CrawlerQueue` (priorities,

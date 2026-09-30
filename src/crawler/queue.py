@@ -18,7 +18,8 @@ class CrawlerQueue:
     waiting, being fetched or already done.
 
     Lifecycle of a URL: `add_url` -> `get_next` (in progress) ->
-    `mark_processed`, `mark_failed`, `mark_skipped` or `mark_blocked`.
+    `mark_processed`, `mark_failed`, `mark_skipped`, `mark_blocked` or
+    `mark_unreachable`.
     Workers loop until `get_next` returns None, which happens when there is
     nothing left to do (see `get_next`) or after `close`.
     """
@@ -38,6 +39,7 @@ class CrawlerQueue:
         self.failed: dict[str, str] = {}  # URL -> error description
         self.skipped: dict[str, str] = {}  # URL -> why it was left out
         self.blocked: dict[str, str] = {}  # URL -> why it may not be fetched
+        self.unreachable: dict[str, str] = {}  # URL -> why its site's rules are unknown
 
     @property
     def closed(self) -> bool:
@@ -109,6 +111,11 @@ class CrawlerQueue:
         self._finish(url)
         self.blocked[url] = reason
 
+    def mark_unreachable(self, url: str, reason: str) -> None:
+        """Finish a URL that was not fetched because the rules of its site could not be read."""
+        self._finish(url)
+        self.unreachable[url] = reason
+
     def requeue(self, url: str, priority: int = 0) -> None:
         """Put a URL taken by `get_next` back unfetched; works after `close` too.
 
@@ -135,6 +142,7 @@ class CrawlerQueue:
             "failed": len(self.failed),
             "skipped": len(self.skipped),
             "blocked": len(self.blocked),
+            "unreachable": len(self.unreachable),
             "seen": len(self._depths),
         }
 

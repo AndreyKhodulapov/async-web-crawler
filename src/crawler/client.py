@@ -23,6 +23,7 @@ from crawler.exceptions import (
     InvalidURLError,
     NetworkError,
     RobotsDisallowedError,
+    RobotsUnreachableError,
     TooManyRedirectsError,
     UnexpectedError,
 )
@@ -69,7 +70,9 @@ class AsyncCrawler:
       the rate to all hosts together; `requests_per_second=None` removes it.
     - With `respect_robots`, every URL is checked against robots.txt of its
       site first. A disallowed URL is not requested and fails with
-      `RobotsDisallowedError` (see `RobotsParser`).
+      `RobotsDisallowedError`. While robots.txt of a site cannot be read,
+      its URLs are not requested either and fail with
+      `RobotsUnreachableError` (see `RobotsParser`).
     - Timeouts, network errors and HTTP 408, 429 and 5xx are retried up to
       `max_retries` times with exponential backoff from `backoff_base` up to
       `max_backoff` seconds (see `RetryPolicy`). While a retry waits, the
@@ -192,6 +195,11 @@ class AsyncCrawler:
         return self._queue.blocked
 
     @property
+    def unreachable_urls(self) -> dict[str, str]:
+        """URL -> reason for pages the latest crawl skipped because robots.txt was unreachable. Do not modify."""
+        return self._queue.unreachable
+
+    @property
     def url_depths(self) -> Mapping[str, int]:
         """Depth of every URL the latest crawl accepted: 0 for start URLs."""
         return self._queue.depths
@@ -277,7 +285,7 @@ class AsyncCrawler:
             self.rate_limiter.penalize(host, delay)
 
     async def _check_robots(self, url: str) -> FetchError | None:
-        """Return the error to fail `url` with if robots.txt disallows it, None if it may be fetched."""
+        """Return the error to fail `url` with if robots.txt does not allow it, None if it may be fetched."""
         host = get_host(url)
         if self.robots is None or host is None:
             return None  # an invalid URL fails in _request() with InvalidURLError
@@ -291,9 +299,13 @@ class AsyncCrawler:
         if allowed:
             return None
         unreachable = self.robots.unreachable_reason(url)
-        reason = "disallowed by robots.txt" if unreachable is None else f"robots.txt is unreachable ({unreachable})"
-        logger.info("Blocked %s: %s", url, reason)
-        return RobotsDisallowedError(url, reason)
+        refusal: FetchError
+        if unreachable is None:
+            refusal = RobotsDisallowedError(url, "disallowed by robots.txt")
+        else:
+            refusal = RobotsUnreachableError(url, f"robots.txt is unreachable ({unreachable})")
+        logger.info("Blocked %s: %s", url, refusal.message)
+        return refusal
 
     async def _download_robots(self, url: str) -> tuple[int, str]:
         """Fetcher for RobotsParser: robots.txt goes through the same limits and retries as a page."""
@@ -383,7 +395,9 @@ class AsyncCrawler:
         to `max_depth`. Every URL is fetched at most once. `max_pages` caps
         the number of pages requested, failed ones included. Pages that
         robots.txt disallows are not requested: they are listed in
-        `blocked_urls` and do not count toward `max_pages`.
+        `blocked_urls` and do not count toward `max_pages`. Neither do pages
+        of sites whose robots.txt cannot be read: they are listed in
+        `unreachable_urls`.
 
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
@@ -395,7 +409,7 @@ class AsyncCrawler:
 
         Failed pages do not stop the crawl: they are listed in `failed_urls`.
         The state of the crawl (`processed_urls`, `visited_urls`,
-        `failed_urls`, `skipped_urls`, `blocked_urls`, `url_depths`,
+        `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `url_depths`,
         `crawl_stats()`) is reset on every call and stays available after it
         returns. The rate limits and the robots.txt cache carry over.
 
@@ -440,11 +454,12 @@ class AsyncCrawler:
             self._crawl_finished = time.perf_counter()
         stats = self.crawl_stats()
         logger.info(
-            "Crawl finished: %d processed, %d failed, %d skipped, %d blocked, %d left in queue, %.2fs",
+            "Crawl finished: %d processed, %d failed, %d skipped, %d blocked, %d unreachable, %d left in queue, %.2fs",
             stats.processed,
             stats.failed,
             stats.skipped,
             stats.blocked,
+            stats.unreachable,
             stats.queued,
             stats.elapsed,
         )
@@ -461,6 +476,7 @@ class AsyncCrawler:
             failed=stats["failed"],
             skipped=stats["skipped"],
             blocked=stats["blocked"],
+            unreachable=stats["unreachable"],
             queued=stats["queued"],
             in_progress=stats["in_progress"],
             active_requests=self._limits.active,
@@ -481,6 +497,8 @@ class AsyncCrawler:
                 if refusal is not None:
                     if isinstance(refusal, RobotsDisallowedError):
                         queue.mark_blocked(url, refusal.message)
+                    elif isinstance(refusal, RobotsUnreachableError):
+                        queue.mark_unreachable(url, refusal.message)
                     else:
                         queue.mark_failed(url, f"{type(refusal).__name__}: {refusal.message}")
                     continue

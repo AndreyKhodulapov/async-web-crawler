@@ -10,6 +10,7 @@ from crawler.exceptions import (
     InvalidURLError,
     NetworkError,
     RobotsDisallowedError,
+    RobotsUnreachableError,
     TooManyRedirectsError,
     UnexpectedError,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "RobotsDisallowedError",
     "RobotsParser",
     "RobotsRules",
+    "RobotsUnreachableError",
     "SemaphoreManager",
     "TooManyRedirectsError",
     "UnexpectedError",

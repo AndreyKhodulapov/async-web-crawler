@@ -55,5 +55,9 @@ class RobotsDisallowedError(FetchError):
     """robots.txt of the site does not allow this crawler to fetch the URL."""
 
 
+class RobotsUnreachableError(FetchError):
+    """robots.txt of the site could not be read, so no URL of the site may be fetched for now."""
+
+
 class UnexpectedError(FetchError):
     """An unforeseen exception (most likely a bug); the traceback is logged."""

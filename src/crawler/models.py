@@ -45,7 +45,8 @@ class CrawlStats:
 
     `skipped` counts pages fetched but left out because they redirected
     outside the crawl scope; `blocked` counts pages robots.txt did not allow
-    to fetch. `in_progress` counts pages taken by workers:
+    to fetch, `unreachable` pages left unfetched because robots.txt of their
+    site could not be read. `in_progress` counts pages taken by workers:
     waiting for a free slot, being fetched or parsed. `active_requests` counts only HTTP requests
     holding a slot, so it never exceeds the concurrency limits. `elapsed`
     runs from the start of the crawl to now, or to its end once it has finished.
@@ -61,6 +62,7 @@ class CrawlStats:
     failed: int = 0
     skipped: int = 0
     blocked: int = 0
+    unreachable: int = 0
     queued: int = 0
     in_progress: int = 0
     active_requests: int = 0

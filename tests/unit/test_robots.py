@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from helpers import BOT
+from helpers import BOT, FakeClock
 
 from crawler import CrawlerClosedError, NetworkError, RobotsParser, RobotsRules, product_token
 
@@ -254,6 +254,47 @@ class TestRobotsParser:
         robots = RobotsParser(FakeFetcher(answer))
         assert await robots.is_allowed("https://site/page", BOT) is (unreachable is None)
         assert robots.unreachable_reason("https://site/page") == unreachable
+
+    async def test_unreachable_robots_txt_is_fetched_again_after_a_while(self):
+        fetch = FakeFetcher((503, ""))
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        assert not await robots.is_allowed("https://site/page", BOT)
+
+        clock.now += RobotsParser.UNREACHABLE_TTL - 1
+        assert not await robots.is_allowed("https://site/page", BOT)
+        assert len(fetch.requested) == 1
+
+        clock.now += 1
+        fetch.answer = (200, "")
+        assert await robots.is_allowed("https://site/page", BOT)
+        assert robots.unreachable_reason("https://site/page") is None
+        assert len(fetch.requested) == 2
+
+    async def test_robots_txt_that_was_read_is_kept(self):
+        fetch = FakeFetcher((200, "User-agent: *\nDisallow: /private/"))
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        await robots.fetch_robots("https://site/")
+
+        clock.now += 10 * RobotsParser.UNREACHABLE_TTL
+        assert await robots.is_allowed("https://site/page", BOT)
+        assert len(fetch.requested) == 1
+
+    async def test_old_rules_answer_while_robots_txt_is_fetched_again(self):
+        fetch = FakeFetcher((503, ""))
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        await robots.fetch_robots("https://site/")
+        clock.now += RobotsParser.UNREACHABLE_TTL
+        fetch.answer, fetch.latency = (200, ""), 0.01
+
+        downloads = [asyncio.create_task(robots.is_allowed(f"https://site/{page}", BOT)) for page in "ab"]
+        await asyncio.sleep(0)
+        assert robots.can_fetch("https://site/a", BOT) is False
+
+        assert await asyncio.gather(*downloads) == [True, True]
+        assert len(fetch.requested) == 2  # the two callers shared one download
 
     async def test_closed_fetcher_is_reported_and_not_cached(self):
         fetch = FakeFetcher(CrawlerClosedError("https://site/robots.txt", "crawler is closed"))

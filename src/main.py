@@ -328,7 +328,7 @@ async def run_parse(args: argparse.Namespace) -> None:
 def format_progress(stats: CrawlStats) -> str:
     return (
         f"pages {stats.processed} | failed {stats.failed} | skipped {stats.skipped} | blocked {stats.blocked} | "
-        f"queued {stats.queued} | in progress {stats.in_progress} | in flight {stats.active_requests} | "
+        f"unreachable {stats.unreachable} | queued {stats.queued} | in progress {stats.in_progress} | in flight {stats.active_requests} | "
         f"{stats.current_rps:.1f} req/s | gap {stats.avg_delay:.2f}s | {stats.elapsed:.1f}s"
     )
 
@@ -366,19 +366,22 @@ def print_crawl_report(crawler: AsyncCrawler) -> None:
             reason = f"skipped, {crawler.skipped_urls[url]}"
         elif url in crawler.blocked_urls:
             reason = f"blocked, {crawler.blocked_urls[url]}"
+        elif url in crawler.unreachable_urls:
+            reason = crawler.unreachable_urls[url]
         else:
             continue  # still in the queue
         result = textwrap.shorten(reason, width=36, placeholder="...")
         print(f"{depth:>5}  {result:<36}  {'':>5}  {url}")
     print(
         f"Crawled: {stats.processed} pages, failed: {stats.failed}, skipped: {stats.skipped}, "
-        f"blocked: {stats.blocked}, left in queue: {stats.queued}, speed: {stats.pages_per_second:.1f} pages/s"
+        f"blocked: {stats.blocked}, unreachable: {stats.unreachable}, left in queue: {stats.queued}, speed: {stats.pages_per_second:.1f} pages/s"
     )
 
 
 def host_stats(crawler: AsyncCrawler) -> list[dict[str, object]]:
-    """Requests, enforced interval, average gap and blocked pages per host, busiest first."""
+    """Requests, enforced interval, average gap, blocked and unreachable pages per host, busiest first."""
     blocked = Counter(get_host(url) for url in crawler.blocked_urls)
+    unreachable = Counter(get_host(url) for url in crawler.unreachable_urls)
     domains = crawler.rate_limiter.get_stats().domains
     return [
         {
@@ -387,6 +390,7 @@ def host_stats(crawler: AsyncCrawler) -> list[dict[str, object]]:
             "interval": round(rate.interval, 3),
             "avg_gap": None if rate.avg_gap is None else round(rate.avg_gap, 3),
             "blocked": blocked[host],
+            "unreachable": unreachable[host],
         }
         for host, rate in sorted(domains.items(), key=lambda item: -item[1].requests)
     ]
@@ -397,17 +401,20 @@ def print_politeness_report(crawler: AsyncCrawler) -> None:
     rows = host_stats(crawler)
     host_width = max([len("HOST")] + [len(str(row["host"])) for row in rows])
     print(f"\n=== Requests by host ({stats.requests} requests, {stats.requests_per_second:.2f} req/s) ===")
-    print(f"{'HOST':<{host_width}}  {'REQUESTS':>8}  {'INTERVAL':>8}  {'AVG GAP':>8}  {'BLOCKED':>7}")
+    print(
+        f"{'HOST':<{host_width}}  {'REQUESTS':>8}  {'INTERVAL':>8}  {'AVG GAP':>8}  {'BLOCKED':>7}  {'UNREACHABLE':>11}"
+    )
     for row in rows:
         avg_gap = "-" if row["avg_gap"] is None else f"{row['avg_gap']:.2f}s"
         print(
             f"{row['host']:<{host_width}}  {row['requests']:>8}  {row['interval']:>7.2f}s  "
-            f"{avg_gap:>8}  {row['blocked']:>7}"
+            f"{avg_gap:>8}  {row['blocked']:>7}  {row['unreachable']:>11}"
         )
     print(
         f"Average gap between requests to a host: {stats.avg_delay:.2f}s, "
         f"average wait for the rate limit: {stats.avg_wait:.2f}s, "
-        f"retries: {stats.retries}, blocked by robots.txt: {stats.blocked}"
+        f"retries: {stats.retries}, blocked by robots.txt: {stats.blocked}, "
+        f"not fetched as robots.txt was unreachable: {stats.unreachable}"
     )
 
 
@@ -420,6 +427,7 @@ def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
             "failed": stats.failed,
             "skipped": stats.skipped,
             "blocked": stats.blocked,
+            "unreachable": stats.unreachable,
             "queued": stats.queued,
             "elapsed": round(stats.elapsed, 3),
             "pages_per_second": round(stats.pages_per_second, 2),
@@ -437,6 +445,9 @@ def save_crawl_json(path: Path, crawler: AsyncCrawler) -> None:
         ],
         "blocked": [
             {"url": url, "depth": depths[url], "reason": reason} for url, reason in crawler.blocked_urls.items()
+        ],
+        "unreachable": [
+            {"url": url, "depth": depths[url], "reason": reason} for url, reason in crawler.unreachable_urls.items()
         ],
     }
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
