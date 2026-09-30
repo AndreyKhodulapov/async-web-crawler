@@ -77,6 +77,8 @@ def test_resolve_with_invalid_base_keeps_only_absolute_links():
         ("https://example.com/caf%c3%a9", "https://example.com/caf%C3%A9"),
         ("https://example.com/a b", "https://example.com/a%20b"),
         ("https://example.com/a%2Fb?x=%26&y=1+2", "https://example.com/a%2Fb?x=%26&y=1+2"),
+        # Escaped unreserved characters are the characters themselves; "%2A" is not "*".
+        ("https://example.com/%7ejoe/%41%2D%2A?q=%5F%2F", "https://example.com/~joe/A-%2A?q=_%2F"),
         ("https://example.com/\ud800", None),
     ],
 )

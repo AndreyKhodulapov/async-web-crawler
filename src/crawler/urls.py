@@ -19,7 +19,8 @@ def normalize_url(url: str) -> str | None:
     host is converted to punycode, a trailing dot in the host, the default
     port and the fragment are dropped, and an empty path becomes "/".
     The path and query are percent-encoded the way an HTTP client sends
-    them: "/café" and "/caf%C3%A9" are the same address.
+    them: "/café" and "/caf%C3%A9" are the same address, and so are
+    "/~joe" and "/%7Ejoe".
     """
     try:
         parts = urlsplit(url.strip())
@@ -85,13 +86,21 @@ def percent_encode(component: str) -> str | None:
 
     Characters that RFC 3986 allows in a path or query are kept, and so are
     existing escapes, whose hex digits are uppercased: "%d0" and "%D0" are
-    the same byte. A lone surrogate cannot be encoded as UTF-8.
+    the same byte. An escaped unreserved character (letter, digit, "-",
+    ".", "_", "~") is decoded, as RFC 3986 says it means the same:
+    "%7E" is "~". Other escapes, such as "%2F" or "%2A", keep their meaning
+    apart from the character. A lone surrogate cannot be encoded as UTF-8.
     """
     try:
         encoded = quote(component, safe="/?:@!$&'()*+,;=-._~%")
     except UnicodeEncodeError:
         return None
-    return re.sub(r"%[0-9a-fA-F]{2}", lambda escape: escape.group().upper(), encoded)
+    return re.sub(r"%[0-9a-fA-F]{2}", _normalize_escape, encoded)
+
+
+def _normalize_escape(escape: re.Match[str]) -> str:
+    char = chr(int(escape.group()[1:], 16))
+    return char if char.isascii() and (char.isalnum() or char in "-._~") else escape.group().upper()
 
 
 def _encode_host(host: str) -> str | None:

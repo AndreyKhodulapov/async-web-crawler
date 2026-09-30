@@ -5,7 +5,7 @@ import asyncio
 import pytest
 from helpers import BOT, FakeClock
 
-from crawler import CrawlerClosedError, NetworkError, RobotsParser, RobotsRules, product_token
+from crawler import CrawlerClosedError, NetworkError, RobotsParser, RobotsRules, TooManyRedirectsError, product_token
 
 
 def allowed(robots_txt: str, path: str, user_agent: str = BOT) -> bool:
@@ -124,6 +124,15 @@ class TestMatching:
         robots = "User-agent: *\nDisallow: /café"
         assert not allowed(robots, "/café/menu")
         assert not allowed(robots, "/caf%C3%A9/menu")
+
+    @pytest.mark.parametrize(("rule", "path"), [("/~joe/", "/%7Ejoe/page"), ("/%7ejoe/", "/~joe/page")])
+    def test_escaped_unreserved_characters_match_the_characters(self, rule, path):
+        assert not allowed(f"User-agent: *\nDisallow: {rule}", path)
+
+    def test_escaped_wildcards_stay_literal(self):
+        robots = "User-agent: *\nDisallow: /a%2Ab$"
+        assert not allowed(robots, "/a%2Ab")
+        assert allowed(robots, "/axb")
 
     def test_robots_txt_itself_is_always_allowed(self):
         assert allowed("User-agent: *\nDisallow: /", "/robots.txt")
@@ -252,6 +261,8 @@ class TestRobotsParser:
             ((500, ""), "HTTP 500"),
             ((503, ""), "HTTP 503"),
             (NetworkError("https://site/robots.txt", "connection refused"), "NetworkError: connection refused"),
+            # A redirect loop counts as no robots.txt (RFC 9309 2.3.1.2).
+            (TooManyRedirectsError("https://site/robots.txt", "too many redirects (10)"), None),
         ],
     )
     async def test_missing_or_unreachable_robots_txt(self, answer, unreachable):

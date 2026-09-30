@@ -44,7 +44,11 @@ sites it visits and follows their rules.
   waiting for its host does not hold a slot another host could use. The
   slot can come later than the booked time, so inside it the interval is
   checked once more against the request that actually started last: the
-  interval holds between requests sent, not only between bookings. The
+  interval holds between requests sent, not only between bookings. Nothing
+  sleeps inside the slot: a request that finds the interval not yet passed
+  lets the slot go and books again. Sleeping there would hold a slot, and a
+  request waking inside it would race the ones waking outside for the same
+  moment and could lose again and again. The
   server sees arrival times, which also carry network jitter, e.g. the first
   request also opens the connection.
 - **Penalties** (HTTP 429, timeouts) move `next_start`, but requests that
@@ -53,6 +57,9 @@ sites it visits and follows their rules.
   Trade-off: it goes to the end of the host's queue. With hundreds of URLs
   of one host booked at once (`fetch_many`), those requests move far back;
   in `crawl()` the queue is no longer than the number of workers.
+  Under a global limit, a request penalized while it waits for its host
+  does not book the shared schedule at all; one that has already booked
+  it loses that turn, as GCRA never gives a booked time back.
 - **Global limit with per-host rules**: a host's own Crawl-delay or penalty
   must not stop other hosts. The host's schedule is waited for first, then
   the shared one is booked: booking both at once would park a far-future
@@ -81,10 +88,13 @@ sites it visits and follows their rules.
   crawler follows `*`.
 - The **longest matching rule wins**, and `Allow` wins a tie; the order of
   lines does not matter. `*` matches any characters, `$` anchors the end.
-  Paths are compared percent-encoded, query string included.
+  Paths are compared percent-encoded, query string included; an escaped
+  unreserved character is the character itself (`%7E` is `~`), or
+  `Disallow: /~joe/` would let `/%7Ejoe/` through.
 - **Status codes**: 2xx means parse; 4xx means there are no rules, so
-  everything is allowed; 5xx or no answer means unreachable, so everything
-  is disallowed. 429 is best treated like 5xx: the site asks crawlers to back off.
+  everything is allowed, and so may a redirect loop (the RFC counts too
+  many redirects as unavailable); 5xx or no answer means unreachable, so
+  everything is disallowed. 429 is best treated like 5xx: the site asks crawlers to back off.
 - An **unreachable** robots.txt is an outage, not a rule: cache it briefly
   (here 60 seconds) and fetch it again, or one timeout closes the site for
   the whole crawl. The TTL helps the URLs that come later: pages refused

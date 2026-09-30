@@ -234,6 +234,24 @@ class TestAcquire:
         assert penalized >= 0.3 - EPSILON
         assert other_again < 0.2
 
+    async def test_penalty_under_a_global_limit_costs_the_others_no_turns(self):
+        limiter = RateLimiter(10.0, per_domain=False)  # 0.1 s apart
+        limiter.set_delay("a", 0.05)
+        waiting = asyncio.gather(*(limiter.acquire("a") for _ in range(5)))
+        await asyncio.sleep(0)  # the first one has started, the others wait for "a"
+        limiter.penalize("a", 1.0)
+        await asyncio.sleep(0.3)
+        began = time.monotonic()
+        await limiter.acquire("b")
+        waited = time.monotonic() - began
+        waiting.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiting
+
+        # Woken during the penalty, the requests to "a" book it again without
+        # taking turns of the global limit: "b" finds it free.
+        assert waited < 0.05
+
 
 class TestSlot:
     async def test_turn_is_waited_for_outside_the_gate(self):
@@ -291,3 +309,39 @@ class TestSlot:
         await asyncio.sleep(0)
         await asyncio.gather(*(request() for _ in range(4)), blocker)
         assert max(held) < 0.02
+
+    @pytest.mark.parametrize(
+        ("per_domain", "domains", "slots", "busy"),
+        [
+            (False, [f"host{number}" for number in range(10)], 3, 0.25),
+            (True, ["a"] * 6, 2, 0.5),
+        ],
+    )
+    async def test_requests_let_in_late_never_wait_inside_the_gate(self, per_domain, domains, slots, busy):
+        limiter = RateLimiter(10.0, per_domain=per_domain)  # 0.1 s apart
+        gate = asyncio.Semaphore(slots)
+        held: list[float] = []
+        started: list[float] = []
+
+        @contextlib.asynccontextmanager
+        async def timed_gate():
+            async with gate:
+                taken = time.monotonic()
+                yield
+                held.append(time.monotonic() - taken)
+
+        async def request(domain: str) -> None:
+            async with limiter.slot(domain, timed_gate):
+                started.append(time.monotonic())
+
+        async def other_work() -> None:
+            async with gate:
+                await asyncio.sleep(busy)
+
+        # The gate is busy at first. A request that gets it too soon after
+        # another one started lets it go and waits for a new turn outside.
+        blockers = [asyncio.create_task(other_work()) for _ in range(slots)]
+        await asyncio.sleep(0)
+        await asyncio.gather(*(request(domain) for domain in domains), *blockers)
+        assert max(held) < 0.02
+        assert all(later - earlier >= 0.1 - EPSILON for earlier, later in itertools.pairwise(sorted(started)))

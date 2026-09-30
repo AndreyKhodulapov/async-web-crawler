@@ -140,22 +140,22 @@ class RateLimiter:
     ) -> AsyncIterator[None]:
         """Wait for the turn of `domain`, then hold `gate()`, e.g. a concurrency slot, for the request.
 
-        The turn is waited for outside the gate, so a request waiting for
-        its domain does not hold a gate that other domains could use. When
-        the gate comes late, the interval is checked again inside it,
-        counted from the request to the domain that started last. A penalty
-        that comes while waiting for the gate sends the request back to wait
-        for a new turn outside it.
+        Nothing is waited for inside the gate, so a request waiting for its
+        domain does not hold a gate that other domains could use. When the
+        gate comes late, the interval is checked again inside it, counted
+        from the request to the domain that started last: if another one
+        started too recently in the meantime, or the domain has been
+        penalized, the request lets the gate go and waits for a new turn
+        outside it.
         """
         waited = 0.0
         while True:
             start, slept = await self._wait_turn(domain)
             waited += slept
             async with gate():
-                slept = await self._start(domain, start)
-                if slept is None:
+                if not self._start(domain, start):
                     continue
-                self._record(domain, self._clock(), waited + slept)
+                self._record(domain, self._clock(), waited)
                 yield
                 return
 
@@ -224,36 +224,36 @@ class RateLimiter:
                 if start > now:
                     await asyncio.sleep(start - now)
                     slept += start - now
-            # The request before may have started later than booked, when
-            # its gate came late: the interval since then is waited for
-            # here too, so that it is not waited for inside the gate.
-            now = self._clock()
-            while (ready := self._ready_at(domain, now)) > now:
-                await asyncio.sleep(ready - now)
-                slept += ready - now
+                # A penalty that came after the booking and outlasts it: the
+                # booked time is void, and a new one comes after the penalty.
+                # The next schedule is not booked, so the shared one does
+                # not lose a turn to a request that cannot start.
+                if self._penalty_end(domain) > start:
+                    break
+            else:
+                # The request before may have started later than booked, when
+                # its gate came late: the interval since then is waited for
+                # here too, so that the gate does not send this one back.
                 now = self._clock()
-            # A penalty that came after the booking and outlasts it: the
-            # booked time is void, and a new one comes after the penalty.
-            if self._penalty_end(domain) <= start:
-                return start, slept
+                while (ready := self._ready_at(domain, now)) > now:
+                    await asyncio.sleep(ready - now)
+                    slept += ready - now
+                    now = self._clock()
+                if self._penalty_end(domain) <= start:
+                    return start, slept
 
-    async def _start(self, domain: str | None, start: float) -> float | None:
-        """Mark a request to `domain` started once the intervals since the last ones have passed.
+    def _start(self, domain: str | None, start: float) -> bool:
+        """Mark a request to `domain` started if it may start now; return whether it has.
 
-        Return the seconds slept for that, or None if the domain has been
-        penalized since `start` was booked.
+        It may not if the domain has been penalized since `start` was
+        booked, or the intervals since the requests that started last have
+        not passed yet.
         """
-        slept = 0.0
-        while True:
-            now = self._clock()
-            if self._penalty_end(domain) > max(now, start):
-                return None
-            ready = self._ready_at(domain, now)
-            if ready <= now:
-                self._mark_started(domain, now)
-                return slept
-            await asyncio.sleep(ready - now)
-            slept += ready - now
+        now = self._clock()
+        if self._penalty_end(domain) > max(now, start) or self._ready_at(domain, now) > now:
+            return False
+        self._mark_started(domain, now)
+        return True
 
     def _ready_at(self, domain: str | None, now: float) -> float:
         """When the intervals since the requests that started last have passed; `now` if none started."""

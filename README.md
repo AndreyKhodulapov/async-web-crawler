@@ -312,13 +312,13 @@ Requests to one host start at least `max(1 / requests_per_second, min_delay,
 Crawl-delay)` seconds apart; with several sites (ports) on one host, the
 longest Crawl-delay counts. robots.txt is fetched once per site (scheme,
 host and port) and cached for the crawler's lifetime. A missing robots.txt
-(HTTP 4xx) allows everything; an unreachable one (HTTP 5xx, 429, network
+(HTTP 4xx, or a redirect loop) allows everything; an unreachable one (HTTP 5xx, 429, network
 errors, after the retries) disallows the whole site for 60 seconds, then it
 is fetched again. Such pages are counted as unreachable, not as blocked:
 the site did not forbid them. A crawl does not queue them again, so only
 the pages found after the 60 seconds are fetched. Only the requested URL is checked: the
 HTTP client follows redirects on its own, so a redirect can still lead to a
-disallowed page. Crawl-delay is capped at 30 seconds. While
+disallowed page, and the rate limit of the host it leads to does not apply. Crawl-delay is capped at 30 seconds. While
 a retry waits, the whole host waits with it, since a timeout or a 429 usually
 means the site is overloaded. A Retry-After header holds back the host even
 when the request is not retried, for at most `max_backoff` seconds; a

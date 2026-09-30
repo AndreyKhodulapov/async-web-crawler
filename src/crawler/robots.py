@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from crawler.exceptions import CrawlerClosedError, FetchError
+from crawler.exceptions import CrawlerClosedError, FetchError, TooManyRedirectsError
 from crawler.urls import normalize_url, percent_encode
 
 logger = logging.getLogger(__name__)
@@ -168,10 +168,11 @@ class RobotsParser:
     not been fetched yet share a single download.
 
     The HTTP status decides what happens when there is no usable file
-    (RFC 9309): 4xx means there are no rules and everything is allowed;
-    5xx, 429 and network errors mean the site is unreachable and
-    everything is disallowed. 429 is treated as a server error, as major
-    search engines do: the site is asking crawlers to back off.
+    (RFC 9309): 4xx means there are no rules and everything is allowed,
+    and so does a redirect loop, which the RFC lets crawlers count as an
+    unavailable file; 5xx, 429 and network errors mean the site is
+    unreachable and everything is disallowed. 429 is treated as a server
+    error, as major search engines do: the site is asking crawlers to back off.
     Unlike the rules of a file that was read, which are kept for good, an
     unreachable robots.txt is fetched again after `UNREACHABLE_TTL`
     seconds, so one timeout does not close the site for the whole crawl.
@@ -273,6 +274,9 @@ class RobotsParser:
             status, text = await self._fetch(url)
         except CrawlerClosedError:
             raise  # not an answer from the site: nothing to cache
+        except TooManyRedirectsError as error:
+            logger.info("robots.txt of %s: %s, everything is allowed", origin, error.message)
+            rules = RobotsRules.allow_all()
         except FetchError as error:
             rules = RobotsRules.forbid_all(f"{type(error).__name__}: {error.message}")
         else:
