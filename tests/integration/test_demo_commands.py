@@ -18,7 +18,9 @@ async def test_crawl_reports_errors_and_circuit_breaker(url, tmp_path, capsys):
     assert "By class: TransientHTTPError 1, PermanentHTTPError 1" in output
     assert "Retries: 1, pages recovered by a retry: 1," in output
     assert f"  {url('/status/404')}  PermanentHTTPError: HTTP 404 Not Found" in output
-    assert "=== Circuit breaker (0 of 1 hosts blocked) ===" in output
+    assert "=== Circuit breaker (1 hosts: 0 open, 0 half-open) ===" in output
+    # The politeness report counts robots.txt too; here it is off.
+    assert "retries (robots.txt included): 1," in output
 
     saved = json.loads(report.read_text(encoding="utf-8"))
     errors = saved["errors"]
@@ -84,5 +86,5 @@ async def test_errors_demo_meets_every_kind_of_error(url, tmp_path, capsys):
     assert (breakers["localhost"]["state"], breakers["localhost"]["times_opened"]) == ("open", 1)
 
     output = capsys.readouterr().out
-    assert "=== Circuit breaker (1 of 3 hosts blocked) ===" in output
+    assert "=== Circuit breaker (3 hosts: 1 open, 0 half-open) ===" in output
     assert f"Error report saved to {report}" in output

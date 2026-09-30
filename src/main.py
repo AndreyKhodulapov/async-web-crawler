@@ -25,6 +25,7 @@ from typing import Any
 from crawler import (
     AsyncCrawler,
     CircuitBreaker,
+    CircuitState,
     CrawlStats,
     FetchError,
     FetchResult,
@@ -38,6 +39,9 @@ from crawler import (
     product_token,
 )
 from demo_site import DemoSite
+
+# The longest pause between retries; a longer --retry-delay would not be doubled.
+MAX_RETRY_DELAY = 30.0
 
 
 def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) -> Callable[[str], int | float]:
@@ -90,9 +94,17 @@ def regex(raw: str) -> str:
 
 
 def add_common_options(
-    parser: argparse.ArgumentParser, *, retries: int = 2, retry_delay: float = 1.0, log_level: str = "INFO"
+    parser: argparse.ArgumentParser,
+    *,
+    retries: int = 2,
+    retry_delay: float = 1.0,
+    log_level: str = "INFO",
+    robots: bool = True,
 ) -> None:
     """Options every command has; the defaults that differ by command are arguments.
+
+    With `robots=False`, the command does not check robots.txt unless given
+    `--robots`, in place of `--no-robots`.
 
     Each command gets its own copy: a parent parser shared through `parents=`
     shares its option objects too, so `set_defaults` on one command would
@@ -101,24 +113,32 @@ def add_common_options(
     parser.add_argument("--concurrency", type=positive(int), default=10, help="max parallel requests")
     timeouts = parser.add_argument_group("timeouts")
     timeouts.add_argument(
-        "--connect-timeout", type=positive(float), default=5.0, metavar="S", help="DNS, TCP and TLS, s (default: 5)"
+        "--connect-timeout",
+        type=positive(float),
+        default=5.0,
+        metavar="S",
+        help="DNS, TCP and TLS, s (default: %(default)g)",
     )
     timeouts.add_argument(
         "--read-timeout",
         type=positive(float),
         default=5.0,
         metavar="S",
-        help="each chunk of the response, s (default: 5)",
+        help="each chunk of the response, s (default: %(default)g)",
     )
     timeouts.add_argument(
-        "--total-timeout", type=positive(float), default=10.0, metavar="S", help="whole request, s (default: 10)"
+        "--total-timeout",
+        type=positive(float),
+        default=10.0,
+        metavar="S",
+        help="whole request, s (default: %(default)g)",
     )
     timeouts.add_argument(
         "--timeout-growth",
         type=at_least_one,
         default=1.5,
         metavar="X",
-        help=f"multiply the timeouts by X on every retry, at most {AsyncCrawler.MAX_TIMEOUT_GROWTH:g}x (default: 1.5)",
+        help=f"multiply the timeouts by X on every retry, at most {AsyncCrawler.MAX_TIMEOUT_GROWTH:g}x (default: %(default)g)",
     )
     parser.add_argument(
         "--log-level",
@@ -131,7 +151,7 @@ def add_common_options(
         "--rps",
         type=positive(float, allow_zero=True),
         default=1.0,
-        help="max requests per second to one host, 0 = no limit (default: 1)",
+        help="max requests per second to one host, 0 = no limit (default: %(default)g)",
     )
     politeness.add_argument(
         "--min-delay", type=positive(float, allow_zero=True), default=0.0, help="min seconds between requests to a host"
@@ -139,7 +159,12 @@ def add_common_options(
     politeness.add_argument(
         "--jitter", type=positive(float, allow_zero=True), default=0.0, help="random extra delay up to this, s"
     )
-    politeness.add_argument("--no-robots", action="store_true", help="do not check robots.txt")
+    if robots:
+        politeness.add_argument("--no-robots", action="store_true", help="do not check robots.txt")
+    else:
+        politeness.add_argument(
+            "--robots", action="store_false", dest="no_robots", help="check robots.txt; for real URLs, add --rps 1"
+        )
     politeness.add_argument(
         "--retries",
         type=positive(int, allow_zero=True),
@@ -151,7 +176,7 @@ def add_common_options(
         type=positive(float),
         default=retry_delay,
         metavar="S",
-        help=f"pause before the first retry, doubled on every next one, s (default: {retry_delay:g})",
+        help=f"seconds before the first retry, doubled for every next one up to {MAX_RETRY_DELAY:g} (default: %(default)g)",
     )
     breaker = parser.add_argument_group("circuit breaker")
     breaker.add_argument(
@@ -160,14 +185,14 @@ def add_common_options(
         default=0.5,
         metavar="SHARE",
         help="block a host once this share of its requests in the last minute (5 at least) "
-        "failed with a timeout, a network error, HTTP 429 or 5xx (default: 0.5)",
+        "failed with a timeout, a network error, HTTP 429 or 5xx (default: %(default)g)",
     )
     breaker.add_argument(
         "--breaker-cooldown",
         type=positive(float, allow_zero=True),
         default=30.0,
         metavar="S",
-        help="how long a blocked host is left alone before a probe request, s (default: 30)",
+        help="how long a blocked host is left alone before a probe request, s (default: %(default)g)",
     )
     breaker.add_argument("--no-breaker", action="store_true", help="never block a host")
     politeness.add_argument(
@@ -244,14 +269,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("error_report.json"),
         metavar="PATH",
-        help="where to save the error report (default: error_report.json)",
+        help="where to save the error report (default: %(default)s)",
     )
     # Fast retries and a short read timeout keep the demo within seconds; the
     # site is local, so no rate limit or robots.txt.
-    add_common_options(errors, retries=3, retry_delay=0.2)
-    errors.set_defaults(read_timeout=1.0, rps=0.0, no_robots=True)
+    add_common_options(errors, retries=3, retry_delay=0.2, robots=False)
+    errors.set_defaults(read_timeout=1.0, rps=0.0)
 
     args = parser.parse_args(argv)
+    if args.retry_delay > MAX_RETRY_DELAY:
+        parser.error(f"--retry-delay must be at most {MAX_RETRY_DELAY:g}, got {args.retry_delay:g}")
     if args.user_agent and len({product_token(agent) for agent in args.user_agent}) > 1:
         parser.error("every --user-agent must start with the same bot name, e.g. MyBot/1.0 (...)")
     return args
@@ -272,7 +299,7 @@ def make_crawler(args: argparse.Namespace, parser: HTMLParser | None = None, **o
         min_delay=args.min_delay,
         jitter=args.jitter,
         respect_robots=not args.no_robots,
-        retry_strategy=RetryStrategy(max_retries=args.retries, base_delay=args.retry_delay),
+        retry_strategy=RetryStrategy(max_retries=args.retries, base_delay=args.retry_delay, max_delay=MAX_RETRY_DELAY),
         circuit_breaker=CircuitBreaker(
             None if args.no_breaker else args.breaker_threshold, cooldown=args.breaker_cooldown
         ),
@@ -505,7 +532,7 @@ def print_politeness_report(crawler: AsyncCrawler) -> None:
     print(
         f"Average gap between requests to a host: {stats.avg_delay:.2f}s, "
         f"average wait for the rate limit: {stats.avg_wait:.2f}s, "
-        f"retries: {stats.retries}, blocked by robots.txt: {stats.blocked}, "
+        f"retries (robots.txt included): {stats.retries}, blocked by robots.txt: {stats.blocked}, "
         f"not fetched as robots.txt was unreachable: {stats.unreachable}"
     )
 
@@ -554,8 +581,11 @@ def print_error_report(crawler: AsyncCrawler) -> None:
         return
     circuits = breaker.get_stats()
     host_width = max([len("HOST")] + [len(host) for host in circuits])
-    opened = sum(circuit.state != "closed" for circuit in circuits.values())
-    print(f"\n=== Circuit breaker ({opened} of {len(circuits)} hosts blocked) ===")
+    states = Counter(circuit.state for circuit in circuits.values())
+    print(
+        f"\n=== Circuit breaker ({len(circuits)} hosts: {states[CircuitState.OPEN]} open, "
+        f"{states[CircuitState.HALF_OPEN]} half-open) ==="
+    )
     print(f"{'HOST':<{host_width}}  {'STATE':<9}  {'REQUESTS':>8}  {'FAILURES':>8}  {'OPENED':>6}  {'REJECTED':>8}")
     for host, circuit in circuits.items():
         print(

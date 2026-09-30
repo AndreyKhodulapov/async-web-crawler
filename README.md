@@ -87,9 +87,9 @@ politeness options:
 | `--rps` | 1 | max requests per second to one host; 0 removes the limit |
 | `--min-delay` | 0 | min seconds between two requests to one host |
 | `--jitter` | 0 | random extra delay of up to this many seconds |
-| `--no-robots` | off | do not check robots.txt |
+| `--no-robots` | off | do not check robots.txt; `errors` does not check it unless given `--robots` |
 | `--retries` | 2 (0 for `benchmark`, 3 for `errors`) | retries of timeouts, network errors, 429 and 5xx |
-| `--retry-delay` | 1 (0.2 for `errors`) | seconds before the first retry, doubled for every next one, see [Retries](#retries) |
+| `--retry-delay` | 1 (0.2 for `errors`) | seconds before the first retry, doubled for every next one up to 30 s, see [Retries](#retries) |
 | `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 429 or 5xx |
 | `--breaker-cooldown` | 30 | seconds a blocked host is left alone before a probe request |
 | `--no-breaker` | off | never block a host |
@@ -145,13 +145,14 @@ webscraper.io                    24     1.00s     1.00s       25            0
 web-scraping.dev                  5     2.00s     5.05s        0            0
 cloud.webscraper.io               3     1.00s     1.00s        0            0
 ...
-Average gap between requests to a host: 1.54s, average wait for the rate limit: 1.12s, retries: 0, blocked by robots.txt: 29, not fetched as robots.txt was unreachable: 0
+Average gap between requests to a host: 1.54s, average wait for the rate limit: 1.12s, retries (robots.txt included): 0, blocked by robots.txt: 29, not fetched as robots.txt was unreachable: 0
 ```
 
 `INTERVAL` is the minimum gap the crawler keeps for the host: the larger of
 `1 / --rps`, `--min-delay` and the site's Crawl-delay. Requests include
-robots.txt and retries. `UNREACHABLE` counts pages not requested because
-the site's robots.txt could not be read.
+robots.txt and retries, and so do the retries in the last line, unlike the
+retries of the error statistics below. `UNREACHABLE` counts pages not
+requested because the site's robots.txt could not be read.
 
 Then come the [error statistics](#error-statistics) and the state of the
 [circuit breaker](#circuit-breaker) of every host, here for a crawl of
@@ -165,7 +166,7 @@ Retries: 1, pages recovered by a retry: 0, average time per retry: 1.08s
 Permanent errors (1):
   https://httpbin.org/status/404  PermanentHTTPError: HTTP 404 NOT FOUND
 
-=== Circuit breaker (0 of 2 hosts blocked) ===
+=== Circuit breaker (2 hosts: 0 open, 0 half-open) ===
 HOST         STATE      REQUESTS  FAILURES  OPENED  REJECTED
 httpbin.org  closed            5         2       0         0
 example.com  closed            2         0       0         0
@@ -181,7 +182,7 @@ per-host table, the error statistics and the circuit breakers are saved to a fil
 
 ```bash
 python src/main.py errors                              # the local site only
-python src/main.py errors https://httpbin.org/status/503 --json report.json
+python src/main.py errors https://httpbin.org/status/503 --robots --rps 1 --json report.json
 python src/main.py errors --log-level WARNING          # failed attempts only
 ```
 
@@ -206,7 +207,10 @@ The breaker tells hosts apart by name, so the server that is down, on
 first, so the site's own failures stay under the breaker's threshold. URLs
 given on the command line are added to the start page's links. To keep the
 run within seconds, the defaults differ from the other commands: `--retries 3`,
-`--retry-delay 0.2`, `--read-timeout 1`, `--rps 0` and no robots.txt.
+`--retry-delay 0.2`, `--read-timeout 1`, `--rps 0` and no robots.txt. Real
+URLs get the same defaults; to fetch them politely, add `--robots --rps 1`.
+With `--robots`, the server that is down and the domain that does not exist
+are not requested at all: their robots.txt is unreachable too.
 
 Every attempt is logged (excerpt):
 
@@ -251,7 +255,7 @@ Permanent errors (2):
   http://127.0.0.1:62269/private  PermanentHTTPError: HTTP 403 Forbidden
   http://127.0.0.1:62269/missing  PermanentHTTPError: HTTP 404 Not Found
 
-=== Circuit breaker (1 of 3 hosts blocked) ===
+=== Circuit breaker (3 hosts: 1 open, 0 half-open) ===
 HOST                 STATE      REQUESTS  FAILURES  OPENED  REJECTED
 127.0.0.1            closed           21         6       0         0
 localhost            open              0         0       1         1

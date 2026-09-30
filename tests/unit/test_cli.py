@@ -1,10 +1,12 @@
-"""Unit tests for command-line parsing of the demo script."""
+"""Unit tests for command-line parsing and reports of the demo script."""
 
 from pathlib import Path
 
 import pytest
+from helpers import FakeClock
 
-from main import make_crawler, parse_args
+from crawler import CircuitBreaker, FetchTimeoutError
+from main import make_crawler, parse_args, print_error_report
 
 
 @pytest.mark.parametrize(
@@ -83,3 +85,46 @@ def test_retry_delay_configures_the_retry_strategy():
 def test_rejects_zero_retry_delay():
     with pytest.raises(SystemExit):
         parse_args(["crawl", "--retry-delay", "0"])
+
+
+def test_help_shows_the_defaults_of_the_command(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["errors", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "each chunk of the response, s (default: 1)" in help_text
+    assert "0 = no limit (default: 0)" in help_text
+    assert "up to 30 (default: 0.2)" in help_text
+
+
+def test_errors_checks_robots_only_when_asked():
+    assert parse_args(["errors", "--robots"]).no_robots is False
+    with pytest.raises(SystemExit):
+        parse_args(["errors", "--no-robots"])
+    with pytest.raises(SystemExit):
+        parse_args(["crawl", "--robots"])
+
+
+def test_rejects_retry_delay_longer_than_the_longest_pause():
+    assert parse_args(["crawl", "--retry-delay", "30"]).retry_delay == 30
+    with pytest.raises(SystemExit):
+        parse_args(["crawl", "--retry-delay", "31"])
+
+
+def test_error_report_tells_open_and_half_open_circuits_apart(capsys):
+    clock = FakeClock()
+    breaker = CircuitBreaker(0.5, min_requests=1, cooldown=30.0, clock=clock)
+    crawler = make_crawler(parse_args(["crawl"]))
+    crawler.circuit_breaker = breaker
+
+    def request(url, error=None):
+        with breaker.call(url) as call:
+            call.record(error)
+
+    request("http://a.test/", FetchTimeoutError("http://a.test/", "timed out"))
+    clock.now += breaker.cooldown  # a.test is half-open now
+    request("http://b.test/", FetchTimeoutError("http://b.test/", "timed out"))
+    request("http://c.test/")
+
+    print_error_report(crawler)
+    output = capsys.readouterr().out
+    assert "=== Circuit breaker (3 hosts: 1 open, 1 half-open) ===" in output
