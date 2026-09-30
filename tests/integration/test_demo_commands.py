@@ -55,7 +55,8 @@ async def test_errors_demo_meets_every_kind_of_error(url, tmp_path, capsys):
     failed = {page["url"]: page["error"] for page in saved["failed"]}
     assert failed.pop("http://unreachable.invalid/").startswith("NetworkError: ClientConnectorDNSError")
     down = {page: error for page, error in failed.items() if urlsplit(page).hostname == "localhost"}
-    assert len(down) == 4
+    # The pages refused by its breaker wait for the probes, then fail with the others.
+    assert len(down) == 8
     assert all(error.startswith(("NetworkError", "CircuitOpenError")) for error in down.values())
     failed = {urlsplit(page).path: error for page, error in failed.items() if page not in down}
     assert failed == {
@@ -83,8 +84,11 @@ async def test_errors_demo_meets_every_kind_of_error(url, tmp_path, capsys):
     breakers = saved["circuit_breaker"]
     # The site's own failures stay under the threshold.
     assert (breakers["127.0.0.1"]["state"], breakers["127.0.0.1"]["times_opened"]) == ("closed", 0)
-    assert (breakers["localhost"]["state"], breakers["localhost"]["times_opened"]) == ("open", 1)
+    # Opened by the first failures, then by two failed probes; half-open if
+    # the last cooldown is over by the end of the crawl.
+    assert breakers["localhost"]["times_opened"] == 3
+    assert breakers["localhost"]["state"] in ("open", "half-open")
 
     output = capsys.readouterr().out
-    assert "=== Circuit breaker (3 hosts: 1 open, 0 half-open) ===" in output
+    assert "=== Circuit breaker (3 hosts: " in output
     assert f"Error report saved to {report}" in output

@@ -124,6 +124,11 @@ leaves a failing site alone.
 - Check the circuit before a request waits for the rate limit (no point in
   queueing for a blocked host) and once more when its turn comes (the circuit
   may have opened meanwhile).
+- **In a crawl, defer rather than fail**. A refused page has not been tried:
+  failing it turns a host that was down for half a minute into a crawl that
+  lost all of its pages in milliseconds. Put it back in the queue until the
+  probe may go, and let the workers fetch other hosts meanwhile. Cap it: after
+  a few openings (3 here) give up on the host, or a dead site holds the crawl forever.
 - Use `time.monotonic` and make the clock injectable: the wall clock can jump,
   and tests move a fake clock instead of sleeping through cooldowns.
 

@@ -19,7 +19,7 @@ class CrawlerQueue:
 
     Lifecycle of a URL: `add_url` -> `get_next` (in progress) ->
     `mark_processed`, `mark_failed`, `mark_skipped`, `mark_blocked` or
-    `mark_unreachable`.
+    `mark_unreachable`; `requeue` and `defer` put it back unfetched.
     Workers loop until `get_next` returns None, which happens when there is
     nothing left to do (see `get_next`) or after `close`.
     """
@@ -32,6 +32,8 @@ class CrawlerQueue:
         self._depths: dict[str, int] = {}  # every accepted URL
         self._seen: set[str] = set()  # accepted URLs plus redirect targets
         self._in_progress: set[str] = set()
+        # Deferred URL -> (its heap entry, the timer that pushes it).
+        self._deferred: dict[str, tuple[tuple[int, int, str], asyncio.TimerHandle]] = {}
         self._processed_count = 0
         self._wakeup = asyncio.Event()
         self._closed = False
@@ -71,8 +73,9 @@ class CrawlerQueue:
         """Take the next URL, waiting while the queue is empty but work is in progress.
 
         An empty queue does not mean the crawl is over: a page that is still
-        being fetched may add new links. None is returned only when the
-        queue is empty and no URL is in progress, or after `close`.
+        being fetched may add new links, and a deferred URL comes back. None
+        is returned only when the queue is empty and no URL is in progress
+        or deferred, or after `close`.
         """
         while not self._closed:
             if self._heap:
@@ -80,9 +83,9 @@ class CrawlerQueue:
                 self._in_progress.add(url)
                 self.visited.add(url)
                 return url
-            if not self._in_progress:
+            if not self._in_progress and not self._deferred:
                 return None
-            # Woken by add_url, mark_* or close; then everything is re-checked.
+            # Woken by add_url, mark_*, a deferred URL or close; then everything is re-checked.
             # Event.set() wakes every current waiter, so clearing it here
             # cannot make another waiter miss a wakeup.
             self._wakeup.clear()
@@ -126,17 +129,36 @@ class CrawlerQueue:
         self.visited.discard(url)
         heapq.heappush(self._heap, (priority, next(self._sequence), url))
 
+    def defer(self, url: str, delay: float, priority: int = 0) -> None:
+        """Like `requeue`, but the URL is queued again only after `delay` seconds.
+
+        Until then it counts as queued, and `get_next` waits for it rather
+        than return None. Deferred URLs that come back at once keep the
+        order they were deferred in. After `close` it is queued at once.
+        """
+        if self._closed:
+            self.requeue(url, priority)
+            return
+        self._finish(url)
+        self.visited.discard(url)
+        entry = (priority, next(self._sequence), url)
+        self._deferred[url] = (entry, asyncio.get_running_loop().call_later(delay, self._undefer, url))
+
     def close(self) -> None:
         """Stop handing out URLs: every current and future `get_next` returns None.
 
         URLs already in progress can still be marked processed or failed.
+        Deferred URLs are queued at once, so they count as left in the queue.
         """
         self._closed = True
+        for url, (_, timer) in list(self._deferred.items()):
+            timer.cancel()
+            self._undefer(url)
         self._wakeup.set()
 
     def get_stats(self) -> dict[str, int]:
         return {
-            "queued": len(self._heap),
+            "queued": len(self._heap) + len(self._deferred),
             "in_progress": len(self._in_progress),
             "processed": self._processed_count,
             "failed": len(self.failed),
@@ -145,6 +167,11 @@ class CrawlerQueue:
             "unreachable": len(self.unreachable),
             "seen": len(self._depths),
         }
+
+    def _undefer(self, url: str) -> None:
+        entry, _ = self._deferred.pop(url)
+        heapq.heappush(self._heap, entry)
+        self._wakeup.set()
 
     def _finish(self, url: str) -> None:
         if url not in self._in_progress:

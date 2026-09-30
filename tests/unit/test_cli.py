@@ -73,6 +73,8 @@ def test_rejects_breaker_threshold_outside_zero_to_one(value):
 def test_errors_defaults_keep_the_local_demo_fast():
     args = parse_args(["errors"])
     assert (args.retry_delay, args.read_timeout, args.rps, args.no_robots) == (0.2, 1.0, 0.0, True)
+    assert args.breaker_cooldown == 1.0
+    assert parse_args(["crawl"]).breaker_cooldown == 30.0
     assert args.json == Path("error_report.json")
 
 

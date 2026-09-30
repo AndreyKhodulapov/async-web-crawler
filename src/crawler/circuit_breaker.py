@@ -121,6 +121,19 @@ class CircuitBreaker:
         circuit = self._circuits.get(host) if self.enabled and host is not None else None
         return None if circuit is None else self._verdict(host, circuit, None)
 
+    def probe_in(self, url: str) -> float:
+        """Seconds until the circuit of the host of `url` lets a probe through; 0 unless it is open."""
+        host = get_host(url)
+        circuit = self._circuits.get(host) if self.enabled and host is not None else None
+        if circuit is None or self._state(circuit) is not CircuitState.OPEN:
+            return 0.0
+        return max(circuit.opened_at + self.cooldown - self._clock(), 0.0)
+
+    def times_opened(self, host: str) -> int:
+        """How many times the circuit of `host` has opened since `reset_stats`."""
+        circuit = self._circuits.get(host)
+        return 0 if circuit is None else circuit.times_opened
+
     def call(self, url: str) -> "BreakerCall":
         """A request to `url`: entering it raises `CircuitOpenError` if the request is refused."""
         return BreakerCall(self, url, get_host(url))

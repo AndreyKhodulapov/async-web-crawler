@@ -197,26 +197,26 @@ class TestCircuitBreaker:
             assert await crawler.fetch_url(url("/flaky/3"))
         assert site.hits["/flaky/3"] == 5
 
-    async def test_crawl_fails_the_pages_of_a_blocked_host(self, url, site):
-        blocked = [url(f"/flaky/100?page={page}") for page in range(5)]
+    async def test_crawl_puts_off_the_pages_of_a_blocked_host_until_it_recovers(self, url, site):
+        # 503 the first 4 times, then pages.
+        blocked = [url(f"/flaky/4?page={page}") for page in range(5)]
         other_host = url("/site/b.html", "localhost")
         options = {
             "max_concurrent": 1,
             "max_depth": 0,
             "retry_strategy": RetryStrategy(max_retries=3, base_delay=0.01),
-            "circuit_breaker": CircuitBreaker(min_requests=3),
+            "circuit_breaker": CircuitBreaker(min_requests=3, cooldown=0.05),
         }
         async with polite(**options) as crawler:
-            await crawler.crawl([*blocked, other_host], max_pages=2)
+            await crawler.crawl([*blocked, other_host], max_pages=6)
 
-        # The first page opens the circuit on its third attempt, with no retry after it.
-        assert site.hits["/flaky/100"] == 3
-        assert crawler.failed_urls[blocked[0]] == "TransientHTTPError: HTTP 503 Service Unavailable"
-        # The others are refused without a request and cost nothing of max_pages.
-        assert list(crawler.failed_urls) == blocked
-        assert crawler.failed_urls[blocked[1]].startswith(
-            "CircuitOpenError: circuit breaker of 127.0.0.1 is open (3 of 3 requests failed in 60s)"
-        )
-        assert list(crawler.processed_urls) == [other_host]
-        assert (crawler.crawl_stats().requests, crawler.crawl_stats().retries) == (4, 2)
-        assert crawler.circuit_breaker.get_stats()["127.0.0.1"].rejected == 4
+        # The first page opens the circuit on its third attempt; the others
+        # wait, and the crawl goes on to the other host.
+        assert [path for path, _ in site.log[:4]] == ["/flaky/4"] * 3 + ["/site/b.html"]
+        # The first probe fails and opens the circuit again; the second one succeeds.
+        assert list(crawler.failed_urls) == blocked[:2]
+        assert set(crawler.failed_urls.values()) == {"TransientHTTPError: HTTP 503 Service Unavailable"}
+        assert list(crawler.processed_urls) == [other_host, *blocked[2:]]
+        assert site.hits["/flaky/4"] == 7
+        assert crawler.circuit_breaker.get_stats()["127.0.0.1"].times_opened == 2
+        assert crawler.crawl_stats().requests == 8

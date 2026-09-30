@@ -31,7 +31,7 @@ from typing import Self
 from aiohttp import web
 
 ARTICLES = 8
-DOWN_SERVER_PAGES = 4
+DOWN_SERVER_PAGES = 8
 FLAKY_FAILURES = 2
 SLOW_DELAY = 1.2
 

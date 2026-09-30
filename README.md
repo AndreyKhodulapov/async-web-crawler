@@ -91,7 +91,7 @@ politeness options:
 | `--retries` | 2 (0 for `benchmark`, 3 for `errors`) | retries of timeouts, network errors, 408, 429, 500, 502-504 and 520-524 |
 | `--retry-delay` | 1 (0.2 for `errors`) | seconds before the first retry, doubled for every next one up to 30 s, see [Retries](#retries) |
 | `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 408, 429 or 5xx |
-| `--breaker-cooldown` | 30 | seconds a blocked host is left alone before a probe request |
+| `--breaker-cooldown` | 30 (1 for `errors`) | seconds a blocked host is left alone before a probe request |
 | `--no-breaker` | off | never block a host |
 | `--user-agent` | `AsyncWebCrawler/0.1 (+repo URL)` | repeat to rotate several; all must share the bot name |
 
@@ -199,7 +199,7 @@ errors a crawler meets:
 | `/slow` | the page after 1.2 s | times out at the 1 s read timeout, retries with 1.5 s and gets the page |
 | `/missing`, `/private` | HTTP 404, 403 | no retry; listed as permanent errors |
 | `/data.json` | JSON | `ParseError`, no retry |
-| `localhost:<closed port>/page/1` ... `4` | connection refused | retries until 5 failures open the circuit breaker of `localhost`; the rest are refused without a request |
+| `localhost:<closed port>/page/1` ... `8` | connection refused | retries until 5 failures open the circuit breaker of `localhost`; the pages not sent yet wait for its probes and are given up once it has opened 3 times |
 | `unreachable.invalid` | DNS error | 3 retries, then gives up |
 
 The breaker tells hosts apart by name, so the server that is down, on
@@ -209,7 +209,8 @@ given on the command line are added to the start page's links; a URL on
 `localhost` or `127.0.0.1` shares the circuit breaker with the local site, so
 the server that is down may block it. To keep the
 run within seconds, the defaults differ from the other commands: `--retries 3`,
-`--retry-delay 0.2`, `--read-timeout 1`, `--rps 0` and no robots.txt. Real
+`--retry-delay 0.2`, `--read-timeout 1`, `--rps 0`, `--breaker-cooldown 1` and
+no robots.txt. Real
 URLs get the same defaults; to fetch them politely, add `--robots --rps 1`.
 With `--robots`, the server that is down and the domain that does not exist
 are not requested at all: their robots.txt is unreachable too.
@@ -217,57 +218,62 @@ are not requested at all: their robots.txt is unreachable too.
 Every attempt is logged (excerpt):
 
 ```
-WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:62269/flaky failed: TransientHTTPError: HTTP 503 Service Unavailable; retrying in 0.2s
-WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:62269/rate-limited failed: TransientHTTPError: HTTP 429 Too Many Requests; retrying in 1.0s
-WARNING | crawler.circuit_breaker | Circuit breaker of localhost opened: 5 of 5 requests failed in 60s; requests to it fail for 30s
-INFO    | crawler.client | Refused http://localhost:62268/page/4: circuit breaker of localhost is open (5 of 5 requests failed in 60s), next probe in 30.0s
-INFO    | crawler.retry | Succeeded http://127.0.0.1:62269/flaky on attempt 3/4 after 1.39s
-WARNING | crawler.retry | Failed http://127.0.0.1:62269/server-error on attempt 2/4 after 1.39s, no retries left for HTTP 500: TransientHTTPError: HTTP 500 Internal Server Error
-WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:62269/slow failed: FetchTimeoutError: read timeout (1.0s); retrying in 0.1s
-INFO    | crawler.retry | Succeeded http://127.0.0.1:62269/slow on attempt 2/4 after 3.34s
+WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:50864/flaky failed: TransientHTTPError: HTTP 503 Service Unavailable; retrying in 0.1s
+WARNING | crawler.circuit_breaker | Circuit breaker of localhost opened: 5 of 5 requests failed in 60s; requests to it fail for 1s
+INFO    | crawler.client | Deferred http://localhost:50865/page/6 for 1.0s: circuit breaker of localhost is open (5 of 5 requests failed in 60s), next probe in 1.0s
+WARNING | crawler.retry | Failed http://127.0.0.1:50864/server-error on attempt 2/4 after 0.62s, no retries left for HTTP 500: TransientHTTPError: HTTP 500 Internal Server Error
+WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:50864/rate-limited failed: TransientHTTPError: HTTP 429 Too Many Requests; retrying in 1.0s
+WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:50864/slow failed: FetchTimeoutError: read timeout (1.0s); retrying in 0.2s
+INFO    | crawler.circuit_breaker | Circuit breaker of localhost is half-open: probing it with http://localhost:50865/page/6
+INFO    | crawler.client | Deferred http://localhost:50865/page/7 for 1.0s: circuit breaker of localhost is half-open, waiting for the probe request
+INFO    | crawler.retry | Succeeded http://127.0.0.1:50864/flaky on attempt 3/4 after 1.63s
+INFO    | crawler.retry | Succeeded http://127.0.0.1:50864/slow on attempt 2/4 after 2.82s
+INFO    | crawler.client | Gave up on http://localhost:50865/page/8: circuit breaker of localhost opened 3 times
 ```
 
 Then come the pages, the error statistics and the circuit breakers:
 
 ```
-=== Crawl (21 pages, 3.87s) ===
+=== Crawl (25 pages, 3.39s) ===
 DEPTH  RESULT                                LINKS  URL
-    0  ok                                       20  http://127.0.0.1:62269/
-    1  ok                                        0  http://127.0.0.1:62269/articles/1
+    0  ok                                       24  http://127.0.0.1:50864/
+    1  ok                                        0  http://127.0.0.1:50864/articles/1
     ...
-    1  ok                                        0  http://127.0.0.1:62269/flaky
-    1  ok                                        0  http://127.0.0.1:62269/rate-limited
-    1  TransientHTTPError: HTTP 500...              http://127.0.0.1:62269/server-error
-    1  ok                                        0  http://127.0.0.1:62269/slow
-    1  PermanentHTTPError: HTTP 404 Not...          http://127.0.0.1:62269/missing
-    1  PermanentHTTPError: HTTP 403...              http://127.0.0.1:62269/private
-    1  ParseError: unsupported content...           http://127.0.0.1:62269/data.json
-    1  NetworkError:...                             http://localhost:62268/page/1
-    1  NetworkError:...                             http://localhost:62268/page/2
-    1  NetworkError:...                             http://localhost:62268/page/3
-    1  CircuitOpenError: circuit breaker...         http://localhost:62268/page/4
+    1  ok                                        0  http://127.0.0.1:50864/flaky
+    1  ok                                        0  http://127.0.0.1:50864/rate-limited
+    1  TransientHTTPError: HTTP 500...              http://127.0.0.1:50864/server-error
+    1  ok                                        0  http://127.0.0.1:50864/slow
+    1  PermanentHTTPError: HTTP 404 Not...          http://127.0.0.1:50864/missing
+    1  PermanentHTTPError: HTTP 403...              http://127.0.0.1:50864/private
+    1  ParseError: unsupported content...           http://127.0.0.1:50864/data.json
+    1  NetworkError:...                             http://localhost:50865/page/1
+    ...
+    1  NetworkError:...                             http://localhost:50865/page/7
+    1  CircuitOpenError: circuit breaker...         http://localhost:50865/page/8
     1  NetworkError:...                             http://unreachable.invalid/
-Crawled: 12 pages, failed: 9, skipped: 0, blocked: 0, unreachable: 0, left in queue: 0, speed: 5.4 pages/s
+Crawled: 12 pages, failed: 13, skipped: 0, blocked: 0, unreachable: 0, left in queue: 0, speed: 7.4 pages/s
 
-=== Errors (20 failed attempts) ===
-By kind:  TransientError 6, PermanentError 2, NetworkError 11, ParseError 1, other 0
-By class: NetworkError 11, TransientHTTPError 5, PermanentHTTPError 2, ParseError 1, FetchTimeoutError 1
-Retries: 12, pages recovered by a retry: 3, average time per retry: 0.55s
+=== Errors (24 failed attempts) ===
+By kind:  TransientError 6, PermanentError 2, NetworkError 15, ParseError 1, other 0
+By class: NetworkError 15, TransientHTTPError 5, PermanentHTTPError 2, ParseError 1, FetchTimeoutError 1
+Retries: 12, pages recovered by a retry: 3, average time per retry: 0.58s
 Permanent errors (2):
-  http://127.0.0.1:62269/private  PermanentHTTPError: HTTP 403 Forbidden
-  http://127.0.0.1:62269/missing  PermanentHTTPError: HTTP 404 Not Found
+  http://127.0.0.1:50864/missing  PermanentHTTPError: HTTP 404 Not Found
+  http://127.0.0.1:50864/private  PermanentHTTPError: HTTP 403 Forbidden
 
-=== Circuit breaker (3 hosts: 1 open, 0 half-open) ===
+=== Circuit breaker (3 hosts: 0 open, 1 half-open) ===
 HOST                 STATE      REQUESTS  FAILURES  OPENED  REJECTED
 127.0.0.1            closed           21         6       0         0
-localhost            open              0         0       1         1
+localhost            half-open         0         0       3         8
 unreachable.invalid  closed            4         4       0         0
 
 Error report saved to error_report.json
 ```
 
 The breaker of `localhost` shows no requests, since opening it clears its
-window. The report in `error_report.json` (or `--json PATH`) holds the error
+window. It opened three times: after the first failures and after two failed
+probes; the crawl then gave up on the page still waiting, so the circuit
+ends up open, or half-open if its last cooldown is over. The report in `error_report.json` (or `--json PATH`) holds the error
 statistics, the circuit breakers, the failed pages with the full errors and
 the fetched pages.
 
@@ -535,9 +541,16 @@ circuit opened is not sent, but it is refused only when its turn comes. A
 retry the breaker would refuse is not made, so the request fails with the
 error of its last attempt, not with `CircuitOpenError`. When the breaker
 refuses the download of robots.txt, the page fails with `CircuitOpenError`
-under its own URL, and robots.txt is not cached as unreachable. In a crawl,
-the pages of a blocked host go to `failed_urls` without counting toward
-`max_pages`.
+under its own URL, and robots.txt is not cached as unreachable.
+
+In a crawl, a page the breaker refuses does not count toward `max_pages`
+and is not failed: it is put off until the circuit may let a probe through,
+or for a second while the probe is in flight, and the workers go on with
+other pages meanwhile. So the pages of a host that went down for a moment
+are fetched once it is back. After the circuit of a host has opened
+`AsyncCrawler.MAX_CIRCUIT_OPENINGS` (3) times in the crawl, no more probes
+are sent: its remaining pages go to `failed_urls` with `CircuitOpenError`,
+and a host that stays down holds the crawl for about two cooldowns.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
@@ -597,7 +610,8 @@ fails with `FetchTimeoutError` that says which timeout fired, e.g.
 found on a page at depth `d` gets depth `d + 1` and is followed only up to
 `max_depth`, so the site is walked breadth-first. `max_pages` caps the pages
 requested, failed ones included; pages that robots.txt disallows are not
-requested and do not count. URLs are normalized (including their
+requested and do not count, and neither do pages the circuit breaker
+refuses: they wait for their host, see [Circuit breaker](#circuit-breaker). URLs are normalized (including their
 percent-encoding, so `/café` and `/caf%C3%A9` are one page), and each one is
 fetched at most once. The target of a redirect is remembered too, but only
 once the response arrives: if a direct link to it was queued or fetched before

@@ -111,6 +111,59 @@ class TestGetNext:
         assert queue.get_stats()["queued"] == 1
 
 
+class TestDefer:
+    async def test_deferred_url_comes_back_after_the_delay(self):
+        queue = CrawlerQueue()
+        queue.add_url("http://site/a", priority=1, depth=1)
+        page = await take(queue)
+
+        queue.defer(page, 0.05, priority=1)
+
+        assert queue.visited == set()
+        assert queue.get_stats()["queued"] == 1
+        assert queue.get_stats()["in_progress"] == 0
+        # Nothing is in progress, yet the crawl is not over.
+        waiter = asyncio.create_task(queue.get_next())
+        await asyncio.sleep(0.01)
+        assert not waiter.done()
+        assert await waiter == page
+        assert queue.depth(page) == 1
+
+    async def test_deferred_url_waits_its_turn_by_priority(self):
+        queue = CrawlerQueue()
+        queue.add_url("http://site/a")
+        page = await take(queue)
+        queue.defer(page, 0.01)
+        await asyncio.sleep(0.02)
+        queue.add_url("http://site/b", priority=1)
+        queue.add_url("http://site/c")
+
+        assert await drain(queue) == ["http://site/a", "http://site/c", "http://site/b"]
+
+    async def test_urls_back_at_once_keep_the_order_they_were_deferred_in(self):
+        queue = CrawlerQueue()
+        for page in "abc":
+            queue.add_url(f"http://site/{page}")
+        pages = [await take(queue) for _ in range(3)]
+        for delay, page in zip([0.03, 0.02, 0.01], pages, strict=True):
+            queue.defer(page, delay)
+        await asyncio.sleep(0.05)
+
+        assert await drain(queue) == pages
+
+    async def test_close_queues_deferred_urls_at_once(self):
+        queue = CrawlerQueue()
+        queue.add_url("http://site/a")
+        queue.add_url("http://site/b")
+        first, second = await take(queue), await take(queue)
+        queue.defer(first, 60)
+        queue.close()
+        queue.defer(second, 60)
+
+        assert await queue.get_next() is None
+        assert queue.get_stats()["queued"] == 2
+
+
 class TestStatus:
     async def test_stats_follow_the_lifecycle(self):
         queue = CrawlerQueue()
@@ -173,6 +226,7 @@ class TestStatus:
             ("mark_blocked", ("reason",)),
             ("mark_unreachable", ("reason",)),
             ("requeue", ()),
+            ("defer", (1.0,)),
         ],
     )
     async def test_marking_a_url_not_in_progress_is_an_error(self, mark, args):

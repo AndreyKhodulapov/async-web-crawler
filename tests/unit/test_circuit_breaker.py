@@ -218,6 +218,31 @@ class TestStats:
         assert breaker.get_stats()["a.test"] == CircuitStats(state="open")
 
 
+class TestProbeIn:
+    def test_time_left_of_the_cooldown_while_open(self, breaker, clock):
+        assert breaker.probe_in(URL) == 0
+        open_circuit(breaker)
+        clock.now += 10
+        assert breaker.probe_in(URL) == 20
+        assert breaker.probe_in(OTHER_HOST_URL) == 0
+
+    def test_nothing_to_wait_for_once_half_open(self, breaker, clock):
+        open_circuit(breaker)
+        clock.now += breaker.cooldown
+        with breaker.call(URL):  # the probe is in flight
+            assert breaker.probe_in(URL) == 0
+
+
+def test_times_opened_counts_since_the_reset(breaker, clock):
+    assert breaker.times_opened("a.test") == 0
+    open_circuit(breaker)
+    clock.now += breaker.cooldown
+    request(breaker, TIMEOUT)  # the probe fails
+    assert breaker.times_opened("a.test") == 2
+    breaker.reset_stats()
+    assert breaker.times_opened("a.test") == 0
+
+
 def test_checks_do_not_create_circuits(breaker):
     breaker.check(URL)
     assert breaker.refusal(URL) is None

@@ -277,10 +277,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="PATH",
         help="where to save the error report (default: %(default)s)",
     )
-    # Fast retries and a short read timeout keep the demo within seconds; the
-    # site is local, so no rate limit or robots.txt.
+    # Fast retries, a short read timeout and a short cooldown of the breaker
+    # (the crawl waits for the probes of the server that is down) keep the
+    # demo within seconds; the site is local, so no rate limit or robots.txt.
     add_common_options(errors, retries=3, retry_delay=0.2, robots=False)
-    errors.set_defaults(read_timeout=1.0, rps=0.0)
+    errors.set_defaults(read_timeout=1.0, rps=0.0, breaker_cooldown=1.0)
 
     args = parser.parse_args(argv)
     if args.retry_delay > MAX_RETRY_DELAY:

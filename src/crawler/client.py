@@ -15,7 +15,7 @@ import aiohttp
 import certifi
 from bs4.dammit import EncodingDetector
 
-from crawler.circuit_breaker import CircuitBreaker
+from crawler.circuit_breaker import CircuitBreaker, CircuitState
 from crawler.error_stats import ErrorTracker
 from crawler.exceptions import (
     CertificateError,
@@ -91,7 +91,7 @@ class AsyncCrawler:
       sent (see `CircuitBreaker`). A retry the breaker would refuse is not
       made: the request fails with the error of its last attempt.
       robots.txt that cannot be downloaded for this reason is not cached
-      as unreachable.
+      as unreachable. In `crawl()`, the pages of such a host wait for it.
 
     Every request has a `connect_timeout` (DNS, TCP and TLS, waiting for a
     pooled connection), a `read_timeout` (for each chunk of the response)
@@ -120,6 +120,7 @@ class AsyncCrawler:
     # URL and may block generic user agents.
     DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
     MAX_TIMEOUT_GROWTH = 4.0
+    MAX_CIRCUIT_OPENINGS = 3
 
     def __init__(
         self,
@@ -307,6 +308,7 @@ class AsyncCrawler:
             return FetchResult.failure(url, refusal, 0.0)
         # Refused at once, without waiting for the turn of the host.
         if (refusal := self._check_circuit(url)) is not None:
+            logger.info("Refused %s: %s", url, refusal.message)
             return FetchResult.failure(url, refusal, 0.0)
         # The strategy needs an attempt that raises; the result of the last
         # one is kept to report a failure with its timing.
@@ -418,7 +420,6 @@ class AsyncCrawler:
         try:
             self.circuit_breaker.check(url)
         except CircuitOpenError as error:
-            logger.info("Refused %s: %s", url, error.message)
             return error
         return None
 
@@ -533,9 +534,13 @@ class AsyncCrawler:
         robots.txt disallows are not requested: they are listed in
         `blocked_urls` and do not count toward `max_pages`. Neither do pages
         of sites whose robots.txt cannot be read: they are listed in
-        `unreachable_urls`. Pages that the circuit breaker refuses go to
-        `failed_urls` and do not count either, unless the circuit opened
-        while they were already waiting for their turn.
+        `unreachable_urls`. Pages that the circuit breaker refuses do not
+        count either: they are put off until their host may be probed and
+        tried again, and the crawl goes on with other pages meanwhile. Once
+        the circuit of a host has opened `MAX_CIRCUIT_OPENINGS` times in
+        the crawl, its refused pages go to `failed_urls` with
+        `CircuitOpenError`, so a host that stays down holds the crawl for
+        about two cooldowns of the breaker.
 
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
@@ -638,12 +643,14 @@ class AsyncCrawler:
             try:
                 # robots.txt and the circuit breaker are checked before the
                 # page counts toward max_pages: a refused page costs no request.
-                refusal = await self._check_robots(url) or self._check_circuit(url)
+                refusal = await self._check_robots(url) or self._check_circuit(url) or self._check_probes_left(url)
                 if refusal is not None:
                     if isinstance(refusal, RobotsDisallowedError):
                         queue.mark_blocked(url, refusal.message)
                     elif isinstance(refusal, RobotsUnreachableError):
                         queue.mark_unreachable(url, refusal.message)
+                    elif isinstance(refusal, CircuitOpenError):
+                        self._defer_or_fail(url, queue, refusal)
                     else:
                         queue.mark_failed(url, f"{type(refusal).__name__}: {refusal.message}")
                     continue
@@ -667,6 +674,11 @@ class AsyncCrawler:
     async def _crawl_page(self, url: str, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
         depth = queue.depth(url)
         result = await self._fetch(url, html_only=True, check_robots=False)
+        if isinstance(result.error, CircuitOpenError):
+            # Not sent: the circuit opened while the page waited for its turn.
+            self._pages_requested -= 1
+            self._defer_or_fail(url, queue, result.error)
+            return
         if result.error is not None:
             queue.mark_failed(url, f"{type(result.error).__name__}: {result.error.message}")
             return
@@ -702,6 +714,31 @@ class AsyncCrawler:
         self.processed_urls[url] = page
         queue.mark_processed(url)
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
+
+    def _check_probes_left(self, url: str) -> CircuitOpenError | None:
+        """In a crawl, a host whose circuit has opened `MAX_CIRCUIT_OPENINGS` times gets no more probes."""
+        host = get_host(url)
+        if host is None or self.circuit_breaker.state(host) is CircuitState.CLOSED:
+            return None
+        opened = self.circuit_breaker.times_opened(host)
+        if opened < self.MAX_CIRCUIT_OPENINGS:
+            return None
+        return CircuitOpenError(url, f"circuit breaker of {host} opened {opened} times, no more probes in this crawl")
+
+    def _defer_or_fail(self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError) -> None:
+        """Put off a page the circuit breaker refused until its host may be probed, or give up on it."""
+        host = get_host(url)
+        assert host is not None  # a URL without a host has no circuit
+        opened = self.circuit_breaker.times_opened(host)
+        if opened >= self.MAX_CIRCUIT_OPENINGS:
+            logger.info("Gave up on %s: circuit breaker of %s opened %d times", url, host, opened)
+            queue.mark_failed(url, f"CircuitOpenError: {refusal.message}")
+            return
+        # Back when the probe may go; a page refused while the probe is in
+        # flight comes back a second later.
+        delay = self.circuit_breaker.probe_in(url) or 1.0
+        logger.info("Deferred %s for %.1fs: %s", url, delay, refusal.message)
+        queue.defer(url, delay, priority=queue.depth(url))
 
     async def close(self) -> None:
         """Close the underlying session. Safe to call more than once."""

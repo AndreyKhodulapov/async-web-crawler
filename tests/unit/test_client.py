@@ -683,6 +683,69 @@ class TestCircuitBreaker:
         assert len(fake_session.requested) == 3
 
 
+class TestCrawlBlockedHost:
+    async def test_gives_up_on_a_host_that_stays_down(self, make_crawler, fake_session, caplog):
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(
+            max_concurrent=1,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+        pages = [f"http://a/{page}" for page in range(4)]
+        for page in pages:
+            fake_session.routes[page] = aiohttp.ClientConnectionError("refused")
+
+        await crawler.crawl([*pages, "http://b/"])
+
+        # Opened by a/0, then by the failed probes a/1 and a/2.
+        assert fake_session.requested == ["http://a/0", "http://b/", "http://a/1", "http://a/2"]
+        assert list(crawler.processed_urls) == ["http://b/"]
+        assert [crawler.failed_urls[page].split(":")[0] for page in pages] == ["NetworkError"] * 3 + [
+            "CircuitOpenError"
+        ]
+        assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(message.startswith("Deferred http://a/1 for 0.") for message in messages)
+        assert "Gave up on http://a/3: circuit breaker of a opened 3 times" in messages
+
+    async def test_no_probe_after_the_last_opening(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            max_concurrent=2,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+        pages = [f"http://a/{page}" for page in range(5)]
+        for page in pages:
+            fake_session.routes[page] = aiohttp.ClientConnectionError("refused")
+
+        # a/0 and a/1 are sent together, a/2 and a/3 are probes. A page
+        # refused while a probe is in flight comes back a second later, when
+        # the circuit is half-open again: a/4 after the third opening.
+        await crawler.crawl(pages)
+
+        assert fake_session.requested == pages[:4]
+        assert crawler.failed_urls[pages[4]] == (
+            "CircuitOpenError: circuit breaker of a opened 3 times, no more probes in this crawl"
+        )
+        assert crawler.circuit_breaker.times_opened("a") == 3
+
+    async def test_page_refused_after_its_wait_costs_nothing_of_max_pages(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            max_concurrent=2,
+            max_depth=0,
+            requests_per_second=20,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.2),
+        )
+        fake_session.routes["http://a/1"] = aiohttp.ClientConnectionError("refused")
+
+        # a/2 waits for its turn while a/1 opens the circuit; a/3 is refused at once.
+        await crawler.crawl(["http://a/1", "http://a/2", "http://a/3"], max_pages=3)
+
+        assert crawler.failed_urls.keys() == {"http://a/1"}
+        assert crawler.processed_urls.keys() == {"http://a/2", "http://a/3"}
+        assert crawler.crawl_stats().queued == 0
+
+
 class TestUserAgents:
     async def test_session_user_agent_by_default(self, crawler, fake_session):
         await crawler.fetch_url("http://a")
