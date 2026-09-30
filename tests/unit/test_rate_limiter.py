@@ -195,16 +195,10 @@ class TestAcquire:
             await limiter.acquire("a")
         assert time.perf_counter() - started >= 0.1 - EPSILON
 
-    async def test_waiting_requests_start_in_arrival_order(self):
-        limiter = RateLimiter(50.0)
-        order: list[int] = []
-
-        async def request(number: int) -> None:
-            await limiter.acquire("a")
-            order.append(number)
-
-        await asyncio.gather(*(request(number) for number in range(5)))
-        assert order == [0, 1, 2, 3, 4]
+    async def test_concurrent_requests_are_spaced_out(self):
+        limiter = RateLimiter(20.0)  # 0.05 s apart
+        times = sorted(await start_times(limiter, ["a"] * 5))
+        assert all(later - earlier >= 0.05 - EPSILON for earlier, later in itertools.pairwise(times))
 
     async def test_penalty_holds_back_requests_already_waiting(self):
         limiter = RateLimiter(20.0)  # 0.05 s apart

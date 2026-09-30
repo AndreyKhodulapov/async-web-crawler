@@ -32,7 +32,10 @@ sites it visits and follows their rules.
   `next_start`, and asyncio switches tasks only at an `await`.
 - **FIFO fairness**: every caller gets its own start time at once. A polling
   loop (`while no_tokens: await sleep(x)`) wakes all waiters together
-  (thundering herd) and serves them in random order.
+  (thundering herd) and serves them in random order. The order is strict
+  only while starts come on time: after one that is late by more than an
+  interval (a busy event loop, a late slot), the requests due in the
+  meantime may be overtaken. The rate holds either way.
 - **Bursts**: a tolerance `tau` turns GCRA into a token bucket:
   `start = max(now, next_start - tau)`. Here `tau = 0`: a minimum delay
   between requests rules out bursts by definition.
@@ -66,9 +69,10 @@ sites it visits and follows their rules.
   must not stop other hosts. The host's schedule is waited for first, then
   the shared one is booked: booking both at once would park a far-future
   time in the shared schedule, and every host would wait for it.
-  Trade-off: while the shared queue is long, a request may reach its slot
-  before its host's Crawl-delay has passed since the host's last request,
-  and it waits out the rest holding the slot.
+  Trade-off: while the shared queue is long, a request's turn may come
+  before its host's Crawl-delay has passed since the host's last request.
+  It waits out the rest outside the slot; if it then has to book again,
+  the shared turn it held is lost.
 
 ## Delays
 
