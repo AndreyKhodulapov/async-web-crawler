@@ -15,7 +15,16 @@ def test_defaults_differ_by_command(command, retries, log_level):
 
 
 @pytest.mark.parametrize(
-    "option", ["--rps", "--min-delay", "--jitter", "--connect-timeout", "--read-timeout", "--timeout-growth"]
+    "option",
+    [
+        "--rps",
+        "--min-delay",
+        "--jitter",
+        "--connect-timeout",
+        "--read-timeout",
+        "--timeout-growth",
+        "--breaker-cooldown",
+    ],
 )
 @pytest.mark.parametrize("value", ["inf", "nan"])
 def test_rejects_non_finite_numbers(option, value):
@@ -41,3 +50,16 @@ def test_timeout_options_configure_the_crawler():
 def test_rejects_timeout_growth_below_one(value):
     with pytest.raises(SystemExit):
         parse_args(["crawl", "--timeout-growth", value])
+
+
+def test_breaker_options_configure_the_crawler():
+    args = parse_args(["crawl", "--breaker-threshold", "0.8", "--breaker-cooldown", "5"])
+    breaker = make_crawler(args).circuit_breaker
+    assert (breaker.failure_threshold, breaker.cooldown) == (0.8, 5)
+    assert not make_crawler(parse_args(["crawl", "--no-breaker"])).circuit_breaker.enabled
+
+
+@pytest.mark.parametrize("value", ["0", "1.5", "nan", "x"])
+def test_rejects_breaker_threshold_outside_zero_to_one(value):
+    with pytest.raises(SystemExit):
+        parse_args(["crawl", "--breaker-threshold", value])

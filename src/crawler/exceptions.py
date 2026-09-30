@@ -13,8 +13,9 @@ Most errors fall into one of four kinds that decide whether a retry can help:
   certificate); every attempt would fail the same way.
 - `ParseError`: the page was downloaded but is not an HTML document.
 
-`CrawlerClosedError`, `RobotsUnreachableError` and `UnexpectedError` belong
-to none of them: they are not about the request itself, and none is retried.
+`CrawlerClosedError`, `RobotsUnreachableError`, `CircuitOpenError` and
+`UnexpectedError` belong to none of them: they are not about the request
+itself, and none is retried.
 """
 
 from typing import ClassVar, Self
@@ -106,6 +107,10 @@ class RobotsDisallowedError(PermanentError):
 
 class RobotsUnreachableError(FetchError):
     """robots.txt of the site could not be read, so no URL of the site may be fetched for now."""
+
+
+class CircuitOpenError(FetchError):
+    """The circuit breaker of the host is open: the request was not sent."""
 
 
 class UnexpectedError(FetchError):

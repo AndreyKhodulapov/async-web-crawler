@@ -137,6 +137,23 @@ class RateStats:
     domains: Mapping[str, DomainRate] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class CircuitStats:
+    """The circuit breaker of one host.
+
+    `state` is "closed", "open" or "half-open". `requests` and `failures`
+    count the outcomes in the sliding window that decide when to open.
+    `times_opened` and `rejected` (requests refused without being sent)
+    count since the stats were last reset.
+    """
+
+    state: str
+    requests: int = 0
+    failures: int = 0
+    times_opened: int = 0
+    rejected: int = 0
+
+
 class Metadata(TypedDict):
     title: str | None
     description: str | None

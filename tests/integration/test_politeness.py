@@ -1,12 +1,19 @@
-"""Integration tests: rate limits, robots.txt and retries against a local aiohttp server."""
+"""Integration tests: rate limits, robots.txt, retries and the circuit breaker against a local aiohttp server."""
 
 import asyncio
 import itertools
 
 import pytest
-from helpers import BOT, UNTHROTTLED
+from helpers import BOT, UNTHROTTLED, FakeClock
 
-from crawler import AsyncCrawler, RetryStrategy, RobotsDisallowedError, RobotsUnreachableError
+from crawler import (
+    AsyncCrawler,
+    CircuitBreaker,
+    CircuitOpenError,
+    RetryStrategy,
+    RobotsDisallowedError,
+    RobotsUnreachableError,
+)
 
 # Gaps are measured where requests arrive, while the limiter controls when
 # they are sent; opening a connection shifts an arrival by a millisecond or so.
@@ -170,3 +177,42 @@ class TestRetries:
         assert site.log[0][0] == "/flaky/1"
         assert all(moment - failed_at >= 0.2 - EPSILON for _, moment in site.log[1:])
         assert min(gaps(site)) >= 0.1 - EPSILON
+
+
+class TestCircuitBreaker:
+    async def test_failing_host_is_left_alone_until_the_cooldown(self, url, site):
+        clock = FakeClock()
+        breaker = CircuitBreaker(min_requests=3, cooldown=10, clock=clock)
+        async with polite(circuit_breaker=breaker) as crawler:
+            # 503 the first 3 times, then a page.
+            for _ in range(5):
+                result = await crawler.fetch_result(url("/flaky/3"))
+            assert isinstance(result.error, CircuitOpenError)
+            assert site.hits["/flaky/3"] == 3
+            # Another host of the same server is not blocked.
+            assert await crawler.fetch_url(url("/ok", "localhost"))
+
+            clock.now += 10
+            assert "Recovered" in await crawler.fetch_url(url("/flaky/3"))
+            assert await crawler.fetch_url(url("/flaky/3"))
+        assert site.hits["/flaky/3"] == 5
+
+    async def test_crawl_fails_the_pages_of_a_blocked_host(self, url, site):
+        start_urls = [url(f"/flaky/100?page={page}") for page in range(6)]
+        options = {
+            "max_concurrent": 1,
+            "max_depth": 0,
+            "retry_strategy": RetryStrategy(max_retries=3, base_delay=0.01),
+            "circuit_breaker": CircuitBreaker(min_requests=3),
+        }
+        async with polite(**options) as crawler:
+            await crawler.crawl(start_urls)
+
+        # The first page opens the circuit on its third attempt; its next retry is refused.
+        assert site.hits["/flaky/100"] == 3
+        assert list(crawler.failed_urls) == start_urls
+        assert crawler.failed_urls[start_urls[3]].startswith(
+            "CircuitOpenError: circuit breaker of 127.0.0.1 is open (3 of 3 requests failed in 60s)"
+        )
+        assert (crawler.crawl_stats().requests, crawler.crawl_stats().retries) == (3, 2)
+        assert crawler.circuit_breaker.get_stats()["127.0.0.1"].rejected == 6

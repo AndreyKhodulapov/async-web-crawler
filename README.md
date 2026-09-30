@@ -28,6 +28,8 @@ and backs off when a site struggles.
 - Retries of timeouts, network errors, HTTP 429 and 5xx with exponential
   backoff and jitter, honoring `Retry-After`; the whole host slows down
   while a retry waits or after a Retry-After
+- Circuit breaker per host: a host whose requests keep failing is left
+  alone for a while, then tested with a single probe request
 - Configurable User-Agent, with optional rotation between variants of the
   same bot name
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
@@ -38,7 +40,8 @@ and backs off when a site struggles.
   (other HTTP errors such as 401, 403, 404, redirect loops, bad
   certificates, invalid URLs, pages disallowed by robots.txt) and
   `ParseError` (a response that is not an HTML document); plus
-  `RobotsUnreachableError`, `CrawlerClosedError` and `UnexpectedError`
+  `RobotsUnreachableError`, `CircuitOpenError`, `CrawlerClosedError` and
+  `UnexpectedError`
 - One failing URL never breaks a batch: even unforeseen exceptions are
   logged with a traceback and reported as `UnexpectedError`
 - Logging for every request: start, success (status, size, time) and failure;
@@ -86,6 +89,9 @@ politeness options:
 | `--jitter` | 0 | random extra delay of up to this many seconds |
 | `--no-robots` | off | do not check robots.txt |
 | `--retries` | 2 (0 for `benchmark`) | retries of timeouts, network errors, 429 and 5xx |
+| `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 429 or 5xx |
+| `--breaker-cooldown` | 30 | seconds a blocked host is left alone before a probe request |
+| `--no-breaker` | off | never block a host |
 | `--user-agent` | `AsyncWebCrawler/0.1 (+repo URL)` | repeat to rotate several; all must share the bot name |
 
 Logs and progress go to stderr; the report goes to stdout.
@@ -299,7 +305,8 @@ asyncio.run(main())
 Every method checks robots.txt, waits for the rate limit and retries transient
 failures; a URL that robots.txt disallows fails with `RobotsDisallowedError`
 without being requested, and a URL of a site whose robots.txt cannot be read
-fails with `RobotsUnreachableError`.
+fails with `RobotsUnreachableError`. A request to a host blocked by the
+circuit breaker fails with `CircuitOpenError` without being sent.
 
 ### Politeness
 
@@ -311,6 +318,7 @@ fails with `RobotsUnreachableError`.
 | `jitter` | `0.0` | random extra delay of up to this many seconds after each request |
 | `respect_robots` | `True` | check robots.txt before every request |
 | `retry_strategy` | `RetryStrategy()` | which failures to retry, how many times and how long to wait, see below |
+| `circuit_breaker` | `CircuitBreaker()` | when to stop sending requests to a failing host, see below |
 | `user_agent` | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name |
 | `user_agents` | `()` | strings to rotate between requests; all must share the name of `user_agent` |
 
@@ -387,11 +395,48 @@ completes or hits `total_timeout`. Fetching from an already closed crawler
 fails the same way: `fetch_url` raises `CrawlerClosedError`, the other methods
 report it per URL.
 
+### Circuit breaker
+
+`CircuitBreaker` keeps a circuit per host. While it is closed, requests go
+through and their outcomes are counted over the last `window` seconds;
+once at least `min_requests` are counted and `failure_threshold` of them
+failed, it opens. For `cooldown` seconds requests to the host then fail at
+once with `CircuitOpenError`: they are not sent, not retried and not
+counted in `error_stats()`. After that one request goes through as a probe
+(half-open): its success closes the circuit, its failure opens it again.
+
+Failures are timeouts, network errors, HTTP 408, 429 and 5xx; any other
+response, a 404 too, is a success, so broken links do not block a site.
+Every attempt counts, retries and robots.txt downloads included. The
+circuit is checked before a request waits for the rate limit and once
+more when its turn comes, so the requests queued for a host stop as soon as
+it opens. In a crawl, the pages of a blocked host go to `failed_urls`.
+
+| Parameter | Default | Meaning |
+|-----------|---------|---------|
+| `failure_threshold` | `0.5` | share of failed requests that opens the circuit; `None` turns the breaker off |
+| `min_requests` | `5` | requests in the window before the share counts |
+| `window` | `60.0` | seconds over which outcomes are counted |
+| `cooldown` | `30.0` | seconds the circuit stays open before a probe |
+
+```python
+breaker = CircuitBreaker(failure_threshold=0.5, min_requests=5, cooldown=30.0)
+async with AsyncCrawler(circuit_breaker=breaker) as crawler:
+    await crawler.crawl(["https://example.com"])
+stats = breaker.get_stats()["example.com"]  # CircuitStats
+print(stats.state, stats.times_opened, stats.rejected)  # e.g. "closed 0 0"
+```
+
+`get_stats()` gives, per host, the state, the requests and failures in the
+window, how many times it opened and how many requests it refused. A
+crawl resets the two counters but keeps the states.
+
 ### Error statistics
 
 `crawler.error_stats()` returns `ErrorStats` for page requests since the
 latest `crawl()` started, or since the crawler was created; robots.txt
-downloads and the URLs it blocks are not counted.
+downloads, the URLs it blocks and the requests the circuit breaker refused
+are not counted.
 
 | Field | Content |
 |-------|---------|
@@ -459,10 +504,12 @@ during one, the crawler exposes its state:
 | `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit |
 | `error_stats()` | `ErrorStats`, see [Error statistics](#error-statistics) |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
+| `circuit_breaker.get_stats()` | `{host: CircuitStats}`, see [Circuit breaker](#circuit-breaker) |
 
 The building blocks can be used on their own: `CrawlerQueue` (priorities,
 deduplication, completion detection), `SemaphoreManager` (global and
-per-domain limits), `RateLimiter`, `RobotsParser` and `UrlFilter`.
+per-domain limits), `RateLimiter`, `RobotsParser`, `RetryStrategy`,
+`CircuitBreaker` and `UrlFilter`.
 
 ### Parsed page
 
@@ -493,8 +540,8 @@ keep only links to the page's own host.
 
 ```bash
 pytest                      # unit + integration, no internet needed
-pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, client with a fake session
-pytest tests/integration    # real HTTP, crawls, rate limits and robots.txt against a local aiohttp server
+pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, client with a fake session
+pytest tests/integration    # real HTTP, crawls, rate limits, robots.txt, retries and the circuit breaker against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
 ```
 
@@ -515,17 +562,18 @@ src/
     ├── rate_limiter.py     # RateLimiter: requests per second, delays, jitter, rate stats
     ├── robots.py           # RobotsParser, RobotsRules: robots.txt per RFC 9309
     ├── retry.py            # RetryStrategy: which errors to retry, backoff, Retry-After
+    ├── circuit_breaker.py  # CircuitBreaker: blocks a failing host for a while
     ├── error_stats.py      # ErrorTracker: counts errors, retries and their outcomes
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
-    ├── models.py           # FetchResult, ParsedPage, CrawlStats, ErrorStats, RateStats
+    ├── models.py           # FetchResult, ParsedPage, CrawlStats, ErrorStats, RateStats, CircuitStats
     └── exceptions.py       # FetchError hierarchy
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness
-├── unit/                   # parser, URLs, queue, limits, robots.txt, retries, error stats, filters, client
+├── unit/                   # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, error stats, filters, client
 └── integration/            # local HTTP server; live tests marked `network`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here

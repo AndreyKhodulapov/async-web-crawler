@@ -22,6 +22,7 @@ from typing import Any
 
 from crawler import (
     AsyncCrawler,
+    CircuitBreaker,
     CrawlStats,
     FetchError,
     FetchResult,
@@ -58,6 +59,16 @@ def at_least_one(raw: str) -> float:
         raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
     if not (math.isfinite(value) and value >= 1):
         raise argparse.ArgumentTypeError(f"must be >= 1, got {raw}")
+    return value
+
+
+def share(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+    if not 0 < value <= 1:
+        raise argparse.ArgumentTypeError(f"must be in (0, 1], got {raw}")
     return value
 
 
@@ -130,6 +141,23 @@ def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log
         default=retries,
         help="retries of timeouts, network errors, HTTP 408, 429 and 5xx",
     )
+    breaker = parser.add_argument_group("circuit breaker")
+    breaker.add_argument(
+        "--breaker-threshold",
+        type=share,
+        default=0.5,
+        metavar="SHARE",
+        help="block a host once this share of its requests in the last minute (5 at least) "
+        "failed with a timeout, a network error, HTTP 429 or 5xx (default: 0.5)",
+    )
+    breaker.add_argument(
+        "--breaker-cooldown",
+        type=positive(float, allow_zero=True),
+        default=30.0,
+        metavar="S",
+        help="how long a blocked host is left alone before a probe request, s (default: 30)",
+    )
+    breaker.add_argument("--no-breaker", action="store_true", help="never block a host")
     politeness.add_argument(
         "--user-agent",
         action="append",
@@ -217,6 +245,9 @@ def make_crawler(args: argparse.Namespace, parser: HTMLParser | None = None, **o
         jitter=args.jitter,
         respect_robots=not args.no_robots,
         retry_strategy=RetryStrategy(max_retries=args.retries),
+        circuit_breaker=CircuitBreaker(
+            None if args.no_breaker else args.breaker_threshold, cooldown=args.breaker_cooldown
+        ),
         parser=parser,
         **options,
     )

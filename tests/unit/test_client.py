@@ -8,11 +8,14 @@ from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
-from helpers import UNTHROTTLED
+from helpers import UNTHROTTLED, FakeClock
 
 from crawler import (
     AsyncCrawler,
     CertificateError,
+    CircuitBreaker,
+    CircuitOpenError,
+    CircuitState,
     CrawlerClosedError,
     FetchResult,
     FetchTimeoutError,
@@ -24,6 +27,7 @@ from crawler import (
     PermanentError,
     RetryStrategy,
     RobotsDisallowedError,
+    RobotsUnreachableError,
     TransientError,
     UnexpectedError,
 )
@@ -552,6 +556,69 @@ class TestErrorStats:
         stats = crawler.error_stats()
         assert stats.total == 0
         assert stats.permanent_errors == {}
+
+
+class TestCircuitBreaker:
+    async def test_open_circuit_stops_requests_and_retries(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(min_requests=3),
+        )
+        fake_session.routes["http://a/1"] = FakeResponse(status=503)
+
+        # The third failed attempt opens the circuit, and the retry after it is refused.
+        first = await crawler.fetch_result("http://a/1")
+        second = await crawler.fetch_result("http://a/2")
+        other_host = await crawler.fetch_result("http://b/")
+
+        assert isinstance(first.error, CircuitOpenError)
+        assert isinstance(second.error, CircuitOpenError)
+        assert second.error.message.startswith("circuit breaker of a is open (3 of 3 requests failed")
+        assert other_host.ok
+        assert fake_session.requested == ["http://a/1"] * 3 + ["http://b/"]
+        # Refused requests were not made: they are not errors of an attempt.
+        stats = crawler.error_stats()
+        assert (stats.total, stats.retries) == (3, 2)
+        assert crawler.circuit_breaker.get_stats()["a"].rejected == 2
+
+    async def test_refused_after_waiting_for_the_rate_limit(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            requests_per_second=20,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1),
+        )
+        fake_session.routes["http://a/1"] = FakeResponse(status=503)
+
+        # a/2 passes the first check, then waits for its turn while a/1 opens the circuit.
+        results = await crawler.fetch_many(["http://a/1", "http://a/2"])
+
+        assert isinstance(results[0].error, HTTPStatusError)
+        assert isinstance(results[1].error, CircuitOpenError)
+        assert fake_session.requested == ["http://a/1"]
+        assert crawler.rate_limiter.get_stats().requests == 1
+
+    async def test_robots_txt_counts(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            respect_robots=True,
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(min_requests=2),
+        )
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=503)
+        with pytest.raises(RobotsUnreachableError):
+            await crawler.fetch_url("http://a/page")
+        assert crawler.circuit_breaker.state("a") is CircuitState.OPEN
+
+    async def test_host_recovers_after_the_cooldown(self, make_crawler, fake_session):
+        clock = FakeClock()
+        crawler = make_crawler(circuit_breaker=CircuitBreaker(min_requests=2, cooldown=10, clock=clock))
+        fake_session.routes["http://a/"] = [aiohttp.ClientConnectionError("refused")] * 2 + [FakeResponse()]
+        await crawler.fetch_many(["http://a/", "http://a/"])
+        with pytest.raises(CircuitOpenError):
+            await crawler.fetch_url("http://a/")
+
+        clock.now += 10
+        assert await crawler.fetch_url("http://a/") == "page"
+        assert crawler.circuit_breaker.state("a") is CircuitState.CLOSED
+        assert len(fake_session.requested) == 3
 
 
 class TestUserAgents:

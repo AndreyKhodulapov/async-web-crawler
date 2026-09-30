@@ -1,8 +1,10 @@
 """Asynchronous web crawler built on asyncio and aiohttp."""
 
+from crawler.circuit_breaker import BreakerCall, CircuitBreaker, CircuitState
 from crawler.client import AsyncCrawler
 from crawler.exceptions import (
     CertificateError,
+    CircuitOpenError,
     CrawlerClosedError,
     FetchError,
     FetchTimeoutError,
@@ -21,7 +23,7 @@ from crawler.exceptions import (
     error_kind,
 )
 from crawler.filters import UrlFilter
-from crawler.models import CrawlStats, DomainRate, ErrorStats, FetchResult, ParsedPage, RateStats
+from crawler.models import CircuitStats, CrawlStats, DomainRate, ErrorStats, FetchResult, ParsedPage, RateStats
 from crawler.parser import HTMLParser
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
@@ -32,7 +34,12 @@ from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
     "AsyncCrawler",
+    "BreakerCall",
     "CertificateError",
+    "CircuitBreaker",
+    "CircuitOpenError",
+    "CircuitState",
+    "CircuitStats",
     "CrawlStats",
     "CrawlerClosedError",
     "CrawlerQueue",
