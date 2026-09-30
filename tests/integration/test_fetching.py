@@ -11,6 +11,7 @@ from crawler import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    TooManyRedirectsError,
 )
 
 
@@ -44,9 +45,11 @@ async def test_idna_error_is_an_invalid_url(crawler):
         await crawler.fetch_url("http://" + "a" * 70 + ".com")
 
 
-async def test_redirect_loop(crawler, server):
-    with pytest.raises(NetworkError, match="too many redirects"):
-        await crawler.fetch_url(str(server.make_url("/redirect-loop")))
+async def test_redirect_loop_is_not_retried(server):
+    async with AsyncCrawler(**{**UNTHROTTLED, "max_retries": 2}) as crawler:
+        with pytest.raises(TooManyRedirectsError, match="too many redirects"):
+            await crawler.fetch_url(str(server.make_url("/redirect-loop")))
+        assert crawler.rate_limiter.get_stats().requests == 1  # one attempt, no retries
 
 
 @pytest.mark.parametrize("timeout", ["read_timeout", "total_timeout"])

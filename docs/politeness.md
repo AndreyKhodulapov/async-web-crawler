@@ -96,6 +96,10 @@ sites it visits and follows their rules.
 - Retry only **transient** failures: timeouts, connection errors, 408, 429,
   500, 502, 503, 504. A 404 or 403 fails the same way again. Retrying is safe
   for idempotent requests such as GET.
+- Not every network error is transient: a redirect loop or a certificate
+  that fails verification is a property of the site. Retrying a redirect
+  loop is costly too: each attempt follows the whole chain (10 requests in
+  aiohttp) outside the rate limiter.
 - **Exponential backoff**: wait `base * 2**n`, capped. **Jitter** keeps
   clients that failed together from retrying in lockstep. "Full jitter"
   (0..delay) spreads retries best but can retry almost at once; "equal

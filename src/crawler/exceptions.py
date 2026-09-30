@@ -31,6 +31,14 @@ class NetworkError(FetchError):
     """The request failed at the network level (DNS, connection, payload)."""
 
 
+class TooManyRedirectsError(NetworkError):
+    """The redirects did not end within the limit, e.g. a redirect loop."""
+
+
+class CertificateError(NetworkError):
+    """The server's TLS certificate failed verification."""
+
+
 class FetchTimeoutError(FetchError):
     """The request did not complete within the configured timeouts."""
 

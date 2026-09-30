@@ -6,6 +6,7 @@ from email.utils import format_datetime
 import pytest
 
 from crawler import (
+    CertificateError,
     CrawlerClosedError,
     FetchTimeoutError,
     HTTPStatusError,
@@ -13,6 +14,7 @@ from crawler import (
     NetworkError,
     RetryPolicy,
     RobotsDisallowedError,
+    TooManyRedirectsError,
     UnexpectedError,
 )
 from crawler.retry import parse_retry_after
@@ -35,6 +37,8 @@ def http_error(status: int, retry_after: float | None = None) -> HTTPStatusError
         (http_error(403), False),
         (FetchTimeoutError(URL, "request timed out"), True),
         (NetworkError(URL, "connection reset"), True),
+        (TooManyRedirectsError(URL, "too many redirects (10)"), False),
+        (CertificateError(URL, "certificate has expired"), False),
         (InvalidURLError(URL, "bad port"), False),
         (RobotsDisallowedError(URL, "disallowed by robots.txt"), False),
         (CrawlerClosedError(URL, "crawler is closed"), False),
@@ -93,6 +97,6 @@ class TestParseRetryAfter:
     def test_date_in_the_past_means_no_wait(self):
         assert parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == 0.0
 
-    @pytest.mark.parametrize("value", [None, "", "soon", "-5", "1.5"])
+    @pytest.mark.parametrize("value", [None, "", "soon", "-5", "1.5", "²", "١٢"])
     def test_invalid_values(self, value):
         assert parse_retry_after(value) is None

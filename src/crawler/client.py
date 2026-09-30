@@ -15,6 +15,7 @@ import certifi
 from bs4.dammit import EncodingDetector
 
 from crawler.exceptions import (
+    CertificateError,
     CrawlerClosedError,
     FetchError,
     FetchTimeoutError,
@@ -22,6 +23,7 @@ from crawler.exceptions import (
     InvalidURLError,
     NetworkError,
     RobotsDisallowedError,
+    TooManyRedirectsError,
     UnexpectedError,
 )
 from crawler.filters import UrlFilter
@@ -609,9 +611,9 @@ class AsyncCrawler:
                 )
         # Order matters: TooManyRedirects is a ClientResponseError, which is a
         # ClientError; aiohttp's ServerTimeoutError is both a ClientError and
-        # a TimeoutError; InvalidURL is a ClientError too.
+        # a TimeoutError; InvalidURL and the certificate error are ClientErrors too.
         except aiohttp.TooManyRedirects as exc:
-            raise NetworkError(url, f"too many redirects ({len(exc.history)})") from exc
+            raise TooManyRedirectsError(url, f"too many redirects ({len(exc.history)})") from exc
         except aiohttp.ClientResponseError as exc:
             retry_after = parse_retry_after(exc.headers.get(aiohttp.hdrs.RETRY_AFTER) if exc.headers else None)
             raise HTTPStatusError(url, exc.status, exc.message, retry_after=retry_after) from exc
@@ -621,6 +623,8 @@ class AsyncCrawler:
         # label longer than 63 characters; aiohttp does not wrap it.
         except (aiohttp.InvalidURL, UnicodeError) as exc:
             raise InvalidURLError(url, f"{type(exc).__name__}: {exc}") from exc
+        except aiohttp.ClientConnectorCertificateError as exc:
+            raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
 

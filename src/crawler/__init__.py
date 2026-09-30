@@ -2,6 +2,7 @@
 
 from crawler.client import AsyncCrawler
 from crawler.exceptions import (
+    CertificateError,
     CrawlerClosedError,
     FetchError,
     FetchTimeoutError,
@@ -9,6 +10,7 @@ from crawler.exceptions import (
     InvalidURLError,
     NetworkError,
     RobotsDisallowedError,
+    TooManyRedirectsError,
     UnexpectedError,
 )
 from crawler.filters import UrlFilter
@@ -23,6 +25,7 @@ from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
     "AsyncCrawler",
+    "CertificateError",
     "CrawlStats",
     "CrawlerClosedError",
     "CrawlerQueue",
@@ -42,6 +45,7 @@ __all__ = [
     "RobotsParser",
     "RobotsRules",
     "SemaphoreManager",
+    "TooManyRedirectsError",
     "UnexpectedError",
     "UrlFilter",
     "get_host",

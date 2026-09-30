@@ -31,9 +31,10 @@ and backs off when a site struggles.
   same bot name
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
 - Separate connect, read and total timeouts
-- Clear error types: `HTTPStatusError`, `NetworkError` (including redirect
-  loops), `FetchTimeoutError`, `InvalidURLError`, `RobotsDisallowedError`,
-  `CrawlerClosedError` and `UnexpectedError`, all subclasses of `FetchError`
+- Clear error types: `HTTPStatusError`, `NetworkError` (with
+  `TooManyRedirectsError` and `CertificateError`), `FetchTimeoutError`,
+  `InvalidURLError`, `RobotsDisallowedError`, `CrawlerClosedError` and
+  `UnexpectedError`, all subclasses of `FetchError`
 - One failing URL never breaks a batch: even unforeseen exceptions are
   logged with a traceback and reported as `UnexpectedError`
 - Logging for every request: start, success (status, size, time) and failure
@@ -298,7 +299,7 @@ without being requested.
 | `min_delay` | `0.0` | min seconds between two requests to one host |
 | `jitter` | `0.0` | random extra delay of up to this many seconds after each request |
 | `respect_robots` | `True` | check robots.txt before every request |
-| `max_retries` | `2` | retries of timeouts, network errors, HTTP 408, 429 and 5xx |
+| `max_retries` | `2` | retries of timeouts, network errors (not redirect loops or bad certificates), HTTP 408, 429 and 5xx |
 | `backoff_base`, `max_backoff` | `1.0`, `30.0` | retry n waits about `backoff_base * 2**n` seconds, at most `max_backoff` |
 | `user_agent` | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name |
 | `user_agents` | `()` | strings to rotate between requests; all must share the name of `user_agent` |

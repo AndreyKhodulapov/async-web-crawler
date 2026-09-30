@@ -1,6 +1,7 @@
 """Unit tests for AsyncCrawler with the HTTP session replaced by fakes."""
 
 import asyncio
+import ssl
 from unittest.mock import MagicMock
 
 import aiohttp
@@ -9,6 +10,7 @@ from helpers import UNTHROTTLED
 
 from crawler import (
     AsyncCrawler,
+    CertificateError,
     CrawlerClosedError,
     FetchResult,
     FetchTimeoutError,
@@ -230,6 +232,20 @@ class TestErrorMapping:
         with pytest.raises(NetworkError, match="refused") as exc_info:
             await crawler.fetch_url("http://a")
         assert isinstance(exc_info.value.__cause__, aiohttp.ClientConnectionError)
+
+    async def test_certificate_error_is_not_retried(self, make_crawler, fake_session):
+        crawler = make_crawler(max_retries=2, backoff_base=0.001)
+        fake_session.routes["http://a"] = aiohttp.ClientConnectorCertificateError(
+            MagicMock(), ssl.SSLCertVerificationError("certificate has expired")
+        )
+        with pytest.raises(CertificateError, match="certificate has expired"):
+            await crawler.fetch_url("http://a")
+        assert fake_session.requested == ["http://a"]
+
+    async def test_non_ascii_retry_after_is_ignored(self, make_crawler, fake_session):
+        crawler = make_crawler(max_retries=1, backoff_base=0.001)
+        fake_session.routes["http://a"] = [FakeResponse(status=429, retry_after="²"), FakeResponse(b"ok")]
+        assert await crawler.fetch_url("http://a") == "ok"
 
     async def test_unexpected_exception_is_wrapped_and_logged(self, crawler, fake_session, caplog):
         fake_session.routes["http://a"] = KeyError("bug")
