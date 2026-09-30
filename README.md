@@ -205,7 +205,9 @@ errors a crawler meets:
 The breaker tells hosts apart by name, so the server that is down, on
 `localhost`, does not block the site on `127.0.0.1`. The ordinary pages come
 first, so the site's own failures stay under the breaker's threshold. URLs
-given on the command line are added to the start page's links. To keep the
+given on the command line are added to the start page's links; a URL on
+`localhost` or `127.0.0.1` shares the circuit breaker with the local site, so
+the server that is down may block it. To keep the
 run within seconds, the defaults differ from the other commands: `--retries 3`,
 `--retry-delay 0.2`, `--read-timeout 1`, `--rps 0` and no robots.txt. Real
 URLs get the same defaults; to fetch them politely, add `--robots --rps 1`.

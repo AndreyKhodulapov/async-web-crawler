@@ -1,11 +1,12 @@
 import asyncio
-import socket
 import time
 from collections import Counter
 
 import pytest
 from aiohttp import web
 from pages import ENCODING_PAGES, SITE_PAGES, fixture_html
+
+from demo_site import free_port
 
 
 class SiteState:
@@ -139,7 +140,4 @@ def site(server) -> SiteState:
 @pytest.fixture
 def closed_port_url() -> str:
     """URL pointing to a local port that nothing listens on."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    return f"http://127.0.0.1:{port}/"
+    return f"http://127.0.0.1:{free_port()}/"

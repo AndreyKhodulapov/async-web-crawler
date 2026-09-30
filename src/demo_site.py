@@ -60,7 +60,7 @@ class DemoSite:
         self.hits: Counter[str] = Counter()
         self._runner: web.AppRunner | None = None
         self._port = 0
-        self._down_port = free_port()
+        self._down_port = 0
 
     @property
     def url(self) -> str:
@@ -77,11 +77,18 @@ class DemoSite:
         app.router.add_get("/private", self._private)
         app.router.add_get("/data.json", self._data)
         # /missing is not routed: aiohttp answers 404.
-        self._runner = web.AppRunner(app, access_log=None)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, "127.0.0.1", 0)
-        await site.start()
-        self._port = self._runner.addresses[0][1]
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        try:
+            await web.TCPSite(runner, "127.0.0.1", 0).start()
+        except BaseException:
+            await runner.cleanup()
+            raise
+        self._runner = runner
+        self._port = runner.addresses[0][1]
+        # Chosen once the site holds its own port, so the system cannot
+        # give the site the port of the server that is down.
+        self._down_port = free_port()
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:

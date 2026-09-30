@@ -263,7 +263,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     errors = commands.add_parser(
         "errors", help="crawl a local site that fails in every way, show retries and error statistics"
     )
-    errors.add_argument("urls", nargs="*", type=http_url, help="real URLs to fetch along with the local site")
+    errors.add_argument(
+        "urls",
+        nargs="*",
+        type=http_url,
+        help="real URLs to fetch along with the local site; ones on localhost or 127.0.0.1 "
+        "share the circuit breaker with the site's hosts",
+    )
     errors.add_argument(
         "--json",
         type=Path,
