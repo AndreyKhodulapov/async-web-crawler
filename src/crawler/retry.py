@@ -1,5 +1,6 @@
 """When to retry a failed request and how long to wait before it."""
 
+import math
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,7 +31,9 @@ class RetryPolicy:
     half. Jitter keeps many clients that failed together from retrying in
     lockstep; the fixed half keeps a retry from coming right back, as "full
     jitter" (0..delay) can. A Retry-After header from the server is honored
-    when it asks for longer, up to `max_delay`.
+    when it asks for longer. A server that asks to wait longer than
+    `max_delay` is not retried at all: coming back early would only earn
+    another refusal.
     """
 
     RETRY_STATUSES: ClassVar[frozenset[int]] = frozenset({408, 429, 500, 502, 503, 504})
@@ -43,14 +46,15 @@ class RetryPolicy:
     def __post_init__(self) -> None:
         if self.max_retries < 0:
             raise ValueError(f"max_retries must be >= 0, got {self.max_retries}")
-        if self.base_delay <= 0 or self.max_delay <= 0:
-            raise ValueError(f"backoff delays must be positive, got {self.base_delay} and {self.max_delay}")
+        if not all(math.isfinite(delay) and delay > 0 for delay in (self.base_delay, self.max_delay)):
+            raise ValueError(f"backoff delays must be positive numbers, got {self.base_delay} and {self.max_delay}")
 
     def should_retry(self, error: FetchError, retries_done: int) -> bool:
         if retries_done >= self.max_retries:
             return False
         if isinstance(error, HTTPStatusError):
-            return error.status in self.RETRY_STATUSES
+            too_long = error.retry_after is not None and error.retry_after > self.max_delay
+            return error.status in self.RETRY_STATUSES and not too_long
         return isinstance(error, FetchTimeoutError | NetworkError) and not isinstance(error, self.PERMANENT)
 
     def delay(self, error: FetchError, retries_done: int) -> float:

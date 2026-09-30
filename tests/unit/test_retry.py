@@ -49,12 +49,27 @@ def test_only_transient_errors_are_retried(error, expected):
     assert RetryPolicy().should_retry(error, 0) is expected
 
 
+def test_retry_after_longer_than_max_delay_is_not_retried():
+    policy = RetryPolicy(max_delay=30.0)
+    assert policy.should_retry(http_error(429, retry_after=30), 0)
+    assert not policy.should_retry(http_error(429, retry_after=31), 0)
+
+
 def test_retries_stop_at_the_limit():
     policy = RetryPolicy(max_retries=2)
     assert [policy.should_retry(http_error(503), done) for done in range(4)] == [True, True, False, False]
 
 
-@pytest.mark.parametrize("options", [{"max_retries": -1}, {"base_delay": 0}, {"max_delay": -1}])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"max_retries": -1},
+        {"base_delay": 0},
+        {"max_delay": -1},
+        {"base_delay": float("nan")},
+        {"max_delay": float("inf")},
+    ],
+)
 def test_rejects_invalid_options(options):
     with pytest.raises(ValueError):
         RetryPolicy(**options)

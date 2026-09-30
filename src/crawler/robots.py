@@ -58,8 +58,9 @@ class RobotsRules:
     the longest one wins, and Allow wins a tie. "*" and "$" work as
     wildcards. /robots.txt itself is always allowed.
 
-    Crawl-delay is not part of the RFC, but many sites use it; when several
-    matching groups set it, the largest value is taken.
+    Crawl-delay is not part of the RFC, but many sites use it; when it is
+    set several times, in one group or in several matching ones, the
+    largest value is taken.
 
     `unreachable` tells why robots.txt could not be read, e.g. "HTTP 503";
     everything is disallowed then.
@@ -311,4 +312,4 @@ def _parse_delay(value: str, current: float | None) -> float | None:
         return current
     if not math.isfinite(delay) or delay < 0:
         return current
-    return delay
+    return delay if current is None else max(current, delay)

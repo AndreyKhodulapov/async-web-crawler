@@ -151,6 +151,10 @@ class TestCrawlDelay:
         rules = RobotsRules.parse("User-agent: testbot\nCrawl-delay: 1\n\nUser-agent: testbot\nCrawl-delay: 3")
         assert rules.crawl_delay(BOT) == 3.0
 
+    def test_largest_crawl_delay_of_one_group_wins(self):
+        rules = RobotsRules.parse("User-agent: *\nCrawl-delay: 10\nCrawl-delay: 1")
+        assert rules.crawl_delay(BOT) == 10.0
+
     @pytest.mark.parametrize("value", ["", "soon", "-1", "nan", "inf"])
     def test_invalid_crawl_delay_is_ignored(self, value):
         assert RobotsRules.parse(f"User-agent: *\nCrawl-delay: {value}").crawl_delay(BOT) is None

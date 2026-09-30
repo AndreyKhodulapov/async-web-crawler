@@ -27,7 +27,7 @@ and backs off when a site struggles.
   unreachable robots.txt closes the site for a minute, then it is fetched again
 - Retries of timeouts, network errors, HTTP 429 and 5xx with exponential
   backoff and jitter, honoring `Retry-After`; the whole host slows down
-  while a retry waits
+  while a retry waits or after a Retry-After
 - Configurable User-Agent, with optional rotation between variants of the
   same bot name
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
@@ -315,11 +315,14 @@ host and port) and cached for the crawler's lifetime. A missing robots.txt
 (HTTP 4xx) allows everything; an unreachable one (HTTP 5xx, 429, network
 errors, after the retries) disallows the whole site for 60 seconds, then it
 is fetched again. Such pages are counted as unreachable, not as blocked:
-the site did not forbid them. Only the requested URL is checked: the
+the site did not forbid them. A crawl does not queue them again, so only
+the pages found after the 60 seconds are fetched. Only the requested URL is checked: the
 HTTP client follows redirects on its own, so a redirect can still lead to a
 disallowed page. Crawl-delay is capped at 30 seconds. While
 a retry waits, the whole host waits with it, since a timeout or a 429 usually
-means the site is overloaded.
+means the site is overloaded. A Retry-After header holds back the host even
+when the request is not retried, for at most `max_backoff` seconds; a
+request whose Retry-After is longer than that is not retried.
 
 The building blocks work on their own too:
 

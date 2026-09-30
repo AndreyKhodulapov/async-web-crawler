@@ -377,6 +377,25 @@ class TestRetries:
             await crawler.fetch_url("http://a")
         assert exc_info.value.retry_after == 120
 
+    async def test_retry_after_holds_back_the_host_without_a_retry(self, make_crawler, fake_session):
+        crawler = make_crawler(max_retries=0, max_backoff=5.0)
+        fake_session.routes["http://a"] = FakeResponse(status=429, retry_after="2")
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_url("http://a")
+
+        assert crawler.rate_limiter.reserve("a") == pytest.approx(2.0, abs=0.1)
+        assert crawler.rate_limiter.reserve("b") == 0
+
+    async def test_retry_after_beyond_max_backoff_is_not_retried(self, make_crawler, fake_session):
+        crawler = make_crawler(max_retries=2, max_backoff=5.0)
+        fake_session.routes["http://a"] = [FakeResponse(status=429, retry_after="120"), FakeResponse(b"ok")]
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_url("http://a")
+
+        assert fake_session.requested == ["http://a"]
+        # The host waits as long as a retry could, not the two minutes asked for.
+        assert crawler.rate_limiter.reserve("a") == pytest.approx(5.0, abs=0.1)
+
     async def test_backoff_holds_back_the_whole_host(self, make_crawler, fake_session):
         crawler = make_crawler(max_retries=1, backoff_base=0.2)
         fake_session.routes["http://a/slow"] = [FakeResponse(status=503), FakeResponse()]

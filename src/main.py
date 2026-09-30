@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import re
 import sys
 import textwrap
@@ -40,6 +41,8 @@ def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) 
             value = number_type(raw)
         except ValueError:
             raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+        if not math.isfinite(value):
+            raise argparse.ArgumentTypeError(f"must be a finite number, got {raw}")
         if value < 0 or (value == 0 and not allow_zero):
             raise argparse.ArgumentTypeError(f"must be {'non-negative' if allow_zero else 'positive'}, got {raw}")
         return value

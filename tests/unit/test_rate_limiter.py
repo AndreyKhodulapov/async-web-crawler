@@ -1,6 +1,7 @@
 """Unit tests for RateLimiter: intervals per domain and overall, delays, jitter, stats."""
 
 import asyncio
+import contextlib
 import itertools
 import random
 import time
@@ -37,11 +38,29 @@ async def start_times(limiter: RateLimiter, domains: list[str]) -> list[float]:
 
 @pytest.mark.parametrize(
     "options",
-    [{"requests_per_second": 0}, {"requests_per_second": -1}, {"min_delay": -1}, {"jitter": -0.1}],
+    [
+        {"requests_per_second": 0},
+        {"requests_per_second": -1},
+        {"requests_per_second": float("inf")},
+        {"requests_per_second": float("nan")},
+        {"min_delay": -1},
+        {"min_delay": float("inf")},
+        {"jitter": -0.1},
+        {"jitter": float("nan")},
+    ],
 )
 def test_rejects_invalid_options(options):
     with pytest.raises(ValueError):
         RateLimiter(**options)
+
+
+@pytest.mark.parametrize("seconds", [-1, float("inf"), float("nan")])
+def test_rejects_invalid_delays_and_penalties(seconds):
+    limiter = RateLimiter()
+    with pytest.raises(ValueError, match="delay"):
+        limiter.set_delay("a", seconds)
+    with pytest.raises(ValueError, match="seconds"):
+        limiter.penalize("a", seconds)
 
 
 @pytest.mark.parametrize(
@@ -245,3 +264,30 @@ class TestSlot:
         # The first request keeps the gate past the turns of the others.
         await asyncio.gather(request(0.2), request(0), request(0), request(0))
         assert all(later - earlier >= 0.05 - EPSILON for earlier, later in itertools.pairwise(started))
+
+    async def test_late_start_does_not_make_the_next_requests_wait_inside_the_gate(self):
+        limiter = RateLimiter(10.0)  # 0.1 s apart
+        gate = asyncio.Semaphore(1)
+        held: list[float] = []
+
+        @contextlib.asynccontextmanager
+        async def timed_gate():
+            async with gate:
+                taken = time.monotonic()
+                yield
+                held.append(time.monotonic() - taken)
+
+        async def request() -> None:
+            async with limiter.slot("a", timed_gate):
+                pass
+
+        async def other_host() -> None:
+            async with gate:
+                await asyncio.sleep(0.05)
+
+        # The first request gets the gate 0.05 s late, and every later start
+        # is 0.05 s behind its booking: that lag is waited for outside the gate.
+        blocker = asyncio.create_task(other_host())
+        await asyncio.sleep(0)
+        await asyncio.gather(*(request() for _ in range(4)), blocker)
+        assert max(held) < 0.02

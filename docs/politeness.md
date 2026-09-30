@@ -87,7 +87,9 @@ sites it visits and follows their rules.
   is disallowed. 429 is best treated like 5xx: the site asks crawlers to back off.
 - An **unreachable** robots.txt is an outage, not a rule: cache it briefly
   (here 60 seconds) and fetch it again, or one timeout closes the site for
-  the whole crawl. Count such pages apart from the disallowed ones, so the
+  the whole crawl. The TTL helps the URLs that come later: pages refused
+  during the outage are not queued again, so a crawl of that one site
+  still ends empty. Count such pages apart from the disallowed ones, so the
   report does not blame robots.txt for a network failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
   origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB.
@@ -114,10 +116,12 @@ sites it visits and follows their rules.
   clients that failed together from retrying in lockstep. "Full jitter"
   (0..delay) spreads retries best but can retry almost at once; "equal
   jitter" (delay/2 + 0..delay/2) keeps a minimum pause.
-- Honor **Retry-After** (seconds or an HTTP date), up to a cap.
+- Honor **Retry-After** (seconds or an HTTP date). When it asks for longer
+  than the backoff cap, do not retry: coming back early earns another 429.
 - A 429 or a timeout usually means the **whole site** is struggling:
   penalize the host in the rate limiter, so that every worker slows down,
-  not only the one that failed. Scrapy's AutoThrottle adapts the delay to
+  not only the one that failed. A Retry-After is a request to the whole
+  crawler: it holds back the host even when the failed URL is not retried. Scrapy's AutoThrottle adapts the delay to
   latency the same way.
 
 ## User-Agent

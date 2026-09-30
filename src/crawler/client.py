@@ -76,7 +76,8 @@ class AsyncCrawler:
     - Timeouts, network errors and HTTP 408, 429 and 5xx are retried up to
       `max_retries` times with exponential backoff from `backoff_base` up to
       `max_backoff` seconds (see `RetryPolicy`). While a retry waits, the
-      whole host waits with it.
+      whole host waits with it; so it does after a Retry-After header, even
+      when the request is not retried.
 
     `user_agent` identifies the crawler, and robots.txt rules are looked up
     by its name ("MyBot/1.0 (+url)" is "mybot"). `user_agents` rotates
@@ -271,13 +272,20 @@ class AsyncCrawler:
         retries = 0
         while True:
             result = await self._fetch_once(url, html_only=html_only, failure_level=failure_level)
-            if result.error is None or not self._retry.should_retry(result.error, retries):
+            error = result.error
+            if error is None:
                 return result
-            delay = self._retry.delay(result.error, retries)
+            host = get_host(url)
+            if not self._retry.should_retry(error, retries):
+                # The server asked to wait: the other requests to the host
+                # wait even when this one is not retried, up to max_backoff.
+                if isinstance(error, HTTPStatusError) and error.retry_after and host is not None:
+                    self.rate_limiter.penalize(host, min(error.retry_after, self._retry.max_delay))
+                return result
+            delay = self._retry.delay(error, retries)
             retries += 1
             self._retries += 1
             logger.warning("Retrying %s in %.1fs (retry %d of %d)", url, delay, retries, self._retry.max_retries)
-            host = get_host(url)
             assert host is not None  # an invalid URL fails with an error that is not retried
             # The retry waits in the rate limiter, and so does every
             # other request to the host: a timeout or HTTP 429 usually

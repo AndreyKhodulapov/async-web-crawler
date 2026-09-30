@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import math
 import random
 import time
 from collections import deque
@@ -64,12 +65,10 @@ class RateLimiter:
         jitter: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if requests_per_second is not None and requests_per_second <= 0:
-            raise ValueError(f"requests_per_second must be positive or None, got {requests_per_second}")
-        if min_delay < 0:
-            raise ValueError(f"min_delay must be >= 0, got {min_delay}")
-        if jitter < 0:
-            raise ValueError(f"jitter must be >= 0, got {jitter}")
+        if requests_per_second is not None and not (math.isfinite(requests_per_second) and requests_per_second > 0):
+            raise ValueError(f"requests_per_second must be a positive number or None, got {requests_per_second}")
+        _check_seconds("min_delay", min_delay)
+        _check_seconds("jitter", jitter)
         self.requests_per_second = requests_per_second
         self.per_domain = per_domain
         self.min_delay = min_delay
@@ -95,8 +94,7 @@ class RateLimiter:
         A delay never goes down: a host may serve several sites (ports,
         schemes), each with a robots.txt of its own, and the longest delay wins.
         """
-        if delay < 0:
-            raise ValueError(f"delay must be >= 0, got {delay}")
+        _check_seconds("delay", delay)
         delay = max(delay, self._delays.get(domain, 0.0))
         self._delays[domain] = delay
         # The request that fetched robots.txt has already booked the next
@@ -109,6 +107,7 @@ class RateLimiter:
 
         Requests already waiting for their turn wait for the penalty too.
         """
+        _check_seconds("seconds", seconds)
         until = self._clock() + seconds
         self._penalized_until[domain] = max(self._penalized_until.get(domain, 0.0), until)
         self._next_start[domain] = max(self._next_start.get(domain, 0.0), until)
@@ -225,6 +224,14 @@ class RateLimiter:
                 if start > now:
                     await asyncio.sleep(start - now)
                     slept += start - now
+            # The request before may have started later than booked, when
+            # its gate came late: the interval since then is waited for
+            # here too, so that it is not waited for inside the gate.
+            now = self._clock()
+            while (ready := self._ready_at(domain, now)) > now:
+                await asyncio.sleep(ready - now)
+                slept += ready - now
+                now = self._clock()
             # A penalty that came after the booking and outlasts it: the
             # booked time is void, and a new one comes after the penalty.
             if self._penalty_end(domain) <= start:
@@ -241,13 +248,17 @@ class RateLimiter:
             now = self._clock()
             if self._penalty_end(domain) > max(now, start):
                 return None
-            last_starts = ((self._last_start.get(key), interval) for key, interval in self._schedules(domain))
-            ready = max((last + interval for last, interval in last_starts if last is not None), default=now)
+            ready = self._ready_at(domain, now)
             if ready <= now:
                 self._mark_started(domain, now)
                 return slept
             await asyncio.sleep(ready - now)
             slept += ready - now
+
+    def _ready_at(self, domain: str | None, now: float) -> float:
+        """When the intervals since the requests that started last have passed; `now` if none started."""
+        last_starts = ((self._last_start.get(key), interval) for key, interval in self._schedules(domain))
+        return max((last + interval for last, interval in last_starts if last is not None), default=now)
 
     def _penalty_end(self, domain: str | None) -> float:
         return 0.0 if domain is None else self._penalized_until.get(domain, 0.0)
@@ -275,3 +286,8 @@ class RateLimiter:
             counter.total_gap += start - counter.last_start
             counter.gaps += 1
         counter.last_start = start
+
+
+def _check_seconds(name: str, value: float) -> None:
+    if not (math.isfinite(value) and value >= 0):
+        raise ValueError(f"{name} must be a number of seconds >= 0, got {value}")
