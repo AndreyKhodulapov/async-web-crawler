@@ -701,6 +701,7 @@ tests/
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here
 ├── concurrency_control.md  # notes on queues, limits and crawl order
+├── error_handling.md       # notes on error kinds, retries, timeouts and circuit breakers
 ├── html_parsing.md         # notes on HTML parsing and URL handling
 └── politeness.md           # notes on rate limiting, robots.txt and backoff
 ```
