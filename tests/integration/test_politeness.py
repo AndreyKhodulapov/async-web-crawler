@@ -1,7 +1,9 @@
 """Integration tests: rate limits, robots.txt, retries and the circuit breaker against a local aiohttp server."""
 
 import asyncio
+import contextlib
 import itertools
+import time
 
 import pytest
 from helpers import BOT, UNTHROTTLED, FakeClock
@@ -15,9 +17,8 @@ from crawler import (
     RobotsUnreachableError,
 )
 
-# Gaps are measured where requests arrive, while the limiter controls when
-# they are sent; opening a connection shifts an arrival by a millisecond or so.
-EPSILON = 0.01
+# Starts are recorded right after the limiter reads its clock for them.
+EPSILON = 0.005
 
 
 def polite(**options) -> AsyncCrawler:
@@ -35,8 +36,27 @@ async def open_session(crawler: AsyncCrawler, url, site) -> None:
     site.hits.clear()
 
 
-def gaps(site) -> list[float]:
-    times = [moment for _, moment in site.log]
+def record_starts(crawler: AsyncCrawler) -> list[float]:
+    """Record when the rate limiter lets each request of `crawler` start.
+
+    That is the moment the limiter controls. Arrivals at the test server
+    may come closer together: the server runs in the same event loop, and
+    a loop busy for a moment delays one request but not the one after it.
+    """
+    starts: list[float] = []
+    slot = crawler.rate_limiter.slot
+
+    @contextlib.asynccontextmanager
+    async def recording_slot(*args, **kwargs):
+        async with slot(*args, **kwargs):
+            starts.append(time.monotonic())
+            yield
+
+    crawler.rate_limiter.slot = recording_slot
+    return starts
+
+
+def gaps(times: list[float]) -> list[float]:
     return [later - earlier for earlier, later in itertools.pairwise(times)]
 
 
@@ -45,9 +65,10 @@ class TestRateLimit:
         paths = ["/site/", "/site/a.html", "/site/b.html", "/site/c.html", "/site/a/deeper.html"]
         async with polite(requests_per_second=10) as crawler:
             await open_session(crawler, url, site)
+            starts = record_starts(crawler)
             await crawler.fetch_many([url(path) for path in paths])
-        assert len(site.log) == len(paths)
-        assert min(gaps(site)) >= 0.1 - EPSILON
+        assert len(site.log) == len(starts) == len(paths)
+        assert min(gaps(starts)) >= 0.1 - EPSILON
 
     async def test_waiting_host_does_not_hold_back_another(self, url, site):
         # Two slots, six pages of one host: the rest of them wait for their
@@ -147,11 +168,13 @@ class TestRobots:
         site.robots = "User-agent: *\nCrawl-delay: 0.1"
         async with polite(respect_robots=True, max_depth=1) as crawler:
             await open_session(crawler, url, site)
+            starts = record_starts(crawler)
             await crawler.crawl([url("/site/")], max_pages=3, same_domain_only=True)
 
         # robots.txt included: the page after it was booked before the delay was known.
         assert [path for path, _ in site.log] == ["/robots.txt", "/site/", "/site/a.html", "/site/b.html"]
-        assert min(gaps(site)) >= 0.1 - EPSILON
+        assert len(starts) == 4
+        assert min(gaps(starts)) >= 0.1 - EPSILON
 
 
 class TestRetries:
@@ -171,12 +194,14 @@ class TestRetries:
             requests_per_second=10, retry_strategy=RetryStrategy(max_retries=1, base_delay=0.4, max_delay=0.4)
         ) as crawler:
             await open_session(crawler, url, site)
+            starts = record_starts(crawler)
             await crawler.fetch_many([url("/flaky/1"), url("/site/"), url("/site/a.html"), url("/site/b.html")])
 
-        failed_at = site.log[0][1]
+        # The first attempt fails at once; its retry and the pages wait out the 0.2..0.4 s pause.
         assert site.log[0][0] == "/flaky/1"
-        assert all(moment - failed_at >= 0.2 - EPSILON for _, moment in site.log[1:])
-        assert min(gaps(site)) >= 0.1 - EPSILON
+        assert len(starts) == 5
+        assert all(start - starts[0] >= 0.2 - EPSILON for start in starts[1:])
+        assert min(gaps(starts)) >= 0.1 - EPSILON
 
 
 class TestCircuitBreaker:
