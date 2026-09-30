@@ -1,5 +1,7 @@
 """Unit tests for command-line parsing of the demo script."""
 
+from pathlib import Path
+
 import pytest
 
 from main import make_crawler, parse_args
@@ -7,7 +9,7 @@ from main import make_crawler, parse_args
 
 @pytest.mark.parametrize(
     ("command", "retries", "log_level"),
-    [("benchmark", 0, "INFO"), ("parse", 2, "INFO"), ("crawl", 2, "WARNING")],
+    [("benchmark", 0, "INFO"), ("parse", 2, "INFO"), ("crawl", 2, "WARNING"), ("errors", 3, "INFO")],
 )
 def test_defaults_differ_by_command(command, retries, log_level):
     args = parse_args([command])
@@ -24,6 +26,7 @@ def test_defaults_differ_by_command(command, retries, log_level):
         "--read-timeout",
         "--timeout-growth",
         "--breaker-cooldown",
+        "--retry-delay",
     ],
 )
 @pytest.mark.parametrize("value", ["inf", "nan"])
@@ -63,3 +66,20 @@ def test_breaker_options_configure_the_crawler():
 def test_rejects_breaker_threshold_outside_zero_to_one(value):
     with pytest.raises(SystemExit):
         parse_args(["crawl", "--breaker-threshold", value])
+
+
+def test_errors_defaults_keep_the_local_demo_fast():
+    args = parse_args(["errors"])
+    assert (args.retry_delay, args.read_timeout, args.rps, args.no_robots) == (0.2, 1.0, 0.0, True)
+    assert args.json == Path("error_report.json")
+
+
+def test_retry_delay_configures_the_retry_strategy():
+    crawler = make_crawler(parse_args(["crawl", "--retry-delay", "0.5"]))
+    assert crawler.retry_strategy.base_delay == 0.5
+    assert make_crawler(parse_args(["crawl"])).retry_strategy.base_delay == 1.0
+
+
+def test_rejects_zero_retry_delay():
+    with pytest.raises(SystemExit):
+        parse_args(["crawl", "--retry-delay", "0"])

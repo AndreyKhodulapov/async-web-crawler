@@ -75,9 +75,9 @@ pip install -e .                       # or: the package alone, runtime deps onl
 
 ## Demo
 
-The demo has three commands: `crawl` follows links from start pages, `parse`
-extracts data from pages, and `benchmark` compares sequential and concurrent
-fetching. All of them accept `--concurrency`, `--log-level`, the timeouts
+The demo has four commands: `crawl` follows links from start pages, `errors`
+crawls a local site that fails on purpose, `parse` extracts data from pages,
+and `benchmark` compares sequential and concurrent fetching. All of them accept `--concurrency`, `--log-level`, the timeouts
 (`--connect-timeout` and `--read-timeout`, 5 s by default, `--total-timeout`,
 10 s, and `--timeout-growth`, 1.5, see [Timeouts](#timeouts)) and the
 politeness options:
@@ -88,7 +88,8 @@ politeness options:
 | `--min-delay` | 0 | min seconds between two requests to one host |
 | `--jitter` | 0 | random extra delay of up to this many seconds |
 | `--no-robots` | off | do not check robots.txt |
-| `--retries` | 2 (0 for `benchmark`) | retries of timeouts, network errors, 429 and 5xx |
+| `--retries` | 2 (0 for `benchmark`, 3 for `errors`) | retries of timeouts, network errors, 429 and 5xx |
+| `--retry-delay` | 1 (0.2 for `errors`) | seconds before the first retry, doubled for every next one, see [Retries](#retries) |
 | `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 429 or 5xx |
 | `--breaker-cooldown` | 30 | seconds a blocked host is left alone before a probe request |
 | `--no-breaker` | off | never block a host |
@@ -175,6 +176,94 @@ minute and include robots.txt; `OPENED` and `REJECTED` count since the crawl
 started. With `--json`, the parsed pages (with their depth), the failed,
 skipped, blocked and unreachable URLs with the reasons, the statistics, the
 per-host table, the error statistics and the circuit breakers are saved to a file.
+
+### errors
+
+```bash
+python src/main.py errors                              # the local site only
+python src/main.py errors https://httpbin.org/status/503 --json report.json
+python src/main.py errors --log-level WARNING          # failed attempts only
+```
+
+The command starts a small site on 127.0.0.1 at a free port and crawls its
+start page and every page it links to, with 3 retries. The links cover the
+errors a crawler meets:
+
+| Page | Answer | What the crawler does |
+|------|--------|-----------------------|
+| `/articles/1` ... `/articles/8` | ordinary pages | fetches them |
+| `/flaky` | HTTP 503 twice, then the page | retries after 0.1–0.2 s, then 0.2–0.4 s, and gets the page |
+| `/rate-limited` | HTTP 429 with `Retry-After: 1` once | waits the second the server asked for, then gets the page |
+| `/server-error` | always HTTP 500 | retries once, as the rule for 500 says, and gives up |
+| `/slow` | the page after 1.2 s | times out at the 1 s read timeout, retries with 1.5 s and gets the page |
+| `/missing`, `/private` | HTTP 404, 403 | no retry; listed as permanent errors |
+| `/data.json` | JSON | `ParseError`, no retry |
+| `localhost:<closed port>/page/1` ... `4` | connection refused | retries until 5 failures open the circuit breaker of `localhost`; the rest are refused without a request |
+| `unreachable.invalid` | DNS error | 3 retries, then gives up |
+
+The breaker tells hosts apart by name, so the server that is down, on
+`localhost`, does not block the site on `127.0.0.1`. The ordinary pages come
+first, so the site's own failures stay under the breaker's threshold. URLs
+given on the command line are added to the start page's links. To keep the
+run within seconds, the defaults differ from the other commands: `--retries 3`,
+`--retry-delay 0.2`, `--read-timeout 1`, `--rps 0` and no robots.txt.
+
+Every attempt is logged (excerpt):
+
+```
+WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:62269/flaky failed: TransientHTTPError: HTTP 503 Service Unavailable; retrying in 0.2s
+WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:62269/rate-limited failed: TransientHTTPError: HTTP 429 Too Many Requests; retrying in 1.0s
+WARNING | crawler.circuit_breaker | Circuit breaker of localhost opened: 5 of 5 requests failed in 60s; requests to it fail for 30s
+INFO    | crawler.client | Refused http://localhost:62268/page/4: circuit breaker of localhost is open (5 of 5 requests failed in 60s), next probe in 30.0s
+INFO    | crawler.retry | Succeeded http://127.0.0.1:62269/flaky on attempt 3/4 after 1.39s
+WARNING | crawler.retry | Failed http://127.0.0.1:62269/server-error on attempt 2/4 after 1.39s, no retries left for HTTP 500: TransientHTTPError: HTTP 500 Internal Server Error
+WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:62269/slow failed: FetchTimeoutError: read timeout (1.0s); retrying in 0.1s
+INFO    | crawler.retry | Succeeded http://127.0.0.1:62269/slow on attempt 2/4 after 3.34s
+```
+
+Then come the pages, the error statistics and the circuit breakers:
+
+```
+=== Crawl (21 pages, 3.87s) ===
+DEPTH  RESULT                                LINKS  URL
+    0  ok                                       20  http://127.0.0.1:62269/
+    1  ok                                        0  http://127.0.0.1:62269/articles/1
+    ...
+    1  ok                                        0  http://127.0.0.1:62269/flaky
+    1  ok                                        0  http://127.0.0.1:62269/rate-limited
+    1  TransientHTTPError: HTTP 500...              http://127.0.0.1:62269/server-error
+    1  ok                                        0  http://127.0.0.1:62269/slow
+    1  PermanentHTTPError: HTTP 404 Not...          http://127.0.0.1:62269/missing
+    1  PermanentHTTPError: HTTP 403...              http://127.0.0.1:62269/private
+    1  ParseError: unsupported content...           http://127.0.0.1:62269/data.json
+    1  NetworkError:...                             http://localhost:62268/page/1
+    1  NetworkError:...                             http://localhost:62268/page/2
+    1  NetworkError:...                             http://localhost:62268/page/3
+    1  CircuitOpenError: circuit breaker...         http://localhost:62268/page/4
+    1  NetworkError:...                             http://unreachable.invalid/
+Crawled: 12 pages, failed: 9, skipped: 0, blocked: 0, unreachable: 0, left in queue: 0, speed: 5.4 pages/s
+
+=== Errors (20 failed attempts) ===
+By kind:  TransientError 6, PermanentError 2, NetworkError 11, ParseError 1, other 0
+By class: NetworkError 11, TransientHTTPError 5, PermanentHTTPError 2, ParseError 1, FetchTimeoutError 1
+Retries: 12, pages recovered by a retry: 3, average time per retry: 0.55s
+Permanent errors (2):
+  http://127.0.0.1:62269/private  PermanentHTTPError: HTTP 403 Forbidden
+  http://127.0.0.1:62269/missing  PermanentHTTPError: HTTP 404 Not Found
+
+=== Circuit breaker (1 of 3 hosts blocked) ===
+HOST                 STATE      REQUESTS  FAILURES  OPENED  REJECTED
+127.0.0.1            closed           21         6       0         0
+localhost            open              0         0       1         1
+unreachable.invalid  closed            4         4       0         0
+
+Error report saved to error_report.json
+```
+
+The breaker of `localhost` shows no requests, since opening it clears its
+window. The report in `error_report.json` (or `--json PATH`) holds the error
+statistics, the circuit breakers, the failed pages with the full errors and
+the fetched pages.
 
 ### parse
 
@@ -581,7 +670,8 @@ ruff check src tests        # lint
 
 ```
 src/
-├── main.py                 # demo CLI: `crawl`, `parse` and `benchmark` commands
+├── main.py                 # demo CLI: `crawl`, `errors`, `parse` and `benchmark` commands
+├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors`
 └── crawler/
     ├── client.py           # AsyncCrawler: fetching, parsing, crawl()
     ├── queue.py            # CrawlerQueue: URL priority queue and statuses

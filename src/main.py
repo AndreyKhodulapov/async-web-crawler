@@ -4,6 +4,7 @@ Usage:
     python src/main.py benchmark [options] [URL ...]   # sequential vs concurrent fetching
     python src/main.py parse [options] [URL ...]       # fetch pages and extract data
     python src/main.py crawl [options] [URL ...]       # follow links from start pages
+    python src/main.py errors [options] [URL ...]      # crawl a local site that fails on purpose
 """
 
 import argparse
@@ -36,6 +37,7 @@ from crawler import (
     is_valid_http_url,
     product_token,
 )
+from demo_site import DemoSite
 
 
 def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) -> Callable[[str], int | float]:
@@ -87,7 +89,9 @@ def regex(raw: str) -> str:
     return raw
 
 
-def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log_level: str = "INFO") -> None:
+def add_common_options(
+    parser: argparse.ArgumentParser, *, retries: int = 2, retry_delay: float = 1.0, log_level: str = "INFO"
+) -> None:
     """Options every command has; the defaults that differ by command are arguments.
 
     Each command gets its own copy: a parent parser shared through `parents=`
@@ -141,6 +145,13 @@ def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log
         type=positive(int, allow_zero=True),
         default=retries,
         help="retries of timeouts, network errors, HTTP 408, 429 and 5xx",
+    )
+    politeness.add_argument(
+        "--retry-delay",
+        type=positive(float),
+        default=retry_delay,
+        metavar="S",
+        help=f"pause before the first retry, doubled on every next one, s (default: {retry_delay:g})",
     )
     breaker = parser.add_argument_group("circuit breaker")
     breaker.add_argument(
@@ -224,6 +235,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # A log line per request would bury the progress line; --log-level INFO shows them.
     add_common_options(crawl, log_level="WARNING")
 
+    errors = commands.add_parser(
+        "errors", help="crawl a local site that fails in every way, show retries and error statistics"
+    )
+    errors.add_argument("urls", nargs="*", type=http_url, help="real URLs to fetch along with the local site")
+    errors.add_argument(
+        "--json",
+        type=Path,
+        default=Path("error_report.json"),
+        metavar="PATH",
+        help="where to save the error report (default: error_report.json)",
+    )
+    # Fast retries and a short read timeout keep the demo within seconds; the
+    # site is local, so no rate limit or robots.txt.
+    add_common_options(errors, retries=3, retry_delay=0.2)
+    errors.set_defaults(read_timeout=1.0, rps=0.0, no_robots=True)
+
     args = parser.parse_args(argv)
     if args.user_agent and len({product_token(agent) for agent in args.user_agent}) > 1:
         parser.error("every --user-agent must start with the same bot name, e.g. MyBot/1.0 (...)")
@@ -245,7 +272,7 @@ def make_crawler(args: argparse.Namespace, parser: HTMLParser | None = None, **o
         min_delay=args.min_delay,
         jitter=args.jitter,
         respect_robots=not args.no_robots,
-        retry_strategy=RetryStrategy(max_retries=args.retries),
+        retry_strategy=RetryStrategy(max_retries=args.retries, base_delay=args.retry_delay),
         circuit_breaker=CircuitBreaker(
             None if args.no_breaker else args.breaker_threshold, cooldown=args.breaker_cooldown
         ),
@@ -596,6 +623,30 @@ async def run_crawl(args: argparse.Namespace) -> None:
         save_crawl_json(args.json, crawler)
 
 
+def save_error_report(path: Path, crawler: AsyncCrawler) -> None:
+    report = {
+        **error_report(crawler),
+        "failed": [{"url": url, "error": error} for url, error in crawler.failed_urls.items()],
+        "fetched": list(crawler.processed_urls),
+    }
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\nError report saved to {path}")
+
+
+async def run_errors(args: argparse.Namespace) -> None:
+    async with DemoSite(extra_links=args.urls) as site:
+        print(f"Crawling {site.url}: ordinary pages, HTTP 503, 429, 500, 404 and 403, a slow page,", file=sys.stderr)
+        print("a JSON file, a server that is down and a domain that does not exist\n", file=sys.stderr)
+        # Depth 1: the start page and its links, none of theirs. Two requests
+        # to a host at a time keep the pages in the order of the links.
+        async with make_crawler(args, max_depth=1, max_per_domain=2) as crawler:
+            await crawler.crawl([site.url], max_pages=len(site.links()) + 1)
+
+    print_crawl_report(crawler)
+    print_error_report(crawler)
+    save_error_report(args.json, crawler)
+
+
 class ProgressAwareHandler(logging.StreamHandler):
     """Writes log records to stderr, erasing the live progress line first.
 
@@ -627,7 +678,7 @@ async def main() -> None:
         datefmt="%H:%M:%S",
         handlers=[ProgressAwareHandler()],
     )
-    commands = {"benchmark": run_benchmark, "parse": run_parse, "crawl": run_crawl}
+    commands = {"benchmark": run_benchmark, "parse": run_parse, "crawl": run_crawl, "errors": run_errors}
     await commands[args.command](args)
 
 
