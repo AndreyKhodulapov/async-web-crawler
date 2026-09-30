@@ -41,6 +41,16 @@ class TestRateLimit:
         assert len(site.log) == len(paths)
         assert min(gaps(site)) >= 0.1 - EPSILON
 
+    async def test_waiting_host_does_not_hold_back_another(self, url, site):
+        # Two slots, six pages of one host: the rest of them wait for their
+        # turn without taking a slot, so the other host starts at once.
+        async with polite(requests_per_second=5, max_concurrent=2) as crawler:
+            await crawler.fetch_many(
+                [url(f"/site/{number}") for number in range(6)] + [url("/site/other", "localhost")]
+            )
+        arrivals = dict(site.log)
+        assert arrivals["/site/other"] - arrivals["/site/0"] < 0.1
+
     async def test_crawl_stats_report_the_rate(self, url, site):
         async with polite(requests_per_second=10, max_depth=1) as crawler:
             await crawler.crawl([url("/site/")], same_domain_only=True)
@@ -118,3 +128,15 @@ class TestRetries:
         assert list(pages) == [url("/flaky/1")]
         assert stats.retries == 1
         assert stats.requests == 2
+
+    async def test_backoff_holds_back_requests_already_waiting(self, url, site):
+        # The retry of /flaky/1 waits 0.2..0.4 s; the pages had booked their
+        # turns before the failure, and they wait for the retry too.
+        async with polite(requests_per_second=10, max_retries=1, backoff_base=0.4, max_backoff=0.4) as crawler:
+            await open_session(crawler, url, site)
+            await crawler.fetch_many([url("/flaky/1"), url("/site/"), url("/site/a.html"), url("/site/b.html")])
+
+        failed_at = site.log[0][1]
+        assert site.log[0][0] == "/flaky/1"
+        assert all(moment - failed_at >= 0.2 - EPSILON for _, moment in site.log[1:])
+        assert min(gaps(site)) >= 0.1 - EPSILON

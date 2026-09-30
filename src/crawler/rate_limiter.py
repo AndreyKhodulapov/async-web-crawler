@@ -1,10 +1,12 @@
 """Request rate limits: a minimum interval between requests, per domain or overall."""
 
 import asyncio
+import contextlib
 import random
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 
 from crawler.models import DomainRate, RateStats
@@ -33,9 +35,12 @@ class RateLimiter:
     slow requests down, never break the limit. There are no bursts: a domain
     that has been idle gets one request at once, not a batch.
 
-    With `per_domain=False` all requests share one schedule. A domain's own
-    delay then still holds between its requests: every request to it pushes
-    the shared schedule by that delay.
+    With `per_domain=False` all requests share one schedule with the
+    common interval. A domain's own delay and penalty (`penalize`) then
+    still apply to that domain alone: it has a schedule of its own, and a
+    request waits for its turn there first, then books the shared schedule.
+    Booking both at once would let a domain waiting out a long delay hold
+    the shared schedule, and every other domain with it.
 
     The algorithm is GCRA (generic cell rate algorithm): each schedule keeps
     only the time its next request may start. `acquire` books that time,
@@ -43,7 +48,8 @@ class RateLimiter:
     booking has no `await` inside, so it is atomic on the event loop and
     needs no lock, and waiting requests start in the order they arrived.
     A task cancelled while it sleeps does not give its time back: the
-    schedule only ever errs on the slow side.
+    schedule only ever errs on the slow side. A request whose domain was
+    penalized while it slept books a new time after the penalty.
     """
 
     # Seconds over which `current_rps` is measured.
@@ -70,10 +76,11 @@ class RateLimiter:
         self.jitter = jitter
         self.interval = max(1 / requests_per_second if requests_per_second else 0.0, min_delay)
         self._clock = clock
-        # Keyed by domain, or by None when all domains share one schedule.
+        # Schedules are keyed by domain, and by None for the shared one.
         self._next_start: dict[str | None, float] = {}
         self._last_start: dict[str | None, float] = {}
         self._delays: dict[str, float] = {}
+        self._penalized_until: dict[str, float] = {}
         self.reset_stats()
 
     def interval_for(self, domain: str | None) -> float:
@@ -83,44 +90,75 @@ class RateLimiter:
         return max(self.interval, self._delays.get(domain, 0.0))
 
     def set_delay(self, domain: str, delay: float) -> None:
-        """Keep requests to `domain` at least `delay` seconds apart, e.g. its Crawl-delay."""
+        """Keep requests to `domain` at least `delay` seconds apart, e.g. its Crawl-delay.
+
+        A delay never goes down: a host may serve several sites (ports,
+        schemes), each with a robots.txt of its own, and the longest delay wins.
+        """
         if delay < 0:
             raise ValueError(f"delay must be >= 0, got {delay}")
+        delay = max(delay, self._delays.get(domain, 0.0))
         self._delays[domain] = delay
-        key = self._key(domain)
         # The request that fetched robots.txt has already booked the next
         # start with the old interval: move it.
-        if key in self._last_start:
-            self._next_start[key] = max(self._next_start[key], self._last_start[key] + delay)
+        if domain in self._last_start:
+            self._next_start[domain] = max(self._next_start[domain], self._last_start[domain] + delay)
 
     def penalize(self, domain: str, seconds: float) -> None:
-        """Let no request to `domain` start in the next `seconds`, e.g. after HTTP 429."""
-        key = self._key(domain)
-        self._next_start[key] = max(self._next_start.get(key, 0.0), self._clock() + seconds)
+        """Let no request to `domain` start in the next `seconds`, e.g. after HTTP 429.
+
+        Requests already waiting for their turn wait for the penalty too.
+        """
+        until = self._clock() + seconds
+        self._penalized_until[domain] = max(self._penalized_until.get(domain, 0.0), until)
+        self._next_start[domain] = max(self._next_start.get(domain, 0.0), until)
 
     def reserve(self, domain: str | None = None) -> float:
         """Book the next start time for `domain`; return the seconds to wait for it.
 
-        `acquire` is `reserve` plus the sleep. `domain` may be None only
-        when `per_domain` is False.
+        For callers that sleep on their own. Unlike `acquire`, it books all
+        schedules at once: under a global limit a domain's own delay then
+        holds back the shared schedule too, and the booking does not move
+        if the domain is penalized after it. `domain` may be None only when
+        `per_domain` is False.
         """
-        key = self._key(domain)
         now = self._clock()
-        start = max(now, self._next_start.get(key, now))
-        interval = self.interval_for(domain)
-        if self.jitter:
-            interval += random.uniform(0, self.jitter)
-        self._next_start[key] = start + interval
-        self._last_start[key] = start
+        start = self._book(self._schedules(domain), now)
+        self._mark_started(domain, start)
         self._record(domain, start, start - now)
-        self._forget_before(now - self.WINDOW)
         return start - now
 
     async def acquire(self, domain: str | None = None) -> None:
         """Wait until a request to `domain` may start."""
-        delay = self.reserve(domain)
-        if delay > 0:
-            await asyncio.sleep(delay)
+        async with self.slot(domain):
+            pass
+
+    @contextlib.asynccontextmanager
+    async def slot(
+        self,
+        domain: str | None = None,
+        gate: Callable[[], AbstractAsyncContextManager[object]] = contextlib.nullcontext,
+    ) -> AsyncIterator[None]:
+        """Wait for the turn of `domain`, then hold `gate()`, e.g. a concurrency slot, for the request.
+
+        The turn is waited for outside the gate, so a request waiting for
+        its domain does not hold a gate that other domains could use. When
+        the gate comes late, the interval is checked again inside it,
+        counted from the request to the domain that started last. A penalty
+        that comes while waiting for the gate sends the request back to wait
+        for a new turn outside it.
+        """
+        waited = 0.0
+        while True:
+            start, slept = await self._wait_turn(domain)
+            waited += slept
+            async with gate():
+                slept = await self._start(domain, start)
+                if slept is None:
+                    continue
+                self._record(domain, self._clock(), waited + slept)
+                yield
+                return
 
     def get_stats(self) -> RateStats:
         now = self._clock()
@@ -157,12 +195,66 @@ class RateLimiter:
         self._recent: deque[float] = deque()
         self._domains: dict[str, _DomainCounter] = {}
 
-    def _key(self, domain: str | None) -> str | None:
-        if not self.per_domain:
-            return None
-        if domain is None:
-            raise ValueError("a domain is required when limits are per domain")
-        return domain
+    def _schedules(self, domain: str | None) -> list[tuple[str | None, float]]:
+        """The schedules a request to `domain` waits for, with the interval of each, in order."""
+        if self.per_domain:
+            if domain is None:
+                raise ValueError("a domain is required when limits are per domain")
+            return [(domain, self.interval_for(domain))]
+        shared: list[tuple[str | None, float]] = [(None, self.interval)]
+        return shared if domain is None else [(domain, self._delays.get(domain, 0.0)), *shared]
+
+    def _book(self, schedules: list[tuple[str | None, float]], now: float) -> float:
+        """Take the next start time common to `schedules`; return it."""
+        start = max(now, *(self._next_start.get(key, now) for key, _ in schedules))
+        extra = random.uniform(0, self.jitter) if self.jitter else 0.0
+        for key, interval in schedules:
+            self._next_start[key] = start + interval + extra
+        return start
+
+    async def _wait_turn(self, domain: str | None) -> tuple[float, float]:
+        """Sleep until a booked start for `domain`; return the start and the seconds slept.
+
+        The schedules are booked one by one, each after the wait for the one before.
+        """
+        slept = 0.0
+        while True:
+            for schedule in self._schedules(domain):
+                now = self._clock()
+                start = self._book([schedule], now)
+                if start > now:
+                    await asyncio.sleep(start - now)
+                    slept += start - now
+            # A penalty that came after the booking and outlasts it: the
+            # booked time is void, and a new one comes after the penalty.
+            if self._penalty_end(domain) <= start:
+                return start, slept
+
+    async def _start(self, domain: str | None, start: float) -> float | None:
+        """Mark a request to `domain` started once the intervals since the last ones have passed.
+
+        Return the seconds slept for that, or None if the domain has been
+        penalized since `start` was booked.
+        """
+        slept = 0.0
+        while True:
+            now = self._clock()
+            if self._penalty_end(domain) > max(now, start):
+                return None
+            last_starts = ((self._last_start.get(key), interval) for key, interval in self._schedules(domain))
+            ready = max((last + interval for last, interval in last_starts if last is not None), default=now)
+            if ready <= now:
+                self._mark_started(domain, now)
+                return slept
+            await asyncio.sleep(ready - now)
+            slept += ready - now
+
+    def _penalty_end(self, domain: str | None) -> float:
+        return 0.0 if domain is None else self._penalized_until.get(domain, 0.0)
+
+    def _mark_started(self, domain: str | None, start: float) -> None:
+        for key, _ in self._schedules(domain):
+            self._last_start[key] = start
 
     def _forget_before(self, cutoff: float) -> None:
         # Starts are not sorted across domains, so an old one can stay behind
@@ -174,6 +266,7 @@ class RateLimiter:
         self._requests += 1
         self._total_wait += wait
         self._recent.append(start)
+        self._forget_before(self._clock() - self.WINDOW)
         if domain is None:
             return
         counter = self._domains.setdefault(domain, _DomainCounter())

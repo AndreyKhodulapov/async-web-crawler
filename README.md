@@ -294,7 +294,7 @@ without being requested.
 | Option | Default | Effect |
 |--------|---------|--------|
 | `requests_per_second` | `1.0` | requests per second to one host; `None` removes the limit |
-| `per_domain_rate` | `True` | `False` applies the rate to all hosts together |
+| `per_domain_rate` | `True` | `False` applies the rate to all hosts together; Crawl-delay and retry pauses stay per host |
 | `min_delay` | `0.0` | min seconds between two requests to one host |
 | `jitter` | `0.0` | random extra delay of up to this many seconds after each request |
 | `respect_robots` | `True` | check robots.txt before every request |
@@ -304,7 +304,8 @@ without being requested.
 | `user_agents` | `()` | strings to rotate between requests; all must share the name of `user_agent` |
 
 Requests to one host start at least `max(1 / requests_per_second, min_delay,
-Crawl-delay)` seconds apart. robots.txt is fetched once per site (scheme,
+Crawl-delay)` seconds apart; with several sites (ports) on one host, the
+longest Crawl-delay counts. robots.txt is fetched once per site (scheme,
 host and port) and cached for the crawler's lifetime. A missing robots.txt
 (HTTP 4xx) allows everything; an unreachable one (HTTP 5xx, 429, network
 errors) disallows the whole site. Only the requested URL is checked: the

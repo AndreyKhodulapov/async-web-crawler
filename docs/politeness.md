@@ -40,14 +40,26 @@ sites it visits and follows their rules.
   on the slow side, which is the safe side for politeness.
 - **Distributed crawlers** use the same algorithm with `next_start` in Redis,
   updated atomically by a Lua script (or the redis-cell module).
-- **Where to wait**: right before the request, inside the concurrency slot,
-  so that the interval holds between requests actually sent. The cost is a
-  slot held while waiting. The server sees arrival times, which also carry
-  network jitter, e.g. the first request also opens the connection.
+- **Where to wait**: before taking the concurrency slot, so a request
+  waiting for its host does not hold a slot another host could use. The
+  slot can come later than the booked time, so inside it the interval is
+  checked once more against the request that actually started last: the
+  interval holds between requests sent, not only between bookings. The
+  server sees arrival times, which also carry network jitter, e.g. the first
+  request also opens the connection.
+- **Penalties** (HTTP 429, timeouts) move `next_start`, but requests that
+  booked earlier already hold their times. Each one checks after its sleep:
+  if a penalty came after its booking, it books again, behind the penalty.
+- **Global limit with per-host rules**: a host's own Crawl-delay or penalty
+  must not stop other hosts. The host's schedule is waited for first, then
+  the shared one is booked: booking both at once would park a far-future
+  time in the shared schedule, and every host would wait for it.
 
 ## Delays
 
 - Interval per host = max(`1 / requests_per_second`, `min_delay`, Crawl-delay).
+  robots.txt is per origin, the limit per host: when one host serves
+  several origins (ports), the longest Crawl-delay wins.
 - **Jitter** adds a random 0..jitter seconds to each interval, so the load
   does not look like a metronome. Adding it only on top keeps `min_delay` a
   guarantee; Scrapy instead multiplies the delay by 0.5-1.5, which keeps the

@@ -1,6 +1,7 @@
 """Asynchronous HTTP client that downloads many pages concurrently."""
 
 import asyncio
+import functools
 import itertools
 import logging
 import ssl
@@ -305,12 +306,11 @@ class AsyncCrawler:
 
     async def _fetch_once(self, url: str, *, html_only: bool, failure_level: int) -> FetchResult:
         host = get_host(url)
-        async with self._limits.slot(url):
-            # The rate limit is waited for inside the concurrency slot, right
-            # before the request: then the interval holds between requests
-            # actually sent. The price is a slot held while waiting.
-            if host is not None:
-                await self.rate_limiter.acquire(host)
+        gate = functools.partial(self._limits.slot, url)
+        # The rate limit is waited for before taking a concurrency slot, so
+        # a request waiting for its host does not hold a slot another host
+        # could use; inside the slot the interval is checked once more.
+        async with gate() if host is None else self.rate_limiter.slot(host, gate):
             logger.info("Fetching %s", url)
             started = time.perf_counter()
             try:

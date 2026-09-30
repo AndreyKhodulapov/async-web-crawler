@@ -1,6 +1,7 @@
 """Unit tests for RateLimiter: intervals per domain and overall, delays, jitter, stats."""
 
 import asyncio
+import itertools
 import random
 import time
 
@@ -22,8 +23,23 @@ def clock() -> FakeClock:
     return FakeClock()
 
 
+# Timer precision for the tests that run in real time.
+EPSILON = 0.005
+
+
 def waits(limiter: RateLimiter, domains: list[str | None]) -> list[float]:
     return [limiter.reserve(domain) for domain in domains]
+
+
+async def start_times(limiter: RateLimiter, domains: list[str]) -> list[float]:
+    """Seconds after the call at which concurrent requests to `domains` may start."""
+    began = time.monotonic()
+
+    async def start(domain: str) -> float:
+        await limiter.acquire(domain)
+        return time.monotonic() - began
+
+    return await asyncio.gather(*(start(domain) for domain in domains))
 
 
 @pytest.mark.parametrize(
@@ -89,10 +105,12 @@ class TestDomainDelays:
         limiter.set_delay("a", 3.0)
         assert limiter.reserve("a") == 3.0
 
-    def test_crawl_delay_holds_under_a_global_limit(self, clock):
-        limiter = RateLimiter(10.0, per_domain=False, clock=clock)
-        limiter.set_delay("slow", 2.0)
-        assert waits(limiter, ["slow", "fast", "slow"]) == pytest.approx([0.0, 2.0, 2.1])
+    def test_longest_crawl_delay_of_a_domain_wins(self, clock):
+        # One host, two sites (ports) with their own robots.txt.
+        limiter = RateLimiter(2.0, clock=clock)
+        limiter.set_delay("a", 5.0)
+        limiter.set_delay("a", 1.0)
+        assert limiter.interval_for("a") == 5.0
 
     def test_penalty_holds_back_one_domain(self, clock):
         limiter = RateLimiter(2.0, clock=clock)
@@ -163,7 +181,7 @@ class TestAcquire:
         started = time.perf_counter()
         for _ in range(3):
             await limiter.acquire("a")
-        assert time.perf_counter() - started >= 0.1 - 0.005
+        assert time.perf_counter() - started >= 0.1 - EPSILON
 
     async def test_waiting_requests_start_in_arrival_order(self):
         limiter = RateLimiter(50.0)
@@ -175,3 +193,62 @@ class TestAcquire:
 
         await asyncio.gather(*(request(number) for number in range(5)))
         assert order == [0, 1, 2, 3, 4]
+
+    async def test_penalty_holds_back_requests_already_waiting(self):
+        limiter = RateLimiter(20.0)  # 0.05 s apart
+        await limiter.acquire("a")
+        waiting = asyncio.create_task(start_times(limiter, ["a", "a", "a"]))
+        await asyncio.sleep(0)  # all three have booked their starts
+        limiter.penalize("a", 0.3)
+        times = sorted(await waiting)
+
+        assert times[0] >= 0.3 - EPSILON
+        assert all(later - earlier >= 0.05 - EPSILON for earlier, later in itertools.pairwise(times))
+
+    async def test_crawl_delay_under_a_global_limit_holds_back_its_domain_only(self):
+        limiter = RateLimiter(20.0, per_domain=False)  # 0.05 s apart
+        limiter.set_delay("slow", 0.3)
+        slow, _, slow_again, fast_again = await start_times(limiter, ["slow", "fast", "slow", "fast"])
+
+        assert slow_again - slow >= 0.3 - EPSILON
+        assert fast_again < 0.2
+
+    async def test_penalty_under_a_global_limit_holds_back_its_domain_only(self):
+        limiter = RateLimiter(20.0, per_domain=False)
+        await limiter.acquire("a")
+        limiter.penalize("a", 0.3)
+        penalized, _, other_again = await start_times(limiter, ["a", "b", "b"])
+
+        assert penalized >= 0.3 - EPSILON
+        assert other_again < 0.2
+
+
+class TestSlot:
+    async def test_turn_is_waited_for_outside_the_gate(self):
+        limiter = RateLimiter(5.0)  # 0.2 s apart
+        gate = asyncio.Semaphore(1)
+        began = time.monotonic()
+        started: dict[str, float] = {}
+
+        async def request(name: str, domain: str) -> None:
+            async with limiter.slot(domain, lambda: gate):
+                started[name] = time.monotonic() - began
+
+        await asyncio.gather(request("a", "a"), request("a again", "a"), request("b", "b"))
+        # "a again" waits for its turn without the gate, so "b" gets it at once.
+        assert started["b"] < 0.1
+        assert started["a again"] >= 0.2 - EPSILON
+
+    async def test_interval_holds_when_the_gate_comes_late(self):
+        limiter = RateLimiter(20.0)  # 0.05 s apart
+        gate = asyncio.Semaphore(1)
+        started: list[float] = []
+
+        async def request(hold: float) -> None:
+            async with limiter.slot("a", lambda: gate):
+                started.append(time.monotonic())
+                await asyncio.sleep(hold)
+
+        # The first request keeps the gate past the turns of the others.
+        await asyncio.gather(request(0.2), request(0), request(0), request(0))
+        assert all(later - earlier >= 0.05 - EPSILON for earlier, later in itertools.pairwise(started))
