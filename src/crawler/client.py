@@ -255,8 +255,8 @@ class AsyncCrawler:
         # report itself even for a URL that robots.txt would block.
         if self._closed:
             return FetchResult.failure(url, CrawlerClosedError(url, "crawler is closed"), 0.0)
-        if check_robots and (blocked := await self._check_robots(url)) is not None:
-            return blocked
+        if check_robots and (refusal := await self._check_robots(url)) is not None:
+            return FetchResult.failure(url, refusal, 0.0)
         retries = 0
         while True:
             result = await self._fetch_once(url, html_only=html_only, failure_level=failure_level)
@@ -267,21 +267,21 @@ class AsyncCrawler:
             self._retries += 1
             logger.warning("Retrying %s in %.1fs (retry %d of %d)", url, delay, retries, self._retry.max_retries)
             host = get_host(url)
-            if host is not None:
-                # The retry waits in the rate limiter, and so does every
-                # other request to the host: a timeout or HTTP 429 usually
-                # means the whole site is overloaded, not one page.
-                self.rate_limiter.penalize(host, delay)
+            assert host is not None  # an invalid URL fails with an error that is not retried
+            # The retry waits in the rate limiter, and so does every
+            # other request to the host: a timeout or HTTP 429 usually
+            # means the whole site is overloaded, not one page.
+            self.rate_limiter.penalize(host, delay)
 
-    async def _check_robots(self, url: str) -> FetchResult | None:
-        """Return a failed result if robots.txt disallows `url`, None if it may be fetched."""
+    async def _check_robots(self, url: str) -> FetchError | None:
+        """Return the error to fail `url` with if robots.txt disallows it, None if it may be fetched."""
         host = get_host(url)
         if self.robots is None or host is None:
             return None  # an invalid URL fails in _request() with InvalidURLError
         try:
             allowed = await self.robots.is_allowed(url, self._user_agent)
         except CrawlerClosedError as error:
-            return FetchResult.failure(url, error, 0.0)
+            return error
         crawl_delay = self.robots.get_crawl_delay(url, self._user_agent)
         if crawl_delay:
             self.rate_limiter.set_delay(host, crawl_delay)
@@ -290,7 +290,7 @@ class AsyncCrawler:
         unreachable = self.robots.unreachable_reason(url)
         reason = "disallowed by robots.txt" if unreachable is None else f"robots.txt is unreachable ({unreachable})"
         logger.info("Blocked %s: %s", url, reason)
-        return FetchResult.failure(url, RobotsDisallowedError(url, reason), 0.0)
+        return RobotsDisallowedError(url, reason)
 
     async def _download_robots(self, url: str) -> tuple[int, str]:
         """Fetcher for RobotsParser: robots.txt goes through the same limits and retries as a page."""
@@ -475,13 +475,12 @@ class AsyncCrawler:
             try:
                 # robots.txt is checked before the page counts toward
                 # max_pages: a blocked page costs no request.
-                refused = await self._check_robots(url)
-                if refused is not None:
-                    assert refused.error is not None
-                    if isinstance(refused.error, RobotsDisallowedError):
-                        queue.mark_blocked(url, refused.error.message)
+                refusal = await self._check_robots(url)
+                if refusal is not None:
+                    if isinstance(refusal, RobotsDisallowedError):
+                        queue.mark_blocked(url, refusal.message)
                     else:
-                        queue.mark_failed(url, f"{type(refused.error).__name__}: {refused.error.message}")
+                        queue.mark_failed(url, f"{type(refusal).__name__}: {refusal.message}")
                     continue
                 if self._pages_requested >= max_pages:
                     # Taken while another worker was still checking the page

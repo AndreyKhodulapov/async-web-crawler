@@ -8,14 +8,6 @@ from helpers import UNTHROTTLED
 from crawler import AsyncCrawler
 
 
-@pytest.fixture
-def url(server):
-    def make(path: str) -> str:
-        return str(server.make_url(path))
-
-    return make
-
-
 async def crawl(start_url: str, *, max_concurrent: int = 5, max_depth: int = 2, **options) -> AsyncCrawler:
     """Run a crawl and return the closed crawler with its state."""
     options.setdefault("same_domain_only", True)

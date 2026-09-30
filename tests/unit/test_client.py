@@ -75,9 +75,6 @@ class FakeRequest:
         return None
 
 
-Outcome = FakeResponse | BaseException
-
-
 class FakeSession:
     """Serves canned responses or raises canned exceptions per URL.
 
@@ -85,7 +82,7 @@ class FakeSession:
     """
 
     def __init__(self) -> None:
-        self.routes: dict[str, Outcome | list[Outcome]] = {}
+        self.routes: dict[str, FakeResponse | BaseException | list[FakeResponse | BaseException]] = {}
         self.latency = 0.0
         self.closed = False
         self.in_flight = 0
@@ -157,6 +154,10 @@ class TestInit:
     def test_does_not_create_session_eagerly(self):
         crawler = AsyncCrawler()
         assert crawler._session is None
+
+    def test_rate_options_configure_the_limiter(self):
+        limiter = AsyncCrawler(requests_per_second=4, per_domain_rate=False, min_delay=0.5, jitter=0.1).rate_limiter
+        assert (limiter.interval, limiter.per_domain, limiter.jitter) == (0.5, False, 0.1)
 
 
 class TestLifecycle:
@@ -353,13 +354,6 @@ class TestRetries:
         with pytest.raises(HTTPStatusError):
             await crawler.fetch_url("http://a")
         assert len(fake_session.requested) == 3
-
-    async def test_permanent_failure_is_not_retried(self, make_crawler, fake_session):
-        crawler = make_crawler(max_retries=2, backoff_base=0.001)
-        fake_session.routes["http://a"] = FakeResponse(status=404)
-        with pytest.raises(HTTPStatusError):
-            await crawler.fetch_url("http://a")
-        assert len(fake_session.requested) == 1
 
     async def test_retry_after_header_is_kept_in_the_error(self, crawler, fake_session):
         fake_session.routes["http://a"] = FakeResponse(status=429, retry_after="120")

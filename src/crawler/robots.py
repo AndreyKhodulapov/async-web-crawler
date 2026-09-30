@@ -15,10 +15,6 @@ from crawler.urls import normalize_url, percent_encode
 
 logger = logging.getLogger(__name__)
 
-# Downloads a URL and returns (HTTP status, body); raises FetchError when no
-# response arrives at all.
-RobotsFetcher = Callable[[str], Awaitable[tuple[int, str]]]
-
 
 def product_token(user_agent: str) -> str:
     """The name robots.txt knows a crawler by: "MyBot/1.0 (+https://...)" gives "mybot"."""
@@ -68,50 +64,45 @@ class RobotsRules:
     everything is disallowed then.
     """
 
-    def __init__(self, groups: list[_Group], sitemaps: list[str], *, unreachable: str | None = None) -> None:
+    def __init__(self, groups: list[_Group], *, unreachable: str | None = None) -> None:
         self._groups = groups
-        self.sitemaps = sitemaps
         self.unreachable = unreachable
 
     @classmethod
     def parse(cls, text: str) -> "RobotsRules":
         groups: list[_Group] = []
-        sitemaps: list[str] = []
         group: _Group | None = None
         # Consecutive User-agent lines share one group; any other rule line
         # closes the list of agents, so the next User-agent starts a new group.
-        collecting_agents = False
+        open_agents: list[str] | None = None
         for line in text.splitlines():
             key, _, value = line.split("#", 1)[0].partition(":")
             key, value = key.strip().lower(), value.strip()
             if key == "user-agent":
                 agent = "*" if value == "*" else product_token(value)
-                if collecting_agents and group is not None:
-                    group.agents.append(agent)
-                else:
+                if open_agents is None:
                     group = _Group(agents=[agent])
                     groups.append(group)
-                    collecting_agents = True
-            elif key == "sitemap":
-                # Sitemaps belong to the whole file, not to a group.
-                sitemaps.append(value)
+                    open_agents = group.agents
+                else:
+                    open_agents.append(agent)
             elif key in ("allow", "disallow", "crawl-delay"):
-                collecting_agents = False
+                open_agents = None
                 if group is None:
                     continue  # rules before the first User-agent apply to nobody
                 if key == "crawl-delay":
                     group.crawl_delay = _parse_delay(value, group.crawl_delay)
                 elif rule := _Rule.parse(key == "allow", value):
                     group.rules.append(rule)
-        return cls(groups, sitemaps)
+        return cls(groups)
 
     @classmethod
     def allow_all(cls) -> "RobotsRules":
-        return cls([], [])
+        return cls([])
 
     @classmethod
     def forbid_all(cls, reason: str) -> "RobotsRules":
-        return cls([], [], unreachable=reason)
+        return cls([], unreachable=reason)
 
     def can_fetch(self, url: str, user_agent: str = "*") -> bool:
         """Whether a crawler with this User-Agent may fetch `url`; False for an invalid URL."""
@@ -149,7 +140,6 @@ class RobotsRules:
                 }
                 for group in self._groups
             ],
-            "sitemaps": self.sitemaps,
         }
 
     def _groups_for(self, user_agent: str) -> list[_Group]:
@@ -168,6 +158,9 @@ class RobotsParser:
         robots.can_fetch("https://example.com/private/", "MyBot/1.0")
         robots.get_crawl_delay("https://example.com/", "MyBot/1.0")
 
+    `fetch` downloads a URL and returns the HTTP status and the body; it
+    raises `FetchError` when no response arrives at all.
+
     Rules are cached per origin (scheme, host and port), as robots.txt
     applies to exactly one origin. Concurrent requests for a site that has
     not been fetched yet share a single download.
@@ -182,12 +175,10 @@ class RobotsParser:
     """
 
     MAX_SIZE = 500 * 1024
+    MAX_CRAWL_DELAY = 30.0
 
-    def __init__(self, fetch: RobotsFetcher, *, max_crawl_delay: float = 30.0) -> None:
-        if max_crawl_delay < 0:
-            raise ValueError(f"max_crawl_delay must be >= 0, got {max_crawl_delay}")
+    def __init__(self, fetch: Callable[[str], Awaitable[tuple[int, str]]]) -> None:
         self._fetch = fetch
-        self.max_crawl_delay = max_crawl_delay
         self._rules: dict[str, RobotsRules] = {}
         self._downloads: dict[str, asyncio.Task[RobotsRules]] = {}
 
@@ -195,8 +186,8 @@ class RobotsParser:
         """Download (or take from the cache) robots.txt of the site of `base_url`.
 
         Returns the parsed rules as a dict: "groups" (user agents, allow and
-        disallow paths, crawl delay), "sitemaps" and "unreachable" (why
-        robots.txt could not be read, None if it could).
+        disallow paths, crawl delay) and "unreachable" (why robots.txt could
+        not be read, None if it could).
 
         Raises:
             ValueError: `base_url` is not a valid http(s) URL.
@@ -217,13 +208,13 @@ class RobotsParser:
         return self._cached(url).can_fetch(url, user_agent)
 
     def get_crawl_delay(self, url: str, user_agent: str = "*") -> float:
-        """Crawl-delay of the site of `url` for `user_agent`, capped at `max_crawl_delay`; 0 if unset.
+        """Crawl-delay of the site of `url` for `user_agent`, capped at `MAX_CRAWL_DELAY`; 0 if unset.
 
         The cap keeps a site asking for, say, one request a day from
         freezing the crawl. The site's rules must have been fetched.
         """
         delay = self._cached(url).crawl_delay(user_agent)
-        return 0.0 if delay is None else min(delay, self.max_crawl_delay)
+        return 0.0 if delay is None else min(delay, self.MAX_CRAWL_DELAY)
 
     def unreachable_reason(self, url: str) -> str | None:
         """Why robots.txt of the site of `url` could not be read, or None. The rules must have been fetched."""

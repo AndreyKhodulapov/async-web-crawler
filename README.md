@@ -429,12 +429,12 @@ src/
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
-    ├── models.py           # FetchResult, ParsedPage, CrawlStats
+    ├── models.py           # FetchResult, ParsedPage, CrawlStats, RateStats
     └── exceptions.py       # FetchError hierarchy
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
-├── helpers.py              # crawler options for tests that skip politeness
+├── helpers.py              # test bot name, crawler options for tests that skip politeness
 ├── unit/                   # parser, URLs, queue, limits, robots.txt, retries, filters, client
 └── integration/            # local HTTP server; live tests marked `network`
 docs/

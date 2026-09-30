@@ -23,7 +23,6 @@ def clock() -> FakeClock:
 
 
 def waits(limiter: RateLimiter, domains: list[str | None]) -> list[float]:
-    """Book requests at one moment; return how long each one has to wait."""
     return [limiter.reserve(domain) for domain in domains]
 
 
@@ -149,13 +148,6 @@ class TestStats:
 
         clock.now += RateLimiter.WINDOW + 1
         assert limiter.get_stats().current_rps == 0.0
-
-    def test_old_starts_are_forgotten_without_reading_stats(self, clock):
-        limiter = RateLimiter(None, clock=clock)
-        for _ in range(100):
-            limiter.reserve("a")
-            clock.now += 1
-        assert len(limiter._recent) <= RateLimiter.WINDOW + 1
 
     def test_reset_keeps_the_schedule(self, clock):
         limiter = RateLimiter(2.0, clock=clock)

@@ -11,14 +11,14 @@ from pages import ENCODING_PAGES, SITE_PAGES, fixture_html
 class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
-    `log` lists (host, path, time) of every request to /site/ pages,
-    /flaky/ and robots.txt, in the order they arrived. `robots` is the body
-    of /robots.txt, served with `robots_status`; None means 404.
+    `log` lists (path, time) of every request to /site/ pages, /flaky/ and
+    robots.txt, in the order they arrived. `robots` is the body of
+    /robots.txt, served with `robots_status`; None means 404.
     """
 
     def __init__(self) -> None:
         self.hits: Counter[str] = Counter()
-        self.log: list[tuple[str, str, float]] = []
+        self.log: list[tuple[str, float]] = []
         self.latency = 0.0
         self.in_flight = 0
         self.peak_in_flight = 0
@@ -27,7 +27,7 @@ class SiteState:
 
     def record(self, request: web.Request) -> None:
         self.hits[request.path] += 1
-        self.log.append((request.url.host, request.path, time.monotonic()))
+        self.log.append((request.path, time.monotonic()))
 
 
 SITE_STATE = web.AppKey("site_state", SiteState)
@@ -121,6 +121,14 @@ async def server(aiohttp_server):
     app.router.add_get("/robots.txt", robots_txt)
     app.router.add_get("/flaky/{fails}", flaky)
     return await aiohttp_server(app)
+
+
+@pytest.fixture
+def url(server):
+    def make(path: str, host: str = "127.0.0.1") -> str:
+        return f"http://{host}:{server.port}{path}"
+
+    return make
 
 
 @pytest.fixture

@@ -1,6 +1,7 @@
 """Data models shared across the crawler."""
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 
 from crawler.exceptions import FetchError, HTTPStatusError
@@ -80,6 +81,31 @@ class CrawlStats:
     def requests_per_second(self) -> float:
         """Average request rate over the whole crawl."""
         return self.requests / self.elapsed if self.elapsed > 0 else 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class DomainRate:
+    """Requests to one domain: how many, the interval enforced now, the average gap seen."""
+
+    requests: int
+    interval: float
+    avg_gap: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class RateStats:
+    """Request rate since the limiter was created or its stats were reset.
+
+    `current_rps` counts requests over the last few seconds. `avg_delay` is
+    the average gap between two consecutive requests to the same domain,
+    `avg_wait` the average time a request waited for its turn.
+    """
+
+    requests: int = 0
+    current_rps: float = 0.0
+    avg_delay: float = 0.0
+    avg_wait: float = 0.0
+    domains: Mapping[str, DomainRate] = field(default_factory=dict)
 
 
 class Metadata(TypedDict):

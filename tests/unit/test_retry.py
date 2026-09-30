@@ -68,7 +68,7 @@ class TestDelay:
         policy = RetryPolicy(base_delay=1.0, max_delay=5.0)
         assert all(policy.delay(http_error(503), 10) <= 5.0 for _ in range(20))
 
-    def test_longer_retry_after_is_honoured(self):
+    def test_longer_retry_after_is_honored(self):
         policy = RetryPolicy(base_delay=0.1, max_delay=30.0)
         assert policy.delay(http_error(429, retry_after=7), 0) == 7
 

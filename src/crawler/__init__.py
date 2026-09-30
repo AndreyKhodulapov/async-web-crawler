@@ -12,12 +12,12 @@ from crawler.exceptions import (
     UnexpectedError,
 )
 from crawler.filters import UrlFilter
-from crawler.models import CrawlStats, FetchResult, ParsedPage
+from crawler.models import CrawlStats, DomainRate, FetchResult, ParsedPage, RateStats
 from crawler.parser import HTMLParser
 from crawler.queue import CrawlerQueue
-from crawler.rate_limiter import DomainRate, RateLimiter, RateStats
+from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryPolicy
-from crawler.robots import RobotsParser, RobotsRules
+from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
@@ -47,4 +47,5 @@ __all__ = [
     "get_host",
     "is_same_host",
     "is_valid_http_url",
+    "product_token",
 ]

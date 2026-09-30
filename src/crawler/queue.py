@@ -19,9 +19,8 @@ class CrawlerQueue:
 
     Lifecycle of a URL: `add_url` -> `get_next` (in progress) ->
     `mark_processed`, `mark_failed`, `mark_skipped` or `mark_blocked`.
-    Workers loop until `get_next` returns
-    None, which happens when there is nothing left to do (see `get_next`)
-    or after `close`.
+    Workers loop until `get_next` returns None, which happens when there is
+    nothing left to do (see `get_next`) or after `close`.
     """
 
     def __init__(self) -> None:

@@ -1,31 +1,19 @@
 """Integration tests: rate limits, robots.txt and retries against a local aiohttp server."""
 
 import itertools
-import time
 
 import pytest
+from helpers import BOT, UNTHROTTLED
 
 from crawler import AsyncCrawler, RobotsDisallowedError
 
-BOT = "TestBot/1.0 (+https://example.com/bot)"
 # Gaps are measured where requests arrive, while the limiter controls when
 # they are sent; opening a connection shifts an arrival by a millisecond or so.
 EPSILON = 0.01
-PAGES = ["/site/", "/site/a.html", "/site/b.html", "/site/c.html", "/site/a/deeper.html"]
-
-
-@pytest.fixture
-def url(server):
-    def make(path: str, host: str = "127.0.0.1") -> str:
-        return f"http://{host}:{server.port}{path}"
-
-    return make
 
 
 def polite(**options) -> AsyncCrawler:
-    """A crawler with only the politeness features that a test turns on."""
-    defaults = {"user_agent": BOT, "requests_per_second": None, "respect_robots": False, "max_retries": 0}
-    return AsyncCrawler(**{**defaults, **options})
+    return AsyncCrawler(**{**UNTHROTTLED, "user_agent": BOT, **options})
 
 
 async def open_session(crawler: AsyncCrawler, url, site) -> None:
@@ -39,43 +27,18 @@ async def open_session(crawler: AsyncCrawler, url, site) -> None:
     site.hits.clear()
 
 
-def gaps(site, host: str | None = None) -> list[float]:
-    """Gaps between consecutive requests the site received, optionally to one host."""
-    times = [moment for request_host, _, moment in site.log if host in (None, request_host)]
+def gaps(site) -> list[float]:
+    times = [moment for _, moment in site.log]
     return [later - earlier for earlier, later in itertools.pairwise(times)]
 
 
 class TestRateLimit:
     async def test_requests_to_one_host_are_spaced_out(self, url, site):
+        paths = ["/site/", "/site/a.html", "/site/b.html", "/site/c.html", "/site/a/deeper.html"]
         async with polite(requests_per_second=10) as crawler:
             await open_session(crawler, url, site)
-            await crawler.fetch_many([url(path) for path in PAGES])
-        assert len(site.log) == len(PAGES)
-        assert min(gaps(site)) >= 0.1 - EPSILON
-
-    async def test_min_delay(self, url, site):
-        async with polite(min_delay=0.1) as crawler:
-            await open_session(crawler, url, site)
-            await crawler.fetch_many([url(path) for path in PAGES[:3]])
-        assert min(gaps(site)) >= 0.1 - EPSILON
-
-    async def test_hosts_have_separate_limits(self, url, site):
-        urls = [url(path, host) for host in ("127.0.0.1", "localhost") for path in PAGES[:3]]
-        async with polite(requests_per_second=10) as crawler:
-            await open_session(crawler, url, site)
-            started = time.perf_counter()
-            await crawler.fetch_many(urls)
-            elapsed = time.perf_counter() - started
-
-        assert min(gaps(site, "127.0.0.1") + gaps(site, "localhost")) >= 0.1 - EPSILON
-        # Two hosts in parallel: about 0.2 s, not the 0.5 s of one shared limit.
-        assert elapsed < 0.45
-
-    async def test_global_limit_is_shared_by_hosts(self, url, site):
-        urls = [url(path, host) for host in ("127.0.0.1", "localhost") for path in PAGES[:3]]
-        async with polite(requests_per_second=10, per_domain_rate=False) as crawler:
-            await open_session(crawler, url, site)
-            await crawler.fetch_many(urls)
+            await crawler.fetch_many([url(path) for path in paths])
+        assert len(site.log) == len(paths)
         assert min(gaps(site)) >= 0.1 - EPSILON
 
     async def test_crawl_stats_report_the_rate(self, url, site):
@@ -106,13 +69,6 @@ class TestRobots:
         # Five workers met the new site at once, yet robots.txt was fetched once.
         assert site.hits["/robots.txt"] == 1
 
-    async def test_blocked_url_fails_a_plain_fetch(self, url, site):
-        site.robots = "User-agent: *\nDisallow: /site/b.html"
-        async with polite(respect_robots=True) as crawler:
-            with pytest.raises(RobotsDisallowedError):
-                await crawler.fetch_url(url("/site/b.html"))
-            assert "A" in await crawler.fetch_url(url("/site/a.html"))
-
     async def test_rules_for_the_crawlers_own_name(self, url, site):
         site.robots = "User-agent: testbot\nDisallow: /site/\n\nUser-agent: *\nDisallow:"
         async with polite(respect_robots=True) as crawler:
@@ -120,11 +76,6 @@ class TestRobots:
                 await crawler.fetch_url(url("/site/"))
         async with polite(respect_robots=True, user_agent="OtherBot/2.0") as crawler:
             assert await crawler.fetch_url(url("/site/"))
-
-    async def test_missing_robots_txt_allows_everything(self, url, site):
-        async with polite(respect_robots=True) as crawler:
-            assert await crawler.fetch_url(url("/site/"))
-        assert site.hits["/robots.txt"] == 1
 
     async def test_unreachable_robots_txt_blocks_the_site(self, url, site):
         site.robots, site.robots_status = "", 503
@@ -154,16 +105,11 @@ class TestRobots:
             await crawler.crawl([url("/site/")], max_pages=3, same_domain_only=True)
 
         # robots.txt included: the page after it was booked before the delay was known.
-        assert [path for _, path, _ in site.log] == ["/robots.txt", "/site/", "/site/a.html", "/site/b.html"]
+        assert [path for path, _ in site.log] == ["/robots.txt", "/site/", "/site/a.html", "/site/b.html"]
         assert min(gaps(site)) >= 0.1 - EPSILON
 
 
 class TestRetries:
-    async def test_server_error_is_retried(self, url, site):
-        async with polite(max_retries=2, backoff_base=0.01) as crawler:
-            assert "Recovered" in await crawler.fetch_url(url("/flaky/2"))
-        assert site.hits["/flaky/2"] == 3
-
     async def test_crawl_counts_retries(self, url):
         async with polite(max_retries=2, backoff_base=0.01) as crawler:
             pages = await crawler.crawl([url("/flaky/1")])

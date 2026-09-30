@@ -30,8 +30,8 @@ from crawler import (
     get_host,
     is_same_host,
     is_valid_http_url,
+    product_token,
 )
-from crawler.robots import product_token
 
 
 def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) -> Callable[[str], int | float]:
@@ -388,15 +388,15 @@ def host_stats(crawler: AsyncCrawler) -> list[dict[str, object]]:
 
 def print_politeness_report(crawler: AsyncCrawler) -> None:
     stats = crawler.crawl_stats()
-    hosts = host_stats(crawler)
-    host_width = max([len("HOST")] + [len(str(host["host"])) for host in hosts])
+    rows = host_stats(crawler)
+    host_width = max([len("HOST")] + [len(str(row["host"])) for row in rows])
     print(f"\n=== Requests by host ({stats.requests} requests, {stats.requests_per_second:.2f} req/s) ===")
     print(f"{'HOST':<{host_width}}  {'REQUESTS':>8}  {'INTERVAL':>8}  {'AVG GAP':>8}  {'BLOCKED':>7}")
-    for host in hosts:
-        avg_gap = "-" if host["avg_gap"] is None else f"{host['avg_gap']:.2f}s"
+    for row in rows:
+        avg_gap = "-" if row["avg_gap"] is None else f"{row['avg_gap']:.2f}s"
         print(
-            f"{host['host']:<{host_width}}  {host['requests']:>8}  {host['interval']:>7.2f}s  "
-            f"{avg_gap:>8}  {host['blocked']:>7}"
+            f"{row['host']:<{host_width}}  {row['requests']:>8}  {row['interval']:>7.2f}s  "
+            f"{avg_gap:>8}  {row['blocked']:>7}"
         )
     print(
         f"Average gap between requests to a host: {stats.avg_delay:.2f}s, "

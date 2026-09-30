@@ -3,11 +3,9 @@
 import asyncio
 
 import pytest
+from helpers import BOT
 
-from crawler import CrawlerClosedError, NetworkError, RobotsParser, RobotsRules
-from crawler.robots import product_token
-
-BOT = "TestBot/1.0 (+https://example.com/bot)"
+from crawler import CrawlerClosedError, NetworkError, RobotsParser, RobotsRules, product_token
 
 
 def allowed(robots_txt: str, path: str, user_agent: str = BOT) -> bool:
@@ -143,7 +141,7 @@ class TestMatching:
         assert RobotsRules.allow_all().can_fetch("ftp://site/", BOT) is False
 
 
-class TestCrawlDelayAndSitemaps:
+class TestCrawlDelay:
     def test_crawl_delay_of_own_group_or_default(self):
         rules = RobotsRules.parse("User-agent: *\nCrawl-delay: 2\n\nUser-agent: testbot\nCrawl-delay: 0.5")
         assert rules.crawl_delay(BOT) == 0.5
@@ -164,7 +162,6 @@ class TestCrawlDelayAndSitemaps:
             Disallow: /private/
             Allow: /private/open
             Crawl-delay: 2
-            Sitemap: https://site/sitemap.xml
             """
         )
         assert rules.to_dict() == {
@@ -172,7 +169,6 @@ class TestCrawlDelayAndSitemaps:
             "groups": [
                 {"user_agents": ["*"], "allow": ["/private/open"], "disallow": ["/private/"], "crawl_delay": 2.0}
             ],
-            "sitemaps": ["https://site/sitemap.xml"],
         }
 
 
@@ -270,9 +266,9 @@ class TestRobotsParser:
         assert len(fetch.requested) == 2
 
     async def test_crawl_delay_is_capped(self):
-        robots = RobotsParser(FakeFetcher((200, "User-agent: *\nCrawl-delay: 86400")), max_crawl_delay=10)
+        robots = RobotsParser(FakeFetcher((200, "User-agent: *\nCrawl-delay: 86400")))
         await robots.fetch_robots("https://site/")
-        assert robots.get_crawl_delay("https://site/") == 10
+        assert robots.get_crawl_delay("https://site/") == RobotsParser.MAX_CRAWL_DELAY
 
     async def test_no_crawl_delay_is_zero(self):
         robots = RobotsParser(FakeFetcher())

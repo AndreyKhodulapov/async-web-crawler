@@ -4,33 +4,10 @@ import asyncio
 import random
 import time
 from collections import deque
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 
-
-@dataclass(frozen=True, slots=True)
-class DomainRate:
-    """Requests to one domain: how many, the interval enforced now, the average gap seen."""
-
-    requests: int
-    interval: float
-    avg_gap: float | None
-
-
-@dataclass(frozen=True, slots=True)
-class RateStats:
-    """Request rate since the limiter was created or its stats were reset.
-
-    `current_rps` counts requests over the last few seconds. `avg_delay` is
-    the average gap between two consecutive requests to the same domain,
-    `avg_wait` the average time a request waited for its turn.
-    """
-
-    requests: int = 0
-    current_rps: float = 0.0
-    avg_delay: float = 0.0
-    avg_wait: float = 0.0
-    domains: Mapping[str, DomainRate] = field(default_factory=dict)
+from crawler.models import DomainRate, RateStats
 
 
 @dataclass(slots=True)

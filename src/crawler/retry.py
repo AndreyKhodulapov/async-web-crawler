@@ -21,7 +21,7 @@ class RetryPolicy:
     `max_delay`, with "equal jitter": a random half of it is added to a fixed
     half. Jitter keeps many clients that failed together from retrying in
     lockstep; the fixed half keeps a retry from coming right back, as "full
-    jitter" (0..delay) can. A Retry-After header from the server is honoured
+    jitter" (0..delay) can. A Retry-After header from the server is honored
     when it asks for longer, up to `max_delay`.
     """
 
