@@ -110,3 +110,14 @@ class RobotsUnreachableError(FetchError):
 
 class UnexpectedError(FetchError):
     """An unforeseen exception (most likely a bug); the traceback is logged."""
+
+
+ERROR_KINDS = (TransientError, PermanentError, NetworkError, ParseError)
+
+
+def error_kind(error: BaseException) -> str:
+    """The kind of an error by class name, such as "TransientError"; "other" if it has none."""
+    for kind in ERROR_KINDS:
+        if isinstance(error, kind):
+            return kind.__name__
+    return "other"

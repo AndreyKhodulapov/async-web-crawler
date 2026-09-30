@@ -41,7 +41,10 @@ and backs off when a site struggles.
   `RobotsUnreachableError`, `CrawlerClosedError` and `UnexpectedError`
 - One failing URL never breaks a batch: even unforeseen exceptions are
   logged with a traceback and reported as `UnexpectedError`
-- Logging for every request: start, success (status, size, time) and failure
+- Logging for every request: start, success (status, size, time) and failure;
+  every retry with the error, the attempt number and the pause before the next one
+- Error statistics: failed attempts by kind and class, successful retries,
+  average time per retry, pages with permanent errors
 - HTML parsing with `lxml` (falling back to `html.parser`), run in a worker
   thread so that it does not block the event loop
 - Relative links resolved against `<base href>` or the final URL after
@@ -384,6 +387,23 @@ completes or hits `total_timeout`. Fetching from an already closed crawler
 fails the same way: `fetch_url` raises `CrawlerClosedError`, the other methods
 report it per URL.
 
+### Error statistics
+
+`crawler.error_stats()` returns `ErrorStats` for page requests since the
+latest `crawl()` started, or since the crawler was created; robots.txt
+downloads and the URLs it blocks are not counted.
+
+| Field | Content |
+|-------|---------|
+| `by_kind` | failed attempts by kind: `TransientError`, `PermanentError`, `NetworkError`, `ParseError`, `other`; attempts a retry made good count too |
+| `by_class` | failed attempts by exception class, e.g. `FetchTimeoutError` |
+| `total` | all failed attempts |
+| `retries`, `successful_retries` | retries made, and pages they recovered |
+| `avg_retry_time` | average seconds from a failed attempt to the end of the next one: the pause plus the request |
+| `permanent_errors` | `{url: "ErrorType: message"}` for pages that failed with a `PermanentError` |
+
+`error_kind(error)` gives the kind of any exception by the same rules.
+
 ### Timeouts
 
 | Option | Default | Effect |
@@ -437,6 +457,7 @@ during one, the crawler exposes its state:
 | `visited_urls` | every URL taken for fetching, successful or not |
 | `url_depths` | depth of every URL accepted into the queue |
 | `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit |
+| `error_stats()` | `ErrorStats`, see [Error statistics](#error-statistics) |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
 
 The building blocks can be used on their own: `CrawlerQueue` (priorities,
@@ -494,16 +515,17 @@ src/
     ├── rate_limiter.py     # RateLimiter: requests per second, delays, jitter, rate stats
     ├── robots.py           # RobotsParser, RobotsRules: robots.txt per RFC 9309
     ├── retry.py            # RetryStrategy: which errors to retry, backoff, Retry-After
+    ├── error_stats.py      # ErrorTracker: counts errors, retries and their outcomes
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
-    ├── models.py           # FetchResult, ParsedPage, CrawlStats, RateStats
+    ├── models.py           # FetchResult, ParsedPage, CrawlStats, ErrorStats, RateStats
     └── exceptions.py       # FetchError hierarchy
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness
-├── unit/                   # parser, URLs, queue, limits, robots.txt, retries, filters, client
+├── unit/                   # parser, URLs, queue, limits, robots.txt, retries, error stats, filters, client
 └── integration/            # local HTTP server; live tests marked `network`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here

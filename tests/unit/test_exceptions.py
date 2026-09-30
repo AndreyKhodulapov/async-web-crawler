@@ -18,6 +18,7 @@ from crawler import (
     TransientError,
     TransientHTTPError,
     UnexpectedError,
+    error_kind,
 )
 
 URL = "https://site/page"
@@ -66,3 +67,21 @@ def test_http_error_subclass_keeps_its_own_kind():
 )
 def test_errors_have_one_kind_at_most(error, kind):
     assert kind_of(error) is kind
+
+
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (HTTPStatusError(URL, 503, "Service Unavailable"), "TransientError"),
+        (FetchTimeoutError(URL, "read timeout (20.0s)"), "TransientError"),
+        (HTTPStatusError(URL, 404, "Not Found"), "PermanentError"),
+        (CertificateError(URL, "certificate has expired"), "PermanentError"),
+        (NetworkError(URL, "connection refused"), "NetworkError"),
+        (ParseError(URL, "empty document"), "ParseError"),
+        (UnexpectedError(URL, "KeyError: 'x'"), "other"),
+        (CrawlerClosedError(URL, "crawler is closed"), "other"),
+        (KeyError("x"), "other"),
+    ],
+)
+def test_error_kind(error, kind):
+    assert error_kind(error) == kind

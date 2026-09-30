@@ -86,6 +86,33 @@ class CrawlStats:
 
 
 @dataclass(frozen=True, slots=True)
+class ErrorStats:
+    """Errors of page requests since the stats were last reset.
+
+    `by_kind` and `by_class` count every failed attempt, including those a
+    retry made good, by kind ("TransientError", "PermanentError",
+    "NetworkError", "ParseError" or "other") and by exception class.
+    `retries` counts retries made, `successful_retries` the pages they
+    recovered, and `avg_retry_time` is the average time from a failed
+    attempt to the end of the next one: the pause plus the request.
+    `permanent_errors` maps the URLs that failed with a `PermanentError`
+    to the error.
+    """
+
+    by_kind: Mapping[str, int] = field(default_factory=dict)
+    by_class: Mapping[str, int] = field(default_factory=dict)
+    retries: int = 0
+    successful_retries: int = 0
+    avg_retry_time: float = 0.0
+    permanent_errors: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def total(self) -> int:
+        """All failed attempts."""
+        return sum(self.by_kind.values())
+
+
+@dataclass(frozen=True, slots=True)
 class DomainRate:
     """Requests to one domain: how many, the interval enforced now, the average gap seen."""
 

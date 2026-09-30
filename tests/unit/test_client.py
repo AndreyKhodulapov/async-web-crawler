@@ -513,6 +513,47 @@ class TestRetryLogging:
         assert self.warnings(caplog) == []
 
 
+class TestErrorStats:
+    async def test_attempts_and_outcomes_are_counted(self, make_crawler, fake_session):
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=2, base_delay=0.001))
+        fake_session.latency = 0.01
+        fake_session.routes["http://a/"] = [FakeResponse(status=503), aiohttp.SocketTimeoutError(), FakeResponse()]
+        fake_session.routes["http://b/"] = FakeResponse(status=404)
+        fake_session.routes["http://c/"] = aiohttp.ClientConnectionError("refused")
+        fake_session.routes["http://d/"] = FakeResponse(b"%PDF", content_type="application/pdf")
+        await crawler.fetch_many(["http://a/", "http://b/", "http://c/"])
+        with pytest.raises(ParseError):
+            await crawler.fetch_and_parse("http://d/")
+
+        stats = crawler.error_stats()
+        assert stats.by_kind == {
+            "TransientError": 2,
+            "PermanentError": 1,
+            "NetworkError": 3,
+            "ParseError": 1,
+            "other": 0,
+        }
+        assert stats.by_class["FetchTimeoutError"] == 1
+        assert (stats.retries, stats.successful_retries) == (4, 1)
+        # A retry takes at least the request itself.
+        assert stats.avg_retry_time >= 0.01
+        assert stats.permanent_errors == {"http://b/": "PermanentHTTPError: HTTP 404 Error"}
+
+    async def test_robots_txt_is_not_counted(self, make_crawler, fake_session):
+        crawler = make_crawler(respect_robots=True)
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(
+            b"User-agent: *\nDisallow: /private/", content_type="text/plain"
+        )
+        fake_session.routes["http://b/robots.txt"] = FakeResponse(status=404)
+        with pytest.raises(RobotsDisallowedError):
+            await crawler.fetch_url("http://a/private/page")
+        await crawler.fetch_url("http://b/page")
+
+        stats = crawler.error_stats()
+        assert stats.total == 0
+        assert stats.permanent_errors == {}
+
+
 class TestUserAgents:
     async def test_session_user_agent_by_default(self, crawler, fake_session):
         await crawler.fetch_url("http://a")

@@ -5,7 +5,7 @@ import asyncio
 import pytest
 from helpers import UNTHROTTLED
 
-from crawler import AsyncCrawler
+from crawler import AsyncCrawler, RetryStrategy
 
 
 async def crawl(start_url: str, *, max_concurrent: int = 5, max_depth: int = 2, **options) -> AsyncCrawler:
@@ -178,6 +178,22 @@ async def test_state_is_reset_between_crawls(url):
     assert list(second) == [url("/site/b.html")]
     assert crawler.visited_urls == {url("/site/b.html")}
     assert crawler.failed_urls == {}
+
+
+async def test_error_stats_after_crawl(url, closed_port_url):
+    retry_strategy = RetryStrategy(max_retries=2, base_delay=0.01)
+    start_urls = [url("/flaky/2"), url("/status/404"), url("/data.json"), closed_port_url]
+    async with AsyncCrawler(max_depth=0, **{**UNTHROTTLED, "retry_strategy": retry_strategy}) as crawler:
+        await crawler.crawl(start_urls)
+        stats = crawler.error_stats()
+        await crawler.crawl([url("/site/b.html")])
+
+    # 503 twice, then the page; 404; JSON instead of HTML; three refused connections.
+    assert stats.by_kind == {"TransientError": 2, "PermanentError": 1, "NetworkError": 3, "ParseError": 1, "other": 0}
+    assert (stats.retries, stats.successful_retries) == (4, 1)
+    assert stats.avg_retry_time > 0
+    assert list(stats.permanent_errors) == [url("/status/404")]
+    assert crawler.error_stats().total == 0  # reset by the second crawl
 
 
 async def test_invalid_start_urls_are_rejected():

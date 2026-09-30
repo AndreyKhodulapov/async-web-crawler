@@ -18,9 +18,10 @@ from crawler.exceptions import (
     TransientError,
     TransientHTTPError,
     UnexpectedError,
+    error_kind,
 )
 from crawler.filters import UrlFilter
-from crawler.models import CrawlStats, DomainRate, FetchResult, ParsedPage, RateStats
+from crawler.models import CrawlStats, DomainRate, ErrorStats, FetchResult, ParsedPage, RateStats
 from crawler.parser import HTMLParser
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
@@ -36,6 +37,7 @@ __all__ = [
     "CrawlerClosedError",
     "CrawlerQueue",
     "DomainRate",
+    "ErrorStats",
     "FetchError",
     "FetchResult",
     "FetchTimeoutError",
@@ -61,6 +63,7 @@ __all__ = [
     "TransientHTTPError",
     "UnexpectedError",
     "UrlFilter",
+    "error_kind",
     "get_host",
     "is_same_host",
     "is_valid_http_url",
