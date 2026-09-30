@@ -116,6 +116,14 @@ class TestOpen:
         clock.now += 0.1
         assert breaker.state("a.test") is CircuitState.HALF_OPEN
 
+    def test_admit_again_refuses_once_it_has_opened(self, breaker):
+        # A request let through, then kept waiting for its turn.
+        with breaker.call(URL) as waiting:
+            open_circuit(breaker)
+            with pytest.raises(CircuitOpenError, match="is open"):
+                waiting.admit()
+        assert breaker.get_stats()["a.test"].rejected == 1
+
     def test_late_outcomes_do_not_close_it(self, breaker):
         # A request sent before the circuit opened ends after it.
         with breaker.call(URL) as late:
@@ -173,12 +181,12 @@ class TestHalfOpen:
         request(half_open, None)
         assert half_open.state("a.test") is CircuitState.CLOSED
 
-    def test_call_can_be_entered_again(self, half_open):
-        call = half_open.call(URL)
-        with call:
-            pass
-        with call:
-            call.record(None)
+    def test_probe_is_taken_on_entry(self, half_open):
+        with half_open.call(URL) as probe:
+            with pytest.raises(CircuitOpenError, match="half-open"):
+                half_open.check(URL)
+            probe.admit()  # asked again after a wait: still the probe
+            probe.record(None)
         assert half_open.state("a.test") is CircuitState.CLOSED
 
 
@@ -203,6 +211,12 @@ class TestStats:
             breaker.check(URL)
         breaker.reset_stats()
         assert breaker.get_stats()["a.test"] == CircuitStats(state="open")
+
+
+def test_checks_do_not_create_circuits(breaker):
+    breaker.check(URL)
+    assert breaker.refusal(URL) is None
+    assert breaker.get_stats() == {}
 
 
 def test_disabled_breaker_lets_everything_through():

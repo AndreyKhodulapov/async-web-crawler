@@ -439,22 +439,24 @@ class AsyncCrawler:
 
         @contextlib.asynccontextmanager
         async def gate() -> AsyncIterator[None]:
-            # The breaker decides after the wait for the rate limit, as it
-            # may have opened meanwhile (_fetch() refuses early only for an
-            # open one); a refused request does not wait for a slot and does
-            # not count as sent.
-            with call:
-                async with self._limits.slot(url):
-                    yield
+            # Asked again after the wait for the rate limit, as the circuit
+            # may have opened meanwhile; a refused request does not wait for
+            # a slot and does not count as sent.
+            call.admit()
+            async with self._limits.slot(url):
+                yield
 
         try:
-            # The rate limit is waited for before taking a concurrency slot,
-            # so a request waiting for its host does not hold a slot another
-            # host could use; inside the slot the interval is checked once more.
-            async with gate() if host is None else self.rate_limiter.slot(host, gate):
-                result = await self._send(url, html_only=html_only, timeout=timeout)
-                call.record(result.error)
-                return result
+            # Admitted before the wait, so that of the requests to a
+            # half-open circuit only the probe waits for its turn.
+            with call:
+                # The rate limit is waited for before taking a concurrency slot,
+                # so a request waiting for its host does not hold a slot another
+                # host could use; inside the slot the interval is checked once more.
+                async with gate() if host is None else self.rate_limiter.slot(host, gate):
+                    result = await self._send(url, html_only=html_only, timeout=timeout)
+                    call.record(result.error)
+                    return result
         except CircuitOpenError as error:
             return FetchResult.failure(url, error, 0.0)
 

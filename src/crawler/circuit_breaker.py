@@ -28,6 +28,7 @@ class _Circuit:
     state: CircuitState = CircuitState.CLOSED
     # (time, failed) of the outcomes counted while closed, oldest first.
     outcomes: deque[tuple[float, bool]] = field(default_factory=deque)
+    failures: int = 0  # the failed ones among `outcomes`
     opened_at: float = 0.0
     reason: str = ""
     probe: "BreakerCall | None" = None
@@ -42,6 +43,8 @@ class CircuitBreaker:
 
         breaker = CircuitBreaker(failure_threshold=0.5, cooldown=30.0)
         with breaker.call(url) as call:  # CircuitOpenError while the host is blocked
+            ...  # wait for the turn of the host
+            call.admit()  # CircuitOpenError if the circuit has opened meanwhile
             error = ...  # send the request
             call.record(error)  # None on success
 
@@ -103,24 +106,23 @@ class CircuitBreaker:
     def check(self, url: str) -> None:
         """Raise `CircuitOpenError` if a request to `url` would be refused now.
 
-        Changes nothing otherwise. It refuses a request early, before it
+        Changes nothing otherwise: it refuses a request early, before it
         waits for a rate limit or a free slot; `call` decides for good.
         """
-        if (message := self.refusal(url)) is not None:
-            self._reject(url, message)
+        host = get_host(url)
+        circuit = self._circuits.get(host) if self.enabled and host is not None else None
+        if circuit is not None and (message := self._verdict(host, circuit, None)) is not None:
+            self._reject(url, circuit, message)
 
     def refusal(self, url: str) -> str | None:
         """Why a request to `url` would be refused now, None if it would go through; not counted as refused."""
-        host, circuit = self._circuit(url)
-        if circuit is None or self._state(circuit) is CircuitState.CLOSED:
-            return None
-        if circuit.state is CircuitState.HALF_OPEN and circuit.probe is None:
-            return None
-        return self._refusal_message(host, circuit)
+        host = get_host(url)
+        circuit = self._circuits.get(host) if self.enabled and host is not None else None
+        return None if circuit is None else self._verdict(host, circuit, None)
 
     def call(self, url: str) -> "BreakerCall":
         """A request to `url`: entering it raises `CircuitOpenError` if the request is refused."""
-        return BreakerCall(self, url)
+        return BreakerCall(self, url, get_host(url))
 
     def get_stats(self) -> dict[str, CircuitStats]:
         """The circuits of the hosts requested so far, by host."""
@@ -131,7 +133,7 @@ class CircuitBreaker:
             stats[host] = CircuitStats(
                 state=self._state(circuit).value,
                 requests=len(circuit.outcomes),
-                failures=sum(failed for _, failed in circuit.outcomes),
+                failures=circuit.failures,
                 times_opened=circuit.times_opened,
                 rejected=circuit.rejected,
             )
@@ -142,44 +144,50 @@ class CircuitBreaker:
         for circuit in self._circuits.values():
             circuit.times_opened = circuit.rejected = 0
 
-    def _circuit(self, url: str) -> tuple[str, _Circuit | None]:
-        """The host of `url` and its circuit; no circuit when the breaker is off or the URL has no host."""
-        host = get_host(url)
-        if not self.enabled or host is None:
-            return "", None
-        return host, self._circuits.setdefault(host, _Circuit())
+    def _circuit(self, call: "BreakerCall") -> _Circuit | None:
+        """The circuit of the host of `call`; none when the breaker is off or the URL has no host."""
+        if not self.enabled or call.host is None:
+            return None
+        return self._circuits.setdefault(call.host, _Circuit())
 
     def _state(self, circuit: _Circuit) -> CircuitState:
         if circuit.state is CircuitState.OPEN and self._clock() >= circuit.opened_at + self.cooldown:
             circuit.state = CircuitState.HALF_OPEN
         return circuit.state
 
-    def _admit(self, url: str, call: "BreakerCall") -> None:
-        host, circuit = self._circuit(url)
-        if circuit is None or self._state(circuit) is CircuitState.CLOSED:
-            return
-        if circuit.state is CircuitState.HALF_OPEN and circuit.probe is None:
-            circuit.probe = call
-            logger.info("Circuit breaker of %s is half-open: probing it with %s", host, url)
-            return
-        self._reject(url, self._refusal_message(host, circuit))
-
-    def _refusal_message(self, host: str, circuit: _Circuit) -> str:
-        if circuit.state is CircuitState.OPEN:
+    def _verdict(self, host: str, circuit: _Circuit, call: "BreakerCall | None") -> str | None:
+        """Why a request is refused, None if it may go; a `call` takes the probe of a half-open circuit."""
+        state = self._state(circuit)
+        if state is CircuitState.CLOSED or (call is not None and circuit.probe is call):
+            return None
+        if state is CircuitState.HALF_OPEN and circuit.probe is None:
+            if call is not None:
+                circuit.probe = call
+                logger.info("Circuit breaker of %s is half-open: probing it with %s", host, call.url)
+            return None
+        if state is CircuitState.OPEN:
             left = circuit.opened_at + self.cooldown - self._clock()
             return f"circuit breaker of {host} is open ({circuit.reason}), next probe in {left:.1f}s"
         return f"circuit breaker of {host} is half-open, waiting for the probe request"
 
-    def _reject(self, url: str, message: str) -> None:
-        _, circuit = self._circuit(url)
-        assert circuit is not None
+    def _admit(self, call: "BreakerCall") -> None:
+        circuit = self._circuit(call)
+        if circuit is None:
+            return
+        assert call.host is not None
+        if (message := self._verdict(call.host, circuit, call)) is not None:
+            self._reject(call.url, circuit, message)
+
+    def _reject(self, url: str, circuit: _Circuit, message: str) -> None:
         circuit.rejected += 1
         raise CircuitOpenError(url, message)
 
-    def _record(self, url: str, call: "BreakerCall", error: FetchError | None) -> None:
-        host, circuit = self._circuit(url)
+    def _record(self, call: "BreakerCall", error: FetchError | None) -> None:
+        circuit = self._circuit(call)
         if circuit is None:
             return
+        assert call.host is not None  # it has a circuit
+        host, url = call.host, call.url
         probe = circuit.probe is call
         if probe:
             circuit.probe = None
@@ -192,25 +200,25 @@ class CircuitBreaker:
                 self._open(host, circuit, f"probe {url} failed: {type(error).__name__}: {error.message}")
             else:
                 circuit.state = CircuitState.CLOSED
-                circuit.outcomes.clear()
+                self._clear(circuit)
                 logger.info("Circuit breaker of %s closed: probe %s succeeded", host, url)
             return
         if self._state(circuit) is not CircuitState.CLOSED:
             return  # a request sent before the circuit opened: the probe decides
         now = self._clock()
         circuit.outcomes.append((now, failed))
+        circuit.failures += failed
         self._forget(circuit, now)
         if not failed:
             return
         assert self.failure_threshold is not None  # the breaker is on
-        failures = sum(failed for _, failed in circuit.outcomes)
         requests = len(circuit.outcomes)
-        if requests >= self.min_requests and failures >= self.failure_threshold * requests:
-            self._open(host, circuit, f"{failures} of {requests} requests failed in {self.window:g}s")
+        if requests >= self.min_requests and circuit.failures >= self.failure_threshold * requests:
+            self._open(host, circuit, f"{circuit.failures} of {requests} requests failed in {self.window:g}s")
 
     def _release(self, call: "BreakerCall") -> None:
         """A call is over: a probe that recorded nothing lets another request probe."""
-        _, circuit = self._circuit(call.url)
+        circuit = self._circuit(call)
         if circuit is not None and circuit.probe is call:
             circuit.probe = None
 
@@ -218,29 +226,39 @@ class CircuitBreaker:
         circuit.state = CircuitState.OPEN
         circuit.opened_at = self._clock()
         circuit.reason = reason
-        circuit.outcomes.clear()
+        self._clear(circuit)
         circuit.times_opened += 1
         logger.warning("Circuit breaker of %s opened: %s; requests to it fail for %gs", host, reason, self.cooldown)
 
     def _forget(self, circuit: _Circuit, now: float) -> None:
         while circuit.outcomes and circuit.outcomes[0][0] <= now - self.window:
-            circuit.outcomes.popleft()
+            _, failed = circuit.outcomes.popleft()
+            circuit.failures -= failed
+
+    @staticmethod
+    def _clear(circuit: _Circuit) -> None:
+        circuit.outcomes.clear()
+        circuit.failures = 0
 
 
 class BreakerCall:
     """One request under a `CircuitBreaker`, a context manager.
 
-    Entering it raises `CircuitOpenError` if the request is refused; inside,
-    `record` tells how the request went. It may be entered again after it
-    exits, e.g. when the request has to wait for another turn.
+    Entering it admits the request or raises `CircuitOpenError`; a request
+    to a half-open circuit may take the probe then. `admit` asks again, e.g.
+    after a wait for the rate limit, in case the circuit has opened
+    meanwhile; it changes nothing for a request already let through as the
+    probe. Inside, `record` tells how the request went. Exiting frees a
+    probe that recorded nothing.
     """
 
-    def __init__(self, breaker: CircuitBreaker, url: str) -> None:
+    def __init__(self, breaker: CircuitBreaker, url: str, host: str | None) -> None:
         self._breaker = breaker
         self.url = url
+        self.host = host
 
     def __enter__(self) -> Self:
-        self._breaker._admit(self.url, self)
+        self.admit()
         return self
 
     def __exit__(
@@ -251,9 +269,13 @@ class BreakerCall:
     ) -> None:
         self._breaker._release(self)
 
+    def admit(self) -> None:
+        """Raise `CircuitOpenError` if the request may not go now."""
+        self._breaker._admit(self)
+
     def record(self, error: FetchError | None) -> None:
         """The outcome of the request: the error it failed with, None on success."""
-        self._breaker._record(self.url, self, error)
+        self._breaker._record(self, error)
 
 
 def _is_failure(error: FetchError | None) -> bool | None:

@@ -408,7 +408,8 @@ counted in `error_stats()`. After that one request goes through as a probe
 Failures are timeouts, network errors, HTTP 408, 429 and 5xx; any other
 response, a 404 too, is a success, so broken links do not block a site.
 Every attempt counts, retries and robots.txt downloads included. The
-circuit is checked before a request waits for the rate limit and once
+circuit is checked before a request waits for the rate limit, where a
+half-open one gives its probe to one request and refuses the rest, and once
 more when its turn comes, so the requests queued for a host stop as soon as
 it opens. A retry the breaker would refuse is not made, so the request
 fails with the error of its last attempt, not with `CircuitOpenError`.

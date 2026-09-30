@@ -4,6 +4,7 @@ import asyncio
 import logging
 import socket
 import ssl
+import time
 from unittest.mock import MagicMock
 
 import aiohttp
@@ -614,6 +615,25 @@ class TestCircuitBreaker:
         assert isinstance(results[1].error, CircuitOpenError)
         assert fake_session.requested == ["http://a/1"]
         assert crawler.rate_limiter.get_stats().requests == 1
+
+    async def test_only_the_probe_waits_for_the_rate_limit(self, make_crawler, fake_session):
+        clock = FakeClock()
+        crawler = make_crawler(
+            requests_per_second=2,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, clock=clock),
+        )
+        fake_session.routes["http://a/down"] = FakeResponse(status=503)
+        await crawler.fetch_result("http://a/down")
+        clock.now += crawler.circuit_breaker.cooldown
+
+        # Refused before booking a turn: the others do not wait 0.5s each for nothing.
+        started = time.perf_counter()
+        results = await crawler.fetch_many(["http://a/1", "http://a/2", "http://a/3"])
+        assert time.perf_counter() - started < 0.9
+
+        assert results[0].ok
+        assert [type(result.error) for result in results[1:]] == [CircuitOpenError, CircuitOpenError]
+        assert crawler.rate_limiter.get_stats().requests == 2
 
     async def test_robots_txt_counts(self, make_crawler, fake_session):
         crawler = make_crawler(
