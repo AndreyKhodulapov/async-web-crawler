@@ -2,7 +2,7 @@
 
 import pytest
 
-from main import parse_args
+from main import make_crawler, parse_args
 
 
 @pytest.mark.parametrize(
@@ -14,7 +14,9 @@ def test_defaults_differ_by_command(command, retries, log_level):
     assert (args.retries, args.log_level) == (retries, log_level)
 
 
-@pytest.mark.parametrize("option", ["--rps", "--min-delay", "--jitter"])
+@pytest.mark.parametrize(
+    "option", ["--rps", "--min-delay", "--jitter", "--connect-timeout", "--read-timeout", "--timeout-growth"]
+)
 @pytest.mark.parametrize("value", ["inf", "nan"])
 def test_rejects_non_finite_numbers(option, value):
     with pytest.raises(SystemExit):
@@ -24,3 +26,18 @@ def test_rejects_non_finite_numbers(option, value):
 def test_options_override_command_defaults():
     args = parse_args(["benchmark", "--retries", "3", "--log-level", "debug"])
     assert (args.retries, args.log_level) == (3, "DEBUG")
+
+
+def test_timeout_options_configure_the_crawler():
+    args = parse_args(
+        ["crawl", "--connect-timeout", "1", "--read-timeout", "2", "--total-timeout", "3", "--timeout-growth", "2"]
+    )
+    crawler = make_crawler(args)
+    timeout = crawler._timeout_for(retries=1)
+    assert (timeout.connect, timeout.sock_read, timeout.total) == (2, 4, 6)
+
+
+@pytest.mark.parametrize("value", ["0.5", "0", "x"])
+def test_rejects_timeout_growth_below_one(value):
+    with pytest.raises(SystemExit):
+        parse_args(["crawl", "--timeout-growth", value])

@@ -96,9 +96,13 @@ class FakeSession:
         self.peak_in_flight = 0
         self.requested: list[str] = []
         self.user_agents: list[str | None] = []  # per-request User-Agent headers
+        self.timeouts: list[aiohttp.ClientTimeout | None] = []  # per-request timeouts
 
-    def get(self, url: str, headers: dict[str, str] | None = None) -> FakeRequest:
+    def get(
+        self, url: str, headers: dict[str, str] | None = None, timeout: aiohttp.ClientTimeout | None = None
+    ) -> FakeRequest:
         self.user_agents.append(None if headers is None else headers.get("User-Agent"))
+        self.timeouts.append(timeout)
         return FakeRequest(self, url)
 
     async def handle(self, url: str) -> FakeResponse:
@@ -157,6 +161,11 @@ class TestInit:
     def test_rejects_non_positive_timeouts(self, name):
         with pytest.raises(ValueError, match=name):
             AsyncCrawler(**{name: 0})
+
+    @pytest.mark.parametrize("value", [0.5, 0, float("inf"), float("nan")])
+    def test_rejects_invalid_timeout_growth(self, value):
+        with pytest.raises(ValueError, match="timeout_growth"):
+            AsyncCrawler(timeout_growth=value)
 
     def test_does_not_create_session_eagerly(self):
         crawler = AsyncCrawler()
@@ -251,6 +260,21 @@ class TestErrorMapping:
         fake_session.routes["http://a"] = aiohttp.ServerTimeoutError("read timeout")
         with pytest.raises(FetchTimeoutError):
             await crawler.fetch_url("http://a")
+
+    @pytest.mark.parametrize(
+        ("outcome", "message"),
+        [
+            (aiohttp.ConnectionTimeoutError(), "connect timeout (2.0s)"),
+            (aiohttp.SocketTimeoutError(), "read timeout (3.0s)"),
+            (TimeoutError(), "total timeout (4.0s)"),
+        ],
+    )
+    async def test_timeout_message_names_the_timeout(self, make_crawler, fake_session, outcome, message):
+        crawler = make_crawler(connect_timeout=2, read_timeout=3, total_timeout=4)
+        fake_session.routes["http://a"] = outcome
+        with pytest.raises(FetchTimeoutError) as exc_info:
+            await crawler.fetch_url("http://a")
+        assert exc_info.value.message == message
 
     async def test_network_error_keeps_cause(self, crawler, fake_session):
         fake_session.routes["http://a"] = aiohttp.ClientConnectionError("refused")
@@ -420,6 +444,32 @@ class TestRetries:
         assert fake_session.requested == ["http://a"]
         # The host waits as long as a retry could, not the two minutes asked for.
         assert crawler.rate_limiter.reserve("a") == pytest.approx(5.0, abs=0.1)
+
+    async def test_timeouts_grow_with_every_retry(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
+            connect_timeout=1,
+            read_timeout=2,
+            total_timeout=4,
+            timeout_growth=2,
+        )
+        fake_session.routes["http://a"] = [aiohttp.SocketTimeoutError()] * 3 + [FakeResponse(b"ok")]
+        assert await crawler.fetch_url("http://a") == "ok"
+
+        timeouts = [(t.connect, t.sock_read, t.total) for t in fake_session.timeouts]
+        # The growth stops at MAX_TIMEOUT_GROWTH (4x) instead of reaching 8x.
+        assert timeouts == [(1, 2, 4), (2, 4, 8), (4, 8, 16), (4, 8, 16)]
+
+    async def test_timeouts_start_over_for_every_url(self, make_crawler, fake_session):
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001), read_timeout=2)
+        fake_session.routes["http://a"] = [aiohttp.SocketTimeoutError(), FakeResponse()]
+        await crawler.fetch_url("http://a")
+        await crawler.fetch_url("http://b")
+        assert [t.sock_read for t in fake_session.timeouts] == [2, 3, 2]
+
+    async def test_huge_timeout_growth_is_capped(self, make_crawler):
+        crawler = make_crawler(timeout_growth=1e300, read_timeout=1)
+        assert crawler._timeout_for(retries=5).sock_read == AsyncCrawler.MAX_TIMEOUT_GROWTH
 
     async def test_backoff_holds_back_the_whole_host(self, make_crawler, fake_session):
         crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=1, base_delay=0.2))

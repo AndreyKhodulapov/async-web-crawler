@@ -51,6 +51,16 @@ def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) 
     return parse
 
 
+def at_least_one(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
+    if not (math.isfinite(value) and value >= 1):
+        raise argparse.ArgumentTypeError(f"must be >= 1, got {raw}")
+    return value
+
+
 def http_url(raw: str) -> str:
     if not is_valid_http_url(raw):
         raise argparse.ArgumentTypeError(f"not an absolute http(s) URL: {raw!r}")
@@ -73,11 +83,26 @@ def add_common_options(parser: argparse.ArgumentParser, *, retries: int = 2, log
     change the default of all of them.
     """
     parser.add_argument("--concurrency", type=positive(int), default=10, help="max parallel requests")
-    parser.add_argument(
-        "--timeout",
+    timeouts = parser.add_argument_group("timeouts")
+    timeouts.add_argument(
+        "--connect-timeout", type=positive(float), default=5.0, metavar="S", help="DNS, TCP and TLS, s (default: 5)"
+    )
+    timeouts.add_argument(
+        "--read-timeout",
         type=positive(float),
         default=5.0,
-        help="connect, read and total timeout per request, s",
+        metavar="S",
+        help="each chunk of the response, s (default: 5)",
+    )
+    timeouts.add_argument(
+        "--total-timeout", type=positive(float), default=10.0, metavar="S", help="whole request, s (default: 10)"
+    )
+    timeouts.add_argument(
+        "--timeout-growth",
+        type=at_least_one,
+        default=1.5,
+        metavar="X",
+        help=f"multiply the timeouts by X on every retry, at most {AsyncCrawler.MAX_TIMEOUT_GROWTH:g}x (default: 1.5)",
     )
     parser.add_argument(
         "--log-level",
@@ -124,7 +149,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "https://httpbin.org/delay/2",
         "https://httpbin.org/status/404",
         "https://httpbin.org/status/500",
-        "https://httpbin.org/delay/10",  # slower than the default --timeout
+        "https://httpbin.org/delay/10",  # slower than the default --read-timeout
         "https://nonexistent-domain.invalid",
     ]
     # Real sites of different kinds.
@@ -183,9 +208,10 @@ def make_crawler(args: argparse.Namespace, parser: HTMLParser | None = None, **o
         options |= {"user_agent": args.user_agent[0], "user_agents": args.user_agent}
     return AsyncCrawler(
         max_concurrent=args.concurrency,
-        total_timeout=args.timeout,
-        connect_timeout=args.timeout,
-        read_timeout=args.timeout,
+        total_timeout=args.total_timeout,
+        connect_timeout=args.connect_timeout,
+        read_timeout=args.read_timeout,
+        timeout_growth=args.timeout_growth,
         requests_per_second=args.rps or None,
         min_delay=args.min_delay,
         jitter=args.jitter,

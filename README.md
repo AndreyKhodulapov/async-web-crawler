@@ -31,7 +31,7 @@ and backs off when a site struggles.
 - Configurable User-Agent, with optional rotation between variants of the
   same bot name
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
-- Separate connect, read and total timeouts
+- Separate connect, read and total timeouts that grow with every retry
 - Clear error types, all subclasses of `FetchError`, grouped by whether a
   retry can help: `TransientError` (timeouts, HTTP 408, 429, 500, 502, 503,
   504), `NetworkError` (DNS, refused or reset connections), `PermanentError`
@@ -71,8 +71,10 @@ pip install -e .                       # or: the package alone, runtime deps onl
 
 The demo has three commands: `crawl` follows links from start pages, `parse`
 extracts data from pages, and `benchmark` compares sequential and concurrent
-fetching. All of them accept `--concurrency`, `--timeout` and `--log-level`,
-and the politeness options:
+fetching. All of them accept `--concurrency`, `--log-level`, the timeouts
+(`--connect-timeout` and `--read-timeout`, 5 s by default, `--total-timeout`,
+10 s, and `--timeout-growth`, 1.5, see [Timeouts](#timeouts)) and the
+politeness options:
 
 | Option | Default | Effect |
 |--------|---------|--------|
@@ -211,7 +213,7 @@ cannot be fetched, and while robots.txt is unreachable the site is not requested
 Pass `--no-robots` to see the `NetworkError` itself.
 
 ```bash
-python src/main.py benchmark --concurrency 3 --timeout 3        # tune the crawler
+python src/main.py benchmark --concurrency 3 --read-timeout 3   # tune the crawler
 python src/main.py benchmark https://example.com https://python.org  # custom URLs
 python src/main.py benchmark --log-level WARNING                # errors only
 ```
@@ -369,6 +371,21 @@ fails with `NetworkError`, one that is already reading the body runs until it
 completes or hits `total_timeout`. Fetching from an already closed crawler
 fails the same way: `fetch_url` raises `CrawlerClosedError`, the other methods
 report it per URL.
+
+### Timeouts
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `connect_timeout` | `10.0` | DNS, TCP and TLS, including the wait for a pooled connection |
+| `read_timeout` | `20.0` | the longest pause between two chunks of the response |
+| `total_timeout` | `30.0` | the whole request, body included |
+| `timeout_growth` | `1.5` | each retry multiplies all three by this, up to 4 times the initial values; `1` keeps them fixed |
+
+With the defaults the read timeout is 20 s on the first attempt and 30, 45
+and 67.5 s on the three retries: a page that is only slow gets through, a
+server that does not answer at all is not waited for forever. A timeout
+fails with `FetchTimeoutError` that says which timeout fired, e.g.
+`read timeout (20.0s)`, and is retried like any other transient error.
 
 ### Crawling
 

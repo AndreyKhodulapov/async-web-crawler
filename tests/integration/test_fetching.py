@@ -128,3 +128,20 @@ async def test_crawler_retries_timeouts(server):
         with pytest.raises(FetchTimeoutError):
             await crawler.fetch_url(str(server.make_url("/delay/1")))
         assert crawler.rate_limiter.get_stats().requests == 3
+
+
+async def test_growing_timeout_lets_a_slow_page_through(server):
+    # The page answers in 0.5s: the first attempt times out after 0.3s, the
+    # retry waits up to 0.9s and gets the page.
+    options = {**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=1, base_delay=0.01)}
+    async with AsyncCrawler(read_timeout=0.3, timeout_growth=3, **options) as crawler:
+        assert await crawler.fetch_url(str(server.make_url("/delay/0.5"))) == "done"
+        assert crawler.rate_limiter.get_stats().requests == 2
+
+
+async def test_fixed_timeout_keeps_failing_a_slow_page(server):
+    options = {**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=1, base_delay=0.01)}
+    async with AsyncCrawler(read_timeout=0.3, timeout_growth=1, **options) as crawler:
+        with pytest.raises(FetchTimeoutError, match=r"read timeout \(0\.3s\)"):
+            await crawler.fetch_url(str(server.make_url("/delay/0.5")))
+        assert crawler.rate_limiter.get_stats().requests == 2

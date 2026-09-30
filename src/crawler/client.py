@@ -4,6 +4,7 @@ import asyncio
 import functools
 import itertools
 import logging
+import math
 import ssl
 import time
 from collections.abc import Iterable, Mapping, Sequence
@@ -81,6 +82,13 @@ class AsyncCrawler:
       it does after a Retry-After header, even when the request is not
       retried.
 
+    Every request has a `connect_timeout` (DNS, TCP and TLS, waiting for a
+    pooled connection), a `read_timeout` (for each chunk of the response)
+    and a `total_timeout` (the whole request). The n-th retry (from 1)
+    multiplies all three by `timeout_growth**n`, at most by
+    `MAX_TIMEOUT_GROWTH`: a server that is merely slow gets a chance to
+    answer, and a dead one is not waited for forever.
+
     `user_agent` identifies the crawler, and robots.txt rules are looked up
     by its name ("MyBot/1.0 (+url)" is "mybot"). `user_agents` rotates
     several User-Agent strings between requests; they must all carry that
@@ -95,6 +103,7 @@ class AsyncCrawler:
     # Sites such as Wikipedia ask bots to identify themselves with a contact
     # URL and may block generic user agents.
     DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
+    MAX_TIMEOUT_GROWTH = 4.0
 
     def __init__(
         self,
@@ -111,6 +120,7 @@ class AsyncCrawler:
         total_timeout: float = 30.0,
         connect_timeout: float = 10.0,
         read_timeout: float = 20.0,
+        timeout_growth: float = 1.5,
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
         parser: HTMLParser | None = None,
@@ -124,6 +134,8 @@ class AsyncCrawler:
         ):
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if not (math.isfinite(timeout_growth) and timeout_growth >= 1):
+            raise ValueError(f"timeout_growth must be a number >= 1, got {timeout_growth}")
         if isinstance(user_agents, str):
             raise TypeError(f"expected a list of user agents, got a string: {user_agents!r}")
         robots_name = product_token(user_agent)
@@ -147,6 +159,7 @@ class AsyncCrawler:
             connect=connect_timeout,
             sock_read=read_timeout,
         )
+        self.timeout_growth = timeout_growth
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
         self._parser = parser or HTMLParser()
@@ -272,10 +285,13 @@ class AsyncCrawler:
         # The strategy needs an attempt that raises; the result of the last
         # one is kept to report a failure with its timing.
         last: FetchResult | None = None
+        attempts = 0
 
         async def attempt() -> FetchResult:
-            nonlocal last
-            last = await self._fetch_once(url, html_only=html_only, failure_level=failure_level)
+            nonlocal last, attempts
+            timeout = self._timeout_for(retries=attempts)
+            attempts += 1
+            last = await self._fetch_once(url, html_only=html_only, failure_level=failure_level, timeout=timeout)
             if last.error is not None:
                 raise last.error
             return last
@@ -304,6 +320,20 @@ class AsyncCrawler:
         self._retries += 1
         logger.warning("Retrying %s in %.1fs after %s: %s", error.url, delay, type(error).__name__, error.message)
         self.rate_limiter.penalize(host, delay)
+
+    def _timeout_for(self, retries: int) -> aiohttp.ClientTimeout:
+        """Timeouts of a request after `retries` failed attempts."""
+        try:
+            growth = min(self.timeout_growth**retries, self.MAX_TIMEOUT_GROWTH)
+        except OverflowError:
+            growth = self.MAX_TIMEOUT_GROWTH
+        base = self._timeout
+        assert base.total is not None and base.connect is not None and base.sock_read is not None
+        return aiohttp.ClientTimeout(
+            total=base.total * growth,
+            connect=base.connect * growth,
+            sock_read=base.sock_read * growth,
+        )
 
     async def _check_robots(self, url: str) -> FetchError | None:
         """Return the error to fail `url` with if robots.txt does not allow it, None if it may be fetched."""
@@ -339,7 +369,9 @@ class AsyncCrawler:
         assert result.status is not None and result.content is not None
         return result.status, result.content
 
-    async def _fetch_once(self, url: str, *, html_only: bool, failure_level: int) -> FetchResult:
+    async def _fetch_once(
+        self, url: str, *, html_only: bool, failure_level: int, timeout: aiohttp.ClientTimeout
+    ) -> FetchResult:
         host = get_host(url)
         gate = functools.partial(self._limits.slot, url)
         # The rate limit is waited for before taking a concurrency slot, so
@@ -349,7 +381,7 @@ class AsyncCrawler:
             logger.info("Fetching %s", url)
             started = time.perf_counter()
             try:
-                response = await self._request(url, html_only=html_only)
+                response = await self._request(url, html_only=html_only, timeout=timeout)
             except FetchError as error:
                 elapsed = time.perf_counter() - started
                 logger.log(
@@ -608,7 +640,7 @@ class AsyncCrawler:
             fallback_charset_resolver=_sniff_charset,
         )
 
-    async def _request(self, url: str, *, html_only: bool = False) -> _Response:
+    async def _request(self, url: str, *, html_only: bool, timeout: aiohttp.ClientTimeout) -> _Response:
         """Perform the GET request and read the whole body.
 
         With `html_only`, the body of a response whose Content-Type is not
@@ -625,7 +657,7 @@ class AsyncCrawler:
         session = self._get_session()
         headers = None if self._rotated_agents is None else {"User-Agent": next(self._rotated_agents)}
         try:
-            async with session.get(url, headers=headers) as response:
+            async with session.get(url, headers=headers, timeout=timeout) as response:
                 response.raise_for_status()
                 # aiohttp reports "application/octet-stream" when the header
                 # is missing; None lets callers tell the two cases apart.
@@ -661,7 +693,7 @@ class AsyncCrawler:
             retry_after = parse_retry_after(exc.headers.get(aiohttp.hdrs.RETRY_AFTER) if exc.headers else None)
             raise HTTPStatusError(url, exc.status, exc.message, retry_after=retry_after) from exc
         except TimeoutError as exc:
-            raise FetchTimeoutError(url, "request timed out") from exc
+            raise FetchTimeoutError(url, _describe_timeout(exc, timeout)) from exc
         # UnicodeError comes from IDNA encoding of the host, e.g. a domain
         # label longer than 63 characters; aiohttp does not wrap it.
         except (aiohttp.InvalidURL, UnicodeError) as exc:
@@ -670,6 +702,16 @@ class AsyncCrawler:
             raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
+
+
+def _describe_timeout(exc: TimeoutError, timeout: aiohttp.ClientTimeout) -> str:
+    # aiohttp raises its own subclasses for the connect and read timeouts
+    # and a plain TimeoutError for the total one.
+    if isinstance(exc, aiohttp.ConnectionTimeoutError):
+        return f"connect timeout ({timeout.connect:.1f}s)"
+    if isinstance(exc, aiohttp.SocketTimeoutError):
+        return f"read timeout ({timeout.sock_read:.1f}s)"
+    return f"total timeout ({timeout.total:.1f}s)"
 
 
 def _sniff_charset(response: aiohttp.ClientResponse, body: bytes) -> str:
