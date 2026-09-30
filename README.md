@@ -298,7 +298,7 @@ asyncio.run(main())
 | `fetch_result(url)` | `FetchResult` | error stored in `result.error` |
 | `fetch_urls(urls)` | `{url: text}` for successful pages | failed URLs are logged and skipped |
 | `fetch_many(urls)` | `list[FetchResult]` in input order | error stored per result |
-| `fetch_and_parse(url)` | `ParsedPage` dict | download errors raise a `FetchError` subclass; parsing problems go to `page["errors"]` |
+| `fetch_and_parse(url)` | `ParsedPage` dict | download errors raise a `FetchError` subclass, a response that is not an HTML document raises `ParseError`; problems in parts of the page go to `page["errors"]` |
 | `crawl(start_urls, max_pages)` | `{url: ParsedPage}` for fetched pages | failed URLs go to `failed_urls` |
 | `close()` | - | safe to call twice; called by `async with` |
 
