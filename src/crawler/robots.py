@@ -6,7 +6,7 @@ import logging
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -72,17 +72,22 @@ class RobotsRules:
     set several times, in one group or in several matching ones, the
     largest value is taken.
 
+    `sitemaps` lists the URLs of the Sitemap lines, which belong to no
+    group: they are meant for every crawler.
+
     `unreachable` tells why robots.txt could not be read, e.g. "HTTP 503";
     everything is disallowed then.
     """
 
-    def __init__(self, groups: list[_Group], *, unreachable: str | None = None) -> None:
+    def __init__(self, groups: list[_Group], *, sitemaps: Sequence[str] = (), unreachable: str | None = None) -> None:
         self._groups = groups
+        self.sitemaps = list(sitemaps)
         self.unreachable = unreachable
 
     @classmethod
     def parse(cls, text: str) -> "RobotsRules":
         groups: list[_Group] = []
+        sitemaps: dict[str, None] = {}
         group: _Group | None = None
         # Consecutive User-agent lines share one group; any other rule line
         # closes the list of agents, so the next User-agent starts a new group.
@@ -106,7 +111,9 @@ class RobotsRules:
                     group.crawl_delay = _parse_delay(value, group.crawl_delay)
                 elif rule := _Rule.parse(key == "allow", value):
                     group.rules.append(rule)
-        return cls(groups)
+            elif key == "sitemap" and (sitemap := normalize_url(value)):
+                sitemaps[sitemap] = None
+        return cls(groups, sitemaps=list(sitemaps))
 
     @classmethod
     def allow_all(cls) -> "RobotsRules":
@@ -143,6 +150,7 @@ class RobotsRules:
     def to_dict(self) -> dict[str, Any]:
         return {
             "unreachable": self.unreachable,
+            "sitemaps": list(self.sitemaps),
             "groups": [
                 {
                     "user_agents": group.agents,
@@ -216,8 +224,9 @@ class RobotsParser:
         `UNREACHABLE_TTL` seconds, then it is downloaded again.
 
         Returns the parsed rules as a dict: "groups" (user agents, allow and
-        disallow paths, crawl delay) and "unreachable" (why robots.txt could
-        not be read, None if it could).
+        disallow paths, crawl delay), "sitemaps" (the URLs of the Sitemap
+        lines) and "unreachable" (why robots.txt could not be read, None if
+        it could).
 
         Raises:
             ValueError: `base_url` is not a valid http(s) URL.
@@ -249,6 +258,10 @@ class RobotsParser:
         """
         delay = self._cached(url).crawl_delay(user_agent)
         return 0.0 if delay is None else min(delay, self.MAX_CRAWL_DELAY)
+
+    def get_sitemaps(self, url: str) -> list[str]:
+        """The sitemaps that robots.txt of the site of `url` lists. The site's rules must have been fetched."""
+        return list(self._cached(url).sitemaps)
 
     def unreachable_reason(self, url: str) -> str | None:
         """Why robots.txt of the site of `url` could not be read, or None. The rules must have been fetched."""

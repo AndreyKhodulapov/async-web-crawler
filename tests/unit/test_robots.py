@@ -200,10 +200,38 @@ class TestCrawlDelay:
         )
         assert rules.to_dict() == {
             "unreachable": None,
+            "sitemaps": [],
             "groups": [
                 {"user_agents": ["*"], "allow": ["/private/open"], "disallow": ["/private/"], "crawl_delay": 2.0}
             ],
         }
+
+
+class TestSitemaps:
+    def test_sitemap_lines_are_collected(self):
+        rules = RobotsRules.parse(
+            """
+            Sitemap: https://site/sitemap.xml
+            User-agent: *
+            Disallow: /private/
+            sitemap: HTTPS://Site/news.xml  # the latest posts
+            """
+        )
+        assert rules.sitemaps == ["https://site/sitemap.xml", "https://site/news.xml"]
+        assert rules.to_dict()["sitemaps"] == rules.sitemaps
+
+    def test_sitemap_line_belongs_to_no_group(self):
+        robots = "User-agent: other\nSitemap: https://site/sitemap.xml\nUser-agent: testbot\nDisallow: /shared/"
+        assert not allowed(robots, "/shared/x", "Other/1.0")
+        assert RobotsRules.parse(robots).sitemaps == ["https://site/sitemap.xml"]
+
+    def test_repeated_and_invalid_sitemaps_are_dropped(self):
+        robots = "Sitemap: https://site/sitemap.xml\nSitemap: /sitemap.xml\nSitemap:\nSitemap: https://site/sitemap.xml"
+        assert RobotsRules.parse(robots).sitemaps == ["https://site/sitemap.xml"]
+
+    def test_no_sitemaps_without_a_file(self):
+        assert RobotsRules.allow_all().sitemaps == []
+        assert RobotsRules.forbid_all("HTTP 503").sitemaps == []
 
 
 class FakeFetcher:
@@ -235,6 +263,13 @@ class TestRobotsParser:
         assert not robots.can_fetch("https://site/private/x", BOT)
         assert robots.can_fetch("https://site/public", BOT)
         assert robots.get_crawl_delay("https://site/", BOT) == 2.0
+
+    async def test_sitemaps_of_a_site(self):
+        robots = RobotsParser(FakeFetcher((200, "Sitemap: https://site/sitemap.xml\nUser-agent: *\nDisallow:")))
+        with pytest.raises(LookupError):
+            robots.get_sitemaps("https://site/page")
+        await robots.fetch_robots("https://site/")
+        assert robots.get_sitemaps("https://site/page") == ["https://site/sitemap.xml"]
 
     async def test_each_origin_has_its_own_rules(self):
         fetch = FakeFetcher()

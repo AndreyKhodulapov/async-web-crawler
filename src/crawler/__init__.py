@@ -16,6 +16,7 @@ from crawler.exceptions import (
     PermanentHTTPError,
     RobotsDisallowedError,
     RobotsUnreachableError,
+    SitemapError,
     StorageError,
     TooManyRedirectsError,
     TransientError,
@@ -40,6 +41,7 @@ from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.sitemap import SitemapParser
 from crawler.storage import (
     CompositeStorage,
     CSVStorage,
@@ -97,6 +99,8 @@ __all__ = [
     "RobotsUnreachableError",
     "SQLiteStorage",
     "SemaphoreManager",
+    "SitemapError",
+    "SitemapParser",
     "StorageError",
     "TooManyRedirectsError",
     "TransientError",

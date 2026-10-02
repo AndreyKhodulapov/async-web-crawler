@@ -10,7 +10,7 @@ Most errors fall into one of four kinds that decide whether a retry can help:
 - `NetworkError`: the request did not reach the server (DNS, a refused or
   reset connection); worth retrying too.
 - `PermanentError`: the request is wrong or forbidden (HTTP 404, 403, a bad
-  certificate); every attempt would fail the same way.
+  certificate, a sitemap that is not one); every attempt would fail the same way.
 - `ParseError`: the page was downloaded but is not an HTML document.
 
 `CrawlerClosedError`, `RobotsUnreachableError`, `CircuitOpenError` and
@@ -115,6 +115,10 @@ class RobotsUnreachableError(FetchError):
 
 class CircuitOpenError(FetchError):
     """The circuit breaker of the host is open: the request was not sent."""
+
+
+class SitemapError(PermanentError):
+    """The sitemap was downloaded but cannot be read: it is not XML, not a sitemap, or too large."""
 
 
 class UnexpectedError(FetchError):

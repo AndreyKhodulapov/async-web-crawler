@@ -899,6 +899,7 @@ src/
     ├── semaphores.py       # SemaphoreManager: global and per-domain limits
     ├── rate_limiter.py     # RateLimiter: requests per second, delays, jitter, rate stats
     ├── robots.py           # RobotsParser, RobotsRules: robots.txt per RFC 9309
+    ├── sitemap.py          # SitemapParser: sitemaps and sitemap indexes, gzip, limits
     ├── retry.py            # RetryStrategy: which errors to retry, backoff, Retry-After
     ├── circuit_breaker.py  # CircuitBreaker: blocks a failing host for a while
     ├── error_stats.py      # ErrorTracker: counts errors, retries and their outcomes
@@ -921,7 +922,7 @@ tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, page records, a storage in memory
-├── unit/                   # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, error stats, filters, storages, client
+├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error stats, filters, storages, client
 └── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here
