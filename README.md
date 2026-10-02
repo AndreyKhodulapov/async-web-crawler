@@ -606,9 +606,11 @@ retries and robots.txt downloads included. An outcome counts for the host
 of the requested URL: the HTTP client follows redirects on its own, so a
 link that redirects to a failing host counts against the host of the link.
 The circuit is checked before a request waits for the rate limit, where a
-half-open one gives its probe to one request and refuses the rest, and
-once more when its turn comes: a request that was already waiting when the
-circuit opened is not sent, but it is refused only when its turn comes. A
+half-open one gives its probe to one request and refuses the rest, once
+more when its turn comes, and a last time once it holds a concurrency slot:
+a request that was already waiting when the circuit opened is not sent, but
+it is refused only when its turn comes, and a request that waited for the
+slot of a host behind the one that opened its circuit is refused too. A
 retry the breaker would refuse is not made, so the request fails with the
 error of its last attempt, not with `CircuitOpenError`. When the breaker
 refuses the download of robots.txt, the page fails with `CircuitOpenError`
@@ -799,9 +801,9 @@ stays in the results, and `crawl_stats()` counts `saved` and `save_failed`.
 are in neither while the crawl runs; `crawl()` flushes the storage before it
 returns, and what could not be written by then is `save_failed`. Only
 processed pages are saved, not the failed or skipped ones. A storage that
-stays down slows the crawl: once its batch is full, every save tries to
-write it again, retries included; give the storage a `RetryStrategy` with
-fewer retries if that matters.
+stays down does not slow the crawl: after a write runs out of retries, saves
+only buffer for `cooldown` seconds before the storage tries again; the pages
+are written at the end of the crawl, or counted as `save_failed`.
 
 The database is chosen by a URL: `storage_from_url(url)` takes it as an
 argument, `storage_from_env()` reads it from `CRAWLER_DATABASE_URL` and
