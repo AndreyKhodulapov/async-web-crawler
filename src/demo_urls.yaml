@@ -1,0 +1,30 @@
+# URLs the demo commands use when none are given on the command line:
+# `python src/demo_main.py benchmark` reads the `benchmark` list, and so on.
+# `errors` and `save` crawl a local site and have no list here.
+
+# A mix of fast pages, slow endpoints and deliberate failures.
+benchmark:
+  - https://example.com
+  - https://www.python.org
+  - https://docs.aiohttp.org/en/stable/
+  - https://httpbin.org/html
+  - https://httpbin.org/delay/1
+  - https://httpbin.org/delay/2
+  - https://httpbin.org/status/404
+  - https://httpbin.org/status/500
+  - https://httpbin.org/delay/10  # slower than the default --read-timeout
+  - https://nonexistent-domain.invalid
+
+# Real sites of different kinds.
+parse:
+  - https://en.wikipedia.org/wiki/Main_Page  # large server-rendered page
+  - https://apilearn.tukas.dev/  # scraping sandbox; answers HTTP 429 to bursts
+  - https://apilearn.tukas.dev/exercises/  # same site, a page with tables
+  - https://httpbin.org/status/403  # an access denied response, as anti-bot protection gives
+
+# Sandboxes made for crawling practice whose robots.txt shows the rules at
+# work: the first disallows its pagination and product pages (with a wildcard
+# rule), the second sets Crawl-delay: 2.
+crawl:
+  - https://webscraper.io/test-sites/pagination
+  - https://web-scraping.dev/products

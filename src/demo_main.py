@@ -1,11 +1,11 @@
 """Command-line demo of the crawler.
 
 Usage:
-    python src/main.py benchmark [options] [URL ...]   # sequential vs concurrent fetching
-    python src/main.py parse [options] [URL ...]       # fetch pages and extract data
-    python src/main.py crawl [options] [URL ...]       # follow links from start pages
-    python src/main.py errors [options] [URL ...]      # crawl a local site that fails on purpose
-    python src/main.py save [options] [URL ...]        # save crawled pages to JSON, CSV and a database
+    python src/demo_main.py benchmark [options] [URL ...]   # sequential vs concurrent fetching
+    python src/demo_main.py parse [options] [URL ...]       # fetch pages and extract data
+    python src/demo_main.py crawl [options] [URL ...]       # follow links from start pages
+    python src/demo_main.py errors [options] [URL ...]      # crawl a local site that fails on purpose
+    python src/demo_main.py save [options] [URL ...]        # save crawled pages to JSON, CSV and a database
 """
 
 import argparse
@@ -25,6 +25,8 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+import yaml
 
 from crawler import (
     AsyncCrawler,
@@ -57,6 +59,11 @@ from demo_site import DemoSite
 
 # The longest pause between retries; a longer --retry-delay would not be doubled.
 MAX_RETRY_DELAY = 30.0
+# The URLs a command uses when none are given, a list per command. Found by
+# the location of this file, so the working directory does not matter.
+DEMO_URLS_FILE = Path(__file__).with_name("demo_urls.yaml")
+# The other commands crawl a local site.
+DEFAULT_URL_COMMANDS = ("benchmark", "parse", "crawl")
 
 
 def number(raw: str, number_type: type[int] | type[float] = float) -> int | float:
@@ -120,6 +127,26 @@ def encoding(raw: str) -> str:
     except LookupError:
         raise argparse.ArgumentTypeError(f"unknown encoding: {raw!r}") from None
     return raw
+
+
+def default_urls(command: str) -> list[str]:
+    """The URLs `command` uses when none are given: its list in the file next to this script.
+
+    Raises ValueError if the file cannot be read or the list is missing, empty
+    or has anything but absolute http(s) URLs.
+    """
+    try:
+        lists = yaml.safe_load(DEMO_URLS_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ValueError(f"cannot read the default URLs from {DEMO_URLS_FILE}: {error}") from None
+    urls = lists.get(command) if isinstance(lists, dict) else None
+    if (
+        not isinstance(urls, list)
+        or not urls
+        or not all(isinstance(url, str) and is_valid_http_url(url) for url in urls)
+    ):
+        raise ValueError(f"{DEMO_URLS_FILE}: `{command}` must be a non-empty list of absolute http(s) URLs")
+    return urls
 
 
 def add_common_options(
@@ -233,48 +260,30 @@ def add_common_options(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    # A mix of fast pages, slow endpoints and deliberate failures.
-    benchmark_urls = [
-        "https://example.com",
-        "https://www.python.org",
-        "https://docs.aiohttp.org/en/stable/",
-        "https://httpbin.org/html",
-        "https://httpbin.org/delay/1",
-        "https://httpbin.org/delay/2",
-        "https://httpbin.org/status/404",
-        "https://httpbin.org/status/500",
-        "https://httpbin.org/delay/10",  # slower than the default --read-timeout
-        "https://nonexistent-domain.invalid",
-    ]
-    # Real sites of different kinds.
-    parse_urls = [
-        "https://en.wikipedia.org/wiki/Main_Page",  # large server-rendered page
-        "https://apilearn.tukas.dev/",  # scraping sandbox; answers HTTP 429 to bursts
-        "https://apilearn.tukas.dev/exercises/",  # same site, a page with tables
-        "https://httpbin.org/status/403",  # an access denied response, as anti-bot protection gives
-    ]
-
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
 
     benchmark = commands.add_parser("benchmark", help="fetch URLs sequentially and concurrently, compare time")
-    benchmark.add_argument("urls", nargs="*", default=benchmark_urls, help="URLs to fetch")
+    benchmark.add_argument(
+        "urls", nargs="*", help=f"URLs to fetch (default: the `benchmark` list of {DEMO_URLS_FILE.name})"
+    )
     # Retries would blur the comparison: the list fails on purpose.
     add_common_options(benchmark, retries=0)
 
     parse = commands.add_parser("parse", help="fetch pages and extract structured data")
-    parse.add_argument("urls", nargs="*", default=parse_urls, help="URLs to parse")
+    parse.add_argument("urls", nargs="*", help=f"URLs to parse (default: the `parse` list of {DEMO_URLS_FILE.name})")
     parse.add_argument("--same-host", action="store_true", help="keep only links to the page's own host")
     parse.add_argument("--preview", type=positive(int), default=5, help="links and headings shown per page")
     parse.add_argument("--json", type=Path, metavar="PATH", help="save full results to a JSON file")
     add_common_options(parse)
 
     crawl = commands.add_parser("crawl", help="follow links from start pages, show live progress")
-    # Sandboxes made for crawling practice whose robots.txt shows the rules
-    # at work: the first disallows its pagination and product pages (with a
-    # wildcard rule), the second sets Crawl-delay: 2.
-    crawl_urls = ["https://webscraper.io/test-sites/pagination", "https://web-scraping.dev/products"]
-    crawl.add_argument("urls", nargs="*", type=http_url, default=crawl_urls, help="start URLs")
+    crawl.add_argument(
+        "urls",
+        nargs="*",
+        type=http_url,
+        help=f"start URLs (default: the `crawl` list of {DEMO_URLS_FILE.name})",
+    )
     crawl.add_argument("--max-depth", type=positive(int, allow_zero=True), default=2, help="0 = start pages only")
     crawl.add_argument("--max-pages", type=positive(int), default=30, help="pages to fetch, failed ones included")
     crawl.add_argument("--per-domain", type=positive(int), default=2, help="max parallel requests to one host")
@@ -369,6 +378,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     save.set_defaults(read_timeout=1.0, rps=0.0, breaker_cooldown=1.0)
 
     args = parser.parse_args(argv)
+    if not args.urls and args.command in DEFAULT_URL_COMMANDS:
+        try:
+            args.urls = default_urls(args.command)
+        except ValueError as error:
+            parser.error(str(error))
     if args.retry_delay > MAX_RETRY_DELAY:
         parser.error(f"--retry-delay must be at most {MAX_RETRY_DELAY:g}, got {args.retry_delay:g}")
     if args.user_agent and len({product_token(agent) for agent in args.user_agent}) > 1:

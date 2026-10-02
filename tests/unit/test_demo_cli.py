@@ -5,8 +5,17 @@ from pathlib import Path
 import pytest
 from helpers import FakeClock
 
-from crawler import CircuitBreaker, CSVStorage, FetchTimeoutError, JSONStorage, PostgresStorage, SQLiteStorage
-from main import format_size, hide_password, make_crawler, open_storages, parse_args, print_error_report
+import demo_main
+from crawler import (
+    CircuitBreaker,
+    CSVStorage,
+    FetchTimeoutError,
+    JSONStorage,
+    PostgresStorage,
+    SQLiteStorage,
+    is_valid_http_url,
+)
+from demo_main import format_size, hide_password, make_crawler, open_storages, parse_args, print_error_report
 
 
 @pytest.mark.parametrize(
@@ -245,3 +254,69 @@ def test_hide_password(url, shown):
 )
 def test_format_size(size, shown):
     assert format_size(size) == shown
+
+
+@pytest.mark.parametrize(("command", "count"), [("benchmark", 10), ("parse", 4), ("crawl", 2)])
+def test_default_urls_come_from_the_file_next_to_the_script(command, count, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # the file is found wherever the script is run from
+
+    urls = parse_args([command]).urls
+
+    assert len(urls) == count
+    assert all(is_valid_http_url(url) for url in urls)
+
+
+def test_default_urls_follow_the_file(tmp_path, monkeypatch):
+    urls_file = tmp_path / "urls.yaml"
+    urls_file.write_text("crawl:\n  - https://one.example/\n  - https://two.example/  # a comment\n")
+    monkeypatch.setattr(demo_main, "DEMO_URLS_FILE", urls_file)
+
+    assert parse_args(["crawl"]).urls == ["https://one.example/", "https://two.example/"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["crawl", "https://example.com/"], ["benchmark", "https://example.com/"], ["errors"], ["save"]],
+)
+def test_default_urls_file_is_not_read_when_not_needed(argv, tmp_path, monkeypatch):
+    monkeypatch.setattr(demo_main, "DEMO_URLS_FILE", tmp_path / "missing.yaml")
+
+    assert parse_args(argv).urls == argv[1:]
+
+
+@pytest.mark.parametrize("argv", [["--help"], ["crawl", "--help"]])
+def test_help_does_not_need_the_default_urls_file(argv, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(demo_main, "DEMO_URLS_FILE", tmp_path / "missing.yaml")
+
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(argv)
+
+    assert exit_info.value.code == 0
+    assert "usage:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,  # no file
+        "",
+        "- https://example.com/\n",
+        "parse:\n  - https://example.com/\n",
+        "crawl: https://example.com/\n",
+        "crawl: []\n",
+        "crawl:\n  - example.com\n",
+        "crawl:\n  - 42\n",
+        "crawl: [unclosed\n",
+    ],
+)
+def test_broken_default_urls_file_is_a_usage_error(content, tmp_path, monkeypatch, capsys):
+    urls_file = tmp_path / "urls.yaml"
+    if content is not None:
+        urls_file.write_text(content)
+    monkeypatch.setattr(demo_main, "DEMO_URLS_FILE", urls_file)
+
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["crawl"])
+
+    assert exit_info.value.code == 2
+    assert "urls.yaml" in capsys.readouterr().err

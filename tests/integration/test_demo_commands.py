@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 import asyncpg
 import pytest
 
-from main import parse_args, run_crawl, run_errors, run_save
+from demo_main import parse_args, run_crawl, run_errors, run_save
 
 # Start page, 8 articles and the three pages a retry makes good.
 SAVED_PATHS = {"/", *(f"/articles/{number}" for number in range(1, 9)), "/flaky", "/rate-limited", "/slow"}

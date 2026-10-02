@@ -126,14 +126,18 @@ politeness options:
 
 Logs and progress go to stderr; the report goes to stdout.
 
+`crawl`, `parse` and `benchmark` take URLs as arguments. Without them each
+uses its list in [`src/demo_urls.yaml`](src/demo_urls.yaml); edit the file to
+change the defaults. `errors` and `save` crawl a local site.
+
 ### crawl
 
 ```bash
-python src/main.py crawl                                     # two sandboxes, depth 2, 30 pages
-python src/main.py crawl https://books.toscrape.com/ --max-depth 1 --max-pages 20 --same-domain
-python src/main.py crawl https://books.toscrape.com/ --exclude '/category/' --include '/catalogue/' --json crawl.json
-python src/main.py crawl --per-domain 4 --concurrency 20     # at most 4 requests to one host at a time
-python src/main.py crawl --rps 2 --min-delay 0.5 --jitter 0.3 --user-agent "MyBot/1.0 (+https://example.com/bot)"
+python src/demo_main.py crawl                                     # two sandboxes, depth 2, 30 pages
+python src/demo_main.py crawl https://books.toscrape.com/ --max-depth 1 --max-pages 20 --same-domain
+python src/demo_main.py crawl https://books.toscrape.com/ --exclude '/category/' --include '/catalogue/' --json crawl.json
+python src/demo_main.py crawl --per-domain 4 --concurrency 20     # at most 4 requests to one host at a time
+python src/demo_main.py crawl --rps 2 --min-delay 0.5 --jitter 0.3 --user-agent "MyBot/1.0 (+https://example.com/bot)"
 ```
 
 The default start pages are sandboxes made for crawling practice, and their
@@ -211,9 +215,9 @@ per-host table, the error statistics and the circuit breakers are saved to a fil
 ### errors
 
 ```bash
-python src/main.py errors                              # the local site only
-python src/main.py errors https://httpbin.org/status/503 --robots --rps 1 --json report.json
-python src/main.py errors --log-level WARNING          # failed attempts only
+python src/demo_main.py errors                              # the local site only
+python src/demo_main.py errors https://httpbin.org/status/503 --robots --rps 1 --json report.json
+python src/demo_main.py errors --log-level WARNING          # failed attempts only
 ```
 
 The command starts a small site on 127.0.0.1 at a free port and crawls its
@@ -310,10 +314,10 @@ the fetched pages.
 ### save
 
 ```bash
-python src/main.py save                                # pages.jsonl, pages.csv and crawler.db
-python src/main.py save --indent 2 --csv-encoding utf-8-sig --batch-size 5
-python src/main.py save --database-url sqlite:///data/pages.db --append
-CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler python src/main.py save
+python src/demo_main.py save                                # pages.jsonl, pages.csv and crawler.db
+python src/demo_main.py save --indent 2 --csv-encoding utf-8-sig --batch-size 5
+python src/demo_main.py save --database-url sqlite:///data/pages.db --append
+CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler python src/demo_main.py save
 ```
 
 The command crawls the local site of [`errors`](#errors), with the same
@@ -368,9 +372,9 @@ up; the report says so. A password in the database URL is shown as `***`.
 ### parse
 
 ```bash
-python src/main.py parse
-python src/main.py parse https://example.com --same-host  # internal links only
-python src/main.py parse --preview 10 --json pages.json   # save full results
+python src/demo_main.py parse
+python src/demo_main.py parse https://example.com --same-host  # internal links only
+python src/demo_main.py parse --preview 10 --json pages.json   # save full results
 ```
 
 By default it parses real sites of different kinds:
@@ -419,7 +423,7 @@ Parsed: 3/4 pages, links: 700, text: 59175 chars
 ### benchmark
 
 ```bash
-python src/main.py benchmark
+python src/demo_main.py benchmark
 ```
 
 The benchmark fetches ten URLs twice: once sequentially and once concurrently. The
@@ -433,9 +437,9 @@ cannot be fetched, and while robots.txt is unreachable the site is not requested
 Pass `--no-robots` to see the `NetworkError` itself.
 
 ```bash
-python src/main.py benchmark --concurrency 3 --read-timeout 3   # tune the crawler
-python src/main.py benchmark https://example.com https://python.org  # custom URLs
-python src/main.py benchmark --log-level WARNING                # errors only
+python src/demo_main.py benchmark --concurrency 3 --read-timeout 3   # tune the crawler
+python src/demo_main.py benchmark https://example.com https://python.org  # custom URLs
+python src/demo_main.py benchmark --log-level WARNING                # errors only
 ```
 
 Sample report (logs omitted):
@@ -1115,7 +1119,7 @@ PostgreSQL server for the crawler, use the compose file of the repository:
 ```bash
 docker compose up -d --wait                  # PostgreSQL 17 on localhost:5432
 export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
-python src/main.py save
+python src/demo_main.py save
 CRAWLER_POSTGRES_PORT=55432 docker compose up -d --wait   # if port 5432 is taken
 ```
 
@@ -1185,7 +1189,8 @@ ruff check src tests        # lint
 
 ```
 src/
-├── main.py                 # demo CLI: `crawl`, `errors`, `save`, `parse` and `benchmark` commands
+├── demo_main.py            # demo CLI: `crawl`, `errors`, `save`, `parse` and `benchmark` commands
+├── demo_urls.yaml          # URLs the demo commands use when none are given
 ├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors` and `save`
 └── crawler/
     ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
