@@ -446,6 +446,9 @@ class AsyncCrawler:
             # a slot and does not count as sent.
             call.admit()
             async with self._limits.slot(url):
+                # And once more with the slot: the request that held it
+                # before may have opened the circuit.
+                call.admit()
                 yield
 
         try:
