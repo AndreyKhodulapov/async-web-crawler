@@ -218,6 +218,7 @@ class AsyncCrawler:
         self._queue = CrawlerQueue()
         self.processed_urls: dict[str, ParsedPage] = {}
         self._start_urls: set[str] = set()
+        self._sitemap_pages_out_of_scope: list[str] = []
         self._failed_sitemaps: dict[str, str] = {}
         self.stats = CrawlerStats()
         self._pages_requested = 0
@@ -618,8 +619,9 @@ class AsyncCrawler:
         has depth 0, like a start URL, but must pass the filters, like a
         link; it comes after the start URLs and before the links.
         `same_domain_only` keeps the hosts of `sitemap_urls` as well as
-        those of the start URLs. A sitemap that cannot be read does not stop
-        the crawl: it is logged and listed in `failed_sitemaps`.
+        those of the start URLs and of the pages they redirect to. A sitemap
+        that cannot be read does not stop the crawl: it is logged and listed
+        in `failed_sitemaps`.
 
         Failed pages do not stop the crawl: they are listed in `failed_urls`.
         Every processed page is saved to the `storage` of the crawler, if it
@@ -665,6 +667,7 @@ class AsyncCrawler:
         self._queue = CrawlerQueue()
         self.processed_urls = {}
         self._failed_sitemaps = {}
+        self._sitemap_pages_out_of_scope = []
         self._pages_requested = 0
         self._pages_to_save = 0
         self._written_before = self.storage.written if self.storage is not None else 0
@@ -723,7 +726,11 @@ class AsyncCrawler:
         for load in loads:
             for page in load.result():
                 listed += 1
-                if url_filter.allows(page) and self._queue.add_url(page, priority=0, depth=0):
+                if not url_filter.allows(page):
+                    # Hosts join the scope only under `same_domain_only`.
+                    if url_filter.allowed_hosts is not None:
+                        self._sitemap_pages_out_of_scope.append(page)
+                elif self._queue.add_url(page, priority=0, depth=0):
                     queued += 1
         logger.info(
             "Sitemaps: %d read, %d failed, %d pages listed, %d new queued",
@@ -732,6 +739,21 @@ class AsyncCrawler:
             listed,
             queued,
         )
+
+    def _queue_sitemap_pages_in_scope(self, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
+        """Queue the sitemap pages that the filter let through once a start URL redirected to their host.
+
+        The sitemaps are read before the first page, when only the hosts of
+        the start URLs are known: the pages of "www.example.com" are out of
+        scope until "example.com" redirects there.
+        """
+        out_of_scope = []
+        for page in self._sitemap_pages_out_of_scope:
+            if url_filter.allows(page):
+                queue.add_url(page, priority=0, depth=0)
+            else:
+                out_of_scope.append(page)
+        self._sitemap_pages_out_of_scope = out_of_scope
 
     async def _sitemaps_in_robots(self, url: str) -> list[str]:
         """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read."""
@@ -846,6 +868,7 @@ class AsyncCrawler:
                 # defines the site as much as the URL itself. A page from a
                 # sitemap has depth 0 too, but is filtered like a link.
                 url_filter.allow_host_of(final_url)
+                self._queue_sitemap_pages_in_scope(queue, url_filter)
             elif not url_filter.allows(final_url):
                 # aiohttp follows redirects on its own, so a link inside the
                 # crawl scope can lead out of it, e.g. to a sign-in page on

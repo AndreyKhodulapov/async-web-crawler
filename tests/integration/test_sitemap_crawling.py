@@ -91,6 +91,35 @@ async def test_same_domain_only_keeps_the_host_of_the_sitemap(url, site):
     assert list(pages) == [url("/site/c.html")]
 
 
+async def test_sitemap_pages_on_the_host_a_start_url_redirects_to(url, site):
+    # The sitemaps are read before the start URL shows where it redirects to.
+    site.sitemaps = {
+        "sitemap.xml": urlset(
+            url("/site/b.html"), url("/site/c.html", "localhost"), url("/site/a/deeper.html", "localhost")
+        )
+    }
+    async with make_crawler() as crawler:
+        pages = await crawler.crawl(
+            [url("/site/to-other-host")],
+            sitemap_urls=[url(SITEMAP)],
+            same_domain_only=True,
+            exclude_patterns=[r"/deeper\.html$"],
+        )
+
+    assert set(pages) == {url("/site/to-other-host"), url("/site/b.html"), url("/site/c.html", "localhost")}
+    assert crawler.url_depths[url("/site/c.html", "localhost")] == 0
+    assert site.hits["/site/a/deeper.html"] == 0
+
+
+async def test_sitemap_pages_on_another_host_stay_out_without_a_redirect(url, site):
+    site.sitemaps = {"sitemap.xml": urlset(url("/site/c.html", "localhost"))}
+    async with make_crawler() as crawler:
+        pages = await crawler.crawl([url("/site/b.html")], sitemap_urls=[url(SITEMAP)], same_domain_only=True)
+
+    assert list(pages) == [url("/site/b.html")]
+    assert crawler.visited_urls == set(pages)
+
+
 async def test_sitemap_page_redirecting_out_of_scope_is_skipped(url, site, server):
     # Unlike a start URL, a page from a sitemap does not bring the host it redirects to into the crawl.
     site.sitemaps = {"sitemap.xml": urlset(url("/site/to-other-host"))}

@@ -301,8 +301,10 @@ in `max_pages` or `error_stats()`. A page a sitemap lists has depth 0, like
 a start URL, so its links are followed up to `max_depth`; unlike a start
 URL, it must pass the filters, and a redirect does not bring another host
 into the crawl. `same_domain_only` keeps the hosts of `sitemap_urls` as well
-as those of the start URLs. A sitemap that cannot be downloaded or read is
-logged and listed in `failed_sitemaps`, and the crawl goes on.
+as those of the start URLs; when a start URL redirects to another host
+("example.com" to "www.example.com"), the sitemap pages on that host are
+crawled too. A sitemap that cannot be downloaded or read is logged and
+listed in `failed_sitemaps`, and the crawl goes on.
 
 `crawl()` returns every parsed page, so it holds them all in memory until
 it ends. A large crawl that saves its pages to a storage does not need
