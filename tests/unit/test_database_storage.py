@@ -1,5 +1,6 @@
 """Unit tests for DatabaseStorage: what it asks of a driver."""
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 
@@ -193,6 +194,23 @@ class TestReading:
 
         await storage.count()
 
+        assert len(driver.batches) == 1
+
+
+class TestConnecting:
+    async def test_first_read_and_first_write_at_once_connect_once(self):
+        class SlowToConnect(RecordingDriver):
+            async def connect(self) -> None:
+                await asyncio.sleep(0)
+                await super().connect()
+
+        driver = SlowToConnect()
+        driver.rows = [(0,)]
+        storage = make_storage(driver, batch_size=1)
+
+        await asyncio.gather(storage.count(), storage.save(make_record()))
+
+        assert driver.connections == 1
         assert len(driver.batches) == 1
 
 

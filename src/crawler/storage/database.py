@@ -1,5 +1,6 @@
 """Storage of crawled pages in a relational database."""
 
+import asyncio
 import contextlib
 import json
 from abc import ABC, abstractmethod
@@ -88,28 +89,31 @@ class DatabaseStorage(DataStorage):
         self._driver = driver
         self._connected = False
         self._initialized = False
+        # A read and a write may both be the first use: only one connects.
+        self._init_lock = asyncio.Lock()
 
     async def init_db(self) -> None:
         """Connect and create the table of pages with its indexes, unless they exist."""
-        if not self._connected:
-            await self._driver.connect()
-            self._connected = True
-        driver = self._driver
-        await driver.execute(
-            f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
-            f"id {driver.ID_COLUMN}, "
-            "url TEXT NOT NULL UNIQUE, "
-            "title TEXT NOT NULL, "
-            "text TEXT NOT NULL, "
-            f"links {driver.JSON_TYPE} NOT NULL, "
-            f"metadata {driver.JSON_TYPE} NOT NULL, "
-            f"crawled_at {driver.TIMESTAMP_TYPE} NOT NULL, "
-            "status_code INTEGER NOT NULL, "
-            "content_type TEXT NOT NULL)"
-        )
-        for column in ("crawled_at", "status_code"):
-            await driver.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_{column} ON {self.TABLE} ({column})")
-        self._initialized = True
+        async with self._init_lock:
+            if not self._connected:
+                await self._driver.connect()
+                self._connected = True
+            driver = self._driver
+            await driver.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
+                f"id {driver.ID_COLUMN}, "
+                "url TEXT NOT NULL UNIQUE, "
+                "title TEXT NOT NULL, "
+                "text TEXT NOT NULL, "
+                f"links {driver.JSON_TYPE} NOT NULL, "
+                f"metadata {driver.JSON_TYPE} NOT NULL, "
+                f"crawled_at {driver.TIMESTAMP_TYPE} NOT NULL, "
+                "status_code INTEGER NOT NULL, "
+                "content_type TEXT NOT NULL)"
+            )
+            for column in ("crawled_at", "status_code"):
+                await driver.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_{column} ON {self.TABLE} ({column})")
+            self._initialized = True
 
     async def count(self) -> int:
         """The number of pages saved."""
