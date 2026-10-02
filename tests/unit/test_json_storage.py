@@ -180,6 +180,20 @@ class TestBothLayouts:
         with pytest.raises(StorageError, match="ends with a broken record"):
             await read_all(reader)
 
+    async def test_nothing_is_added_to_a_truncated_file(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        async with JSONStorage(path, indent=indent) as storage:
+            for record in make_records(2):
+                await storage.save(record)
+        whole = path.read_bytes()
+        path.write_bytes(whole[: len(whole) - 40])
+
+        storage = JSONStorage(path, indent=indent, batch_size=1)
+        with pytest.raises(StorageError, match="line break|it was not written"):
+            await storage.save(make_record())
+
+        assert path.read_bytes() == whole[: len(whole) - 40]
+
     async def test_unwritable_path_is_a_storage_error(self, tmp_path, indent):
         storage = JSONStorage(tmp_path / "missing" / "pages", indent=indent, retry_strategy=FAST_RETRIES)
         await storage.save(make_record())

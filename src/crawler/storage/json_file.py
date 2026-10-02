@@ -34,8 +34,9 @@ class JSONStorage(DataStorage):
     file is UTF-8, `crawled_at` is written in ISO 8601.
 
     Raises (on the first write):
-        StorageError: the file exists in the other layout, or is an array
-            that some other program wrote.
+        StorageError: the file exists in the other layout, is an array
+            that some other program wrote, or is JSON Lines whose last
+            line is not complete.
     """
 
     READ_CHUNK = 64 * 1024
@@ -84,6 +85,11 @@ class JSONStorage(DataStorage):
                 await file.close()
                 layout, option = ("JSON Lines", "without") if self.indent is None else ("a JSON array", "with")
                 raise StorageError(f"{self.path} is not {layout} of this storage: it was not written {option} indent")
+            await file.seek(size - 1)
+            if self.indent is None and await file.read() != b"\n":
+                # A write that was cut short: the next record would be glued to its last line.
+                await file.close()
+                raise StorageError(f"{self.path} does not end with a line break: its last record may be broken")
         self._file = file
         return file
 
