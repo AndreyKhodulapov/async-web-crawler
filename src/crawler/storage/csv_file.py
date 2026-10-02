@@ -24,9 +24,13 @@ class CSVStorage(DataStorage):
 
     The header row is made of the fields of the first record; a file that
     exists keeps the header it has, and its columns decide the order. A
-    record with a field the header lacks is refused with `ValueError`. A
-    file that starts with an empty line is left alone: the first write
-    raises `StorageError`.
+    record with a field the header lacks is refused with `ValueError`.
+
+    A file that is not what this storage writes is left alone and reported
+    with `StorageError`: on the first write, if it starts with an empty
+    line or does not end with a line break (a write that was cut short);
+    on `read`, if a row does not fit the header or the file is not in
+    `encoding`.
 
     Commas, quotes and line breaks in a value are quoted as RFC 4180 says,
     so a row may span several lines. `links` and `metadata` are written as
@@ -81,16 +85,27 @@ class CSVStorage(DataStorage):
 
     async def _open(self) -> AsyncBufferedReader:
         if await aiofiles.os.path.exists(self.path):
-            async with aiofiles.open(self.path, encoding=self.encoding, newline="") as file:
-                first_line = await file.readline()
+            try:
+                async with aiofiles.open(self.path, encoding=self.encoding, newline="") as file:
+                    first_line = await file.readline()
+            except UnicodeError as error:
+                raise StorageError(f"{self.path} is not in {self.encoding}: {error}") from error
             # An empty file has no header yet.
             self._header = next(csv.reader([first_line]), None) or None
             if first_line and self._header is None:
                 # Not a file to start anew: there may be rows below.
                 raise StorageError(f"{self.path} starts with an empty line, not with a header")
-        self._file = await aiofiles.open(self.path, "w+b" if self._header is None else "r+b")
-        self._end = await self._file.seek(0, os.SEEK_END)
-        return self._file
+        file = await aiofiles.open(self.path, "w+b" if self._header is None else "r+b")
+        self._end = await file.seek(0, os.SEEK_END)
+        if self._header is not None:
+            line_break = "\n".encode(self.encoding)[len("".encode(self.encoding)) :]
+            await file.seek(self._end - len(line_break))
+            if await file.read() != line_break:
+                # A write that was cut short: the next row would be glued to its last line.
+                await file.close()
+                raise StorageError(f"{self.path} does not end with a line break: its last row may be broken")
+        self._file = file
+        return file
 
     async def _read(self) -> AsyncIterator[PageRecord]:
         if not await aiofiles.os.path.exists(self.path):
@@ -101,25 +116,35 @@ class CSVStorage(DataStorage):
         header: list[str] | None = None
         row_lines: list[str] = []
         inside_quotes = False
-        async with aiofiles.open(self.path, encoding=self.encoding, newline="") as file:
-            async for line in file:
-                row_lines.append(line)
-                # An odd number of quotes: the line starts or ends a quoted
-                # value that spans several lines.
-                if line.count('"') % 2:
-                    inside_quotes = not inside_quotes
-                if inside_quotes:
-                    continue
-                row = next(csv.reader(["".join(row_lines)]))
-                row_lines = []
-                if header is None:
-                    header = row
-                    continue
-                record = dict(zip(header, row, strict=True))
-                for field, parse in self.PARSERS.items():
-                    if field in record:
-                        record[field] = parse(record[field])
-                yield record
+        try:
+            async with aiofiles.open(self.path, encoding=self.encoding, newline="") as file:
+                async for line in file:
+                    row_lines.append(line)
+                    # An odd number of quotes: the line starts or ends a quoted
+                    # value that spans several lines.
+                    if line.count('"') % 2:
+                        inside_quotes = not inside_quotes
+                    if inside_quotes:
+                        continue
+                    row_text = "".join(row_lines)
+                    row_lines = []
+                    row = next(csv.reader([row_text]))
+                    if header is None:
+                        header = row
+                        continue
+                    try:
+                        record = dict(zip(header, row, strict=True))
+                        for field, parse in self.PARSERS.items():
+                            if field in record:
+                                record[field] = parse(record[field])
+                    except ValueError as error:
+                        # Too few or too many values, or one that is not what its column holds.
+                        raise StorageError(f"{self.path} has a broken row: {row_text[:80]!r}") from error
+                    yield record
+        except UnicodeError as error:
+            raise StorageError(f"{self.path} is not in {self.encoding}: {error}") from error
+        if row_lines:
+            raise StorageError(f"{self.path} ends with a broken row: {''.join(row_lines)[:80]!r}")
 
     async def _close(self) -> None:
         if self._file is not None:

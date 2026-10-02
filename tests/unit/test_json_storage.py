@@ -194,6 +194,20 @@ class TestBothLayouts:
 
         assert path.read_bytes() == whole[: len(whole) - 40]
 
+    async def test_record_that_is_not_a_page_is_reported(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        path.write_text('{"url": "https://site/a"}\n' if indent is None else '[\n  {"url": "https://site/a"}\n]\n')
+
+        with pytest.raises(StorageError, match="has a record that is not a page"):
+            await read_all(JSONStorage(path, indent=indent))
+
+    async def test_file_that_is_not_utf_8_is_reported(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        path.write_bytes(b'{"title": "caf\xe9"}\n')
+
+        with pytest.raises(StorageError, match="is not UTF-8"):
+            await read_all(JSONStorage(path, indent=indent))
+
     async def test_unwritable_path_is_a_storage_error(self, tmp_path, indent):
         storage = JSONStorage(tmp_path / "missing" / "pages", indent=indent, retry_strategy=FAST_RETRIES)
         await storage.save(make_record())

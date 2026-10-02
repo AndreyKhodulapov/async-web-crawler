@@ -37,6 +37,9 @@ class JSONStorage(DataStorage):
         StorageError: the file exists in the other layout, is an array
             that some other program wrote, or is JSON Lines whose last
             line is not complete.
+    Raises (on `read`):
+        StorageError: the file is not UTF-8, ends with a broken record, or
+            holds something that is not a page.
     """
 
     READ_CHUNK = 64 * 1024
@@ -102,20 +105,28 @@ class JSONStorage(DataStorage):
             return
         decoder = json.JSONDecoder()
         unread = ""
-        async with aiofiles.open(self.path, encoding="utf-8") as file:
-            while chunk := await file.read(self.READ_CHUNK):
-                unread += chunk
-                position = 0
-                while True:
-                    start = _BETWEEN_RECORDS.match(unread, position).end()
-                    try:
-                        record, position = decoder.raw_decode(unread, start)
-                    except json.JSONDecodeError:
-                        # The rest of the record is in the next chunk.
-                        break
-                    record["crawled_at"] = datetime.fromisoformat(record["crawled_at"])
-                    yield record
-                unread = unread[position:]
+        try:
+            async with aiofiles.open(self.path, encoding="utf-8") as file:
+                while chunk := await file.read(self.READ_CHUNK):
+                    unread += chunk
+                    position = 0
+                    while True:
+                        start = _BETWEEN_RECORDS.match(unread, position).end()
+                        try:
+                            record, position = decoder.raw_decode(unread, start)
+                        except json.JSONDecodeError:
+                            # The rest of the record is in the next chunk.
+                            break
+                        try:
+                            record["crawled_at"] = datetime.fromisoformat(record["crawled_at"])
+                        except (KeyError, TypeError, ValueError) as error:
+                            raise StorageError(
+                                f"{self.path} has a record that is not a page: {unread[start:position][:80]!r}"
+                            ) from error
+                        yield record
+                    unread = unread[position:]
+        except UnicodeError as error:
+            raise StorageError(f"{self.path} is not UTF-8: {error}") from error
         if not _BETWEEN_RECORDS.fullmatch(unread):
             raise StorageError(f"{self.path} ends with a broken record: {unread[:80]!r}")
 

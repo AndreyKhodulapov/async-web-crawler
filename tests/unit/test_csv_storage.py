@@ -94,6 +94,28 @@ class TestHeader:
 
         assert path.read_bytes() == b"\r\nurl,title\r\nhttps://site/a,A\r\n"
 
+    async def test_nothing_is_added_to_a_truncated_file(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        async with CSVStorage(path) as storage:
+            await save_all(storage, make_records(2))
+        truncated = path.read_bytes()[:-40]
+        path.write_bytes(truncated)
+
+        storage = CSVStorage(path, batch_size=1)
+        with pytest.raises(StorageError, match="does not end with a line break"):
+            await storage.save(make_record())
+
+        assert path.read_bytes() == truncated
+
+    async def test_records_are_added_to_a_file_in_utf_16(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        records = make_records(2)
+        for record in records:
+            async with CSVStorage(path, encoding="utf-16") as storage:
+                await storage.save(record)
+
+        assert await read_all(CSVStorage(path, encoding="utf-16")) == records
+
     async def test_record_with_an_unknown_field_is_refused(self, tmp_path):
         storage = CSVStorage(tmp_path / "pages.csv", batch_size=1)
         await storage.save({"url": "https://site/a"})
@@ -223,3 +245,48 @@ class TestWriteErrors:
         await storage.close()
 
         assert [row[0] for row in parse_csv(path)] == ["url", "https://site/a", "https://site/b"]
+
+
+class TestBrokenFiles:
+    """A file this storage did not write, or did not finish, is reported with StorageError."""
+
+    @staticmethod
+    async def written(path) -> bytes:
+        async with CSVStorage(path) as storage:
+            await save_all(storage, make_records(2))
+        return path.read_bytes()
+
+    @pytest.mark.parametrize("row", [b"\r\n", b"https://site/a,A\r\n", b"a,b,c,d,e,f,g,h,i\r\n"])
+    async def test_row_that_does_not_fit_the_header(self, tmp_path, row):
+        path = tmp_path / "pages.csv"
+        path.write_bytes(await self.written(path) + row)
+
+        with pytest.raises(StorageError, match="has a broken row"):
+            await read_all(CSVStorage(path))
+
+    async def test_value_that_is_not_what_its_column_holds(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        path.write_bytes(await self.written(path) + b"https://site/a,A,text,[],{},yesterday,200,text/html\r\n")
+
+        with pytest.raises(StorageError, match="has a broken row"):
+            await read_all(CSVStorage(path))
+
+    async def test_file_cut_inside_a_quoted_value(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        path.write_bytes(await self.written(path) + b'https://site/a,A,"two\r\nlines of te')
+
+        with pytest.raises(StorageError, match="ends with a broken row"):
+            await read_all(CSVStorage(path))
+
+    async def test_file_in_another_encoding(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        async with CSVStorage(path, encoding="utf-16") as storage:
+            await storage.save(make_record())
+        written = path.read_bytes()
+
+        with pytest.raises(StorageError, match="is not in utf-8"):
+            await read_all(CSVStorage(path))
+        with pytest.raises(StorageError, match="is not in utf-8"):
+            await CSVStorage(path, batch_size=1).save(make_record())
+
+        assert path.read_bytes() == written
