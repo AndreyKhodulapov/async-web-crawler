@@ -40,12 +40,13 @@ from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
-from crawler.storage import DataStorage, JSONStorage
+from crawler.storage import CSVStorage, DataStorage, JSONStorage
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
     "AsyncCrawler",
     "BreakerCall",
+    "CSVStorage",
     "CertificateError",
     "CircuitBreaker",
     "CircuitOpenError",
