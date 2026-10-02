@@ -11,7 +11,7 @@ import asyncpg
 import pytest
 from helpers import make_record
 
-from crawler import DatabaseStorage, PostgresStorage, RetryStrategy, SQLiteStorage, StorageError
+from crawler import DatabaseStorage, PostgresStorage, RetryStrategy, SQLiteStorage, StorageError, storage_from_env
 
 StorageFactory = Callable[..., DatabaseStorage]
 
@@ -284,6 +284,16 @@ class TestPostgres:
         rows = await run_in_postgres("SELECT url FROM pages WHERE metadata ->> 'language' = 'fr'")
 
         assert [url for (url,) in rows] == ["https://site/page"]
+
+    @pytest.mark.postgres
+    async def test_storage_chosen_by_the_url_reaches_the_server(self):
+        await run_in_postgres("DROP TABLE IF EXISTS pages")
+
+        async with storage_from_env({"CRAWLER_DATABASE_URL": POSTGRES_DSN}) as storage:
+            await storage.save(make_record())
+
+            assert type(storage) is PostgresStorage
+            assert await storage.count() == 1
 
     async def test_server_that_cannot_be_reached_is_a_storage_error(self, closed_port_url):
         port = closed_port_url.rstrip("/").rpartition(":")[2]

@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Self
 
 import aiosqlite
 
@@ -75,3 +76,19 @@ class SQLiteStorage(DatabaseStorage):
     ) -> None:
         super().__init__(SQLiteDriver(path), batch_size=batch_size, retry_strategy=retry_strategy)
         self.path = Path(path)
+
+    @classmethod
+    def from_url(cls, url: str, **options: Any) -> Self:
+        """The storage for a URL such as "sqlite:///crawler.db".
+
+        The path follows the three slashes: "sqlite:///data/crawler.db" is
+        relative to the working directory, "sqlite:////var/data/crawler.db"
+        is absolute. `options` are those of the constructor.
+
+        Raises:
+            ValueError: the URL names no file, or has a host before the path.
+        """
+        _, _, location = url.partition("://")
+        if not location.startswith("/") or len(location) == 1:
+            raise ValueError(f'An SQLite URL must look like "sqlite:///path/to/file.db", got "{url}"')
+        return cls(location[1:], **options)

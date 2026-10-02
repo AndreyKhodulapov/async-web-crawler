@@ -48,6 +48,9 @@ from crawler.storage import (
     JSONStorage,
     PostgresStorage,
     SQLiteStorage,
+    register_database,
+    storage_from_env,
+    storage_from_url,
 )
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
@@ -103,4 +106,7 @@ __all__ = [
     "is_same_host",
     "is_valid_http_url",
     "product_token",
+    "register_database",
+    "storage_from_env",
+    "storage_from_url",
 ]
