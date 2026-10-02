@@ -214,3 +214,21 @@ class TestClosing:
 
         assert driver.connections == 0
         assert driver.closed == 0
+
+    @pytest.mark.parametrize("read", ["count", "status_counts", "get", "read"])
+    async def test_closed_storage_refuses_to_read(self, read):
+        driver = RecordingDriver()
+        storage = make_storage(driver)
+        await storage.save(make_record())
+        await storage.close()
+
+        with pytest.raises(StorageError, match="is closed"):
+            if read == "read":
+                _ = [record async for record in storage.read()]
+            elif read == "get":
+                await storage.get("https://site/page")
+            else:
+                await getattr(storage, read)()
+
+        assert driver.connections == 1
+        assert driver.queries == []

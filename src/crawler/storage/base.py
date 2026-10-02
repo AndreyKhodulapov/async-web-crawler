@@ -139,6 +139,9 @@ class DataStorage(ABC):
             try:
                 await self._flush_buffer()
             finally:
+                # Whatever is still here is lost: a later flush must not
+                # reopen what `_close` releases.
+                self._buffer = []
                 await self._close()
 
     async def _flush_buffer(self) -> None:

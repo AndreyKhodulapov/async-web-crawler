@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 from typing import ClassVar
 
+from crawler.exceptions import StorageError
 from crawler.models import PageRecord
 from crawler.retry import RetryStrategy
 from crawler.storage.base import DataStorage
@@ -140,8 +141,7 @@ class DatabaseStorage(DataStorage):
         )
 
     async def _read(self) -> AsyncIterator[PageRecord]:
-        if not self._initialized:
-            await self.init_db()
+        await self._prepare_to_read()
         query = f"SELECT {', '.join(self.COLUMNS)} FROM {self.TABLE} ORDER BY id"
         # Closed explicitly, so that a reader that stops early does not leave a cursor open.
         async with contextlib.aclosing(self._driver.fetch(query)) as rows:
@@ -154,6 +154,9 @@ class DatabaseStorage(DataStorage):
             self._connected = False
 
     async def _prepare_to_read(self) -> None:
+        if self._closed:
+            # The connection is gone, and a new one would never be closed.
+            raise StorageError(f"{type(self).__name__} is closed")
         await self.flush()
         if not self._initialized:
             await self.init_db()

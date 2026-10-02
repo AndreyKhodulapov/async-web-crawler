@@ -136,6 +136,17 @@ class TestClosing:
 
         assert storage.released == 1
 
+    async def test_flush_after_a_failed_close_writes_nothing(self):
+        storage = MemoryStorage(failures=[OSError("disk full")] * 4)
+        await save_pages(storage, "a")
+        with pytest.raises(StorageError):
+            await storage.close()
+
+        await storage.flush()
+
+        assert storage.attempts == 4
+        assert storage.pending == 0
+
 
 class TestWriteErrors:
     async def test_failed_write_is_retried(self, caplog):
