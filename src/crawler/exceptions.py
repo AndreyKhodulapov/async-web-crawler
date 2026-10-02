@@ -16,6 +16,9 @@ Most errors fall into one of four kinds that decide whether a retry can help:
 `CrawlerClosedError`, `RobotsUnreachableError`, `CircuitOpenError` and
 `UnexpectedError` belong to none of them: they are not about the request
 itself, and none is retried.
+
+`StorageError` is not about a URL at all: it reports a failure to save the
+pages already crawled.
 """
 
 from typing import ClassVar, Self
@@ -116,6 +119,10 @@ class CircuitOpenError(FetchError):
 
 class UnexpectedError(FetchError):
     """An unforeseen exception (most likely a bug); the traceback is logged."""
+
+
+class StorageError(Exception):
+    """Crawled pages could not be written to a storage, or the storage is closed."""
 
 
 ERROR_KINDS = (TransientError, PermanentError, NetworkError, ParseError)

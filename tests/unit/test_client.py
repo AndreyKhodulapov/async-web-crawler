@@ -616,6 +616,22 @@ class TestCircuitBreaker:
         assert fake_session.requested == ["http://a/1"]
         assert crawler.rate_limiter.get_stats().requests == 1
 
+    async def test_refused_after_waiting_for_a_slot(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            max_per_domain=1,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1),
+        )
+        fake_session.latency = 0.01
+        fake_session.routes["http://a/1"] = FakeResponse(status=503)
+
+        # a/2 and a/3 pass both checks, then wait for the slot of the host while a/1 opens the circuit.
+        results = await crawler.fetch_many(["http://a/1", "http://a/2", "http://a/3"])
+
+        assert isinstance(results[0].error, HTTPStatusError)
+        assert [type(result.error) for result in results[1:]] == [CircuitOpenError, CircuitOpenError]
+        assert fake_session.requested == ["http://a/1"]
+        assert crawler.rate_limiter.get_stats().requests == 1
+
     async def test_only_the_probe_waits_for_the_rate_limit(self, make_crawler, fake_session):
         clock = FakeClock()
         crawler = make_crawler(
@@ -717,6 +733,8 @@ class TestCrawlBlockedHost:
         pages = [f"http://a/{page}" for page in range(5)]
         for page in pages:
             fake_session.routes[page] = aiohttp.ClientConnectionError("refused")
+        # A probe is still in flight when the pages deferred along with it come back.
+        fake_session.latency = 0.01
 
         # a/0 and a/1 are sent together, a/2 and a/3 are probes. A page
         # refused while a probe is in flight comes back a second later, when

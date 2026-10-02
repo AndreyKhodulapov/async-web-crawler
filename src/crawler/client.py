@@ -7,7 +7,8 @@ import logging
 import math
 import ssl
 import time
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import NamedTuple, Self
 
@@ -29,17 +30,19 @@ from crawler.exceptions import (
     ParseError,
     RobotsDisallowedError,
     RobotsUnreachableError,
+    StorageError,
     TooManyRedirectsError,
     UnexpectedError,
 )
 from crawler.filters import UrlFilter
-from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage
+from crawler.models import CrawlStats, ErrorStats, FetchResult, PageRecord, ParsedPage
 from crawler.parser import HTMLParser, is_html_content_type
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryStrategy, parse_retry_after
 from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.storage.base import DataStorage
 from crawler.urls import get_host, is_valid_http_url, normalize_url
 
 logger = logging.getLogger(__name__)
@@ -110,6 +113,11 @@ class AsyncCrawler:
     counted there, and neither are the requests the circuit breaker refused
     (see `circuit_breaker.get_stats()`).
 
+    With a `storage`, `crawl()` saves every page it has processed there (see
+    `DataStorage`, `PageRecord`). A page that cannot be saved is logged and
+    counted in `crawl_stats()`; the crawl goes on. Closing the crawler
+    closes the storage too.
+
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
     the same way as any other per-URL failure. Closing does not interrupt
     requests that are already in flight: they finish on their own or hit
@@ -142,6 +150,7 @@ class AsyncCrawler:
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
         parser: HTMLParser | None = None,
+        storage: DataStorage | None = None,
     ) -> None:
         if max_depth < 0:
             raise ValueError(f"max_depth must be >= 0, got {max_depth}")
@@ -182,12 +191,16 @@ class AsyncCrawler:
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
         self._parser = parser or HTMLParser()
+        self.storage = storage
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
         # State of the latest crawl() call.
         self._queue = CrawlerQueue()
         self.processed_urls: dict[str, ParsedPage] = {}
         self._pages_requested = 0
+        self._pages_to_save = 0
+        self._written_before = 0
+        self._pending_before = 0
         self._retries = 0
         self._errors = ErrorTracker()
         self._crawl_started: float | None = None
@@ -440,12 +453,15 @@ class AsyncCrawler:
         call = self.circuit_breaker.call(url)
 
         @contextlib.asynccontextmanager
-        async def gate() -> AsyncIterator[None]:
+        async def gate() -> AsyncGenerator[None, None]:
             # Asked again after the wait for the rate limit, as the circuit
             # may have opened meanwhile; a refused request does not wait for
             # a slot and does not count as sent.
             call.admit()
             async with self._limits.slot(url):
+                # And once more with the slot: the request that held it
+                # before may have opened the circuit.
+                call.admit()
                 yield
 
         try:
@@ -551,6 +567,10 @@ class AsyncCrawler:
         `skipped_urls` with the reason.
 
         Failed pages do not stop the crawl: they are listed in `failed_urls`.
+        Every processed page is saved to the `storage` of the crawler, if it
+        has one, and the storage is flushed before the crawl returns. A page
+        that cannot be saved is still returned: the failure is logged and
+        counted in `crawl_stats()`.
         The state of the crawl (`processed_urls`, `visited_urls`,
         `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `url_depths`,
         `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()`) is reset
@@ -581,6 +601,9 @@ class AsyncCrawler:
         self._queue = CrawlerQueue()
         self.processed_urls = {}
         self._pages_requested = 0
+        self._pages_to_save = 0
+        self._written_before = self.storage.written if self.storage is not None else 0
+        self._pending_before = self.storage.pending if self.storage is not None else 0
         self._retries = 0
         self._errors = ErrorTracker()
         self.rate_limiter.reset_stats()
@@ -596,6 +619,7 @@ class AsyncCrawler:
             async with asyncio.TaskGroup() as group:
                 for _ in range(self.max_concurrent):
                     group.create_task(self._crawl_worker(self._queue, url_filter, max_pages))
+            await self._flush_storage()
         finally:
             self._crawl_finished = time.perf_counter()
         stats = self.crawl_stats()
@@ -609,6 +633,10 @@ class AsyncCrawler:
             stats.queued,
             stats.elapsed,
         )
+        if self.storage is not None:
+            logger.info(
+                "Saved %d pages to %s, %d not saved", stats.saved, type(self.storage).__name__, stats.save_failed
+            )
         return self.processed_urls
 
     def crawl_stats(self) -> CrawlStats:
@@ -617,6 +645,16 @@ class AsyncCrawler:
             return CrawlStats()
         stats = self._queue.get_stats()
         rate = self.rate_limiter.get_stats()
+        saved = save_failed = 0
+        if self.storage is not None:
+            # Records left in the buffer by an earlier crawl are written
+            # first and are not pages of this one.
+            written = self.storage.written - self._written_before - self._pending_before
+            saved = min(max(written, 0), self._pages_to_save)
+            save_failed = self._pages_to_save - saved
+            if self._crawl_finished is None:
+                # Buffered pages are yet to be written.
+                save_failed = max(save_failed - self.storage.pending, 0)
         return CrawlStats(
             processed=stats["processed"],
             failed=stats["failed"],
@@ -632,6 +670,8 @@ class AsyncCrawler:
             current_rps=rate.current_rps,
             avg_delay=rate.avg_delay,
             avg_wait=rate.avg_wait,
+            saved=saved,
+            save_failed=save_failed,
         )
 
     def error_stats(self) -> ErrorStats:
@@ -714,6 +754,32 @@ class AsyncCrawler:
         self.processed_urls[url] = page
         queue.mark_processed(url)
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
+        if self.storage is not None:
+            await self._save_page(_page_record(result, page, depth))
+
+    async def _save_page(self, record: PageRecord) -> None:
+        """Hand a page to the storage; a failure is logged and does not stop the crawl."""
+        assert self.storage is not None
+        self._pages_to_save += 1
+        try:
+            await self.storage.save(record)
+        except StorageError as error:
+            logger.error("Failed to save %s: %s", record["url"], error)
+        except Exception:
+            # Not a failed write, which the storage reports as StorageError:
+            # a bug in the storage must not stop the crawl either.
+            logger.exception("Unexpected error while saving %s", record["url"])
+
+    async def _flush_storage(self) -> None:
+        """Write out the pages the storage still buffers; a failure is logged."""
+        if self.storage is None:
+            return
+        try:
+            await self.storage.flush()
+        except StorageError as error:
+            logger.error("Failed to save the last pages of the crawl: %s", error)
+        except Exception:
+            logger.exception("Unexpected error while saving the last pages of the crawl")
 
     def _check_probes_left(self, url: str) -> CircuitOpenError | None:
         """In a crawl, a host whose circuit has opened `MAX_CIRCUIT_OPENINGS` times gets no more probes."""
@@ -741,12 +807,23 @@ class AsyncCrawler:
         queue.defer(url, delay, priority=queue.depth(url))
 
     async def close(self) -> None:
-        """Close the underlying session. Safe to call more than once."""
+        """Close the underlying session and the storage. Safe to call more than once.
+
+        A storage that cannot write its last pages is closed all the same;
+        the failure is logged.
+        """
         self._closed = True
         if self._session is not None:
             await self._session.close()
             self._session = None
             logger.debug("HTTP session closed")
+        if self.storage is not None:
+            try:
+                await self.storage.close()
+            except StorageError as error:
+                logger.error("Failed to close %s: %s", type(self.storage).__name__, error)
+            except Exception:
+                logger.exception("Unexpected error while closing %s", type(self.storage).__name__)
 
     def _get_session(self) -> aiohttp.ClientSession:
         # The session is created lazily because aiohttp requires a running
@@ -831,6 +908,23 @@ class AsyncCrawler:
             raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
+
+
+def _page_record(result: FetchResult, page: ParsedPage, depth: int) -> PageRecord:
+    """A crawled page as a storage keeps it: the parsed page with the facts of its response."""
+    assert result.status is not None
+    # The title has a field of its own.
+    metadata = {name: value for name, value in page["metadata"].items() if name != "title"}
+    return PageRecord(
+        url=page["url"],
+        title=page["title"] or "",
+        text=page["text"],
+        links=page["links"],
+        metadata={**metadata, "final_url": page["final_url"], "depth": depth},
+        crawled_at=datetime.now(UTC),
+        status_code=result.status,
+        content_type=result.content_type or "",
+    )
 
 
 def _describe_timeout(exc: TimeoutError, timeout: aiohttp.ClientTimeout) -> str:

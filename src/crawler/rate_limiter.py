@@ -6,7 +6,7 @@ import math
 import random
 import time
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 
@@ -143,7 +143,7 @@ class RateLimiter:
         self,
         domain: str | None = None,
         gate: Callable[[], AbstractAsyncContextManager[object]] = contextlib.nullcontext,
-    ) -> AsyncIterator[None]:
+    ) -> AsyncGenerator[None, None]:
         """Wait for the turn of `domain`, then hold `gate()`, e.g. a concurrency slot, for the request.
 
         Nothing is waited for inside the gate, so a request waiting for its

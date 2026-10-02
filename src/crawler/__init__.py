@@ -16,6 +16,7 @@ from crawler.exceptions import (
     PermanentHTTPError,
     RobotsDisallowedError,
     RobotsUnreachableError,
+    StorageError,
     TooManyRedirectsError,
     TransientError,
     TransientHTTPError,
@@ -23,26 +24,53 @@ from crawler.exceptions import (
     error_kind,
 )
 from crawler.filters import UrlFilter
-from crawler.models import CircuitStats, CrawlStats, DomainRate, ErrorStats, FetchResult, ParsedPage, RateStats
+from crawler.models import (
+    CircuitStats,
+    CrawlStats,
+    DomainRate,
+    ErrorStats,
+    FetchResult,
+    PageRecord,
+    ParsedPage,
+    RateStats,
+)
 from crawler.parser import HTMLParser
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.storage import (
+    CompositeStorage,
+    CSVStorage,
+    DatabaseDriver,
+    DatabaseStorage,
+    DataStorage,
+    JSONStorage,
+    PostgresStorage,
+    SQLiteStorage,
+    register_database,
+    storage_from_env,
+    storage_from_url,
+)
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
     "AsyncCrawler",
     "BreakerCall",
+    "CSVStorage",
     "CertificateError",
     "CircuitBreaker",
     "CircuitOpenError",
     "CircuitState",
     "CircuitStats",
+    "CompositeStorage",
     "CrawlStats",
     "CrawlerClosedError",
     "CrawlerQueue",
+    "DataStorage",
+    "DatabaseDriver",
+    "DatabaseStorage",
     "DomainRate",
     "ErrorStats",
     "FetchError",
@@ -51,11 +79,14 @@ __all__ = [
     "HTMLParser",
     "HTTPStatusError",
     "InvalidURLError",
+    "JSONStorage",
     "NetworkError",
+    "PageRecord",
     "ParseError",
     "ParsedPage",
     "PermanentError",
     "PermanentHTTPError",
+    "PostgresStorage",
     "RateLimiter",
     "RateStats",
     "RetryRule",
@@ -64,7 +95,9 @@ __all__ = [
     "RobotsParser",
     "RobotsRules",
     "RobotsUnreachableError",
+    "SQLiteStorage",
     "SemaphoreManager",
+    "StorageError",
     "TooManyRedirectsError",
     "TransientError",
     "TransientHTTPError",
@@ -75,4 +108,7 @@ __all__ = [
     "is_same_host",
     "is_valid_http_url",
     "product_token",
+    "register_database",
+    "storage_from_env",
+    "storage_from_url",
 ]

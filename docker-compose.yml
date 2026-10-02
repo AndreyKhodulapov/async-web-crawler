@@ -1,0 +1,22 @@
+# PostgreSQL for the crawler and its tests:
+#   docker compose up -d --wait
+#   export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: crawler
+      POSTGRES_PASSWORD: crawler
+      POSTGRES_DB: crawler
+    ports:
+      - "${CRAWLER_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crawler -d crawler"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  postgres-data:

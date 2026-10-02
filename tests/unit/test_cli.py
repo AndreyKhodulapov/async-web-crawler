@@ -5,13 +5,19 @@ from pathlib import Path
 import pytest
 from helpers import FakeClock
 
-from crawler import CircuitBreaker, FetchTimeoutError
-from main import make_crawler, parse_args, print_error_report
+from crawler import CircuitBreaker, CSVStorage, FetchTimeoutError, JSONStorage, PostgresStorage, SQLiteStorage
+from main import format_size, hide_password, make_crawler, open_storages, parse_args, print_error_report
 
 
 @pytest.mark.parametrize(
     ("command", "retries", "log_level"),
-    [("benchmark", 0, "INFO"), ("parse", 2, "INFO"), ("crawl", 2, "WARNING"), ("errors", 3, "INFO")],
+    [
+        ("benchmark", 0, "INFO"),
+        ("parse", 2, "INFO"),
+        ("crawl", 2, "WARNING"),
+        ("errors", 3, "INFO"),
+        ("save", 3, "INFO"),
+    ],
 )
 def test_defaults_differ_by_command(command, retries, log_level):
     args = parse_args([command])
@@ -130,3 +136,112 @@ def test_error_report_tells_open_and_half_open_circuits_apart(capsys):
     print_error_report(crawler)
     output = capsys.readouterr().out
     assert "=== Circuit breaker (3 hosts: 1 open, 1 half-open) ===" in output
+
+
+def test_save_defaults(monkeypatch):
+    monkeypatch.delenv("CRAWLER_DATABASE_URL", raising=False)
+
+    args = parse_args(["save"])
+
+    assert (args.json, args.csv, args.database_url) == (Path("pages.jsonl"), Path("pages.csv"), "sqlite:///crawler.db")
+    assert (args.indent, args.csv_encoding, args.batch_size, args.append, args.preview) == (None, "utf-8", 10, False, 3)
+    # The site is local, as in `errors`.
+    assert (args.retry_delay, args.read_timeout, args.rps, args.no_robots) == (0.2, 1.0, 0.0, True)
+
+
+def test_save_takes_the_database_from_the_environment(monkeypatch):
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", "postgresql://crawler:secret@db.example/pages")
+    assert parse_args(["save"]).database_url == "postgresql://crawler:secret@db.example/pages"
+    # The option wins over the variable.
+    assert parse_args(["save", "--database-url", "sqlite:///other.db"]).database_url == "sqlite:///other.db"
+
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", "")
+    assert parse_args(["save"]).database_url == "sqlite:///crawler.db"
+
+
+@pytest.mark.parametrize("url", ["mysql://localhost/crawler", "crawler.db", "sqlite://crawler.db"])
+def test_save_rejects_a_database_url_it_cannot_use(url, monkeypatch, capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["save", "--database-url", url])
+    assert "argument --database-url: " in capsys.readouterr().err
+
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", url)
+    with pytest.raises(SystemExit):
+        parse_args(["save"])
+    # The variable is read by `save` alone.
+    assert parse_args(["crawl"]).command == "crawl"
+
+
+def test_save_help_does_not_show_the_database_password(monkeypatch, capsys):
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", "postgresql://crawler:secret@db.example/pages")
+    with pytest.raises(SystemExit):
+        parse_args(["save", "--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "(default: $CRAWLER_DATABASE_URL, or sqlite:///crawler.db)" in help_text
+    assert "secret" not in help_text
+
+
+@pytest.mark.parametrize(
+    "options", [["--csv-encoding", "no-such-encoding"], ["--batch-size", "0"], ["--indent", "-1"], ["--preview", "0"]]
+)
+def test_save_rejects_bad_storage_options(options):
+    with pytest.raises(SystemExit):
+        parse_args(["save", *options])
+
+
+def test_save_rejects_one_file_for_json_and_csv(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["save", "--json", str(tmp_path / "pages"), "--csv", str(tmp_path / "pages")])
+
+    assert "--json and --csv must be different files" in capsys.readouterr().err
+
+
+def test_save_options_configure_the_storages(tmp_path):
+    database = tmp_path / "pages.db"
+    options = ["--json", str(tmp_path / "p.json"), "--indent", "2", "--csv", str(tmp_path / "p.csv")]
+    options += ["--csv-encoding", "cp1252", "--database-url", f"sqlite:///{database}", "--batch-size", "5"]
+
+    storages = open_storages(parse_args(["save", *options]))
+
+    assert list(storages) == [str(tmp_path / "p.json"), str(tmp_path / "p.csv"), f"sqlite:///{database}"]
+    json_storage, csv_storage, database_storage = storages.values()
+    assert type(json_storage) is JSONStorage
+    assert (json_storage.path, json_storage.indent) == (tmp_path / "p.json", 2)
+    assert type(csv_storage) is CSVStorage
+    assert (csv_storage.path, csv_storage.encoding) == (tmp_path / "p.csv", "cp1252")
+    assert type(database_storage) is SQLiteStorage
+    assert database_storage.path == database
+    assert {storage.batch_size for storage in storages.values()} == {5}
+    # Nothing is opened until the first page is saved.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_shows_the_database_without_its_password():
+    args = parse_args(["save", "--database-url", "postgresql://crawler:secret@db.example:5433/pages"])
+
+    location, storage = list(open_storages(args).items())[2]
+
+    assert location == "postgresql://crawler:***@db.example:5433/pages"
+    assert type(storage) is PostgresStorage
+
+
+@pytest.mark.parametrize(
+    ("url", "shown"),
+    [
+        ("postgresql://crawler:secret@host/db", "postgresql://crawler:***@host/db"),
+        ("postgresql://crawler@host/db", "postgresql://crawler@host/db"),
+        ("sqlite:///crawler.db", "sqlite:///crawler.db"),
+        ("postgresql://host/db?user=crawler&password=secret", "postgresql://host/db?user=crawler&password=***"),
+        ("postgresql://host/db?password=secret&sslmode=require", "postgresql://host/db?password=***&sslmode=require"),
+    ],
+)
+def test_hide_password(url, shown):
+    assert hide_password(url) == shown
+
+
+@pytest.mark.parametrize(
+    ("size", "shown"),
+    [(0, "0 B"), (1023, "1023 B"), (1536, "1.5 KB"), (5 * 1024**2, "5.0 MB"), (3 * 1024**3, "3072.0 MB")],
+)
+def test_format_size(size, shown):
+    assert format_size(size) == shown

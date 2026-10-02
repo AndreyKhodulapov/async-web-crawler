@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal, TypedDict
 
 from crawler.exceptions import FetchError, HTTPStatusError
@@ -56,6 +57,12 @@ class CrawlStats:
     over the last few seconds, `avg_delay` the average gap between two
     requests to the same host, `avg_wait` the average time a request waited
     for the rate limit.
+
+    `saved` counts the pages written to the storage of the crawler, and
+    `save_failed` those that could not be written. A page still in the
+    buffer of the storage is in neither while the crawl runs; once the
+    crawl has finished, it counts as not saved until it is written. Both
+    are 0 without a storage.
     """
 
     processed: int = 0
@@ -72,6 +79,8 @@ class CrawlStats:
     current_rps: float = 0.0
     avg_delay: float = 0.0
     avg_wait: float = 0.0
+    saved: int = 0
+    save_failed: int = 0
 
     @property
     def pages_per_second(self) -> float:
@@ -202,3 +211,22 @@ class ParsedPage(TypedDict):
     tables: list[Table]
     lists: list[ItemList]
     errors: list[str]
+
+
+class PageRecord(TypedDict):
+    """A crawled page as the storages keep it.
+
+    `url` is the requested URL. `title` and `content_type` are empty strings
+    when the page has no title or the server sent no Content-Type header.
+    `crawled_at` is an aware datetime. `metadata` must be serializable to
+    JSON.
+    """
+
+    url: str
+    title: str
+    text: str
+    links: list[str]
+    metadata: dict[str, object]
+    crawled_at: datetime
+    status_code: int
+    content_type: str

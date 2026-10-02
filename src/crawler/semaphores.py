@@ -3,7 +3,7 @@
 import asyncio
 import contextlib
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 from crawler.urls import get_host
 
@@ -41,7 +41,7 @@ class SemaphoreManager:
         return self._active.total()
 
     @contextlib.asynccontextmanager
-    async def slot(self, url: str) -> AsyncIterator[None]:
+    async def slot(self, url: str) -> AsyncGenerator[None, None]:
         # An invalid URL still takes a global slot; it fails right after.
         domain = get_host(url) or ""
         self._users[domain] += 1
