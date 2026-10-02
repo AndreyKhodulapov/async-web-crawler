@@ -48,6 +48,17 @@ class DataStorage(ABC):
         # Keeps the batches in order and a record out of two writes at once.
         self._lock = asyncio.Lock()
         self._closed = False
+        self._written = 0
+
+    @property
+    def pending(self) -> int:
+        """The number of records saved but not written out yet."""
+        return len(self._buffer)
+
+    @property
+    def written(self) -> int:
+        """The number of records written out since the storage was created."""
+        return self._written
 
     async def __aenter__(self) -> Self:
         return self
@@ -121,6 +132,7 @@ class DataStorage(ABC):
         except self.WRITE_ERRORS as error:
             raise StorageError(f"failed to write {len(batch)} records: {error}") from error
         self._buffer = []
+        self._written += len(batch)
         logger.debug("Wrote %d records to %s", len(batch), type(self).__name__)
 
     @abstractmethod

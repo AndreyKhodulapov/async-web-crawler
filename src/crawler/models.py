@@ -57,6 +57,12 @@ class CrawlStats:
     over the last few seconds, `avg_delay` the average gap between two
     requests to the same host, `avg_wait` the average time a request waited
     for the rate limit.
+
+    `saved` counts the pages written to the storage of the crawler, and
+    `save_failed` those that could not be written. A page still in the
+    buffer of the storage is in neither while the crawl runs; once the
+    crawl has finished, it counts as not saved until it is written. Both
+    are 0 without a storage.
     """
 
     processed: int = 0
@@ -73,6 +79,8 @@ class CrawlStats:
     current_rps: float = 0.0
     avg_delay: float = 0.0
     avg_wait: float = 0.0
+    saved: int = 0
+    save_failed: int = 0
 
     @property
     def pages_per_second(self) -> float:
