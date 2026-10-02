@@ -152,6 +152,46 @@ async def test_interrupted_crawl_saves_and_reports_the_pages_it_fetched(url, sit
     assert f"Reports: {stats_file}\n" in summary
 
 
+async def test_summary_lists_only_the_reports_that_were_written(url, config_file, tmp_path, capsys):
+    (tmp_path / "taken").write_text("a file, not a directory")
+    stats_file = tmp_path / "stats.json"
+    argv = [
+        "--config", config_file(logging={"level": "CRITICAL"}),
+        "--max-depth", "0",
+        "--stats-json", str(stats_file),
+        "--report", str(tmp_path / "taken" / "report.html"),
+    ]  # fmt: skip
+
+    await run(build_config(parse_args(argv)), progress=False)
+
+    assert f"Reports: {stats_file}\n" in capsys.readouterr().out
+
+
+async def test_crawl_is_stopped_when_the_progress_cannot_be_shown(url, site, config_file, tmp_path, monkeypatch):
+    async def broken_pipe(crawler, crawl_task, max_pages):
+        while crawler.crawl_stats().processed < 1:  # /ok is fetched, /delay/30 is in flight
+            await asyncio.sleep(0.05)
+        raise BrokenPipeError("Broken pipe")
+
+    monkeypatch.setattr(main, "show_progress", broken_pipe)
+    pages, stats_file = tmp_path / "pages.jsonl", tmp_path / "stats.json"
+    argv = [
+        "--config", config_file(urls=[url("/ok"), url("/delay/30")], storage={"batch_size": 100}),
+        "--max-depth", "0",
+        "--output", str(pages),
+        "--stats-json", str(stats_file),
+    ]  # fmt: skip
+
+    async with asyncio.timeout(10):
+        with pytest.raises(BrokenPipeError):
+            await run(build_config(parse_args(argv)))
+
+    assert saved_urls(pages) == {url("/ok")}
+    stats = json.loads(stats_file.read_text(encoding="utf-8"))
+    # The page in flight was dropped with the crawl, not failed by a crawler closed under it.
+    assert (stats["total_pages"], stats["successful"], stats["errors"]) == (1, 1, {})
+
+
 async def test_command_runs_as_a_script(url, config_file, tmp_path):
     script = Path(main.__file__)
     process = await asyncio.create_subprocess_exec(

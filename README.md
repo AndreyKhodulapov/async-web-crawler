@@ -147,7 +147,8 @@ URL is shown as `***`.
 | 130 | interrupted with Ctrl-C |
 
 A crawl interrupted with Ctrl-C stops its requests, saves the pages fetched
-by then, writes the reports of them and prints the summary.
+by then, writes the reports of them and prints the summary. The summary names
+the reports that were written: one that could not be is an error in the log.
 
 ## Usage from Python
 

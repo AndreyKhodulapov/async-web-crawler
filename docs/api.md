@@ -422,6 +422,7 @@ asyncio.run(main())
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
 | `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats` |
+| `reports` | the report files the latest `write_reports()` wrote |
 
 Directories of the log, the reports and the files of the storage are created
 if they are missing. A configuration with neither `urls` nor `sitemaps.urls`

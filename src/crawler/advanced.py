@@ -35,7 +35,8 @@ class AdvancedCrawler:
     retries, the circuit breaker), where to save the pages, where to write
     the log and the reports. The parts are there to be used directly:
     `crawler` is the `AsyncCrawler` that does the work, `storage` its
-    storage (None without outputs), `stats` its `CrawlerStats`.
+    storage (None without outputs), `stats` its `CrawlerStats`. `reports`
+    are the report files the latest crawl wrote.
 
     Directories of the log, the reports and the files of the storage are
     created if they are missing. Logging is set up when the crawler is
@@ -83,6 +84,7 @@ class AdvancedCrawler:
         )
         self.crawler.sitemaps.max_urls = config.sitemaps.max_urls
         self.crawler.stats.top_domains = config.report.top_domains
+        self.reports: list[Path] = []
         self._closed = False
 
         for path in _storage_files(self.storage):
@@ -163,7 +165,7 @@ class AdvancedCrawler:
 
         `crawl()` does it when the crawl ends; call it yourself after a
         crawl that was cancelled. A report that cannot be written is logged
-        and left out.
+        and left out. The files written are kept in `reports` as well.
         """
         written = []
         for path, export in (
@@ -179,6 +181,7 @@ class AdvancedCrawler:
             else:
                 logger.info("Report written to %s", path)
                 written.append(Path(path))
+        self.reports = written
         return written
 
     def get_stats(self) -> dict[str, Any]:

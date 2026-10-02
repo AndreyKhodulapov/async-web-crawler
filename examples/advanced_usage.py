@@ -24,9 +24,9 @@ PREVIEW = 5  # pages listed at the end
 
 async def main(config_path: str | Path = CONFIG, report: str | Path = REPORT) -> None:
     crawler = AdvancedCrawler.from_config(config_path)
+    # crawl() alone is enough; run as a task, it can be watched while it works.
+    crawl = asyncio.create_task(crawler.crawl())
     try:
-        # crawl() alone is enough; run as a task, it can be watched while it works.
-        crawl = asyncio.create_task(crawler.crawl())
         await show_progress(crawler.crawler, crawl, crawler.config.crawler.max_pages)
         pages = await crawl
 
@@ -45,6 +45,9 @@ async def main(config_path: str | Path = CONFIG, report: str | Path = REPORT) ->
         if crawler.config.storage.outputs:
             print(f"Pages: {', '.join(crawler.config.storage.outputs)}")
     finally:
+        # Interrupted (Ctrl-C), the crawl is still running: stop it first.
+        crawl.cancel()
+        await asyncio.gather(crawl, return_exceptions=True)
         await crawler.close()  # writes what the storage still holds, closes the log file
 
 

@@ -17,8 +17,6 @@ a file could not be opened, 2 - wrong options or configuration,
 import argparse
 import asyncio
 import sys
-from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
 from cli_options import hide_password, http_url, positive
@@ -113,7 +111,7 @@ def build_config(args: argparse.Namespace) -> CrawlerConfig:
     return config
 
 
-def print_summary(crawler: AdvancedCrawler, reports: Sequence[str | Path], *, interrupted: bool = False) -> None:
+def print_summary(crawler: AdvancedCrawler, *, interrupted: bool = False) -> None:
     stats = crawler.get_stats()
     state = "interrupted" if interrupted else "finished"
     print(f"\n=== Crawl {state} ({stats['elapsed_seconds']:.2f}s) ===")
@@ -134,8 +132,8 @@ def print_summary(crawler: AdvancedCrawler, reports: Sequence[str | Path], *, in
         saving = crawler.crawler.crawl_stats()
         not_saved = f", {saving.save_failed} not saved" if saving.save_failed else ""
         print(f"Saved: {saving.saved} pages to {', '.join(map(hide_password, outputs))}{not_saved}")
-    if reports:
-        print(f"Reports: {', '.join(map(str, reports))}")
+    if crawler.reports:
+        print(f"Reports: {', '.join(map(str, crawler.reports))}")
     if crawler.config.logging.file is not None:
         print(f"Log: {crawler.config.logging.file}")
 
@@ -145,6 +143,8 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
 
     Cancelled (Ctrl-C), it stops the crawl, writes the reports of the pages
     fetched so far and saves those pages before the cancellation goes on.
+    So it does when the progress cannot be shown, e.g. stderr is a pipe
+    that was closed.
 
     Raises:
         OSError: a directory cannot be created, or the log file cannot be opened.
@@ -155,15 +155,16 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
             if progress:
                 await show_progress(crawler.crawler, crawl, config.crawler.max_pages)
             await crawl
-        except asyncio.CancelledError:
+        except BaseException as error:
+            # The crawl must stop before the crawler is closed under it.
             crawl.cancel()
             await asyncio.gather(crawl, return_exceptions=True)
-            reports = crawler.write_reports()
-            await crawler.close()  # writes the pages the storage still holds, so the summary counts them
-            print_summary(crawler, reports, interrupted=True)
+            crawler.write_reports()
+            if isinstance(error, asyncio.CancelledError):
+                await crawler.close()  # writes the pages the storage still holds, so the summary counts them
+                print_summary(crawler, interrupted=True)
             raise
-        reports = [path for path in (config.report.stats_json, config.report.html) if path is not None]
-        print_summary(crawler, reports)
+        print_summary(crawler)
         return EXIT_OK if crawler.get_stats()["successful"] else EXIT_FAILED
 
 
