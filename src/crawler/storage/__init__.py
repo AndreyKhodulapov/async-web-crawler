@@ -4,6 +4,7 @@ from crawler.storage.base import DataStorage
 from crawler.storage.csv_file import CSVStorage
 from crawler.storage.database import DatabaseDriver, DatabaseStorage
 from crawler.storage.json_file import JSONStorage
+from crawler.storage.postgres import PostgresDriver, PostgresStorage
 from crawler.storage.sqlite import SQLiteDriver, SQLiteStorage
 
 __all__ = [
@@ -12,6 +13,8 @@ __all__ = [
     "DatabaseDriver",
     "DatabaseStorage",
     "JSONStorage",
+    "PostgresDriver",
+    "PostgresStorage",
     "SQLiteDriver",
     "SQLiteStorage",
 ]

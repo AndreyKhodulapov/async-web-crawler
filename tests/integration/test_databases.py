@@ -2,25 +2,44 @@
 
 import asyncio
 import contextlib
+import os
 import sqlite3
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime, timedelta, timezone
 
+import asyncpg
 import pytest
 from helpers import make_record
 
-from crawler import DatabaseStorage, RetryStrategy, SQLiteStorage, StorageError
+from crawler import DatabaseStorage, PostgresStorage, RetryStrategy, SQLiteStorage, StorageError
 
 StorageFactory = Callable[..., DatabaseStorage]
 
 
-@pytest.fixture
-async def open_storage(tmp_path) -> AsyncGenerator[StorageFactory, None]:
+# The server of docker-compose.yml, unless another one is given.
+POSTGRES_DSN = os.environ.get("CRAWLER_TEST_DATABASE_URL", "postgresql://crawler:crawler@localhost:5432/crawler")
+
+
+async def run_in_postgres(query: str) -> list[asyncpg.Record]:
+    connection = await asyncpg.connect(POSTGRES_DSN)
+    try:
+        return await connection.fetch(query)
+    finally:
+        await connection.close()
+
+
+@pytest.fixture(params=["sqlite", pytest.param("postgres", marks=pytest.mark.postgres)])
+async def open_storage(request, tmp_path) -> AsyncGenerator[StorageFactory, None]:
     """Opens storages on one empty database; closes them after the test."""
     opened = []
+    if request.param == "postgres":
+        await run_in_postgres("DROP TABLE IF EXISTS pages")
 
     def open_storage(**options) -> DatabaseStorage:
-        storage = SQLiteStorage(tmp_path / "crawler.db", **options)
+        if request.param == "postgres":
+            storage = PostgresStorage(POSTGRES_DSN, **options)
+        else:
+            storage = SQLiteStorage(tmp_path / "crawler.db", **options)
         opened.append(storage)
         return storage
 
@@ -237,3 +256,48 @@ class TestSQLite:
 
         with pytest.raises(StorageError, match="unable to open database file"):
             await storage.save(make_record())
+
+
+class TestPostgres:
+    @pytest.mark.postgres
+    async def test_table_has_its_indexes_and_native_types(self):
+        await run_in_postgres("DROP TABLE IF EXISTS pages")
+        async with PostgresStorage(POSTGRES_DSN) as storage:
+            await storage.init_db()
+
+        indexes = await run_in_postgres("SELECT indexname FROM pg_indexes WHERE tablename = 'pages'")
+        columns = await run_in_postgres(
+            "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'pages'"
+        )
+
+        assert {"idx_pages_crawled_at", "idx_pages_status_code", "pages_url_key"} <= {name for (name,) in indexes}
+        types = dict(columns)
+        assert (types["links"], types["metadata"]) == ("jsonb", "jsonb")
+        assert types["crawled_at"] == "timestamp with time zone"
+
+    @pytest.mark.postgres
+    async def test_json_is_queryable_in_the_database(self):
+        await run_in_postgres("DROP TABLE IF EXISTS pages")
+        async with PostgresStorage(POSTGRES_DSN) as storage:
+            await storage.save(make_record(metadata={"language": "fr", "depth": 2}))
+
+        rows = await run_in_postgres("SELECT url FROM pages WHERE metadata ->> 'language' = 'fr'")
+
+        assert [url for (url,) in rows] == ["https://site/page"]
+
+    async def test_server_that_cannot_be_reached_is_a_storage_error(self, closed_port_url):
+        port = closed_port_url.rstrip("/").rpartition(":")[2]
+        waits = []
+
+        async def no_wait(error: Exception, delay: float) -> None:
+            waits.append(type(error))
+
+        retries = RetryStrategy(max_retries=2, retry_on=PostgresStorage.WRITE_ERRORS, wait=no_wait)
+        storage = PostgresStorage(f"postgresql://crawler:crawler@127.0.0.1:{port}/crawler", retry_strategy=retries)
+        await storage.save(make_record())
+
+        with pytest.raises(StorageError, match="failed to write 1 records"):
+            await storage.flush()
+
+        assert len(waits) == 2
+        assert all(issubclass(error, OSError) for error in waits)
