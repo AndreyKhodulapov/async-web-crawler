@@ -46,6 +46,13 @@ def test_options_are_shaped_like_the_configuration():
     }
 
 
+def test_pages_are_not_kept_in_memory_whatever_the_file_says(tmp_path):
+    path = write_config(tmp_path, {"urls": ["https://example.com/"], "crawler": {"keep_pages": True}})
+
+    assert build_config(parse_args(["--config", path])).crawler.keep_pages is False
+    assert build_config(parse_args(["--urls", "https://example.com/"])).crawler.keep_pages is False
+
+
 def test_rate_limit_of_zero_lifts_the_limit():
     args = parse_args(["--urls", "https://example.com/", "--rate-limit", "0"])
 

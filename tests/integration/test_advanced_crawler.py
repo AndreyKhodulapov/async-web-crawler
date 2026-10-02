@@ -102,7 +102,7 @@ async def test_overrides_win_over_the_file(url, tmp_path):
 
 async def test_configuration_reaches_every_part(tmp_path):
     config = make_config(
-        crawler={"max_concurrent": 3, "max_depth": 4, "user_agent": BOT},
+        crawler={"max_concurrent": 3, "max_depth": 4, "user_agent": BOT, "keep_pages": False},
         sitemaps={"max_urls": 7},
         retry={"max_retries": 5},
         circuit_breaker={"failure_threshold": 0.9},
@@ -112,7 +112,7 @@ async def test_configuration_reaches_every_part(tmp_path):
     )
     async with AdvancedCrawler(config) as advanced:
         crawler = advanced.crawler
-        assert (crawler.max_concurrent, crawler.max_depth) == (3, 4)
+        assert (crawler.max_concurrent, crawler.max_depth, crawler.keep_pages) == (3, 4, False)
         assert crawler.sitemaps.max_urls == 7
         assert crawler.retry_strategy.max_retries == 5
         assert crawler.circuit_breaker.enabled

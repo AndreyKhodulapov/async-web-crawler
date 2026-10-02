@@ -79,6 +79,10 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
   reported in `errors`, and the other fields are still returned
 - Content that a browser with JavaScript does not render (`<script>`, `<style>`,
   `<noscript>`, `<template>`) is left out of every field, including links and images
+- Memory that does not grow with the crawl: with `keep_pages=False` a page
+  is dropped once it is saved, and a parsed tree is freed as soon as its
+  page is extracted; measured against a synchronous crawler on 100, 500
+  and 1000 pages ([docs/performance.md](docs/performance.md))
 - Crawled pages saved as the crawl goes, behind one interface (`DataStorage`):
   JSON Lines or an indented JSON array (`JSONStorage`), CSV in any encoding
   (`CSVStorage`), SQLite (`SQLiteStorage`) and PostgreSQL (`PostgresStorage`),
@@ -134,7 +138,8 @@ the default without a file.
 | `--no-progress` | | do not show the progress line |
 
 Everything else (sitemaps, filters, retries, the circuit breaker, timeouts)
-is set in the file. The log and the [progress line](#live-progress) go to
+is set in the file. The command line never keeps the pages in memory
+(`crawler.keep_pages` is off whatever the file says): they go to `--output`. The log and the [progress line](#live-progress) go to
 stderr, the summary to stdout:
 
 ```
@@ -167,10 +172,12 @@ by then, writes the reports of them and prints the summary.
 
 The demo commands show the parts of the crawler one by one.
 
-The demo has five commands: `crawl` follows links from start pages, `errors`
+The demo has six commands: `crawl` follows links from start pages, `errors`
 crawls a local site that fails on purpose, `save` writes crawled pages to
 JSON, CSV and a database, `parse` extracts data from pages,
-and `benchmark` compares sequential and concurrent fetching. All of them accept `--concurrency`, `--log-level`, the timeouts
+`benchmark` compares sequential and concurrent fetching, and `scale`
+measures the crawler against a synchronous one on sites of growing size.
+All but `scale` accept `--concurrency`, `--log-level`, the timeouts
 (`--connect-timeout` and `--read-timeout`, 5 s by default, `--total-timeout`,
 10 s, and `--timeout-growth`, 1.5, see [Timeouts](#timeouts)) and the
 politeness options:
@@ -532,6 +539,33 @@ wait for its turn among the httpbin.org requests. `--rps 0` shows the speedup
 without the rate limit. `SIZE` is the body size after
 content decoding (gzip, deflate), so it can exceed the bytes transferred.
 
+### scale
+
+```bash
+python src/demo_main.py scale                    # sites of 100, 500 and 1000 pages
+python src/demo_main.py scale 200 2000 --delay 0.1 --concurrency 50
+python src/demo_main.py scale --no-memory --json scale.json
+```
+
+Compares the crawler with a synchronous one that fetches a page at a time
+(`SyncCrawler` in `src/demo_scale.py`: `urllib` and the same parser). Both
+crawl a local site whose every response takes `--delay` seconds, as a
+remote server's would. The time is measured first, then the peak memory in
+runs of their own (allocation tracing slows a crawl down); the last column
+is the crawler with `keep_pages=False`. The default run takes about three
+minutes, most of it the synchronous crawler.
+
+```
+=== Scale: one request at a time vs 20 at once (the site answers in 50 ms) ===
+PAGES  SYNC TIME  SYNC PAGES/S  ASYNC TIME  ASYNC PAGES/S  SPEEDUP  SYNC MEMORY  ASYNC MEMORY  PAGES NOT KEPT
+  100      5.65s          17.7       0.60s          166.7     9.4x       1.4 MB        2.4 MB          2.2 MB
+  500     27.99s          17.9       2.48s          201.3    11.3x       4.6 MB        5.9 MB          2.3 MB
+ 1000     55.93s          17.9       5.03s          198.7    11.1x       8.5 MB       10.1 MB          2.7 MB
+```
+
+What the numbers mean, the bottlenecks they showed and what was done about
+them is in [docs/performance.md](docs/performance.md).
+
 ## Usage
 
 ```python
@@ -814,11 +848,18 @@ into the crawl. `same_domain_only` keeps the hosts of `sitemap_urls` as well
 as those of the start URLs. A sitemap that cannot be downloaded or read is
 logged and listed in `failed_sitemaps`, and the crawl goes on.
 
+`crawl()` returns every parsed page, so it holds them all in memory until
+it ends. A large crawl that saves its pages to a storage does not need
+that: `AsyncCrawler(storage=..., keep_pages=False)` lets a page go once it
+is saved and its links are queued. `crawl()` then returns an empty dict,
+the pages are in the storage and the counts in `stats` and `crawl_stats()`;
+memory stays nearly flat (see [docs/performance.md](docs/performance.md)).
+
 After a crawl, and during one, the crawler exposes its state:
 
 | Attribute | Content |
 |-----------|---------|
-| `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()` |
+| `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()`; empty with `keep_pages=False` |
 | `failed_urls` | `{url: "ErrorType: message"}` |
 | `skipped_urls` | `{url: reason}` for pages fetched but left out, e.g. redirected out of scope |
 | `blocked_urls` | `{url: reason}` for pages robots.txt did not allow to fetch |
@@ -1234,7 +1275,7 @@ keep only links to the page's own host.
 ```bash
 pytest                      # unit + integration, no internet needed
 pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, storages, client with a fake session
-pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker, saving, AdvancedCrawler and the command line against a local aiohttp server
+pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker, saving, AdvancedCrawler, the command line and the scale demo against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
 pytest -m postgres          # the database tests and the save demo against PostgreSQL
 ```
@@ -1256,9 +1297,10 @@ ruff check src tests        # lint
 src/
 ├── main.py                 # command line of the crawler: a configuration file and options over it
 ├── cli_options.py          # checks of command-line values shared by main.py and demo_main.py
-├── demo_main.py            # demo CLI: `crawl`, `errors`, `save`, `parse` and `benchmark` commands
+├── demo_main.py            # demo CLI: `crawl`, `errors`, `save`, `parse`, `benchmark` and `scale` commands
 ├── demo_urls.yaml          # URLs the demo commands use when none are given
 ├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors` and `save`
+├── demo_scale.py           # ScaleSite, SyncCrawler and the measurements of the `scale` command
 └── crawler/
     ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
     ├── client.py           # AsyncCrawler: fetching, parsing, crawl()
@@ -1303,5 +1345,6 @@ docs/
 ├── data_storage.md         # notes on saving data: files, databases, batching, failed writes
 ├── error_handling.md       # notes on error kinds, retries, timeouts and circuit breakers
 ├── html_parsing.md         # notes on HTML parsing and URL handling
+├── performance.md          # sync vs async measurements, memory, bottlenecks found and fixed
 └── politeness.md           # notes on rate limiting, robots.txt and backoff
 ```

@@ -29,6 +29,7 @@ crawler:
   connect_timeout: 10.0
   read_timeout: 20.0
   timeout_growth: 1.5   # the timeouts grow by this factor on every retry
+  keep_pages: true      # false: a page is dropped from memory once it is saved, for large crawls
 
 # Repeated attempts of a request that failed for a while.
 retry:

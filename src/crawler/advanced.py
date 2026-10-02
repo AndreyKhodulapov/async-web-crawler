@@ -79,6 +79,7 @@ class AdvancedCrawler:
             user_agent=options.user_agent,
             user_agents=options.user_agents,
             storage=self.storage,
+            keep_pages=options.keep_pages,
         )
         self.crawler.sitemaps.max_urls = config.sitemaps.max_urls
         self.crawler.stats.top_domains = config.report.top_domains
@@ -128,6 +129,9 @@ class AdvancedCrawler:
 
     async def crawl(self) -> dict[str, ParsedPage]:
         """Crawl what the configuration says; return the pages by normalized URL.
+
+        With `crawler.keep_pages: false` the pages are not kept in memory and
+        the result is empty.
 
         The pages are saved to the storage as they are crawled. Afterwards
         the statistics are written to the files of the `report` section,

@@ -248,3 +248,28 @@ class TestSaveErrors:
 
         assert seen == [(0, 0), (2, 0), (2, 0), (4, 0), (4, 0)]
         assert crawler.crawl_stats().saved == 5
+
+
+class TestPagesNotKept:
+    async def test_pages_go_to_the_storage_and_not_to_memory(self, url):
+        storage = MemoryStorage()
+
+        async with AsyncCrawler(max_concurrent=5, storage=storage, keep_pages=False, **UNTHROTTLED) as crawler:
+            pages = await crawler.crawl([url("/site/")], same_domain_only=True)
+
+        kept = await crawl(MemoryStorage(), url("/site/"))
+        assert pages == {} and crawler.processed_urls == {}
+        # The links of the pages were followed all the same, and every page was saved and counted.
+        assert set(saved_records(storage)) == set(kept.processed_urls)
+        assert crawler.visited_urls == kept.visited_urls
+        assert crawler.failed_urls.keys() == kept.failed_urls.keys()
+        stats = crawler.crawl_stats()
+        assert (stats.processed, stats.saved, stats.save_failed) == (5, 5, 0)
+        assert crawler.stats.get_stats()["successful"] == 5
+
+    async def test_pages_are_kept_by_default(self, url):
+        async with AsyncCrawler(**UNTHROTTLED) as crawler:
+            pages = await crawler.crawl([url("/site/")], same_domain_only=True)
+
+        assert crawler.keep_pages
+        assert len(pages) == 5 and pages is crawler.processed_urls

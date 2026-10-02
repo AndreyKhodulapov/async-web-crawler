@@ -50,6 +50,7 @@ FULL = {
         "connect_timeout": 5.0,
         "read_timeout": 15.0,
         "timeout_growth": 2.0,
+        "keep_pages": False,
     },
     "retry": {"max_retries": 5, "backoff_factor": 3.0, "base_delay": 0.5, "max_delay": 10.0},
     "circuit_breaker": {"failure_threshold": 0.8, "min_requests": 10, "window": 120.0, "cooldown": 15.0},
@@ -104,7 +105,14 @@ class TestDefaults:
         assert options.rate_limit == crawler["requests_per_second"]
         for name in ("max_depth", "max_concurrent", "max_per_domain", "per_domain_rate", "min_delay", "jitter"):
             assert getattr(options, name) == crawler[name], name
-        for name in ("respect_robots", "total_timeout", "connect_timeout", "read_timeout", "timeout_growth"):
+        for name in (
+            "respect_robots",
+            "total_timeout",
+            "connect_timeout",
+            "read_timeout",
+            "timeout_growth",
+            "keep_pages",
+        ):
             assert getattr(options, name) == crawler[name], name
         retry, breaker = defaults(RetryStrategy.__init__), defaults(CircuitBreaker.__init__)
         assert RetryOptions() == RetryOptions(**{name: retry[name] for name in RetryOptions.__dataclass_fields__})

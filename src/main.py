@@ -103,6 +103,9 @@ def build_config(args: argparse.Namespace) -> CrawlerConfig:
         ConfigError: the file or an option is invalid, or there is nothing to crawl.
     """
     overrides = config_overrides(args)
+    # The pages go to the storage and the counts to the statistics; nothing
+    # here reads them from memory, so a large crawl need not hold them.
+    overrides.setdefault("crawler", {})["keep_pages"] = False
     config = CrawlerConfig.from_dict(overrides) if args.config is None else load_config(args.config, overrides)
     if not config.urls and not config.sitemaps.urls:
         where = "--urls" if args.config is None else "--urls, or `urls` or `sitemaps.urls` in the configuration"

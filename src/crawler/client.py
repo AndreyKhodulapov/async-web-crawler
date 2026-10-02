@@ -129,6 +129,12 @@ class AsyncCrawler:
     counted in `crawl_stats()`; the crawl goes on. Closing the crawler
     closes the storage too.
 
+    `crawl()` keeps every parsed page in `processed_urls` and returns them,
+    so its memory grows with the size of the crawl. `keep_pages=False`
+    lets a page go once it is saved and its links are queued:
+    `processed_urls` stays empty, the pages are in the storage, the counts
+    in `stats` and `crawl_stats()`. That is the setting for a large crawl.
+
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
     the same way as any other per-URL failure. Closing does not interrupt
     requests that are already in flight: they finish on their own or hit
@@ -162,6 +168,7 @@ class AsyncCrawler:
         user_agents: Sequence[str] = (),
         parser: HTMLParser | None = None,
         storage: DataStorage | None = None,
+        keep_pages: bool = True,
     ) -> None:
         if max_depth < 0:
             raise ValueError(f"max_depth must be >= 0, got {max_depth}")
@@ -204,6 +211,7 @@ class AsyncCrawler:
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
         self._parser = parser or HTMLParser()
         self.storage = storage
+        self.keep_pages = keep_pages
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
         # State of the latest crawl() call.
@@ -578,6 +586,8 @@ class AsyncCrawler:
     ) -> dict[str, ParsedPage]:
         """Crawl from the start URLs following links; return pages by normalized URL.
 
+        With `keep_pages=False` the pages are not kept and the result is empty.
+
         Pages are fetched by `max_concurrent` workers, breadth-first: a link
         found on a page at depth d gets depth d + 1 and is followed only up
         to `max_depth`. Every URL is fetched at most once. `max_pages` caps
@@ -856,7 +866,8 @@ class AsyncCrawler:
             for link in page["links"]:
                 if url_filter.allows(link) and queue.add_url(link, priority=depth + 1, depth=depth + 1):
                     queued += 1
-        self.processed_urls[url] = page
+        if self.keep_pages:
+            self.processed_urls[url] = page
         queue.mark_processed(url)
         self.stats.record_page(url, status=result.status, elapsed=result.elapsed)
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)

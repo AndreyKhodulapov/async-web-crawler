@@ -320,3 +320,23 @@ def test_broken_default_urls_file_is_a_usage_error(content, tmp_path, monkeypatc
 
     assert exit_info.value.code == 2
     assert "urls.yaml" in capsys.readouterr().err
+
+
+def test_scale_defaults_and_options():
+    args = parse_args(["scale"])
+    assert (args.pages, args.delay, args.concurrency, args.no_memory, args.log_level) == (
+        [100, 500, 1000],
+        0.05,
+        20,
+        False,
+        "WARNING",
+    )
+
+    args = parse_args(["scale", "10", "20", "--delay", "0", "--concurrency", "5", "--no-memory"])
+    assert (args.pages, args.delay, args.concurrency, args.no_memory) == ([10, 20], 0.0, 5, True)
+
+
+@pytest.mark.parametrize("options", [["0"], ["ten"], ["--delay", "-1"], ["--concurrency", "0"], ["--rps", "1"]])
+def test_scale_rejects_invalid_options(options):
+    with pytest.raises(SystemExit):
+        parse_args(["scale", *options])

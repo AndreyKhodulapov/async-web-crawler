@@ -24,6 +24,8 @@ _HIDDEN_TAGS = frozenset({"script", "style", "noscript", "template"})
 # The document head holds metadata, not page content: its text, links and
 # images are left out too. Metadata extractors look into it on purpose.
 _NON_CONTENT_TAGS = _HIDDEN_TAGS | {"head", "title"}
+_ARTICLE = frozenset({"article"})
+_SVG = frozenset({"svg"})
 
 
 class HTMLParser:
@@ -80,22 +82,32 @@ class HTMLParser:
         if not html.strip():
             raise ParseError(url, "empty document")
         soup = self._make_soup(html, page)
-        if "<" not in html:
-            self._report(page, "no HTML markup found")
+        try:
+            if "<" not in html:
+                self._report(page, "no HTML markup found")
 
-        base_url = self._extract(page, "<base href>", _base_url, soup, page["final_url"], default=page["final_url"])
-        metadata = self._extract(page, "metadata", self.extract_metadata, soup, base_url, default=None)
-        if metadata is not None:
-            page["metadata"] = metadata
-            page["title"] = metadata["title"]
-            if page["title"] is None:
-                logger.warning("No <title> on %s", url)
-        page["text"] = self._extract(page, "text", self.extract_text, soup, default="")
-        page["links"] = self._extract(page, "links", self.extract_links, soup, base_url, page["final_url"], default=[])
-        page["headings"] = self._extract(page, "headings", self.extract_headings, soup, default=[])
-        page["images"] = self._extract(page, "images", self.extract_images, soup, base_url, default=[])
-        page["tables"] = self._extract(page, "tables", self.extract_tables, soup, default=[])
-        page["lists"] = self._extract(page, "lists", self.extract_lists, soup, default=[])
+            base_url = self._extract(page, "<base href>", _base_url, soup, page["final_url"], default=page["final_url"])
+            metadata = self._extract(page, "metadata", self.extract_metadata, soup, base_url, default=None)
+            if metadata is not None:
+                page["metadata"] = metadata
+                page["title"] = metadata["title"]
+                if page["title"] is None:
+                    logger.warning("No <title> on %s", url)
+            page["text"] = self._extract(page, "text", self.extract_text, soup, default="")
+            page["links"] = self._extract(
+                page, "links", self.extract_links, soup, base_url, page["final_url"], default=[]
+            )
+            page["headings"] = self._extract(page, "headings", self.extract_headings, soup, default=[])
+            page["images"] = self._extract(page, "images", self.extract_images, soup, base_url, default=[])
+            page["tables"] = self._extract(page, "tables", self.extract_tables, soup, default=[])
+            page["lists"] = self._extract(page, "lists", self.extract_lists, soup, default=[])
+        finally:
+            # A parsed tree is full of reference cycles (parent and child,
+            # siblings), so only the garbage collector could free it, at a
+            # time of its own choosing: trees of the pages parsed meanwhile
+            # would pile up. Taken apart, it is freed right here. (The
+            # root's own decompose() does not reach its children.)
+            soup.clear(decompose=True)
 
         logger.info(
             "Parsed %s: text=%d chars, links=%d, images=%d, errors=%d, elapsed=%.3fs",
@@ -141,7 +153,7 @@ class HTMLParser:
             soupsieve.SelectorSyntaxError: `selector` is not valid CSS.
         """
         if selector is not None:
-            matches = [tag for tag in soup.select(selector) if tag.find_parent(_HIDDEN_TAGS) is None]
+            matches = [tag for tag in soup.select(selector) if not _inside(tag, _HIDDEN_TAGS)]
             matched = {id(tag) for tag in matches}
             # The text of a nested match is already part of its ancestor's.
             roots = [tag for tag in matches if not any(id(parent) in matched for parent in tag.parents)]
@@ -149,7 +161,7 @@ class HTMLParser:
             # Several top-level <article> elements usually mean a listing
             # page, where the whole body is the content. Nested ones, such as
             # comments inside a post, belong to their article.
-            articles = [tag for tag in _content_tags(soup, "article") if tag.find_parent("article") is None]
+            articles = [tag for tag in _content_tags(soup, "article") if not _inside(tag, _ARTICLE)]
             article = articles[0] if len(articles) == 1 else None
             main = _first_content_tag(soup, "main")
             roots = [main or article or soup.body or soup]
@@ -164,7 +176,7 @@ class HTMLParser:
         # An inline <svg> may have its own <title> (a tooltip); it is not the
         # page title. Documents without <head> put the real one in <body>.
         titles = _content_tags(soup, "title", skip=_HIDDEN_TAGS)
-        title_tag = next((tag for tag in titles if tag.find_parent("svg") is None), None)
+        title_tag = next((tag for tag in titles if not _inside(tag, _SVG)), None)
         title = _clean(title_tag.get_text()) if title_tag is not None else None
         keywords = _meta_content(soup, "name", "keywords") or ""
 
@@ -231,7 +243,7 @@ class HTMLParser:
             for row in table.find_all("tr"):
                 # The table itself is visible, so a hidden ancestor of a row
                 # (a <template> with a row template, a <noscript>) is inside it.
-                if row.find_parent("table") is not table or row.find_parent(_HIDDEN_TAGS) is not None:
+                if row.find_parent("table") is not table or _inside(row, _HIDDEN_TAGS):
                     continue
                 in_thead = row.parent is not None and row.parent.name == "thead"
                 (head_rows if in_thead else rows).append(row)
@@ -352,7 +364,16 @@ def _content_tags(
 
     `filters` are passed on to `find_all`: attribute values or `attrs`.
     """
-    return [tag for tag in soup.find_all(name, **filters) if tag.find_parent(skip) is None]
+    return [tag for tag in soup.find_all(name, **filters) if not _inside(tag, skip)]
+
+
+def _inside(tag: Tag, names: frozenset[str]) -> bool:
+    """Whether an ancestor of `tag` is an element named in `names`.
+
+    A plain walk up the tree: `find_parent` builds a filter on every call,
+    which costs more than the walk itself and adds up over every tag of a page.
+    """
+    return any(parent.name in names for parent in tag.parents)
 
 
 def _first_content_tag(

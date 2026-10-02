@@ -6,6 +6,7 @@ Usage:
     python src/demo_main.py crawl [options] [URL ...]       # follow links from start pages
     python src/demo_main.py errors [options] [URL ...]      # crawl a local site that fails on purpose
     python src/demo_main.py save [options] [URL ...]        # save crawled pages to JSON, CSV and a database
+    python src/demo_main.py scale [options] [PAGES ...]     # synchronous vs asynchronous crawl of 100, 500, 1000 pages
 """
 
 import argparse
@@ -61,6 +62,7 @@ from crawler import (
 from crawler.logging_setup import configure_logging
 from crawler.progress import show_progress
 from crawler.storage import DATABASE_URL_VARIABLE, DEFAULT_DATABASE_URL
+from demo_scale import Comparison, compare
 from demo_site import DemoSite
 
 # The longest pause between retries; a longer --retry-delay would not be doubled.
@@ -320,7 +322,35 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_common_options(save, retries=3, retry_delay=0.2, robots=False)
     save.set_defaults(read_timeout=1.0, rps=0.0, breaker_cooldown=1.0)
 
+    scale = commands.add_parser(
+        "scale",
+        help="crawl local sites of growing size one request at a time and concurrently, compare time and memory",
+    )
+    scale.add_argument(
+        "pages",
+        nargs="*",
+        type=positive(int),
+        default=[100, 500, 1000],
+        help="sizes of the sites (default: 100 500 1000)",
+    )
+    scale.add_argument(
+        "--delay",
+        type=positive(float, allow_zero=True),
+        default=0.05,
+        metavar="S",
+        help="how long the site takes to answer a request, s (default: %(default)g)",
+    )
+    scale.add_argument(
+        "--concurrency", type=positive(int), default=20, help="parallel requests of the asynchronous crawler"
+    )
+    scale.add_argument("--no-memory", action="store_true", help="skip the runs that measure peak memory")
+    scale.add_argument("--json", type=Path, metavar="PATH", help="save the results to a JSON file")
+    # A log line per page would cost time that is not the crawler's.
+    scale.add_argument("--log-level", type=str.upper, choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="WARNING")
+
     args = parser.parse_args(argv)
+    if args.command == "scale":
+        return args
     if not args.urls and args.command in DEFAULT_URL_COMMANDS:
         try:
             args.urls = default_urls(args.command)
@@ -819,6 +849,57 @@ async def run_save(args: argparse.Namespace) -> None:
             await saved.close()
 
 
+def scale_row(result: Comparison) -> str:
+    def memory(size: int | None) -> str:
+        return "-" if size is None else format_size(size)
+
+    sync, concurrent = result.sync, result.concurrent
+    return (
+        f"{result.pages:>5}  {sync.elapsed:>8.2f}s  {sync.pages_per_second:>12.1f}  "
+        f"{concurrent.elapsed:>9.2f}s  {concurrent.pages_per_second:>13.1f}  {result.speedup:>6.1f}x  "
+        f"{memory(sync.peak_memory):>11}  {memory(concurrent.peak_memory):>12}  {memory(result.lean_memory):>14}"
+    )
+
+
+def save_scale_json(path: Path, args: argparse.Namespace, results: list[Comparison]) -> None:
+    report = {
+        "delay": args.delay,
+        "concurrency": args.concurrency,
+        "results": [{**dataclasses.asdict(result), "speedup": round(result.speedup, 2)} for result in results],
+    }
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"\nResults saved to {path}")
+
+
+async def run_scale(args: argparse.Namespace) -> None:
+    print(
+        f"\n=== Scale: one request at a time vs {args.concurrency} at once "
+        f"(the site answers in {args.delay * 1000:g} ms) ==="
+    )
+    print(
+        f"{'PAGES':>5}  {'SYNC TIME':>9}  {'SYNC PAGES/S':>12}  {'ASYNC TIME':>10}  {'ASYNC PAGES/S':>13}  "
+        f"{'SPEEDUP':>7}  {'SYNC MEMORY':>11}  {'ASYNC MEMORY':>12}  {'PAGES NOT KEPT':>14}"
+    )
+    results = []
+    for pages in args.pages:
+        print(f"Crawling a site of {pages} pages with both crawlers...", file=sys.stderr)
+        # In a thread: the synchronous crawler blocks, and the asynchronous
+        # one is given an event loop of its own, as in a program that runs it.
+        result = await asyncio.to_thread(compare, pages, args.delay, args.concurrency, memory=not args.no_memory)
+        results.append(result)
+        print(scale_row(result), flush=True)
+        for name, run in (("synchronous", result.sync), ("asynchronous", result.concurrent)):
+            if run.pages != pages:
+                print(f"  the {name} crawler fetched {run.pages} of {pages} pages, {run.failed} failed")
+    if not args.no_memory:
+        print(
+            "Memory is the peak of what Python allocated during a crawl; "
+            "PAGES NOT KEPT is the asynchronous crawler with keep_pages=False."
+        )
+    if args.json is not None:
+        save_scale_json(args.json, args, results)
+
+
 async def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
@@ -828,6 +909,7 @@ async def main() -> None:
         "crawl": run_crawl,
         "errors": run_errors,
         "save": run_save,
+        "scale": run_scale,
     }
     await commands[args.command](args)
 

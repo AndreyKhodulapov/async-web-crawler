@@ -1,9 +1,10 @@
 """Unit tests for HTMLParser on valid, broken and non-HTML input."""
 
+import gc
 import logging
 
 import pytest
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from pages import fixture_html
 
 import crawler.parser as parser_module
@@ -384,3 +385,23 @@ class TestPartialResults:
         monkeypatch.setattr(parser_module, "BeautifulSoup", always_fails)
         with pytest.raises(ParseError, match="lxml parser failed: ValueError: lxml; html.parser parser failed"):
             parser.parse("<p>body</p>", "https://example.com/")
+
+
+def test_parsed_tree_is_freed_without_the_garbage_collector():
+    def tags() -> int:
+        # The roots are few and small; the tags are the tree.
+        return sum(isinstance(item, Tag) and not isinstance(item, BeautifulSoup) for item in gc.get_objects())
+
+    parser = HTMLParser()
+    html = fixture_html("valid_page.html")
+    gc.collect()
+    gc.disable()
+    try:
+        before = tags()
+        page = parser.parse(html, "https://example.com/catalog/")
+        after = tags()
+    finally:
+        gc.enable()
+
+    assert page["links"] and page["text"]  # parsed in full before the tree was taken apart
+    assert after == before
