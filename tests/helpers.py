@@ -1,6 +1,8 @@
 """Helpers shared by unit and integration tests."""
 
-from crawler import CircuitBreaker, RetryStrategy
+from datetime import UTC, datetime
+
+from crawler import CircuitBreaker, PageRecord, RetryStrategy
 
 BOT = "TestBot/1.0 (+https://example.com/bot)"
 
@@ -23,3 +25,18 @@ class FakeClock:
 
     def __call__(self) -> float:
         return self.now
+
+
+def make_record(url: str = "https://site/page", **fields: object) -> PageRecord:
+    """A page record for storage tests; `fields` replace the defaults."""
+    record: PageRecord = {
+        "url": url,
+        "title": "Page",
+        "text": "Some text",
+        "links": ["https://site/a", "https://site/b"],
+        "metadata": {"description": "A page", "keywords": ["one", "two"], "language": "en", "depth": 1},
+        "crawled_at": datetime(2025, 3, 14, 15, 9, 26, 535897, tzinfo=UTC),
+        "status_code": 200,
+        "content_type": "text/html",
+    }
+    return record | fields

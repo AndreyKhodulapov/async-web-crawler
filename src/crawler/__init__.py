@@ -16,6 +16,7 @@ from crawler.exceptions import (
     PermanentHTTPError,
     RobotsDisallowedError,
     RobotsUnreachableError,
+    StorageError,
     TooManyRedirectsError,
     TransientError,
     TransientHTTPError,
@@ -23,13 +24,23 @@ from crawler.exceptions import (
     error_kind,
 )
 from crawler.filters import UrlFilter
-from crawler.models import CircuitStats, CrawlStats, DomainRate, ErrorStats, FetchResult, ParsedPage, RateStats
+from crawler.models import (
+    CircuitStats,
+    CrawlStats,
+    DomainRate,
+    ErrorStats,
+    FetchResult,
+    PageRecord,
+    ParsedPage,
+    RateStats,
+)
 from crawler.parser import HTMLParser
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.storage import DataStorage
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
@@ -43,6 +54,7 @@ __all__ = [
     "CrawlStats",
     "CrawlerClosedError",
     "CrawlerQueue",
+    "DataStorage",
     "DomainRate",
     "ErrorStats",
     "FetchError",
@@ -52,6 +64,7 @@ __all__ = [
     "HTTPStatusError",
     "InvalidURLError",
     "NetworkError",
+    "PageRecord",
     "ParseError",
     "ParsedPage",
     "PermanentError",
@@ -65,6 +78,7 @@ __all__ = [
     "RobotsRules",
     "RobotsUnreachableError",
     "SemaphoreManager",
+    "StorageError",
     "TooManyRedirectsError",
     "TransientError",
     "TransientHTTPError",

@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Literal, TypedDict
 
 from crawler.exceptions import FetchError, HTTPStatusError
@@ -202,3 +203,22 @@ class ParsedPage(TypedDict):
     tables: list[Table]
     lists: list[ItemList]
     errors: list[str]
+
+
+class PageRecord(TypedDict):
+    """A crawled page as the storages keep it.
+
+    `url` is the requested URL. `title` and `content_type` are empty strings
+    when the page has no title or the server sent no Content-Type header.
+    `crawled_at` is an aware datetime. `metadata` must be serializable to
+    JSON.
+    """
+
+    url: str
+    title: str
+    text: str
+    links: list[str]
+    metadata: dict[str, object]
+    crawled_at: datetime
+    status_code: int
+    content_type: str
