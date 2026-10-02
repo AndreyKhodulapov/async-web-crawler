@@ -8,13 +8,6 @@ from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-CONSOLE_FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
-CONSOLE_DATE_FORMAT = "%H:%M:%S"
-
-# Marks the handlers `configure_logging` installed, so that a later call
-# replaces them and leaves the handlers of the application alone.
-_OWNED = "_crawler_logging"
-
 
 class ProgressAwareHandler(logging.StreamHandler):
     """Writes log records to stderr, erasing the live progress line first.
@@ -94,7 +87,9 @@ def configure_logging(
             raise ValueError(f"unknown logging level: {level!r}")
 
     handlers: list[logging.Handler] = [ProgressAwareHandler()]
-    handlers[0].setFormatter(logging.Formatter(CONSOLE_FORMAT, datefmt=CONSOLE_DATE_FORMAT))
+    handlers[0].setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s", datefmt="%H:%M:%S")
+    )
     if file is not None:
         # Opened before the old handlers are removed: a file that cannot be
         # opened leaves the logging as it was.
@@ -111,7 +106,9 @@ def configure_logging(
     # records for one report, among which those of the crawl are lost.
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
     for handler in handlers:
-        setattr(handler, _OWNED, True)
+        # The mark of the handlers installed here: a later call replaces them
+        # and leaves the handlers of the application alone.
+        handler._crawler_logging = True
         root.addHandler(handler)
 
 
@@ -119,6 +116,6 @@ def reset_logging() -> None:
     """Remove and close the handlers `configure_logging` installed; the level stays."""
     root = logging.getLogger()
     for handler in list(root.handlers):
-        if getattr(handler, _OWNED, False):
+        if getattr(handler, "_crawler_logging", False):
             root.removeHandler(handler)
             handler.close()

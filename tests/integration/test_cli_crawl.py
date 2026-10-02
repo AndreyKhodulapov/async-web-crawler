@@ -2,41 +2,28 @@
 
 import asyncio
 import json
-import logging
 import sys
 from pathlib import Path
 
 import pytest
 import yaml
-from helpers import BOT
+from helpers import FAST_CONFIG
 
 import main
 from crawler import AdvancedCrawler
-from crawler.logging_setup import reset_logging
 from main import build_config, parse_args, run
 
-# No rate limit, robots.txt, retries or circuit breaker, as in the tests of AdvancedCrawler.
-FAST = {
-    "crawler": {"rate_limit": None, "respect_robots": False, "user_agent": BOT, "max_depth": 1},
-    "retry": {"max_retries": 0},
-    "circuit_breaker": {"failure_threshold": None},
-    "logging": {"level": "WARNING"},
-}
-
-
-@pytest.fixture(autouse=True)
-def restore_logging():
-    level = logging.getLogger().level
-    yield
-    reset_logging()
-    logging.getLogger().setLevel(level)
+pytestmark = pytest.mark.usefixtures("restore_logging")
 
 
 @pytest.fixture
 def config_file(tmp_path, url):
     def write(**sections) -> str:
         path = tmp_path / "config.yaml"
-        path.write_text(yaml.safe_dump(FAST | {"urls": [url("/site/")]} | sections), encoding="utf-8")
+        path.write_text(
+            yaml.safe_dump({**FAST_CONFIG, "logging": {"level": "WARNING"}, "urls": [url("/site/")], **sections}),
+            encoding="utf-8",
+        )
         return str(path)
 
     return write

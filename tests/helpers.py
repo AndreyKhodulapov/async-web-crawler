@@ -18,6 +18,12 @@ UNTHROTTLED = {
     "retry_strategy": RetryStrategy(max_retries=0),
     "circuit_breaker": CircuitBreaker(failure_threshold=None),
 }
+# The same as sections of a configuration file.
+FAST_CONFIG = {
+    "crawler": {"rate_limit": None, "respect_robots": False, "user_agent": BOT, "max_depth": 1},
+    "retry": {"max_retries": 0},
+    "circuit_breaker": {"failure_threshold": None},
+}
 
 
 def urlset(*locations: str) -> bytes:

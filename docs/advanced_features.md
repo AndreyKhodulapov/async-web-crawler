@@ -1,6 +1,6 @@
 # Advanced features: sitemaps, configuration, logging, monitoring and integration
 
-Short, interview-ready notes on what turns a crawling library into a tool
+Short notes on what turns a crawling library into a tool
 that can be run, configured and watched.
 
 ## Sitemaps

@@ -26,19 +26,6 @@ _HIDDEN_TAGS = frozenset({"script", "style", "noscript", "template"})
 # The document head holds metadata, not page content: its text, links and
 # images are left out too. Metadata extractors look into it on purpose.
 _NON_CONTENT_TAGS = _HIDDEN_TAGS | {"head", "title"}
-_ARTICLE = frozenset({"article"})
-_SVG = frozenset({"svg"})
-# Elements that start on a new line in a browser. Text on both sides of
-# them is separated by a space; text inside inline elements (<b>, <a>, ...)
-# is joined as is, so "<b>to</b>, go" stays "to, go".
-_BLOCK_TAGS = frozenset({
-    "address", "article", "aside", "blockquote", "br", "caption", "dd", "details", "div", "dl", "dt",
-    "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
-    "hr", "li", "main", "nav", "ol", "option", "p", "pre", "section", "summary", "table", "td", "th",
-    "tr", "ul",
-})  # fmt: skip
-# rel values are case-insensitive: "Canonical" is valid too.
-_CANONICAL = re.compile("^canonical$", re.IGNORECASE)
 
 
 class _TagIndex:
@@ -201,7 +188,7 @@ class HTMLParser:
             # Several top-level <article> elements usually mean a listing
             # page, where the whole body is the content. Nested ones, such as
             # comments inside a post, belong to their article.
-            articles = [tag for tag in _content_tags(soup, "article") if not _inside(tag, _ARTICLE)]
+            articles = [tag for tag in _content_tags(soup, "article") if not _inside(tag, frozenset({"article"}))]
             article = articles[0] if len(articles) == 1 else None
             main = _first_content_tag(soup, "main")
             roots = [main or article or soup.body or soup]
@@ -216,16 +203,16 @@ class HTMLParser:
         # An inline <svg> may have its own <title> (a tooltip); it is not the
         # page title. Documents without <head> put the real one in <body>.
         titles = _content_tags(soup, "title", skip=_HIDDEN_TAGS)
-        title_tag = next((tag for tag in titles if not _inside(tag, _SVG)), None)
+        title_tag = next((tag for tag in titles if not _inside(tag, frozenset({"svg"}))), None)
         title = _clean(title_tag.get_text()) if title_tag is not None else None
         metas = [tag for tag in _content_tags(soup, "meta", skip=_HIDDEN_TAGS) if tag.has_attr("content")]
         keywords = _meta_content(metas, "name", "keywords") or ""
 
         canonical = None
         links = _content_tags(soup, "link", skip=_HIDDEN_TAGS)
-        canonical_tag = next(
-            (tag for tag in links if tag.has_attr("href") and _attr_matches(tag, "rel", _CANONICAL)), None
-        )
+        # rel values are case-insensitive: "Canonical" is valid too.
+        rel = _exactly("canonical")
+        canonical_tag = next((tag for tag in links if tag.has_attr("href") and _attr_matches(tag, "rel", rel)), None)
         if canonical_tag is not None:
             href = _attr(canonical_tag, "href").strip()
             canonical = resolve_url(href, base_url) if base_url else (href or None)
@@ -398,7 +385,6 @@ def _meta_content(metas: list[Tag], attribute: str, value: str) -> str | None:
 
 @functools.cache
 def _exactly(value: str) -> re.Pattern[str]:
-    """A pattern for an attribute value that is `value` in any case."""
     return re.compile(f"^{re.escape(value)}$", re.IGNORECASE)
 
 
@@ -432,16 +418,12 @@ def _content_tags(soup: BeautifulSoup, *names: str, skip: frozenset[str] = _NON_
 
 
 def _inside(tag: Tag, names: frozenset[str]) -> bool:
-    """Whether an ancestor of `tag` is an element named in `names`.
-
-    A plain walk up the tree: `find_parent` builds a filter on every call,
-    which costs more than the walk itself and adds up over every tag of a page.
-    """
+    # A plain walk up the tree: `find_parent` builds a filter on every call,
+    # which costs more than the walk itself and adds up over every tag of a page.
     return any(parent.name in names for parent in tag.parents)
 
 
 def _closest(tag: Tag, name: str) -> Tag | None:
-    """The nearest ancestor of `tag` named `name`."""
     return next((parent for parent in tag.parents if parent.name == name), None)
 
 
@@ -455,6 +437,15 @@ def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
     Iterative rather than recursive: broken HTML can nest thousands of
     unclosed tags, which would exceed Python's recursion limit.
     """
+    # Elements that start on a new line in a browser. Text on both sides of
+    # them is separated by a space; text inside inline elements (<b>, <a>, ...)
+    # is joined as is, so "<b>to</b>, go" stays "to, go".
+    block_tags = frozenset({
+        "address", "article", "aside", "blockquote", "br", "caption", "dd", "details", "div", "dl", "dt",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+        "hr", "li", "main", "nav", "ol", "option", "p", "pre", "section", "summary", "table", "td", "th",
+        "tr", "ul",
+    })  # fmt: skip
     parts: list[str] = []
     # None marks the end of a block element: a space is emitted there.
     stack: list[PageElement | None] = [root]
@@ -464,7 +455,7 @@ def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
             parts.append(" ")
         elif isinstance(node, Tag):
             if node is root or node.name not in skip:
-                if node.name in _BLOCK_TAGS:
+                if node.name in block_tags:
                     parts.append(" ")
                     stack.append(None)
                 stack.extend(reversed(node.contents))

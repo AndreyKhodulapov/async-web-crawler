@@ -12,17 +12,11 @@ import yaml
 from helpers import BOT
 
 from crawler import load_config
-from crawler.logging_setup import reset_logging
 
 EXAMPLES = Path(__file__).parents[2] / "examples"
 
 
-@pytest.fixture(autouse=True)
-def restore_logging():
-    level = logging.getLogger().level
-    yield
-    reset_logging()
-    logging.getLogger().setLevel(level)
+pytestmark = pytest.mark.usefixtures("restore_logging")
 
 
 @pytest.fixture

@@ -6,29 +6,15 @@ from logging.handlers import RotatingFileHandler
 
 import pytest
 import yaml
-from helpers import BOT, urlset
+from helpers import BOT, FAST_CONFIG, urlset
 
 from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, CSVStorage, JSONStorage
-from crawler.logging_setup import reset_logging
 
-# No rate limit, robots.txt, retries or circuit breaker: the tests are about putting the parts together.
-FAST = {
-    "crawler": {"rate_limit": None, "respect_robots": False, "user_agent": BOT, "max_depth": 1},
-    "retry": {"max_retries": 0},
-    "circuit_breaker": {"failure_threshold": None},
-}
-
-
-@pytest.fixture(autouse=True)
-def restore_logging():
-    level = logging.getLogger().level
-    yield
-    reset_logging()
-    logging.getLogger().setLevel(level)
+pytestmark = pytest.mark.usefixtures("restore_logging")
 
 
 def make_config(**sections) -> CrawlerConfig:
-    data = {name: dict(section) for name, section in FAST.items()}
+    data = {name: dict(section) for name, section in FAST_CONFIG.items()}
     for name, section in sections.items():
         data[name] = {**data[name], **section} if isinstance(section, dict) and name in data else section
     return CrawlerConfig.from_dict(data)
@@ -45,7 +31,7 @@ async def test_crawl_by_a_configuration_file(url, site, tmp_path):
     config_file = tmp_path / "config.yaml"
     config_file.write_text(
         yaml.safe_dump(
-            FAST
+            FAST_CONFIG
             | {
                 "urls": [url("/site/")],
                 "sitemaps": {"urls": [url("/sitemaps/sitemap.xml")]},
@@ -91,7 +77,7 @@ async def test_crawl_by_a_configuration_file(url, site, tmp_path):
 
 async def test_overrides_win_over_the_file(url, tmp_path):
     config_file = tmp_path / "config.json"
-    config_file.write_text(json.dumps(FAST | {"urls": [url("/site/")]}), encoding="utf-8")
+    config_file.write_text(json.dumps(FAST_CONFIG | {"urls": [url("/site/")]}), encoding="utf-8")
 
     async with AdvancedCrawler.from_config(config_file, {"crawler": {"max_pages": 2}}) as crawler:
         await crawler.crawl()

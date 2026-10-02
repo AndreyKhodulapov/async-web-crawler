@@ -1,6 +1,6 @@
 # Error handling: retries, timeouts and circuit breakers
 
-Short, interview-ready notes on how a crawler tells failures that pass from
+Short notes on how a crawler tells failures that pass from
 failures that stay, retries the first kind without making things worse, and
 leaves a failing site alone.
 

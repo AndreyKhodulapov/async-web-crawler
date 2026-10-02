@@ -1,6 +1,6 @@
 # Data storage: files, databases, batching and failed writes
 
-Short, interview-ready notes on saving what a crawler collects without
+Short notes on saving what a crawler collects without
 blocking the event loop, losing pages or writing them twice.
 
 ## File I/O and the event loop

@@ -1,6 +1,6 @@
 # Asynchronous Python: key concepts
 
-Short, interview-ready notes on the ideas this crawler is built on.
+Short notes on the ideas this crawler is built on.
 
 ## Concurrency vs parallelism
 

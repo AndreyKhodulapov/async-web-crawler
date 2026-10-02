@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -153,3 +155,38 @@ class TestMeasurements:
             (12, 12, 12),
         ]
         assert all(result["lean_memory"] > 0 and result["sync"]["peak_memory"] > 0 for result in saved["results"])
+
+
+class TestStopping:
+    def test_stopped_sync_crawl_ends_after_the_page_it_is_fetching(self):
+        stop = threading.Event()
+        with ScaleSite(30, 0.02) as site:
+            threading.Timer(0.1, stop.set).start()
+            fetched, failed = crawl_sync(site, stop)
+
+        assert 0 < fetched < 30
+        assert failed == 0
+
+    def test_stopped_concurrent_crawl_is_cancelled(self):
+        stop = threading.Event()
+        stop.set()
+        started = time.perf_counter()
+        # Left alone, the crawl takes 30 * 0.5 / 2 seconds.
+        with ScaleSite(30, 0.5) as site, pytest.raises(asyncio.CancelledError):
+            crawl_async(site, 2, stop=stop)
+
+        assert time.perf_counter() - started < 3
+
+    async def test_interrupted_scale_command_stops_its_crawls(self):
+        # The synchronous crawl alone takes 200 * 0.05 seconds.
+        command = asyncio.create_task(run_scale(parse_args(["scale", "200", "--delay", "0.05", "--no-memory"])))
+        await asyncio.sleep(0.3)
+        command.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await command
+
+        # The crawls run in a thread, which the program waits for at exit: it must not go on for long.
+        deadline = time.monotonic() + 3
+        while any(thread.name == "scale-site" for thread in threading.enumerate()) and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        assert not [thread for thread in threading.enumerate() if thread.name == "scale-site"]

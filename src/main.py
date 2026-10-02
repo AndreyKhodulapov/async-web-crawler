@@ -23,8 +23,6 @@ from cli_options import hide_password, http_url, positive
 from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, load_config, show_progress
 from crawler.config import LOG_LEVELS
 
-EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 130
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -165,7 +163,7 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
                 print_summary(crawler, interrupted=True)
             raise
         print_summary(crawler)
-        return EXIT_OK if crawler.get_stats()["successful"] else EXIT_FAILED
+        return 0 if crawler.get_stats()["successful"] else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -174,14 +172,14 @@ def main(argv: list[str] | None = None) -> int:
         config = build_config(args)
     except ConfigError as error:
         print(f"error: {error}", file=sys.stderr)
-        return EXIT_USAGE
+        return 2  # as argparse exits for a wrong flag
     try:
         return asyncio.run(run(config, progress=not args.no_progress))
     except OSError as error:
         print(f"error: {error}", file=sys.stderr)
-        return EXIT_FAILED
+        return 1
     except KeyboardInterrupt:
-        return EXIT_INTERRUPTED
+        return 130  # 128 + SIGINT, as a shell reports a program stopped by Ctrl-C
 
 
 if __name__ == "__main__":

@@ -259,10 +259,6 @@ class RobotsParser:
         delay = self._cached(url).crawl_delay(user_agent)
         return 0.0 if delay is None else min(delay, self.MAX_CRAWL_DELAY)
 
-    def get_sitemaps(self, url: str) -> list[str]:
-        """The sitemaps that robots.txt of the site of `url` lists. The site's rules must have been fetched."""
-        return list(self._cached(url).sitemaps)
-
     def unreachable_reason(self, url: str) -> str | None:
         """Why robots.txt of the site of `url` could not be read, or None. The rules must have been fetched."""
         return self._cached(url).unreachable

@@ -11,8 +11,6 @@ from crawler.models import CrawlStats
 if TYPE_CHECKING:
     from crawler.client import AsyncCrawler
 
-BAR_WIDTH = 20
-
 
 @dataclass(frozen=True, slots=True)
 class Progress:
@@ -118,7 +116,8 @@ def format_duration(seconds: float) -> str:
 def format_progress(progress: Progress) -> str:
     """One line: a bar, the percent, pages done, speed, time left, active tasks, the queue and the time passed."""
     # Rounded down: the bar is full and the percent is 100 only when every page is done.
-    filled = int(BAR_WIDTH * progress.percent / 100)
+    width = 20
+    filled = int(width * progress.percent / 100)
     if progress.finished:
         left = "done"
     elif progress.eta is None:
@@ -126,7 +125,7 @@ def format_progress(progress: Progress) -> str:
     else:
         left = f"ETA {format_duration(progress.eta)}"
     return (
-        f"[{'#' * filled}{'-' * (BAR_WIDTH - filled)}] {int(progress.percent):3d}% | "
+        f"[{'#' * filled}{'-' * (width - filled)}] {int(progress.percent):3d}% | "
         f"{progress.done}/{progress.total} pages, {progress.failed} failed | "
         f"{progress.pages_per_second:.1f} pages/s | {left} | "
         f"active {progress.active} ({progress.in_flight} in flight) | queued {progress.queued} | "

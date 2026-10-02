@@ -216,7 +216,7 @@ class CrawlerConfig:
     report: ReportOptions = field(default_factory=ReportOptions)
 
     @classmethod
-    def from_dict(cls, data: Mapping[str, Any], *, source: str | None = None) -> Self:
+    def from_dict(cls, mapping: Mapping[str, Any], *, source: str | None = None) -> Self:
         """The configuration for a mapping shaped like the file: `{"urls": [...], "crawler": {...}}`.
 
         `source` names where the mapping came from in the error message.
@@ -225,7 +225,7 @@ class CrawlerConfig:
             ConfigError: a key is unknown or a value is invalid; all of them are listed.
         """
         problems: list[str] = []
-        config = _build(cls, data, "", problems)
+        config = _build(cls, mapping, "", problems)
         if not problems:
             _check_together(config, problems)
         if problems:
@@ -251,10 +251,10 @@ def load_config(path: str | Path, overrides: Mapping[str, Any] | None = None) ->
             valid YAML or JSON, or holds an unknown key or an invalid value.
     """
     path = Path(path)
-    data = _read(path)
-    if overrides and isinstance(data, Mapping):
-        data = _merge(data, overrides)
-    return CrawlerConfig.from_dict(data, source=str(path))
+    mapping = _read(path)
+    if overrides and isinstance(mapping, Mapping):
+        mapping = _merge(mapping, overrides)
+    return CrawlerConfig.from_dict(mapping, source=str(path))
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):
@@ -287,11 +287,11 @@ def _read(path: Path) -> Any:
     try:
         if extension == ".json":
             return json.loads(text) if text.strip() else {}
-        data = yaml.load(text, Loader=_UniqueKeyLoader)  # a SafeLoader
+        document = yaml.load(text, Loader=_UniqueKeyLoader)  # a SafeLoader
     except (yaml.YAMLError, json.JSONDecodeError, RecursionError) as error:
         kind = "JSON" if extension == ".json" else "YAML"
         raise ConfigError([f"not valid {kind}: {' '.join(str(error).split())}"], str(path)) from error
-    return {} if data is None else data
+    return {} if document is None else document
 
 
 def _merge(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, Any]:
@@ -304,17 +304,17 @@ def _merge(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, A
     return merged
 
 
-def _build(section: type, data: Any, path: str, problems: list[str]) -> Any:
+def _build(section: type, mapping: Any, path: str, problems: list[str]) -> Any:
     """An instance of a section for its mapping; what is wrong goes to `problems`, the defaults stay."""
-    if data is None and path:  # a section with every key commented out
+    if mapping is None and path:  # a section with every key commented out
         return section()
-    if not isinstance(data, Mapping):
-        problems.append(f"{path or 'the top level'}: expected a mapping of keys to values, got {_show(data)}")
+    if not isinstance(mapping, Mapping):
+        problems.append(f"{path or 'the top level'}: expected a mapping of keys to values, got {_show(mapping)}")
         return section()
     hints = get_type_hints(section)
     fields = {item.name: item for item in dataclasses.fields(section)}
     values = {}
-    for key, value in data.items():
+    for key, value in mapping.items():
         where = f"{path}.{key}" if path else str(key)
         if key not in fields:
             close = difflib.get_close_matches(str(key), fields, n=1)
@@ -343,7 +343,7 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
             _convert(item, get_args(hint)[0], limits, f"{path}[{index}]", problems) for index, item in enumerate(value)
         ]
         return _INVALID if any(item is _INVALID for item in items) else tuple(items)
-    expected = _TYPES[hint]
+    expected = {int: "a whole number", float: "a number", bool: "true or false", str: "a string"}[hint]
     # True is an int in Python, but "max_pages: yes" is a mistake.
     fits = isinstance(value, bool) if hint is bool else isinstance(value, hint) and not isinstance(value, bool)
     if hint is float and isinstance(value, int) and not isinstance(value, bool):
@@ -361,9 +361,6 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
         problems.append(f"{path}: {problem}, got {_show(value)}")
         return _INVALID
     return value
-
-
-_TYPES = {int: "a whole number", float: "a number", bool: "true or false", str: "a string"}
 
 
 def _out_of_limits(value: Any, limits: Mapping[str, Any]) -> str | None:

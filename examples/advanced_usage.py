@@ -18,11 +18,9 @@ from pathlib import Path
 from crawler import AdvancedCrawler, ConfigError, show_progress
 
 CONFIG = Path(__file__).with_name("config.yaml")
-REPORT = Path("out/report.html")
-PREVIEW = 5  # pages listed at the end
 
 
-async def main(config_path: str | Path = CONFIG, report: str | Path = REPORT) -> None:
+async def main(config_path: str | Path = CONFIG) -> None:
     crawler = AdvancedCrawler.from_config(config_path)
     # crawl() alone is enough; run as a task, it can be watched while it works.
     crawl = asyncio.create_task(crawler.crawl())
@@ -37,9 +35,10 @@ async def main(config_path: str | Path = CONFIG, report: str | Path = REPORT) ->
         print(f"Status codes: {stats['status_codes']}")
         print(f"Top domains: {stats['top_domains']}")
 
-        for url, page in list(pages.items())[:PREVIEW]:
+        for url, page in list(pages.items())[:5]:
             print(f"  {page['title']!r}, {len(page['links'])} links: {url}")
 
+        report = Path("out/report.html")
         crawler.export_to_html_report(report)
         print(f"Report: {report}")
         if crawler.config.storage.outputs:

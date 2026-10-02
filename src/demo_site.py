@@ -30,11 +30,6 @@ from typing import Self
 
 from aiohttp import web
 
-ARTICLES = 8
-DOWN_SERVER_PAGES = 8
-FLAKY_FAILURES = 2
-SLOW_DELAY = 1.2
-
 
 def free_port() -> int:
     """A local port that nothing listens on right now."""
@@ -54,6 +49,8 @@ class DemoSite:
     `extra_links` are added to the start page, so that real URLs are
     fetched along with the demo pages, without following their links.
     """
+
+    ARTICLES = 8
 
     def __init__(self, extra_links: list[str] | None = None) -> None:
         self.extra_links = extra_links or []
@@ -97,9 +94,9 @@ class DemoSite:
 
     def links(self) -> list[str]:
         """Every link of the start page, in order."""
-        own = [f"articles/{number}" for number in range(1, ARTICLES + 1)]
+        own = [f"articles/{number}" for number in range(1, self.ARTICLES + 1)]
         own += ["flaky", "rate-limited", "server-error", "slow", "missing", "private", "data.json"]
-        down = [f"http://localhost:{self._down_port}/page/{number}" for number in range(1, DOWN_SERVER_PAGES + 1)]
+        down = [f"http://localhost:{self._down_port}/page/{number}" for number in range(1, 8 + 1)]
         return [self.url + path for path in own] + down + ["http://unreachable.invalid/", *self.extra_links]
 
     async def _index(self, request: web.Request) -> web.Response:
@@ -114,7 +111,7 @@ class DemoSite:
         return self.hits[request.path]
 
     async def _flaky(self, request: web.Request) -> web.Response:
-        if self._count(request) <= FLAKY_FAILURES:
+        if self._count(request) <= 2:
             raise web.HTTPServiceUnavailable()
         return page("Flaky page", "<p>Answered after a few failures.</p>")
 
@@ -127,11 +124,11 @@ class DemoSite:
         raise web.HTTPInternalServerError()
 
     async def _slow(self, request: web.Request) -> web.Response:
-        await asyncio.sleep(SLOW_DELAY)
+        await asyncio.sleep(1.2)
         return page("Slow page", "<p>Answered once the read timeout grew.</p>")
 
     async def _private(self, request: web.Request) -> web.Response:
         raise web.HTTPForbidden()
 
     async def _data(self, request: web.Request) -> web.Response:
-        return web.json_response({"pages": ARTICLES})
+        return web.json_response({"pages": self.ARTICLES})

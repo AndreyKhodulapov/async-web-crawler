@@ -2,6 +2,7 @@
 
 import base64
 import json
+import textwrap
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from html import escape
@@ -9,31 +10,12 @@ from http import HTTPStatus
 from io import BytesIO
 from typing import Any
 
+from crawler.progress import format_duration
+
 # Colors of the charts and of the page around them.
 _SURFACE = "#fcfcfb"
 _TEXT = "#0b0b0b"
 _MUTED = "#52514e"
-_BAR = "#2a78d6"
-
-_LABEL_LENGTH = 48  # longer chart labels are cut; the table next to the chart has them in full
-
-_STYLE = f"""
-body {{ margin: 0; padding: 32px 16px; background: {_SURFACE}; color: {_TEXT};
-       font: 15px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
-main {{ max-width: 860px; margin: 0 auto; }}
-h1 {{ margin: 0 0 4px; font-size: 26px; }}
-h2 {{ margin: 40px 0 12px; font-size: 19px; }}
-.period, .empty {{ color: {_MUTED}; }}
-.summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 24px 0 0; }}
-.summary div {{ padding: 12px 14px; border: 1px solid #e4e3df; border-radius: 8px; background: #fff; }}
-.summary dt {{ color: {_MUTED}; font-size: 13px; }}
-.summary dd {{ margin: 2px 0 0; font-size: 22px; font-weight: 600; }}
-img {{ display: block; max-width: 100%; height: auto; margin: 0 0 12px; }}
-table {{ width: 100%; border-collapse: collapse; }}
-th, td {{ padding: 6px 10px; border-bottom: 1px solid #e4e3df; text-align: left; overflow-wrap: anywhere; }}
-th {{ color: {_MUTED}; font-size: 13px; font-weight: 600; }}
-th.number, td.number {{ text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }}
-"""
 
 
 def render_json(stats: Mapping[str, Any]) -> str:
@@ -53,6 +35,23 @@ def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str
     PNG images embedded as data URIs, and there are no scripts. Everything
     that comes from the crawl (hosts, error names) is escaped.
     """
+    style = textwrap.dedent(f"""
+    body {{ margin: 0; padding: 32px 16px; background: {_SURFACE}; color: {_TEXT};
+           font: 15px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }}
+    main {{ max-width: 860px; margin: 0 auto; }}
+    h1 {{ margin: 0 0 4px; font-size: 26px; }}
+    h2 {{ margin: 40px 0 12px; font-size: 19px; }}
+    .period, .empty {{ color: {_MUTED}; }}
+    .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 24px 0 0; }}
+    .summary div {{ padding: 12px 14px; border: 1px solid #e4e3df; border-radius: 8px; background: #fff; }}
+    .summary dt {{ color: {_MUTED}; font-size: 13px; }}
+    .summary dd {{ margin: 2px 0 0; font-size: 22px; font-weight: 600; }}
+    img {{ display: block; max-width: 100%; height: auto; margin: 0 0 12px; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ padding: 6px 10px; border-bottom: 1px solid #e4e3df; text-align: left; overflow-wrap: anywhere; }}
+    th {{ color: {_MUTED}; font-size: 13px; font-weight: 600; }}
+    th.number, td.number {{ text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }}
+    """)
     total = stats["total_pages"]
     summary = {
         "Pages": _count(total),
@@ -74,7 +73,7 @@ def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        f"<title>{escape(title)}</title>\n<style>{_STYLE}</style>\n</head>\n<body>\n<main>\n"
+        f"<title>{escape(title)}</title>\n<style>{style}</style>\n</head>\n<body>\n<main>\n"
         f"<h1>{escape(title)}</h1>\n"
         f'<p class="period">{escape(_period(stats["started_at"], stats["finished_at"]))}</p>\n'
         f'<dl class="summary">{tiles}</dl>\n' + "".join(sections) + "</main>\n</body>\n</html>\n"
@@ -109,7 +108,7 @@ def _bar_chart(counts: Mapping[str, int]) -> bytes:
     figure = Figure(figsize=(7.6, 0.2 + 0.36 * len(values)), dpi=120, facecolor=_SURFACE, layout="constrained")
     axes = figure.add_subplot()
     axes.set_facecolor(_SURFACE)
-    bars = axes.barh(range(len(values)), values, height=0.62, color=_BAR)
+    bars = axes.barh(range(len(values)), values, height=0.62, color="#2a78d6")
     axes.bar_label(bars, labels=[_count(value) for value in values], padding=5, color=_TEXT, fontsize=10)
     # Labels come from the crawl: `$` in one must not start a formula.
     axes.set_yticks(range(len(values)), labels=labels, color=_TEXT, fontsize=10, parse_math=False)
@@ -125,7 +124,9 @@ def _bar_chart(counts: Mapping[str, int]) -> bytes:
 
 
 def _shorten(label: str) -> str:
-    return label if len(label) <= _LABEL_LENGTH else f"{label[: _LABEL_LENGTH - 1]}…"
+    # Longer chart labels are cut; the table next to the chart has them in full.
+    longest = 48
+    return label if len(label) <= longest else f"{label[: longest - 1]}…"
 
 
 def _status_name(code: int) -> str:
@@ -148,9 +149,7 @@ def _duration(seconds: float) -> str:
         return f"{seconds * 1000:.0f} ms"
     if seconds < 60:
         return f"{seconds:.1f} s"
-    minutes, rest = divmod(round(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours} h {minutes} min {rest} s" if hours else f"{minutes} min {rest} s"
+    return format_duration(seconds)
 
 
 def _period(started_at: str | None, finished_at: str | None) -> str:

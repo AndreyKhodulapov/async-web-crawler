@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import textwrap
+import threading
 import time
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
@@ -70,8 +71,6 @@ MAX_RETRY_DELAY = 30.0
 # The URLs a command uses when none are given, a list per command. Found by
 # the location of this file, so the working directory does not matter.
 DEMO_URLS_FILE = Path(__file__).with_name("demo_urls.yaml")
-# The other commands crawl a local site.
-DEFAULT_URL_COMMANDS = ("benchmark", "parse", "crawl")
 
 
 def default_urls(command: str) -> list[str]:
@@ -351,7 +350,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.command == "scale":
         return args
-    if not args.urls and args.command in DEFAULT_URL_COMMANDS:
+    # The other commands crawl a local site.
+    if not args.urls and args.command in ("benchmark", "parse", "crawl"):
         try:
             args.urls = default_urls(args.command)
         except ValueError as error:
@@ -533,8 +533,8 @@ def print_crawl_report(crawler: AsyncCrawler) -> None:
     for url, depth in crawler.url_depths.items():
         if url in crawler.processed_urls:
             page = crawler.processed_urls[url]
-            result = f"ok, {len(page['errors'])} warning(s)" if page["errors"] else "ok"
-            print(f"{depth:>5}  {result:<36}  {len(page['links']):>5}  {url}")
+            outcome = f"ok, {len(page['errors'])} warning(s)" if page["errors"] else "ok"
+            print(f"{depth:>5}  {outcome:<36}  {len(page['links']):>5}  {url}")
             continue
         if url in crawler.failed_urls:
             reason = crawler.failed_urls[url]
@@ -546,8 +546,8 @@ def print_crawl_report(crawler: AsyncCrawler) -> None:
             reason = crawler.unreachable_urls[url]
         else:
             continue  # still in the queue
-        result = textwrap.shorten(reason, width=36, placeholder="...")
-        print(f"{depth:>5}  {result:<36}  {'':>5}  {url}")
+        outcome = textwrap.shorten(reason, width=36, placeholder="...")
+        print(f"{depth:>5}  {outcome:<36}  {'':>5}  {url}")
     print(
         f"Crawled: {stats.processed} pages, failed: {stats.failed}, skipped: {stats.skipped}, "
         f"blocked: {stats.blocked}, unreachable: {stats.unreachable}, left in queue: {stats.queued}, speed: {stats.pages_per_second:.1f} pages/s"
@@ -786,11 +786,6 @@ async def print_storage_report(storages: Mapping[str, DataStorage], stats: Crawl
         print("A storage with more records than this crawl had pages also keeps those of earlier runs.")
 
 
-RECORD_COLUMNS = (
-    f"{'CRAWLED AT (UTC)':<19}  {'STATUS':>6}  {'TYPE':<9}  {'TEXT':>6}  {'LINKS':>5}  {'DEPTH':>5}  URL  TITLE"
-)
-
-
 def format_record(record: PageRecord) -> str:
     return (
         f"{record['crawled_at']:%Y-%m-%d %H:%M:%S}  {record['status_code']:>6}  "
@@ -807,7 +802,7 @@ async def print_saved_records(location: str, storage: DataStorage, urls: list[st
     """
     by_url = isinstance(storage, DatabaseStorage)
     print(f"\n=== {'Pages found by URL' if by_url else 'First records'} in {location} ({type(storage).__name__}) ===")
-    print(RECORD_COLUMNS)
+    print(f"{'CRAWLED AT (UTC)':<19}  {'STATUS':>6}  {'TYPE':<9}  {'TEXT':>6}  {'LINKS':>5}  {'DEPTH':>5}  URL  TITLE")
     try:
         if by_url:
             for url in urls:
@@ -849,15 +844,15 @@ async def run_save(args: argparse.Namespace) -> None:
             await saved.close()
 
 
-def scale_row(result: Comparison) -> str:
+def scale_row(comparison: Comparison) -> str:
     def memory(size: int | None) -> str:
         return "-" if size is None else format_size(size)
 
-    sync, concurrent = result.sync, result.concurrent
+    sync, concurrent = comparison.sync, comparison.concurrent
     return (
-        f"{result.pages:>5}  {sync.elapsed:>8.2f}s  {sync.pages_per_second:>12.1f}  "
-        f"{concurrent.elapsed:>9.2f}s  {concurrent.pages_per_second:>13.1f}  {result.speedup:>6.1f}x  "
-        f"{memory(sync.peak_memory):>11}  {memory(concurrent.peak_memory):>12}  {memory(result.lean_memory):>14}"
+        f"{comparison.pages:>5}  {sync.elapsed:>8.2f}s  {sync.pages_per_second:>12.1f}  "
+        f"{concurrent.elapsed:>9.2f}s  {concurrent.pages_per_second:>13.1f}  {comparison.speedup:>6.1f}x  "
+        f"{memory(sync.peak_memory):>11}  {memory(concurrent.peak_memory):>12}  {memory(comparison.lean_memory):>14}"
     )
 
 
@@ -865,7 +860,9 @@ def save_scale_json(path: Path, args: argparse.Namespace, results: list[Comparis
     report = {
         "delay": args.delay,
         "concurrency": args.concurrency,
-        "results": [{**dataclasses.asdict(result), "speedup": round(result.speedup, 2)} for result in results],
+        "results": [
+            {**dataclasses.asdict(comparison), "speedup": round(comparison.speedup, 2)} for comparison in results
+        ],
     }
     path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"\nResults saved to {path}")
@@ -885,10 +882,19 @@ async def run_scale(args: argparse.Namespace) -> None:
         print(f"Crawling a site of {pages} pages with both crawlers...", file=sys.stderr)
         # In a thread: the synchronous crawler blocks, and the asynchronous
         # one is given an event loop of its own, as in a program that runs it.
-        result = await asyncio.to_thread(compare, pages, args.delay, args.concurrency, memory=not args.no_memory)
-        results.append(result)
-        print(scale_row(result), flush=True)
-        for name, run in (("synchronous", result.sync), ("asynchronous", result.concurrent)):
+        stop = threading.Event()
+        try:
+            comparison = await asyncio.to_thread(
+                compare, pages, args.delay, args.concurrency, memory=not args.no_memory, stop=stop
+            )
+        except asyncio.CancelledError:
+            # Ctrl-C cancels the wait, not the thread, and the program
+            # would not exit until the crawls in it are over.
+            stop.set()
+            raise
+        results.append(comparison)
+        print(scale_row(comparison), flush=True)
+        for name, run in (("synchronous", comparison.sync), ("asynchronous", comparison.concurrent)):
             if run.pages != pages:
                 print(f"  the {name} crawler fetched {run.pages} of {pages} pages, {run.failed} failed")
     if not args.no_memory:

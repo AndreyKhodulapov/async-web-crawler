@@ -15,12 +15,7 @@ from crawler.logging_setup import JsonLinesFormatter, ProgressAwareHandler, rese
 logger = logging.getLogger("crawler.test")
 
 
-@pytest.fixture(autouse=True)
-def restore_logging():
-    level = logging.getLogger().level
-    yield
-    reset_logging()
-    logging.getLogger().setLevel(level)
+pytestmark = pytest.mark.usefixtures("restore_logging")
 
 
 def own_handlers() -> list[logging.Handler]:

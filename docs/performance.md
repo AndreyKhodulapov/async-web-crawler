@@ -1,6 +1,6 @@
 # Performance: synchronous vs asynchronous crawling, memory and bottlenecks
 
-Short, interview-ready notes on what concurrency buys a crawler, where it
+Short notes on what concurrency buys a crawler, where it
 stops helping and what the measurements of this project show.
 
 ## How it was measured

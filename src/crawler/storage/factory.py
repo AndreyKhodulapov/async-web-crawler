@@ -20,17 +20,6 @@ StorageBuilder = Callable[..., DatabaseStorage]
 
 _builders: dict[str, StorageBuilder] = {}
 
-# File extensions `storage_from_output` knows, with what the files hold.
-OUTPUT_EXTENSIONS = {
-    ".jsonl": "JSON Lines",
-    ".ndjson": "JSON Lines",
-    ".json": "a JSON array",
-    ".csv": "CSV",
-    ".db": "an SQLite database",
-    ".sqlite": "an SQLite database",
-    ".sqlite3": "an SQLite database",
-}
-
 
 def register_database(scheme: str, builder: StorageBuilder) -> None:
     """Make `storage_from_url` build the storages of a URL scheme with `builder`.
@@ -81,19 +70,19 @@ def storage_from_output(output: str | Path, *, csv_encoding: str = "utf-8", **op
         return storage_from_url(output, **options)
     path = Path(output).expanduser()
     extension = path.suffix.lower()
-    if extension not in OUTPUT_EXTENSIONS:
-        known = ", ".join(OUTPUT_EXTENSIONS)
-        problem = f'unknown extension "{path.suffix}"' if path.suffix else "it has no extension"
-        raise ValueError(
-            f'Cannot choose a storage for "{output}": {problem}; expected one of {known}, or a database URL'
-        )
     if extension == ".csv":
         return CSVStorage(path, encoding=csv_encoding, **options)
     if extension == ".json":
         return JSONStorage(path, indent=2, **options)
     if extension in (".jsonl", ".ndjson"):
         return JSONStorage(path, **options)
-    return SQLiteStorage(path, **options)
+    if extension in (".db", ".sqlite", ".sqlite3"):
+        return SQLiteStorage(path, **options)
+    problem = f'unknown extension "{path.suffix}"' if path.suffix else "it has no extension"
+    raise ValueError(
+        f'Cannot choose a storage for "{output}": {problem}; '
+        "expected one of .jsonl, .ndjson, .json, .csv, .db, .sqlite, .sqlite3, or a database URL"
+    )
 
 
 def storage_from_env(environ: Mapping[str, str] | None = None, **options: Any) -> DatabaseStorage:

@@ -24,11 +24,6 @@ from crawler.urls import get_host, is_same_host, normalize_url
 
 # Links of a page to the pages below it: the site is a tree this wide.
 FANOUT = 10
-PARAGRAPHS = 12
-PARAGRAPH = (
-    "A crawler spends most of its time waiting for servers to answer, which is why "
-    "fetching many pages at once pays off so much more than fetching them faster. "
-)
 
 
 class ScaleSite:
@@ -79,10 +74,9 @@ class ScaleSite:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
-        if self._loop is not None and self._stop is not None:
-            self._loop.call_soon_threadsafe(self._stop.set)
-        if self._thread is not None:
-            self._thread.join()
+        assert self._loop is not None and self._stop is not None and self._thread is not None
+        self._loop.call_soon_threadsafe(self._stop.set)
+        self._thread.join()
 
     def _run(self, started: threading.Event, failure: list[BaseException]) -> None:
         try:
@@ -119,7 +113,11 @@ class ScaleSite:
     def _html(self, number: int) -> str:
         children = range(number * FANOUT + 1, min(number * FANOUT + FANOUT, self.pages - 1) + 1)
         links = "".join(f'<li><a href="/pages/{child}">Page {child}</a></li>' for child in children)
-        text = "".join(f"<p>{PARAGRAPH * 3}</p>" for _ in range(PARAGRAPHS))
+        paragraph = (
+            "A crawler spends most of its time waiting for servers to answer, which is why "
+            "fetching many pages at once pays off so much more than fetching them faster. "
+        )
+        text = f"<p>{paragraph * 3}</p>" * 12
         return (
             f'<!doctype html><html lang="en"><head><title>Page {number}</title>'
             f'<meta name="description" content="Page {number} of {self.pages}"></head>'
@@ -135,14 +133,18 @@ class SyncCrawler:
     normalized URLs, the same breadth-first order and limits, and nothing
     else, no rate limit, robots.txt or retries. Links are followed on the
     hosts of the start URLs only.
+
+    A blocking crawl cannot be cancelled from outside: it runs until it is
+    done. `stop` is how the thread that waits for it ends it: once the event
+    is set, the crawl returns after the page it is fetching.
     """
 
-    def __init__(self, *, max_depth: int = 2, timeout: float = 10.0, parser: HTMLParser | None = None) -> None:
+    def __init__(self, *, max_depth: int = 2, stop: threading.Event | None = None) -> None:
         self.max_depth = max_depth
-        self.timeout = timeout
         self.processed_urls: dict[str, ParsedPage] = {}
         self.failed_urls: dict[str, str] = {}
-        self._parser = parser or HTMLParser()
+        self._stop = stop or threading.Event()
+        self._parser = HTMLParser()
 
     def crawl(self, start_urls: list[str], max_pages: int = 100) -> dict[str, ParsedPage]:
         """Crawl from `start_urls`; return the parsed pages by normalized URL.
@@ -155,7 +157,7 @@ class SyncCrawler:
         queue = deque((url, 0) for url in dict.fromkeys(starts))
         seen = set(starts)
         requested = 0
-        while queue and requested < max_pages:
+        while queue and requested < max_pages and not self._stop.is_set():
             url, depth = queue.popleft()
             requested += 1
             try:
@@ -166,17 +168,16 @@ class SyncCrawler:
             self.processed_urls[url] = page
             if depth >= self.max_depth:
                 continue
-            for link in page["links"]:
-                normalized = normalize_url(link)
-                if normalized is None or normalized in seen or not any(is_same_host(normalized, s) for s in starts):
+            for link in page["links"]:  # normalized by the parser
+                if link in seen or not any(is_same_host(link, start) for start in starts):
                     continue
-                seen.add(normalized)
-                queue.append((normalized, depth + 1))
+                seen.add(link)
+                queue.append((link, depth + 1))
         return self.processed_urls
 
     def _fetch_and_parse(self, url: str) -> ParsedPage:
         request = urllib.request.Request(url, headers={"User-Agent": AsyncCrawler.DEFAULT_USER_AGENT})
-        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+        with urllib.request.urlopen(request, timeout=10.0) as response:
             body = response.read()
             content_type = response.headers.get_content_type()
             charset = response.headers.get_content_charset() or "utf-8"
@@ -214,15 +215,21 @@ class Comparison:
         return self.sync.elapsed / self.concurrent.elapsed if self.concurrent.elapsed > 0 else 0.0
 
 
-def crawl_sync(site: ScaleSite) -> tuple[int, int]:
-    """Crawl the whole site one page at a time; return the pages fetched and failed."""
-    crawler = SyncCrawler(max_depth=site.pages)
+def crawl_sync(site: ScaleSite, stop: threading.Event | None = None) -> tuple[int, int]:
+    """Crawl the whole site one page at a time, or until `stop` is set; return the pages fetched and failed."""
+    crawler = SyncCrawler(max_depth=site.pages, stop=stop)
     crawler.crawl([site.url], max_pages=site.pages)
     return len(crawler.processed_urls), len(crawler.failed_urls)
 
 
-def crawl_async(site: ScaleSite, concurrency: int, *, keep_pages: bool = True) -> tuple[int, int]:
-    """Crawl the whole site with `concurrency` requests in flight; return the pages fetched and failed."""
+def crawl_async(
+    site: ScaleSite, concurrency: int, *, keep_pages: bool = True, stop: threading.Event | None = None
+) -> tuple[int, int]:
+    """Crawl the whole site with `concurrency` requests in flight; return the pages fetched and failed.
+
+    Raises:
+        asyncio.CancelledError: `stop` was set; the crawl is cancelled within a tenth of a second.
+    """
 
     async def crawl() -> tuple[int, int]:
         # As bare as the synchronous crawler: no rate limit, robots.txt,
@@ -236,7 +243,13 @@ def crawl_async(site: ScaleSite, concurrency: int, *, keep_pages: bool = True) -
             circuit_breaker=CircuitBreaker(None),
             keep_pages=keep_pages,
         ) as crawler:
-            await crawler.crawl([site.url], max_pages=site.pages, same_domain_only=True)
+            crawling = asyncio.create_task(crawler.crawl([site.url], max_pages=site.pages, same_domain_only=True))
+            while not crawling.done():
+                # The event belongs to another thread, so it cannot be awaited: it is looked at.
+                await asyncio.wait({crawling}, timeout=0.1)
+                if stop is not None and stop.is_set():
+                    crawling.cancel()
+            await crawling
             return crawler.crawl_stats().processed, len(crawler.failed_urls)
 
     return asyncio.run(crawl())
@@ -280,19 +293,30 @@ def measure(crawl: Callable[[ScaleSite], tuple[int, int]], pages: int, delay: fl
     return Run(pages=fetched, failed=failed, elapsed=elapsed, peak_memory=peak)
 
 
-def compare(pages: int, delay: float, concurrency: int, *, memory: bool = True) -> Comparison:
+def compare(
+    pages: int, delay: float, concurrency: int, *, memory: bool = True, stop: threading.Event | None = None
+) -> Comparison:
     """Crawl a site of `pages` pages with both crawlers.
 
     With `memory`, the concurrent crawler is also run with
     `keep_pages=False`, to show what holding the pages costs.
+
+    The crawls block, so a caller that waits in another thread cannot
+    cancel them; it sets `stop` instead. The synchronous crawls then end
+    after the page they are fetching, and the concurrent one that runs
+    then or next is cancelled.
+
+    Raises:
+        asyncio.CancelledError: `stop` was set.
     """
     lean = None
     if memory:
         with ScaleSite(pages) as site:
-            lean = _peak_memory(lambda: crawl_async(site, concurrency, keep_pages=False))
+            lean = _peak_memory(lambda: crawl_async(site, concurrency, keep_pages=False, stop=stop))
     return Comparison(
         pages=pages,
-        sync=measure(crawl_sync, pages, delay, memory=memory),
-        concurrent=measure(lambda site: crawl_async(site, concurrency), pages, delay, memory=memory),
+        sync=measure(lambda site: crawl_sync(site, stop), pages, delay, memory=memory),
+        # The last one: a crawl stopped before it never gets here to return its numbers.
+        concurrent=measure(lambda site: crawl_async(site, concurrency, stop=stop), pages, delay, memory=memory),
         lean_memory=lean,
     )

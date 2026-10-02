@@ -1,6 +1,6 @@
 # Crawling: queues and concurrency control
 
-Short, interview-ready notes on how the crawler walks a site and keeps its
+Short notes on how the crawler walks a site and keeps its
 load under control.
 
 ## Producer–consumer with a worker pool

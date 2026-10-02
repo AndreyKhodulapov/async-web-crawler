@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from collections import Counter
 
@@ -6,6 +7,7 @@ import pytest
 from aiohttp import web
 from pages import ENCODING_PAGES, SITE_PAGES, fixture_html
 
+from crawler.logging_setup import reset_logging
 from demo_site import free_port
 
 
@@ -123,6 +125,15 @@ async def site_page(request: web.Request) -> web.Response:
         raise web.HTTPNotFound()
     html = SITE_PAGES[request.path].replace("{other_host}", f"http://localhost:{request.url.port}")
     return web.Response(text=html, content_type="text/html")
+
+
+@pytest.fixture
+def restore_logging():
+    """Undoes `configure_logging` after the test: its handlers are removed and closed, the level is put back."""
+    level = logging.getLogger().level
+    yield
+    reset_logging()
+    logging.getLogger().setLevel(level)
 
 
 @pytest.fixture

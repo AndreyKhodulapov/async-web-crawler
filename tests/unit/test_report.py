@@ -154,7 +154,7 @@ def test_html_report_of_a_running_crawl_says_so():
 
 @pytest.mark.parametrize(
     ("seconds", "text"),
-    [(0, "0 ms"), (0.25, "250 ms"), (59.94, "59.9 s"), (75, "1 min 15 s"), (3725, "1 h 2 min 5 s")],
+    [(0, "0 ms"), (0.25, "250 ms"), (59.94, "59.9 s"), (75, "1m 15s"), (3725, "1h 02m")],
 )
 def test_running_time_is_readable(seconds, text):
     assert f"<dt>Running time</dt><dd>{text}</dd>" in render_html(empty_stats() | {"elapsed_seconds": seconds})

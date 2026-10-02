@@ -266,10 +266,8 @@ class TestRobotsParser:
 
     async def test_sitemaps_of_a_site(self):
         robots = RobotsParser(FakeFetcher((200, "Sitemap: https://site/sitemap.xml\nUser-agent: *\nDisallow:")))
-        with pytest.raises(LookupError):
-            robots.get_sitemaps("https://site/page")
-        await robots.fetch_robots("https://site/")
-        assert robots.get_sitemaps("https://site/page") == ["https://site/sitemap.xml"]
+        rules = await robots.fetch_robots("https://site/")
+        assert rules["sitemaps"] == ["https://site/sitemap.xml"]
 
     async def test_each_origin_has_its_own_rules(self):
         fetch = FakeFetcher()

@@ -14,11 +14,9 @@ def is_valid_http_url(url: str) -> bool:
 
 # A crawl asks about the same URL many times over: a link when it is found,
 # filtered and queued, a page at every step of its request, a link to the
-# site's menu on every page. The answers for the latest URLs are remembered.
-_CACHE_SIZE = 4096
-
-
-@functools.lru_cache(maxsize=_CACHE_SIZE)
+# site's menu on every page. The answers for the latest URLs are remembered,
+# here and in `get_host`.
+@functools.lru_cache(maxsize=4096)
 def normalize_url(url: str) -> str | None:
     """Return a canonical form of an absolute http(s) URL, or None if invalid.
 
@@ -80,7 +78,7 @@ def resolve_url(href: str, base_url: str) -> str | None:
     return normalize_url(absolute)
 
 
-@functools.lru_cache(maxsize=_CACHE_SIZE)
+@functools.lru_cache(maxsize=4096)
 def get_host(url: str) -> str | None:
     """Return the normalized host of an http(s) URL, or None if the URL is invalid.
 
