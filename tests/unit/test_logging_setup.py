@@ -99,6 +99,17 @@ def test_file_and_console_get_the_same_records(tmp_path, capsys):
     assert console.count("shown") == 2
 
 
+def test_debug_records_of_matplotlib_are_left_out(tmp_path):
+    log = tmp_path / "crawler.log"
+    configure_logging("DEBUG", log)
+
+    logging.getLogger("matplotlib.font_manager").debug("findfont: score(FontEntry(...)) = 10.05")
+    logging.getLogger("matplotlib.font_manager").warning("findfont: font family not found")
+    logger.debug("ours")
+
+    assert [entry["message"] for entry in read_entries(log)] == ["findfont: font family not found", "ours"]
+
+
 @pytest.mark.parametrize("level", ["debug", "DEBUG", logging.DEBUG])
 def test_level_by_name_in_any_case_or_by_number(level):
     configure_logging(level)

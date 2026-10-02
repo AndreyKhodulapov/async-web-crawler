@@ -76,7 +76,8 @@ def configure_logging(
     never rotated.
 
     The root logger is configured, so the records of other libraries are
-    written as well. Calling this again replaces the handlers of the
+    written as well; of matplotlib, which draws the charts of the HTML
+    report, only warnings and errors are. Calling this again replaces the handlers of the
     previous call; handlers added by other code are left in place.
 
     Raises:
@@ -106,6 +107,9 @@ def configure_logging(
     reset_logging()
     root = logging.getLogger()
     root.setLevel(level)
+    # At DEBUG matplotlib logs every font it looks at: about a thousand
+    # records for one report, among which those of the crawl are lost.
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
     for handler in handlers:
         setattr(handler, _OWNED, True)
         root.addHandler(handler)

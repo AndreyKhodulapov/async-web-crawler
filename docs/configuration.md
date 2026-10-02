@@ -144,7 +144,7 @@ See [Logging](api.md#logging).
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `level` | string | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, in any case; for the console and the file |
+| `level` | string | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, in any case; for the console and the file. matplotlib, which draws the report charts, logs from `WARNING` up whatever the level |
 | `file` | string or `null` | `null` | also write the log to this file, as JSON Lines; the console gets it either way |
 | `max_bytes` | whole number, >= 0 | `10485760` | the file is rotated at this size; 0 never rotates it |
 | `backup_count` | whole number, >= 0 | `5` | rotated files that are kept; 0 never rotates the file |
