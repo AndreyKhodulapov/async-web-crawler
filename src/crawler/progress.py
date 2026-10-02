@@ -20,7 +20,9 @@ class Progress:
 
     `done` counts the pages requested and finished: processed, failed
     (`failed` of them) and skipped; `total` is the page limit of the crawl.
-    `percent` is `done` of `total`. `pages_per_second` is the speed over the
+    Pages that failed without a request, refused by an open circuit breaker,
+    are not held against the limit by the crawl, so `done` stops at `total`
+    while `failed` and the speed count them all. `percent` is `done` of `total`. `pages_per_second` is the speed over the
     last seconds, `eta` the seconds left at that speed until `total` pages
     are done: `None` while the speed is 0, and 0 once the crawl has
     finished. `active` counts the pages taken by workers, `in_flight` the
@@ -62,36 +64,37 @@ class ProgressTracker:
             raise ValueError(f"window must be positive, got {window}")
         self.max_pages = max_pages
         self.window = window
-        # (seconds since the crawl started, pages done) of the latest updates.
+        # (seconds since the crawl started, pages finished) of the latest updates.
         self._samples: deque[tuple[float, int]] = deque()
 
     def update(self, stats: CrawlStats, *, finished: bool = False) -> Progress:
         """Progress as of `stats`, the latest snapshot of the crawl; `finished` marks the last one."""
-        done = stats.processed + stats.failed + stats.skipped
+        finished_pages = stats.processed + stats.failed + stats.skipped
+        done = min(finished_pages, self.max_pages)
         if self._samples and stats.elapsed < self._samples[-1][0]:
             self._samples.clear()  # another crawl has started
-        self._samples.append((stats.elapsed, done))
+        self._samples.append((stats.elapsed, finished_pages))
         # The oldest sample kept is the latest one at least `window` old.
         while len(self._samples) > 1 and self._samples[1][0] <= stats.elapsed - self.window:
             self._samples.popleft()
 
-        since, done_before = self._samples[0]
+        since, finished_before = self._samples[0]
         if stats.elapsed > since:
-            speed = (done - done_before) / (stats.elapsed - since)
+            speed = (finished_pages - finished_before) / (stats.elapsed - since)
         else:
             # The first snapshot: the average since the crawl started.
             speed = stats.pages_per_second
         if finished:
             eta = 0.0
         elif speed > 0:
-            eta = max(self.max_pages - done, 0) / speed
+            eta = (self.max_pages - done) / speed
         else:
             eta = None
         return Progress(
             done=done,
             total=self.max_pages,
             failed=stats.failed,
-            percent=min(100.0 * done / self.max_pages, 100.0),
+            percent=100.0 * done / self.max_pages,
             pages_per_second=speed,
             eta=eta,
             active=stats.in_progress,

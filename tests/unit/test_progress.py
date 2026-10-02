@@ -73,6 +73,16 @@ class TestProgressTracker:
         progress = ProgressTracker(max_pages=2).update(snapshot(1.0, 3))
         assert (progress.percent, progress.eta) == (100.0, 0.0)
 
+    def test_pages_failed_without_a_request_do_not_take_done_over_the_limit(self):
+        # An open circuit breaker fails pages that are not held against the page limit.
+        tracker = ProgressTracker(max_pages=100)
+        tracker.update(snapshot(1.0, 80, failed=10))
+        progress = tracker.update(snapshot(2.0, 95, failed=35))
+
+        assert (progress.done, progress.total, progress.failed, progress.percent) == (100, 100, 35, 100.0)
+        assert progress.pages_per_second == 40.0
+        assert "| 100/100 pages, 35 failed |" in format_progress(progress)
+
     def test_next_crawl_starts_the_speed_anew(self):
         tracker = ProgressTracker(max_pages=100)
         tracker.update(snapshot(9.0, 90))
