@@ -558,9 +558,9 @@ minutes, most of it the synchronous crawler.
 ```
 === Scale: one request at a time vs 20 at once (the site answers in 50 ms) ===
 PAGES  SYNC TIME  SYNC PAGES/S  ASYNC TIME  ASYNC PAGES/S  SPEEDUP  SYNC MEMORY  ASYNC MEMORY  PAGES NOT KEPT
-  100      5.65s          17.7       0.60s          166.7     9.4x       1.4 MB        2.4 MB          2.2 MB
-  500     27.99s          17.9       2.48s          201.3    11.3x       4.6 MB        5.9 MB          2.3 MB
- 1000     55.93s          17.9       5.03s          198.7    11.1x       8.5 MB       10.1 MB          2.7 MB
+  100      5.50s          18.2       0.56s          178.6     9.8x       1.4 MB        2.3 MB          2.2 MB
+  500     27.57s          18.1       2.12s          235.4    13.0x       4.7 MB        6.1 MB          2.5 MB
+ 1000     55.00s          18.2       4.13s          242.2    13.3x       8.8 MB       10.3 MB          3.0 MB
 ```
 
 What the numbers mean, the bottlenecks they showed and what was done about

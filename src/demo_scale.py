@@ -20,7 +20,7 @@ from typing import Self
 from aiohttp import web
 
 from crawler import AsyncCrawler, CircuitBreaker, HTMLParser, ParsedPage, ParseError, RetryStrategy
-from crawler.urls import is_same_host, normalize_url
+from crawler.urls import get_host, is_same_host, normalize_url
 
 # Links of a page to the pages below it: the site is a tree this wide.
 FANOUT = 10
@@ -250,6 +250,9 @@ def _timed(crawl: Callable[[], tuple[int, int]]) -> tuple[int, int, float]:
 
 def _peak_memory(crawl: Callable[[], tuple[int, int]]) -> int:
     """The most memory Python held at once during `crawl`, over what it held before, in bytes."""
+    # What the runs before this one left there would be freed during it and hide a part of its own.
+    normalize_url.cache_clear()
+    get_host.cache_clear()
     tracemalloc.start()
     try:
         before, _ = tracemalloc.get_traced_memory()

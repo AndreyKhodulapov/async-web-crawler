@@ -140,3 +140,27 @@ def test_is_same_host(url, other, same):
 )
 def test_get_host(url, host):
     assert get_host(url) == host
+
+
+def test_repeated_url_is_worked_out_once():
+    normalize_url.cache_clear()
+    get_host.cache_clear()
+
+    for _ in range(3):
+        assert normalize_url("https://Example.com/a/../b") == "https://example.com/b"
+        assert get_host("https://Example.com/a/../b") == "example.com"
+
+    assert normalize_url.cache_info().misses == 1
+    assert get_host.cache_info().misses == 1
+
+
+def test_remembered_urls_are_limited():
+    # A crawl of any size keeps the answers for a fixed number of URLs.
+    limit = normalize_url.cache_info().maxsize
+    assert limit is not None and limit == get_host.cache_info().maxsize
+
+    normalize_url.cache_clear()
+    for number in range(limit + 10):
+        normalize_url(f"https://example.com/{number}")
+
+    assert normalize_url.cache_info().currsize == limit

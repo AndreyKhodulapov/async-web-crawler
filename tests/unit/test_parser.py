@@ -405,3 +405,31 @@ def test_parsed_tree_is_freed_without_the_garbage_collector():
 
     assert page["links"] and page["text"]  # parsed in full before the tree was taken apart
     assert after == before
+
+
+def test_parse_walks_the_tree_once_for_all_its_tags(parser, monkeypatch):
+    walks = []
+    find_all = BeautifulSoup.find_all
+
+    def counting(self, *args, **kwargs):
+        walks.append(args)
+        return find_all(self, *args, **kwargs)
+
+    # Set on the class of the root: searches inside one table or one list are not counted.
+    monkeypatch.setattr(BeautifulSoup, "find_all", counting)
+    page = parser.parse(fixture_html("valid_page.html"), PAGE_URL)
+
+    assert page["links"] and page["headings"] and page["images"] and page["tables"] and page["lists"]
+    assert walks == [(True,)]
+
+
+def test_extractors_on_their_own_agree_with_parse(parser, valid_page):
+    tree = soup(fixture_html("valid_page.html"))
+
+    assert parser.extract_metadata(tree, PAGE_URL) == valid_page["metadata"]
+    assert parser.extract_text(tree) == valid_page["text"]
+    assert parser.extract_links(tree, PAGE_URL) == valid_page["links"]
+    assert parser.extract_headings(tree) == valid_page["headings"]
+    assert parser.extract_images(tree, PAGE_URL) == valid_page["images"]
+    assert parser.extract_tables(tree) == valid_page["tables"]
+    assert parser.extract_lists(tree) == valid_page["lists"]

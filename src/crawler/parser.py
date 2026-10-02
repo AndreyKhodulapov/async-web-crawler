@@ -1,10 +1,12 @@
 """HTML parsing: turns a downloaded page into structured data."""
 
 import asyncio
+import functools
 import logging
 import re
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from typing import TypeVar
 
 from bs4 import BeautifulSoup
@@ -26,6 +28,40 @@ _HIDDEN_TAGS = frozenset({"script", "style", "noscript", "template"})
 _NON_CONTENT_TAGS = _HIDDEN_TAGS | {"head", "title"}
 _ARTICLE = frozenset({"article"})
 _SVG = frozenset({"svg"})
+# Elements that start on a new line in a browser. Text on both sides of
+# them is separated by a space; text inside inline elements (<b>, <a>, ...)
+# is joined as is, so "<b>to</b>, go" stays "to, go".
+_BLOCK_TAGS = frozenset({
+    "address", "article", "aside", "blockquote", "br", "caption", "dd", "details", "div", "dl", "dt",
+    "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+    "hr", "li", "main", "nav", "ol", "option", "p", "pre", "section", "summary", "table", "td", "th",
+    "tr", "ul",
+})  # fmt: skip
+# rel values are case-insensitive: "Canonical" is valid too.
+_CANONICAL = re.compile("^canonical$", re.IGNORECASE)
+
+
+class _TagIndex:
+    """The tags of a parsed tree by name, from one walk of the tree."""
+
+    def __init__(self, soup: BeautifulSoup) -> None:
+        self.soup = soup
+        self._tags: list[Tag] = soup.find_all(True)
+        self._by_name: dict[str, list[Tag]] = {}
+        for tag in self._tags:
+            self._by_name.setdefault(tag.name, []).append(tag)
+
+    def named(self, names: tuple[str, ...]) -> list[Tag]:
+        """The tags with one of `names`, in document order."""
+        if len(names) == 1:
+            return self._by_name.get(names[0], [])
+        return [tag for tag in self._tags if tag.name in names]
+
+
+# The index of the tree that `HTMLParser.parse` is working on, for the
+# extractors it calls: they look tags up a dozen times a page, and every
+# `find_all` walks the whole tree.
+_parsing: ContextVar[_TagIndex | None] = ContextVar("_parsing", default=None)
 
 
 class HTMLParser:
@@ -82,6 +118,7 @@ class HTMLParser:
         if not html.strip():
             raise ParseError(url, "empty document")
         soup = self._make_soup(html, page)
+        index = _parsing.set(_TagIndex(soup))
         try:
             if "<" not in html:
                 self._report(page, "no HTML markup found")
@@ -102,6 +139,7 @@ class HTMLParser:
             page["tables"] = self._extract(page, "tables", self.extract_tables, soup, default=[])
             page["lists"] = self._extract(page, "lists", self.extract_lists, soup, default=[])
         finally:
+            _parsing.reset(index)
             # A parsed tree is full of reference cycles (parent and child,
             # siblings), so only the garbage collector could free it, at a
             # time of its own choosing: trees of the pages parsed meanwhile
@@ -131,7 +169,9 @@ class HTMLParser:
         own_url = page_url or base_url
         links: dict[str, None] = {}  # an ordered set
         skipped = 0
-        for anchor in _content_tags(soup, "a", href=True):
+        for anchor in _content_tags(soup, "a"):
+            if not anchor.has_attr("href"):
+                continue
             link = resolve_url(_attr(anchor, "href"), base_url)
             if link is None or (self.same_host_only and not is_same_host(link, own_url)):
                 skipped += 1
@@ -178,12 +218,14 @@ class HTMLParser:
         titles = _content_tags(soup, "title", skip=_HIDDEN_TAGS)
         title_tag = next((tag for tag in titles if not _inside(tag, _SVG)), None)
         title = _clean(title_tag.get_text()) if title_tag is not None else None
-        keywords = _meta_content(soup, "name", "keywords") or ""
+        metas = [tag for tag in _content_tags(soup, "meta", skip=_HIDDEN_TAGS) if tag.has_attr("content")]
+        keywords = _meta_content(metas, "name", "keywords") or ""
 
         canonical = None
-        # rel values are case-insensitive: "Canonical" is valid too.
-        rel = re.compile("^canonical$", re.IGNORECASE)
-        canonical_tag = _first_content_tag(soup, "link", skip=_HIDDEN_TAGS, rel=rel, href=True)
+        links = _content_tags(soup, "link", skip=_HIDDEN_TAGS)
+        canonical_tag = next(
+            (tag for tag in links if tag.has_attr("href") and _attr_matches(tag, "rel", _CANONICAL)), None
+        )
         if canonical_tag is not None:
             href = _attr(canonical_tag, "href").strip()
             canonical = resolve_url(href, base_url) if base_url else (href or None)
@@ -193,9 +235,9 @@ class HTMLParser:
             language = lang.strip() or None
 
         return Metadata(
-            title=title or _meta_content(soup, "property", "og:title"),
+            title=title or _meta_content(metas, "property", "og:title"),
             description=(
-                _meta_content(soup, "name", "description") or _meta_content(soup, "property", "og:description")
+                _meta_content(metas, "name", "description") or _meta_content(metas, "property", "og:description")
             ),
             keywords=[word for word in map(str.strip, keywords.split(",")) if word],
             language=language,
@@ -222,7 +264,7 @@ class HTMLParser:
     def extract_headings(self, soup: BeautifulSoup) -> list[Heading]:
         """Return non-empty h1-h3 headings in document order."""
         headings = []
-        for tag in _content_tags(soup, ["h1", "h2", "h3"]):
+        for tag in _content_tags(soup, "h1", "h2", "h3"):
             if text := _visible_text(tag):
                 headings.append(Heading(level=int(tag.name[1]), text=text))
         return headings
@@ -243,7 +285,7 @@ class HTMLParser:
             for row in table.find_all("tr"):
                 # The table itself is visible, so a hidden ancestor of a row
                 # (a <template> with a row template, a <noscript>) is inside it.
-                if row.find_parent("table") is not table or _inside(row, _HIDDEN_TAGS):
+                if _closest(row, "table") is not table or _inside(row, _HIDDEN_TAGS):
                     continue
                 in_thead = row.parent is not None and row.parent.name == "thead"
                 (head_rows if in_thead else rows).append(row)
@@ -268,7 +310,7 @@ class HTMLParser:
         lists = []
         # A list item's own text leaves out nested lists: they are reported separately.
         item_skip = _NON_CONTENT_TAGS | {"ul", "ol"}
-        for tag in _content_tags(soup, ["ul", "ol"]):
+        for tag in _content_tags(soup, "ul", "ol"):
             texts = (_visible_text(item, skip=item_skip) for item in tag.find_all("li", recursive=False))
             items = [text for text in texts if text]
             if items:
@@ -338,33 +380,55 @@ def _empty_page(url: str, final_url: str) -> ParsedPage:
 
 def _base_url(soup: BeautifulSoup, page_url: str) -> str:
     """Return the URL relative links are resolved against: <base href> or the page URL."""
-    base = _first_content_tag(soup, "base", skip=_HIDDEN_TAGS, href=True)
+    bases = _content_tags(soup, "base", skip=_HIDDEN_TAGS)
+    base = next((tag for tag in bases if tag.has_attr("href")), None)
     if base is not None:
         return resolve_url(_attr(base, "href"), page_url) or page_url
     return page_url
 
 
-def _meta_content(soup: BeautifulSoup, attribute: str, value: str) -> str | None:
-    """Return the first non-empty content of <meta attribute=value>, if any."""
-    pattern = re.compile(f"^{re.escape(value)}$", re.IGNORECASE)
-    for tag in _content_tags(soup, "meta", skip=_HIDDEN_TAGS, attrs={attribute: pattern, "content": True}):
-        if content := _clean(_attr(tag, "content")):
+def _meta_content(metas: list[Tag], attribute: str, value: str) -> str | None:
+    """Return the first non-empty content of the <meta attribute=value> among `metas`, if any."""
+    pattern = _exactly(value)
+    for tag in metas:
+        if _attr_matches(tag, attribute, pattern) and (content := _clean(_attr(tag, "content"))):
             return content
     return None
 
 
+@functools.cache
+def _exactly(value: str) -> re.Pattern[str]:
+    """A pattern for an attribute value that is `value` in any case."""
+    return re.compile(f"^{re.escape(value)}$", re.IGNORECASE)
+
+
+def _attr_matches(tag: Tag, name: str, pattern: re.Pattern[str]) -> bool:
+    """Whether an attribute, or one of its values if it holds several (rel, class), matches `pattern`."""
+    value = tag.get(name)
+    if value is None:
+        return False
+    return any(pattern.search(item) for item in ([value] if isinstance(value, str) else value))
+
+
 def _cells(row: Tag) -> list[Tag]:
-    return row.find_all(["th", "td"], recursive=False)
+    return [cell for cell in row.find_all(True, recursive=False) if cell.name in ("th", "td")]
 
 
-def _content_tags(
-    soup: BeautifulSoup, name: str | list[str], *, skip: frozenset[str] = _NON_CONTENT_TAGS, **filters: object
-) -> list[Tag]:
-    """Find tags by name, leaving out those inside elements named in `skip`.
+def _content_tags(soup: BeautifulSoup, *names: str, skip: frozenset[str] = _NON_CONTENT_TAGS) -> list[Tag]:
+    """Find tags by name, in document order, leaving out those inside elements named in `skip`.
 
-    `filters` are passed on to `find_all`: attribute values or `attrs`.
+    Attributes are for the caller to check: bs4 finds tags by one name or
+    all of them much faster than by several names or by an attribute.
     """
-    return [tag for tag in soup.find_all(name, **filters) if not _inside(tag, skip)]
+    index = _parsing.get()
+    tags: list[Tag]
+    if index is not None and index.soup is soup:
+        tags = index.named(names)
+    elif len(names) == 1:
+        tags = soup.find_all(names[0])
+    else:
+        tags = [tag for tag in soup.find_all(True) if tag.name in names]
+    return [tag for tag in tags if not _inside(tag, skip)]
 
 
 def _inside(tag: Tag, names: frozenset[str]) -> bool:
@@ -376,10 +440,13 @@ def _inside(tag: Tag, names: frozenset[str]) -> bool:
     return any(parent.name in names for parent in tag.parents)
 
 
-def _first_content_tag(
-    soup: BeautifulSoup, name: str, *, skip: frozenset[str] = _NON_CONTENT_TAGS, **filters: object
-) -> Tag | None:
-    return next(iter(_content_tags(soup, name, skip=skip, **filters)), None)
+def _closest(tag: Tag, name: str) -> Tag | None:
+    """The nearest ancestor of `tag` named `name`."""
+    return next((parent for parent in tag.parents if parent.name == name), None)
+
+
+def _first_content_tag(soup: BeautifulSoup, name: str, *, skip: frozenset[str] = _NON_CONTENT_TAGS) -> Tag | None:
+    return next(iter(_content_tags(soup, name, skip=skip)), None)
 
 
 def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
@@ -388,15 +455,6 @@ def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
     Iterative rather than recursive: broken HTML can nest thousands of
     unclosed tags, which would exceed Python's recursion limit.
     """
-    # Elements that start on a new line in a browser. Text on both sides of
-    # them is separated by a space; text inside inline elements (<b>, <a>, ...)
-    # is joined as is, so "<b>to</b>, go" stays "to, go".
-    block_tags = {
-        "address", "article", "aside", "blockquote", "br", "caption", "dd", "details", "div", "dl", "dt",
-        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
-        "hr", "li", "main", "nav", "ol", "option", "p", "pre", "section", "summary", "table", "td", "th",
-        "tr", "ul",
-    }  # fmt: skip
     parts: list[str] = []
     # None marks the end of a block element: a space is emitted there.
     stack: list[PageElement | None] = [root]
@@ -406,7 +464,7 @@ def _visible_text(root: Tag, skip: frozenset[str] = _NON_CONTENT_TAGS) -> str:
             parts.append(" ")
         elif isinstance(node, Tag):
             if node is root or node.name not in skip:
-                if node.name in block_tags:
+                if node.name in _BLOCK_TAGS:
                     parts.append(" ")
                     stack.append(None)
                 stack.extend(reversed(node.contents))
