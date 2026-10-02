@@ -4,8 +4,10 @@ import time
 from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+from crawler.report import render_html, render_json
 from crawler.urls import get_host
 
 
@@ -20,6 +22,7 @@ class CrawlerStats:
         stats.record_page("https://example.com/gone", status=404, error="PermanentHTTPError")
         stats.finish()
         stats.get_stats()["total_pages"]              # 2
+        stats.export_to_html_report("report.html")    # or export_to_json("stats.json")
 
     A page is counted once, however many attempts it took. It is
     successful, failed (`error` names the class of its error) or skipped:
@@ -119,6 +122,27 @@ class CrawlerStats:
             "started_at": None if self._started_at is None else self._started_at.isoformat(),
             "finished_at": None if self._finished_at is None else self._finished_at.isoformat(),
         }
+
+    def export_to_json(self, filename: str | Path) -> None:
+        """Write `get_stats()` to a JSON file (UTF-8), replacing the file if it exists.
+
+        JSON has only string keys, so the status codes are strings there.
+
+        Raises:
+            OSError: the file cannot be written, e.g. its directory does not exist.
+        """
+        Path(filename).write_text(render_json(self.get_stats()), encoding="utf-8")
+
+    def export_to_html_report(self, filename: str | Path, *, title: str = "Crawl report") -> None:
+        """Write a report to an HTML file: a summary, charts and tables of `get_stats()`.
+
+        The file needs nothing else to be viewed: the styles and the charts
+        are inside it. It replaces the file if it exists.
+
+        Raises:
+            OSError: the file cannot be written, e.g. its directory does not exist.
+        """
+        Path(filename).write_text(render_html(self.get_stats(), title=title), encoding="utf-8")
 
 
 def _largest_first(counts: Counter[str], limit: int | None = None) -> dict[str, int]:

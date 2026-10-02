@@ -22,7 +22,8 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
   requests in flight, requests per second, average gap between requests to a host
 - Statistics of a crawl (`CrawlerStats`): pages in total, successful, failed
   and skipped, pages by status code and by error, top domains, average
-  speed and response time, running time
+  speed and response time, running time; export to JSON and to an HTML
+  report with tables and charts
 - Rate limiting per host or overall (`RateLimiter`, GCRA): requests per
   second, a minimum delay between requests and random jitter
 - robots.txt support (`RobotsParser`, RFC 9309): rules for the crawler's own
@@ -790,6 +791,21 @@ and `unreachable_urls`. The statistics are reset when the next `crawl()`
 starts. `CrawlerStats(top_domains=20)` can also be used on its own: `start()`,
 `record_page(url, status=..., elapsed=..., error=..., skipped=...)`, `finish()`.
 
+The statistics can be written to a file, during the crawl or after it:
+
+```python
+crawler.stats.export_to_json("stats.json")           # get_stats() as JSON
+crawler.stats.export_to_html_report("report.html")   # title="Crawl report" by default
+```
+
+The JSON file holds the same keys; the status codes are strings there, as
+JSON has no other keys. The HTML report is a single file with a summary and,
+for status codes, top domains and errors, a bar chart and a table. It needs
+no network and no other files to be viewed: the styles are inline, the charts
+(drawn with matplotlib) are embedded images, and there are no scripts. Both
+methods replace the file if it exists and raise `OSError` if it cannot be
+written.
+
 ### Saving pages
 
 Give the crawler a storage, and `crawl()` saves every page it has processed:
@@ -969,6 +985,7 @@ src/
     ├── circuit_breaker.py  # CircuitBreaker: blocks a failing host for a while
     ├── error_stats.py      # ErrorTracker: counts errors, retries and their outcomes
     ├── stats.py            # CrawlerStats: pages by outcome, status code and domain, speed, running time
+    ├── report.py           # the statistics as JSON and as an HTML report with charts
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
@@ -988,7 +1005,7 @@ tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
-├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, filters, storages, client
+├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, filters, storages, client
 └── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here
