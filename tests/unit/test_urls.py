@@ -164,3 +164,13 @@ def test_remembered_urls_are_limited():
         normalize_url(f"https://example.com/{number}")
 
     assert normalize_url.cache_info().currsize == limit
+
+
+def test_inline_data_is_not_remembered():
+    # An inline image is tens of kilobytes that would stay in the cache as its key.
+    normalize_url.cache_clear()
+
+    assert resolve_url("data:image/png;base64," + "A" * 50_000, "https://example.com/") is None
+    assert resolve_url("mailto:someone@example.com", "https://example.com/") is None
+
+    assert normalize_url.cache_info().currsize == 0

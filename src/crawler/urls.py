@@ -70,7 +70,12 @@ def resolve_url(href: str, base_url: str) -> str | None:
         return None
     try:
         absolute = urljoin(base_url, href)
+        scheme = urlsplit(absolute).scheme
     except ValueError:
+        return None
+    # Turned away before `normalize_url`, which would remember the whole of
+    # an inline image ("data:" with tens of kilobytes) as a key of its cache.
+    if scheme not in ("http", "https"):
         return None
     return normalize_url(absolute)
 
