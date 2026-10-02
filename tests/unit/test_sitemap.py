@@ -5,20 +5,10 @@ import gzip
 import logging
 
 import pytest
+from helpers import SITEMAP_NAMESPACE as NAMESPACE
+from helpers import index, urlset
 
 from crawler import HTTPStatusError, NetworkError, SitemapError, SitemapParser
-
-NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
-
-
-def urlset(*locations: str) -> bytes:
-    entries = "".join(f"<url><loc>{location}</loc><lastmod>2026-01-01</lastmod></url>" for location in locations)
-    return f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="{NAMESPACE}">{entries}</urlset>'.encode()
-
-
-def index(*locations: str) -> bytes:
-    entries = "".join(f"<sitemap><loc>{location}</loc></sitemap>" for location in locations)
-    return f'<?xml version="1.0" encoding="UTF-8"?><sitemapindex xmlns="{NAMESPACE}">{entries}</sitemapindex>'.encode()
 
 
 class FakeSite:

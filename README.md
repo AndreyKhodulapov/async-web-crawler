@@ -26,6 +26,9 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
   name, wildcards, longest-match precedence, Crawl-delay; one download per
   site, cached; disallowed URLs are logged and never requested; an
   unreachable robots.txt closes the site for a minute, then it is fetched again
+- Sitemaps as a source of pages (`SitemapParser`): plain and index sitemaps,
+  gzip, the sitemaps named in robots.txt; downloaded through the same
+  robots.txt check, limits and retries as pages
 - Retries of timeouts, network errors, HTTP 408, 429 and 5xx that usually
   pass, with exponential backoff and jitter, honoring `Retry-After`; the
   whole host slows down while a retry waits or after a Retry-After
@@ -697,14 +700,39 @@ that, the page is downloaded twice and appears in the results under both URLs.
 | `same_domain_only=False` | follow links on the start hosts only (and on the hosts they redirect to) |
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
+| `sitemap_urls=()` | sitemaps whose pages are crawled too |
+| `robots_sitemaps=False` | also read the sitemaps that robots.txt of the start URLs' sites names; needs `respect_robots` |
 
 Filters apply to discovered links, not to the start URLs. Patterns match the
 normalized URL both percent-encoded and decoded, so `r"/café"` works. A link
 that passes the filters but redirects to a URL that does not, such as a
 sign-in page on another domain, is skipped: it is left out of the results
 and listed in `skipped_urls` as `redirected out of scope`.
-Invalid start URLs or patterns raise `ValueError` before anything is fetched. After a crawl, and
-during one, the crawler exposes its state:
+Invalid start URLs, sitemap URLs or patterns raise `ValueError` before anything is fetched.
+
+```python
+async with AsyncCrawler(max_depth=1) as crawler:
+    pages = await crawler.crawl(
+        ["https://example.com/"],                          # may be empty when sitemaps are given
+        sitemap_urls=["https://example.com/sitemap.xml"],
+        robots_sitemaps=True,
+        same_domain_only=True,
+    )
+    crawler.failed_sitemaps                                # {sitemap URL: "ErrorType: message"}
+```
+
+Sitemaps are read before the first page is fetched: indexes are followed,
+gzipped files unpacked (see `SitemapParser` for the limits). A sitemap is
+downloaded like a page: robots.txt, the rate limit, retries and the circuit
+breaker apply, and its requests count in `crawl_stats().requests`, but not
+in `max_pages` or `error_stats()`. A page a sitemap lists has depth 0, like
+a start URL, so its links are followed up to `max_depth`; unlike a start
+URL, it must pass the filters, and a redirect does not bring another host
+into the crawl. `same_domain_only` keeps the hosts of `sitemap_urls` as well
+as those of the start URLs. A sitemap that cannot be downloaded or read is
+logged and listed in `failed_sitemaps`, and the crawl goes on.
+
+After a crawl, and during one, the crawler exposes its state:
 
 | Attribute | Content |
 |-----------|---------|
@@ -713,8 +741,9 @@ during one, the crawler exposes its state:
 | `skipped_urls` | `{url: reason}` for pages fetched but left out, e.g. redirected out of scope |
 | `blocked_urls` | `{url: reason}` for pages robots.txt did not allow to fetch |
 | `unreachable_urls` | `{url: reason}` for pages not fetched because robots.txt of their site was unreachable |
+| `failed_sitemaps` | `{sitemap url: "ErrorType: message"}` for sitemaps that could not be read |
 | `visited_urls` | every URL taken for fetching, successful or not |
-| `url_depths` | depth of every URL accepted into the queue |
+| `url_depths` | depth of every URL accepted into the queue; 0 for start URLs and pages listed in sitemaps |
 | `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit; pages saved and not saved, see [Saving pages](#saving-pages) |
 | `error_stats()` | `ErrorStats`, see [Error statistics](#error-statistics) |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
@@ -722,7 +751,7 @@ during one, the crawler exposes its state:
 
 The building blocks can be used on their own: `CrawlerQueue` (priorities,
 deduplication, completion detection), `SemaphoreManager` (global and
-per-domain limits), `RateLimiter`, `RobotsParser`, `RetryStrategy`,
+per-domain limits), `RateLimiter`, `RobotsParser`, `SitemapParser`, `RetryStrategy`,
 `CircuitBreaker` and `UrlFilter`.
 
 ### Saving pages
@@ -871,7 +900,7 @@ keep only links to the page's own host.
 ```bash
 pytest                      # unit + integration, no internet needed
 pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, storages, client with a fake session
-pytest tests/integration    # real HTTP, crawls, rate limits, robots.txt, retries, the circuit breaker and saving against a local aiohttp server
+pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker and saving against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
 pytest -m postgres          # the database tests and the save demo against PostgreSQL
 ```
@@ -921,7 +950,7 @@ docker-compose.yml          # PostgreSQL for the crawler and its tests
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
-├── helpers.py              # test bot name, crawler options for tests that skip politeness, page records, a storage in memory
+├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
 ├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error stats, filters, storages, client
 └── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
 docs/

@@ -42,6 +42,7 @@ from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryStrategy, parse_retry_after
 from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.sitemap import SitemapParser
 from crawler.storage.base import DataStorage
 from crawler.urls import get_host, is_valid_http_url, normalize_url
 
@@ -55,6 +56,7 @@ class _Response(NamedTuple):
     final_url: str
     content_type: str | None
     redirected: bool
+    body: bytes | None = None  # the bytes as sent, when asked for instead of the text
 
 
 class AsyncCrawler:
@@ -112,6 +114,10 @@ class AsyncCrawler:
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
     counted there, and neither are the requests the circuit breaker refused
     (see `circuit_breaker.get_stats()`).
+
+    `crawl()` can take the pages to start from out of sitemaps (see
+    `SitemapParser`), which are downloaded like pages: robots.txt, the
+    limits, the retries and the circuit breaker apply to them.
 
     With a `storage`, `crawl()` saves every page it has processed there (see
     `DataStorage`, `PageRecord`). A page that cannot be saved is logged and
@@ -178,6 +184,7 @@ class AsyncCrawler:
         self.retry_strategy = retry_strategy or RetryStrategy()
         self.circuit_breaker = circuit_breaker or CircuitBreaker()
         self.robots = RobotsParser(self._download_robots) if respect_robots else None
+        self.sitemaps = SitemapParser(self._download_sitemap)
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
         # `connect` covers DNS resolution and waiting for a pooled connection,
@@ -197,6 +204,8 @@ class AsyncCrawler:
         # State of the latest crawl() call.
         self._queue = CrawlerQueue()
         self.processed_urls: dict[str, ParsedPage] = {}
+        self._start_urls: set[str] = set()
+        self._failed_sitemaps: dict[str, str] = {}
         self._pages_requested = 0
         self._pages_to_save = 0
         self._written_before = 0
@@ -247,8 +256,13 @@ class AsyncCrawler:
         return self._queue.unreachable
 
     @property
+    def failed_sitemaps(self) -> dict[str, str]:
+        """Sitemap URL -> error description for sitemaps the latest crawl could not read. Do not modify."""
+        return self._failed_sitemaps
+
+    @property
     def url_depths(self) -> Mapping[str, int]:
-        """Depth of every URL the latest crawl accepted: 0 for start URLs."""
+        """Depth of every URL the latest crawl accepted: 0 for start URLs and pages listed in sitemaps."""
         return self._queue.depths
 
     async def fetch_url(self, url: str) -> str:
@@ -305,13 +319,16 @@ class AsyncCrawler:
         url: str,
         *,
         html_only: bool = False,
+        raw: bool = False,
         check_robots: bool = True,
         failure_level: int = logging.WARNING,
         track_errors: bool = True,
     ) -> FetchResult:
         """Download a page, checking robots.txt first and retrying transient failures.
 
-        With `track_errors`, the attempts count in `error_stats()`.
+        With `raw`, the result has the `body` as it was sent instead of the
+        decoded `content`. With `track_errors`, the attempts count in
+        `error_stats()`.
         """
         # Checked up front as well as in _request(): a closed crawler must
         # report itself even for a URL that robots.txt would block.
@@ -333,7 +350,7 @@ class AsyncCrawler:
             nonlocal last, attempts, failed_at
             timeout = self._timeout_for(retries=attempts)
             attempts += 1
-            result = await self._fetch_once(url, html_only=html_only, timeout=timeout)
+            result = await self._fetch_once(url, html_only=html_only, raw=raw, timeout=timeout)
             if isinstance(result.error, CircuitOpenError):
                 # Not sent. A retry fails as the attempt before it did: the
                 # strategy sees the circuit open and stops, and the failure
@@ -447,7 +464,16 @@ class AsyncCrawler:
         assert result.status is not None and result.content is not None
         return result.status, result.content
 
-    async def _fetch_once(self, url: str, *, html_only: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
+    async def _download_sitemap(self, url: str) -> bytes:
+        """Fetcher for SitemapParser: a sitemap goes through robots.txt, the limits and retries as a page does."""
+        # Not decoded: a sitemap may be gzipped. Whoever asked for the sitemap logs the failure.
+        result = await self._fetch(url, raw=True, failure_level=logging.INFO, track_errors=False)
+        if result.error is not None:
+            raise result.error
+        assert result.body is not None
+        return result.body
+
+    async def _fetch_once(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
         """Make one request, unless the circuit breaker of the host refuses it."""
         host = get_host(url)
         call = self.circuit_breaker.call(url)
@@ -472,18 +498,18 @@ class AsyncCrawler:
                 # so a request waiting for its host does not hold a slot another
                 # host could use; inside the slot the interval is checked once more.
                 async with gate() if host is None else self.rate_limiter.slot(host, gate):
-                    result = await self._send(url, html_only=html_only, timeout=timeout)
+                    result = await self._send(url, html_only=html_only, raw=raw, timeout=timeout)
                     call.record(result.error)
                     return result
         except CircuitOpenError as error:
             return FetchResult.failure(url, error, 0.0)
 
-    async def _send(self, url: str, *, html_only: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
+    async def _send(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
         """Send the request and report its outcome, whatever it is, as a FetchResult."""
         logger.info("Fetching %s", url)
         started = time.perf_counter()
         try:
-            response = await self._request(url, html_only=html_only, timeout=timeout)
+            response = await self._request(url, html_only=html_only, raw=raw, timeout=timeout)
         except FetchError as error:
             elapsed = time.perf_counter() - started
             # RetryStrategy logs the failure along with what comes next.
@@ -516,6 +542,7 @@ class AsyncCrawler:
             final_url=response.final_url,
             content_type=response.content_type,
             redirected=response.redirected,
+            body=response.body,
         )
 
     async def _parse(self, result: FetchResult) -> ParsedPage:
@@ -540,6 +567,8 @@ class AsyncCrawler:
         same_domain_only: bool = False,
         include_patterns: Iterable[str] = (),
         exclude_patterns: Iterable[str] = (),
+        sitemap_urls: Iterable[str] = (),
+        robots_sitemaps: bool = False,
     ) -> dict[str, ParsedPage]:
         """Crawl from the start URLs following links; return pages by normalized URL.
 
@@ -566,20 +595,31 @@ class AsyncCrawler:
         not returned, its links are not followed, and it is listed in
         `skipped_urls` with the reason.
 
+        The pages listed in the sitemaps `sitemap_urls` are crawled too, and
+        with `robots_sitemaps` so are those of the sitemaps that robots.txt
+        of the start URLs' sites names. The sitemaps are read before the
+        first page is fetched (see `SitemapParser`). A page a sitemap lists
+        has depth 0, like a start URL, but must pass the filters, like a
+        link; it comes after the start URLs and before the links.
+        `same_domain_only` keeps the hosts of `sitemap_urls` as well as
+        those of the start URLs. A sitemap that cannot be read does not stop
+        the crawl: it is logged and listed in `failed_sitemaps`.
+
         Failed pages do not stop the crawl: they are listed in `failed_urls`.
         Every processed page is saved to the `storage` of the crawler, if it
         has one, and the storage is flushed before the crawl returns. A page
         that cannot be saved is still returned: the failure is logged and
         counted in `crawl_stats()`.
         The state of the crawl (`processed_urls`, `visited_urls`,
-        `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `url_depths`,
+        `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `failed_sitemaps`, `url_depths`,
         `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()`) is reset
         on every call and stays available after it returns. The rate limits, the robots.txt
         cache and the states of the circuit breaker carry over.
 
         Raises:
             TypeError: a single string is passed instead of a list of URLs or patterns.
-            ValueError: `max_pages` is not positive, a start URL or a pattern is invalid.
+            ValueError: `max_pages` is not positive, a start URL, a sitemap URL or a pattern is invalid,
+                `robots_sitemaps` is asked of a crawler that does not read robots.txt.
             RuntimeError: another crawl is running on this crawler.
         """
         if isinstance(start_urls, str):
@@ -590,16 +630,25 @@ class AsyncCrawler:
         invalid = [url for url in start_urls if not is_valid_http_url(url)]
         if invalid:
             raise ValueError(f"invalid start URLs: {', '.join(map(repr, invalid))}")
+        if isinstance(sitemap_urls, str):
+            raise TypeError(f"expected a list of sitemap URLs, got a string: {sitemap_urls!r}")
+        sitemap_urls = list(sitemap_urls)
+        invalid = [url for url in sitemap_urls if not is_valid_http_url(url)]
+        if invalid:
+            raise ValueError(f"invalid sitemap URLs: {', '.join(map(repr, invalid))}")
+        if robots_sitemaps and self.robots is None:
+            raise ValueError("robots_sitemaps needs a crawler that reads robots.txt (respect_robots=True)")
         if self._crawl_started is not None and self._crawl_finished is None:
             raise RuntimeError("a crawl is already running on this crawler")
 
         url_filter = UrlFilter(
-            allowed_hosts={get_host(url) for url in start_urls} if same_domain_only else None,
+            allowed_hosts={get_host(url) for url in start_urls + sitemap_urls} if same_domain_only else None,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
         )
         self._queue = CrawlerQueue()
         self.processed_urls = {}
+        self._failed_sitemaps = {}
         self._pages_requested = 0
         self._pages_to_save = 0
         self._written_before = self.storage.written if self.storage is not None else 0
@@ -610,12 +659,15 @@ class AsyncCrawler:
         self.circuit_breaker.reset_stats()
         for url in start_urls:
             self._queue.add_url(url, priority=0, depth=0)
+        self._start_urls = set(self._queue.depths)
 
         logger.info(
             "Crawl started: %d start URLs, max_depth=%d, max_pages=%d", len(start_urls), self.max_depth, max_pages
         )
         self._crawl_started, self._crawl_finished = time.perf_counter(), None
         try:
+            if sitemap_urls or robots_sitemaps:
+                await self._queue_sitemap_pages(sitemap_urls, start_urls if robots_sitemaps else [], url_filter)
             async with asyncio.TaskGroup() as group:
                 for _ in range(self.max_concurrent):
                     group.create_task(self._crawl_worker(self._queue, url_filter, max_pages))
@@ -638,6 +690,49 @@ class AsyncCrawler:
                 "Saved %d pages to %s, %d not saved", stats.saved, type(self.storage).__name__, stats.save_failed
             )
         return self.processed_urls
+
+    async def _queue_sitemap_pages(self, sitemap_urls: list[str], robots_of: list[str], url_filter: UrlFilter) -> None:
+        """Queue the pages listed in `sitemap_urls` and in the sitemaps robots.txt of the sites of `robots_of` names."""
+        async with asyncio.TaskGroup() as group:
+            named = [group.create_task(self._sitemaps_in_robots(url)) for url in robots_of]
+        # Normalized, so a sitemap given twice, or given and named in robots.txt, is read once.
+        sitemaps = dict.fromkeys(normalize_url(url) for url in sitemap_urls)
+        for task in named:
+            sitemaps.update(dict.fromkeys(task.result()))
+        async with asyncio.TaskGroup() as group:
+            loads = [group.create_task(self._load_sitemap(url)) for url in sitemaps if url is not None]
+        listed = queued = 0
+        for load in loads:
+            for page in load.result():
+                listed += 1
+                if url_filter.allows(page) and self._queue.add_url(page, priority=0, depth=0):
+                    queued += 1
+        logger.info(
+            "Sitemaps: %d read, %d failed, %d pages listed, %d new queued",
+            len(loads) - len(self._failed_sitemaps),
+            len(self._failed_sitemaps),
+            listed,
+            queued,
+        )
+
+    async def _sitemaps_in_robots(self, url: str) -> list[str]:
+        """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read."""
+        assert self.robots is not None
+        try:
+            return (await self.robots.fetch_robots(url))["sitemaps"]
+        except (CrawlerClosedError, CircuitOpenError) as error:
+            logger.warning("No sitemaps from robots.txt of %s: %s: %s", url, type(error).__name__, error.message)
+            return []
+
+    async def _load_sitemap(self, url: str) -> list[str]:
+        """The pages a sitemap lists; a sitemap that cannot be read is logged and lists none."""
+        try:
+            return await self.sitemaps.fetch_sitemap(url)
+        except FetchError as error:
+            reason = f"{type(error).__name__}: {error.message}"
+            logger.warning("Sitemap %s is left out: %s", url, reason)
+            self._failed_sitemaps[url] = reason
+            return []
 
     def crawl_stats(self) -> CrawlStats:
         """Progress of the running crawl, or the result of the latest one."""
@@ -728,9 +823,10 @@ class AsyncCrawler:
             assert final_url is not None  # aiohttp has just fetched it
             # A later link to the redirect target must not fetch the page again.
             queue.mark_seen(final_url)
-            if depth == 0:
+            if url in self._start_urls:
                 # A start URL that redirects ("example.com" -> "www.example.com")
-                # defines the site as much as the URL itself.
+                # defines the site as much as the URL itself. A page from a
+                # sitemap has depth 0 too, but is filtered like a link.
                 url_filter.allow_host_of(final_url)
             elif not url_filter.allows(final_url):
                 # aiohttp follows redirects on its own, so a link inside the
@@ -846,11 +942,12 @@ class AsyncCrawler:
             fallback_charset_resolver=_sniff_charset,
         )
 
-    async def _request(self, url: str, *, html_only: bool, timeout: aiohttp.ClientTimeout) -> _Response:
+    async def _request(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> _Response:
         """Perform the GET request and read the whole body.
 
         With `html_only`, the body of a response whose Content-Type is not
-        HTML is not read: the content is empty and the size is 0.
+        HTML is not read: the content is empty and the size is 0. With
+        `raw`, the body is returned as bytes and the content is empty.
         The size is measured after content decoding (gzip, deflate, ...),
         so it may be larger than the number of bytes sent over the network.
         """
@@ -884,11 +981,12 @@ class AsyncCrawler:
                 body = await response.read()
                 return _Response(
                     status=response.status,
-                    content=_decode(body, response.get_encoding()),
+                    content="" if raw else _decode(body, response.get_encoding()),
                     size=len(body),
                     final_url=str(response.url),
                     content_type=content_type,
                     redirected=bool(response.history),
+                    body=body if raw else None,
                 )
         # Order matters: TooManyRedirects is a ClientResponseError, which is a
         # ClientError; aiohttp's ServerTimeoutError is both a ClientError and
