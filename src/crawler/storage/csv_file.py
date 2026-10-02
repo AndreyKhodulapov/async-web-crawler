@@ -13,6 +13,7 @@ import aiofiles
 import aiofiles.os
 from aiofiles.threadpool.binary import AsyncBufferedReader
 
+from crawler.exceptions import StorageError
 from crawler.models import PageRecord
 from crawler.retry import RetryStrategy
 from crawler.storage.base import DataStorage
@@ -23,7 +24,9 @@ class CSVStorage(DataStorage):
 
     The header row is made of the fields of the first record; a file that
     exists keeps the header it has, and its columns decide the order. A
-    record with a field the header lacks is refused with `ValueError`.
+    record with a field the header lacks is refused with `ValueError`. A
+    file that starts with an empty line is left alone: the first write
+    raises `StorageError`.
 
     Commas, quotes and line breaks in a value are quoted as RFC 4180 says,
     so a row may span several lines. `links` and `metadata` are written as
@@ -78,8 +81,12 @@ class CSVStorage(DataStorage):
     async def _open(self) -> AsyncBufferedReader:
         if await aiofiles.os.path.exists(self.path):
             async with aiofiles.open(self.path, encoding=self.encoding, newline="") as file:
-                # An empty file has no header yet.
-                self._header = next(csv.reader([await file.readline()]), None) or None
+                first_line = await file.readline()
+            # An empty file has no header yet.
+            self._header = next(csv.reader([first_line]), None) or None
+            if first_line and self._header is None:
+                # Not a file to start anew: there may be rows below.
+                raise StorageError(f"{self.path} starts with an empty line, not with a header")
         self._file = await aiofiles.open(self.path, "w+b" if self._header is None else "r+b")
         self._end = await self._file.seek(0, os.SEEK_END)
         return self._file

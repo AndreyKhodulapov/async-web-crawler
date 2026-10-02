@@ -84,6 +84,16 @@ class TestHeader:
 
         assert parse_csv(path)[0] == FIELDS
 
+    async def test_file_that_starts_with_an_empty_line_is_left_alone(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        path.write_bytes(b"\r\nurl,title\r\nhttps://site/a,A\r\n")
+
+        storage = CSVStorage(path, batch_size=1)
+        with pytest.raises(StorageError, match="starts with an empty line"):
+            await storage.save(make_record())
+
+        assert path.read_bytes() == b"\r\nurl,title\r\nhttps://site/a,A\r\n"
+
     async def test_record_with_an_unknown_field_is_refused(self, tmp_path):
         storage = CSVStorage(tmp_path / "pages.csv", batch_size=1)
         await storage.save({"url": "https://site/a"})
