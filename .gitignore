@@ -219,3 +219,8 @@ __marimo__/
 
 # Report of the errors demo
 error_report.json
+
+# Output of the save demo
+pages.jsonl
+pages.csv
+crawler.db

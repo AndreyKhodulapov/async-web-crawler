@@ -41,6 +41,7 @@ from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
 from crawler.storage import (
+    CompositeStorage,
     CSVStorage,
     DatabaseDriver,
     DatabaseStorage,
@@ -63,6 +64,7 @@ __all__ = [
     "CircuitOpenError",
     "CircuitState",
     "CircuitStats",
+    "CompositeStorage",
     "CrawlStats",
     "CrawlerClosedError",
     "CrawlerQueue",

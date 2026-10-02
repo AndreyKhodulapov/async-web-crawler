@@ -5,14 +5,18 @@ Usage:
     python src/main.py parse [options] [URL ...]       # fetch pages and extract data
     python src/main.py crawl [options] [URL ...]       # follow links from start pages
     python src/main.py errors [options] [URL ...]      # crawl a local site that fails on purpose
+    python src/main.py save [options] [URL ...]        # save crawled pages to JSON, CSV and a database
 """
 
 import argparse
 import asyncio
+import codecs
+import contextlib
 import dataclasses
 import json
 import logging
 import math
+import os
 import re
 import sys
 import textwrap
@@ -21,23 +25,33 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from crawler import (
     AsyncCrawler,
     CircuitBreaker,
     CircuitState,
+    CompositeStorage,
     CrawlStats,
+    CSVStorage,
+    DatabaseStorage,
+    DataStorage,
     FetchError,
     FetchResult,
     HTMLParser,
     HTTPStatusError,
+    JSONStorage,
+    PageRecord,
     ParsedPage,
     RetryStrategy,
+    StorageError,
     get_host,
     is_same_host,
     is_valid_http_url,
     product_token,
+    storage_from_url,
 )
+from crawler.storage import DATABASE_URL_VARIABLE, DEFAULT_DATABASE_URL
 from demo_site import DemoSite
 
 # The longest pause between retries; a longer --retry-delay would not be doubled.
@@ -88,6 +102,22 @@ def regex(raw: str) -> str:
         re.compile(raw)
     except re.error as exc:
         raise argparse.ArgumentTypeError(f"invalid regular expression {raw!r}: {exc}") from None
+    return raw
+
+
+def database_url(raw: str) -> str:
+    try:
+        storage_from_url(raw)  # opens nothing
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    return raw
+
+
+def encoding(raw: str) -> str:
+    try:
+        codecs.lookup(raw)
+    except LookupError:
+        raise argparse.ArgumentTypeError(f"unknown encoding: {raw!r}") from None
     return raw
 
 
@@ -280,6 +310,62 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # demo within seconds; the site is local, so no rate limit or robots.txt.
     add_common_options(errors, retries=3, retry_delay=0.2, robots=False)
     errors.set_defaults(read_timeout=1.0, rps=0.0, breaker_cooldown=1.0)
+
+    save = commands.add_parser(
+        "save", help="crawl a local site, save its pages to JSON, CSV and a database, read them back"
+    )
+    save.add_argument("urls", nargs="*", type=http_url, help="real URLs to fetch and save along with the local site")
+    storages = save.add_argument_group("storages")
+    storages.add_argument(
+        "--json",
+        type=Path,
+        default=Path("pages.jsonl"),
+        metavar="PATH",
+        help="JSON file, a record per line (default: %(default)s)",
+    )
+    storages.add_argument(
+        "--indent",
+        type=positive(int, allow_zero=True),
+        metavar="N",
+        help="write --json as one JSON array indented by N spaces instead",
+    )
+    storages.add_argument(
+        "--csv", type=Path, default=Path("pages.csv"), metavar="PATH", help="CSV file (default: %(default)s)"
+    )
+    storages.add_argument(
+        "--csv-encoding",
+        type=encoding,
+        default="utf-8",
+        metavar="NAME",
+        help="encoding of --csv (default: %(default)s)",
+    )
+    storages.add_argument(
+        "--database-url",
+        type=database_url,
+        # Checked like a value given on the command line.
+        default=os.environ.get(DATABASE_URL_VARIABLE) or DEFAULT_DATABASE_URL,
+        metavar="URL",
+        help="sqlite:///path or postgresql://user:password@host:port/database "
+        f"(default: ${DATABASE_URL_VARIABLE}, or {DEFAULT_DATABASE_URL})",
+    )
+    storages.add_argument(
+        "--batch-size",
+        type=positive(int),
+        default=10,
+        metavar="N",
+        help="pages written to a storage at once (default: %(default)s)",
+    )
+    storages.add_argument(
+        "--append",
+        action="store_true",
+        help="add to the files of an earlier run instead of replacing them; the database is never emptied",
+    )
+    save.add_argument(
+        "--preview", type=positive(int), default=3, help="records read back from each storage (default: %(default)s)"
+    )
+    # The site is the one of `errors`, and so are the defaults.
+    add_common_options(save, retries=3, retry_delay=0.2, robots=False)
+    save.set_defaults(read_timeout=1.0, rps=0.0, breaker_cooldown=1.0)
 
     args = parser.parse_args(argv)
     if args.retry_delay > MAX_RETRY_DELAY:
@@ -682,6 +768,127 @@ async def run_errors(args: argparse.Namespace) -> None:
     save_error_report(args.json, crawler)
 
 
+def hide_password(url: str) -> str:
+    """A database URL fit to be shown."""
+    password = urlsplit(url).password
+    return url if password is None else url.replace(f":{password}@", ":***@", 1)
+
+
+def open_storages(args: argparse.Namespace) -> dict[str, DataStorage]:
+    """The storages of the `save` command by the name shown for each; nothing is opened yet."""
+    return {
+        str(args.json): JSONStorage(args.json, indent=args.indent, batch_size=args.batch_size),
+        str(args.csv): CSVStorage(args.csv, encoding=args.csv_encoding, batch_size=args.batch_size),
+        hide_password(args.database_url): storage_from_url(args.database_url, batch_size=args.batch_size),
+    }
+
+
+async def count_records(storage: DataStorage) -> tuple[int, dict[int, int]]:
+    """The number of records in a storage, in all and by HTTP status."""
+    if isinstance(storage, DatabaseStorage):
+        # The database counts them itself.
+        return await storage.count(), await storage.status_counts()
+    statuses: Counter[int] = Counter()
+    async with contextlib.aclosing(storage.read()) as records:
+        async for record in records:
+            statuses[record["status_code"]] += 1
+    return statuses.total(), dict(sorted(statuses.items()))
+
+
+def format_size(size: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if size < 1024 or unit == "MB":
+            return f"{size} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    raise AssertionError("unreachable")
+
+
+async def print_storage_report(storages: Mapping[str, DataStorage], stats: CrawlStats) -> None:
+    print(f"\n=== Saved pages (this crawl: {stats.saved} saved, {stats.save_failed} not saved) ===")
+    name_width = max(len(type(storage).__name__) for storage in storages.values())
+    print(f"{'STORAGE':<{name_width}}  {'RECORDS':>7}  {'SIZE':>9}  {'BY STATUS':<16}  LOCATION")
+    earlier_runs = False
+    for location, storage in storages.items():
+        name = type(storage).__name__
+        try:
+            records, statuses = await count_records(storage)
+        except (StorageError, *storage.WRITE_ERRORS) as error:
+            # A file that cannot be read, a database that is down.
+            print(f"{name:<{name_width}}  cannot be read: {type(error).__name__}: {error}")
+            continue
+        # A database on a server has no file to measure.
+        path = getattr(storage, "path", None)
+        size = format_size(path.stat().st_size) if path is not None and path.exists() else "-"
+        by_status = ", ".join(f"{status}: {pages}" for status, pages in statuses.items()) or "-"
+        print(f"{name:<{name_width}}  {records:>7}  {size:>9}  {by_status:<16}  {location}")
+        earlier_runs = earlier_runs or records > stats.saved + stats.save_failed
+    if earlier_runs:
+        print("A storage with more records than this crawl had pages also keeps those of earlier runs.")
+
+
+RECORD_COLUMNS = (
+    f"{'CRAWLED AT (UTC)':<19}  {'STATUS':>6}  {'TYPE':<9}  {'TEXT':>6}  {'LINKS':>5}  {'DEPTH':>5}  URL  TITLE"
+)
+
+
+def format_record(record: PageRecord) -> str:
+    return (
+        f"{record['crawled_at']:%Y-%m-%d %H:%M:%S}  {record['status_code']:>6}  "
+        f"{record['content_type']:<9}  {len(record['text']):>6}  {len(record['links']):>5}  "
+        f"{record['metadata'].get('depth', ''):>5}  {record['url']}  {record['title']!r}"
+    )
+
+
+async def print_saved_records(location: str, storage: DataStorage, urls: list[str]) -> None:
+    """Read records back from a storage and show them: as many as there are `urls`.
+
+    A file is read from its start. A database finds the pages by URL, so it
+    shows those of this crawl, not the oldest it keeps.
+    """
+    by_url = isinstance(storage, DatabaseStorage)
+    print(f"\n=== {'Pages found by URL' if by_url else 'First records'} in {location} ({type(storage).__name__}) ===")
+    print(RECORD_COLUMNS)
+    try:
+        if by_url:
+            for url in urls:
+                record = await storage.get(url)
+                print(f"not saved: {url}" if record is None else format_record(record))
+            return
+        # Closed explicitly: the reader stops before the storage runs out of records.
+        async with contextlib.aclosing(storage.read()) as records:
+            shown = 0
+            async for record in records:
+                if shown >= len(urls):
+                    break
+                print(format_record(record))
+                shown += 1
+    except (StorageError, *storage.WRITE_ERRORS) as error:
+        print(f"cannot be read: {type(error).__name__}: {error}")
+
+
+async def run_save(args: argparse.Namespace) -> None:
+    if not args.append:
+        for path in (args.json, args.csv):
+            path.unlink(missing_ok=True)
+    storage = CompositeStorage(*open_storages(args).values())
+    async with DemoSite(extra_links=args.urls) as site:
+        print(f"Crawling {site.url} and saving its pages to JSON, CSV and a database\n", file=sys.stderr)
+        # As in `errors`: the start page and its links.
+        async with make_crawler(args, max_depth=1, max_per_domain=2, storage=storage) as crawler:
+            await crawler.crawl([site.url], max_pages=len(site.links()) + 1)
+
+    print_crawl_report(crawler)
+    # The crawler has closed its storages: the pages are read from new ones.
+    storages = open_storages(args)
+    try:
+        await print_storage_report(storages, crawler.crawl_stats())
+        for location, saved in storages.items():
+            await print_saved_records(location, saved, list(crawler.processed_urls)[: args.preview])
+    finally:
+        for saved in storages.values():
+            await saved.close()
+
+
 class ProgressAwareHandler(logging.StreamHandler):
     """Writes log records to stderr, erasing the live progress line first.
 
@@ -713,7 +920,13 @@ async def main() -> None:
         datefmt="%H:%M:%S",
         handlers=[ProgressAwareHandler()],
     )
-    commands = {"benchmark": run_benchmark, "parse": run_parse, "crawl": run_crawl, "errors": run_errors}
+    commands = {
+        "benchmark": run_benchmark,
+        "parse": run_parse,
+        "crawl": run_crawl,
+        "errors": run_errors,
+        "save": run_save,
+    }
     await commands[args.command](args)
 
 

@@ -1,9 +1,18 @@
 """Integration tests: run the demo commands against a local aiohttp server."""
 
+import csv
 import json
+import os
+import sqlite3
 from urllib.parse import urlsplit
 
-from main import parse_args, run_crawl, run_errors
+import asyncpg
+import pytest
+
+from main import parse_args, run_crawl, run_errors, run_save
+
+# Start page, 8 articles and the three pages a retry makes good.
+SAVED_PATHS = {"/", *(f"/articles/{number}" for number in range(1, 9)), "/flaky", "/rate-limited", "/slow"}
 
 
 async def test_crawl_reports_errors_and_circuit_breaker(url, tmp_path, capsys):
@@ -92,3 +101,108 @@ async def test_errors_demo_meets_every_kind_of_error(url, tmp_path, capsys):
     output = capsys.readouterr().out
     assert "=== Circuit breaker (3 hosts: " in output
     assert f"Error report saved to {report}" in output
+
+
+def save_options(tmp_path, *extra: str) -> list[str]:
+    files = ["--json", str(tmp_path / "pages.jsonl"), "--csv", str(tmp_path / "pages.csv")]
+    return ["save", *files, "--database-url", f"sqlite:///{tmp_path / 'crawler.db'}", *extra]
+
+
+async def test_save_demo_writes_three_storages_and_reads_them_back(tmp_path, capsys):
+    await run_save(parse_args(save_options(tmp_path, "--preview", "2", "--batch-size", "5")))
+
+    lines = (tmp_path / "pages.jsonl").read_text(encoding="utf-8").splitlines()
+    from_json = [json.loads(line) for line in lines]
+    assert {urlsplit(record["url"]).path for record in from_json} == SAVED_PATHS
+    with (tmp_path / "pages.csv").open(encoding="utf-8", newline="") as file:
+        from_csv = list(csv.DictReader(file))
+    with sqlite3.connect(tmp_path / "crawler.db") as connection:
+        from_database = connection.execute("SELECT url, title, status_code FROM pages ORDER BY id").fetchall()
+    connection.close()
+    # The same pages in the same order, whatever the storage.
+    in_json = [(record["url"], record["title"], record["status_code"]) for record in from_json]
+    assert [(row["url"], row["title"], int(row["status_code"])) for row in from_csv] == in_json
+    assert from_database == in_json
+    start = from_json[0]
+    assert (start["title"], start["status_code"], start["content_type"]) == ("Unreliable site", 200, "text/html")
+    assert (start["metadata"]["depth"], len(start["links"])) == (0, 24)
+
+    output = capsys.readouterr().out
+    assert "=== Saved pages (this crawl: 12 saved, 0 not saved) ===" in output
+    report = {line.split()[0]: line.split() for line in output.splitlines() if "Storage " in line}
+    assert set(report) == {"JSONStorage", "CSVStorage", "SQLiteStorage"}
+    for row in report.values():
+        assert row[1] == "12"
+        assert row[-3:-1] == ["200:", "12"]
+    assert report["JSONStorage"][-1] == str(tmp_path / "pages.jsonl")
+    assert "earlier runs" not in output
+    database = f"sqlite:///{tmp_path / 'crawler.db'}"
+    for title in (f"First records in {tmp_path / 'pages.jsonl'} (JSONStorage)", f"Pages found by URL in {database}"):
+        preview = output.split(f"=== {title}")[1].split("\n\n")[0].splitlines()[2:]
+        assert len(preview) == 2
+        assert preview[0].endswith(f"{start['url']}  'Unreliable site'")
+
+
+async def test_save_demo_replaces_the_files_unless_told_to_append(tmp_path, capsys):
+    await run_save(parse_args(save_options(tmp_path)))
+    await run_save(parse_args(save_options(tmp_path)))
+
+    # The site gets another port every run, so its pages are new to the database.
+    assert len((tmp_path / "pages.jsonl").read_text(encoding="utf-8").splitlines()) == 12
+    output = capsys.readouterr().out
+    assert "A storage with more records than this crawl had pages also keeps those of earlier runs." in output
+
+    await run_save(parse_args(save_options(tmp_path, "--append")))
+
+    assert len((tmp_path / "pages.jsonl").read_text(encoding="utf-8").splitlines()) == 24
+    with sqlite3.connect(tmp_path / "crawler.db") as connection:
+        assert connection.execute("SELECT COUNT(*) FROM pages").fetchone() == (36,)
+    connection.close()
+
+
+async def test_save_demo_goes_on_when_a_storage_cannot_be_written(tmp_path, capsys):
+    options = save_options(tmp_path, "--batch-size", "100")
+    options[options.index("--csv") + 1] = str(tmp_path / "missing" / "pages.csv")
+
+    await run_save(parse_args([*options, "--log-level", "ERROR"]))
+
+    assert len((tmp_path / "pages.jsonl").read_text(encoding="utf-8").splitlines()) == 12
+    output = capsys.readouterr().out
+    # A page counts as saved once every storage has it.
+    assert "=== Saved pages (this crawl: 0 saved, 12 not saved) ===" in output
+    report = {line.split()[0]: line.split()[1] for line in output.splitlines() if "Storage " in line}
+    assert report == {"JSONStorage": "12", "CSVStorage": "0", "SQLiteStorage": "12"}
+    assert "earlier runs" not in output
+
+
+async def test_save_demo_writes_an_indented_array_in_another_encoding(tmp_path):
+    await run_save(parse_args(save_options(tmp_path, "--indent", "2", "--csv-encoding", "utf-16")))
+
+    pages = json.loads((tmp_path / "pages.jsonl").read_text(encoding="utf-8"))
+    assert len(pages) == 12
+    with (tmp_path / "pages.csv").open(encoding="utf-16", newline="") as file:
+        assert len(list(csv.DictReader(file))) == 12
+
+
+@pytest.mark.postgres
+async def test_save_demo_with_postgres(tmp_path, capsys, monkeypatch):
+    dsn = os.environ.get("CRAWLER_TEST_DATABASE_URL", "postgresql://crawler:crawler@localhost:5432/crawler")
+    connection = await asyncpg.connect(dsn)
+    await connection.execute("DROP TABLE IF EXISTS pages")
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", dsn)
+    files = ["--json", str(tmp_path / "pages.jsonl"), "--csv", str(tmp_path / "pages.csv")]
+
+    try:
+        await run_save(parse_args(["save", *files]))
+        saved = await connection.fetch("SELECT url FROM pages")
+    finally:
+        await connection.close()
+
+    assert {urlsplit(url).path for (url,) in saved} == SAVED_PATHS
+    output = capsys.readouterr().out
+    assert "=== Saved pages (this crawl: 12 saved, 0 not saved) ===" in output
+    row = next(line.split() for line in output.splitlines() if line.startswith("PostgresStorage "))
+    assert row[1:3] == ["12", "-"]
+    assert f":{urlsplit(dsn).password}@" not in row[-1]
+    assert ":***@" in row[-1]
+    assert "Pages found by URL in postgresql://" in output
