@@ -8,7 +8,8 @@ metadata, text, absolute links, images, headings, tables and lists. Starting
 from a few URLs, it can crawl a whole site: it follows links breadth-first up
 to a given depth, never fetches a page twice, and shows live progress. It is
 polite by default: it limits the request rate per host, follows robots.txt
-and backs off when a site struggles.
+and backs off when a site struggles. The pages of a crawl can be saved as it
+goes: to a JSON or CSV file, to SQLite or PostgreSQL.
 
 ## Features
 
@@ -59,6 +60,17 @@ and backs off when a site struggles.
   reported in `errors`, and the other fields are still returned
 - Content that a browser with JavaScript does not render (`<script>`, `<style>`,
   `<noscript>`, `<template>`) is left out of every field, including links and images
+- Crawled pages saved as the crawl goes, behind one interface (`DataStorage`):
+  JSON Lines or an indented JSON array (`JSONStorage`), CSV in any encoding
+  (`CSVStorage`), SQLite (`SQLiteStorage`) and PostgreSQL (`PostgresStorage`),
+  or several of them at once (`CompositeStorage`)
+- The database is chosen by one URL, in code or in `CRAWLER_DATABASE_URL`;
+  another database is added as a driver, without changes to the storage
+- Asynchronous writes in batches: files through `aiofiles`, databases through
+  `aiosqlite` and `asyncpg`, one transaction per batch, saving a URL again
+  replaces its row
+- Failed writes are retried with backoff; a storage that stays down is
+  logged and counted, and the crawl goes on
 
 ## Requirements
 
@@ -75,8 +87,9 @@ pip install -e .                       # or: the package alone, runtime deps onl
 
 ## Demo
 
-The demo has four commands: `crawl` follows links from start pages, `errors`
-crawls a local site that fails on purpose, `parse` extracts data from pages,
+The demo has five commands: `crawl` follows links from start pages, `errors`
+crawls a local site that fails on purpose, `save` writes crawled pages to
+JSON, CSV and a database, `parse` extracts data from pages,
 and `benchmark` compares sequential and concurrent fetching. All of them accept `--concurrency`, `--log-level`, the timeouts
 (`--connect-timeout` and `--read-timeout`, 5 s by default, `--total-timeout`,
 10 s, and `--timeout-growth`, 1.5, see [Timeouts](#timeouts)) and the
@@ -87,11 +100,11 @@ politeness options:
 | `--rps` | 1 | max requests per second to one host; 0 removes the limit |
 | `--min-delay` | 0 | min seconds between two requests to one host |
 | `--jitter` | 0 | random extra delay of up to this many seconds |
-| `--no-robots` | off | do not check robots.txt; `errors` does not check it unless given `--robots` |
-| `--retries` | 2 (0 for `benchmark`, 3 for `errors`) | retries of timeouts, network errors, 408, 429, 500, 502-504 and 520-524 |
-| `--retry-delay` | 1 (0.2 for `errors`) | seconds before the first retry, doubled for every next one up to 30 s, see [Retries](#retries) |
+| `--no-robots` | off | do not check robots.txt; `errors` and `save` do not check it unless given `--robots` |
+| `--retries` | 2 (0 for `benchmark`, 3 for `errors` and `save`) | retries of timeouts, network errors, 408, 429, 500, 502-504 and 520-524 |
+| `--retry-delay` | 1 (0.2 for `errors` and `save`) | seconds before the first retry, doubled for every next one up to 30 s, see [Retries](#retries) |
 | `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 408, 429 or 5xx |
-| `--breaker-cooldown` | 30 (1 for `errors`) | seconds a blocked host is left alone before a probe request |
+| `--breaker-cooldown` | 30 (1 for `errors` and `save`) | seconds a blocked host is left alone before a probe request |
 | `--no-breaker` | off | never block a host |
 | `--user-agent` | `AsyncWebCrawler/0.1 (+repo URL)` | repeat to rotate several; all must share the bot name |
 
@@ -277,6 +290,64 @@ ends up open, or half-open if its last cooldown is over. The report in `error_re
 statistics, the circuit breakers, the failed pages with the full errors and
 the fetched pages.
 
+### save
+
+```bash
+python src/main.py save                                # pages.jsonl, pages.csv and crawler.db
+python src/main.py save --indent 2 --csv-encoding utf-8-sig --batch-size 5
+python src/main.py save --database-url sqlite:///data/pages.db --append
+CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler python src/main.py save
+```
+
+The command crawls the local site of [`errors`](#errors), with the same
+defaults, and saves every page it gets to three storages at once: a JSON
+file, a CSV file and a database. Pages that failed are not saved. The
+database is chosen by `--database-url`, else by the `CRAWLER_DATABASE_URL`
+environment variable, else it is `sqlite:///crawler.db`; for PostgreSQL see
+[Saving pages](#saving-pages). URLs given on the command line are fetched and
+saved along with the local site.
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `--json` | `pages.jsonl` | JSON file, a record per line |
+| `--indent` | off | write `--json` as one JSON array indented by this many spaces |
+| `--csv` | `pages.csv` | CSV file |
+| `--csv-encoding` | `utf-8` | encoding of the CSV file, e.g. `utf-8-sig` for Excel |
+| `--database-url` | `$CRAWLER_DATABASE_URL`, or `sqlite:///crawler.db` | `sqlite:///path` or `postgresql://user:password@host:port/database` |
+| `--batch-size` | 10 | pages written to a storage at once |
+| `--append` | off | add to the files of an earlier run instead of replacing them |
+| `--preview` | 3 | records read back from each storage |
+
+After the pages of the crawl, the command opens the storages again, counts
+what they hold and reads the first records back:
+
+```
+=== Saved pages (this crawl: 12 saved, 0 not saved) ===
+STORAGE        RECORDS       SIZE  BY STATUS         LOCATION
+JSONStorage         12     5.8 KB  200: 12           pages.jsonl
+CSVStorage          12     4.9 KB  200: 12           pages.csv
+SQLiteStorage       12    32.0 KB  200: 12           sqlite:///crawler.db
+
+=== First records in pages.jsonl (JSONStorage) ===
+CRAWLED AT (UTC)     STATUS  TYPE         TEXT  LINKS  DEPTH  URL  TITLE
+2026-10-02 12:00:24     200  text/html     779     24      0  http://127.0.0.1:50495/  'Unreliable site'
+2026-10-02 12:00:24     200  text/html      24      0      1  http://127.0.0.1:50495/articles/1  'Article 1'
+2026-10-02 12:00:24     200  text/html      24      0      1  http://127.0.0.1:50495/articles/2  'Article 2'
+...
+=== Pages found by URL in sqlite:///crawler.db (SQLiteStorage) ===
+CRAWLED AT (UTC)     STATUS  TYPE         TEXT  LINKS  DEPTH  URL  TITLE
+2026-10-02 12:00:24     200  text/html     779     24      0  http://127.0.0.1:50495/  'Unreliable site'
+...
+```
+
+A page counts as saved once every storage has written it; when one of them
+cannot be written, the table shows which storages have the pages. The files
+are read from their start, and the database finds the pages of this crawl by
+URL. The files are replaced on every run, unless `--append` is given. The
+database is never emptied: saving a URL again replaces its row, but the local
+site gets a new port on every run, so its pages are new URLs and the rows add
+up; the report says so. A password in the database URL is shown as `***`.
+
 ### parse
 
 ```bash
@@ -423,7 +494,7 @@ asyncio.run(main())
 | `fetch_many(urls)` | `list[FetchResult]` in input order | error stored per result |
 | `fetch_and_parse(url)` | `ParsedPage` dict | download errors raise a `FetchError` subclass, a response that is not an HTML document raises `ParseError`; problems in parts of the page go to `page["errors"]` |
 | `crawl(start_urls, max_pages)` | `{url: ParsedPage}` for fetched pages | failed URLs go to `failed_urls` |
-| `close()` | - | safe to call twice; called by `async with` |
+| `close()` | - | safe to call twice; called by `async with`; closes the storage too |
 
 Every method checks robots.txt, waits for the rate limit and retries transient
 failures; a URL that robots.txt disallows fails with `RobotsDisallowedError`
@@ -642,7 +713,7 @@ during one, the crawler exposes its state:
 | `unreachable_urls` | `{url: reason}` for pages not fetched because robots.txt of their site was unreachable |
 | `visited_urls` | every URL taken for fetching, successful or not |
 | `url_depths` | depth of every URL accepted into the queue |
-| `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit |
+| `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit; pages saved and not saved, see [Saving pages](#saving-pages) |
 | `error_stats()` | `ErrorStats`, see [Error statistics](#error-statistics) |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
 | `circuit_breaker.get_stats()` | `{host: CircuitStats}`, see [Circuit breaker](#circuit-breaker) |
@@ -651,6 +722,118 @@ The building blocks can be used on their own: `CrawlerQueue` (priorities,
 deduplication, completion detection), `SemaphoreManager` (global and
 per-domain limits), `RateLimiter`, `RobotsParser`, `RetryStrategy`,
 `CircuitBreaker` and `UrlFilter`.
+
+### Saving pages
+
+Give the crawler a storage, and `crawl()` saves every page it has processed:
+
+```python
+from crawler import AsyncCrawler, CompositeStorage, CSVStorage, JSONStorage, SQLiteStorage, storage_from_env
+
+storage = JSONStorage("pages.jsonl")              # a record per line
+storage = JSONStorage("pages.json", indent=2)     # or one indented JSON array
+storage = CSVStorage("pages.csv", encoding="utf-8-sig")
+storage = SQLiteStorage("crawler.db")
+storage = storage_from_env()                      # the database of CRAWLER_DATABASE_URL
+storage = CompositeStorage(JSONStorage("pages.jsonl"), SQLiteStorage("crawler.db"))  # both
+
+crawler = AsyncCrawler(storage=storage)
+await crawler.crawl(start_urls=["https://example.com"])
+await crawler.close()                             # writes what is left and closes the storage
+
+async with SQLiteStorage("crawler.db") as storage:
+    async for record in storage.read():           # oldest first, one at a time
+        print(record["url"], record["status_code"], record["crawled_at"])
+    print(await storage.count(), await storage.status_counts(), await storage.get("https://example.com/"))
+```
+
+Every storage keeps the same record, `PageRecord`, and gives it back with
+the same types:
+
+| Key | Content |
+|-----|---------|
+| `url` | the requested URL, normalized |
+| `title` | the page title; an empty string if it has none |
+| `text` | visible text of the page |
+| `links` | absolute links found on the page |
+| `metadata` | `description`, `keywords`, `language`, `canonical`, plus `final_url` (the URL after redirects) and `depth` in the crawl |
+| `crawled_at` | when the page was processed: a `datetime` in UTC |
+| `status_code` | HTTP status of the response |
+| `content_type` | media type of the response; an empty string if the server sent none |
+
+| Storage | Keeps the pages in | Notes |
+|---------|--------------------|-------|
+| `JSONStorage(path, indent=None)` | a JSON Lines file, or one indented array with `indent` | records are added without reading the file, and read back in pieces; the array is valid JSON after every write |
+| `CSVStorage(path, encoding="utf-8")` | a CSV file with a header row | the header comes from the first record, or from the file if it exists; `links` and `metadata` are JSON in a cell; quoting per RFC 4180; a character the encoding lacks is written as `?` |
+| `SQLiteStorage(path)` | the `pages` table of an SQLite file | `links` and `metadata` as JSON text, `crawled_at` as ISO 8601 in UTC |
+| `PostgresStorage(dsn)` | the `pages` table of a PostgreSQL database | `links` and `metadata` as `JSONB`, `crawled_at` as `TIMESTAMPTZ`; a connection pool |
+| `CompositeStorage(*storages)` | each of the storages | a page counts as written once all of them have it; one failing does not stop the others |
+
+All of them share the behavior of `DataStorage`:
+
+- `save(record)` puts the record into a buffer; the buffer is written once
+  it holds `batch_size` records (100 by default), on `flush()` and on
+  `close()`. Several workers may save at once.
+- A failed write is retried by the storage's own `retry_strategy`: by default
+  3 times with exponential backoff from 0.1 s, for the errors a retry can
+  cure (I/O errors, a locked SQLite database, a lost PostgreSQL connection).
+  When the retries run out, `StorageError` is raised and the records stay in
+  the buffer, so the next write takes them along. A repeated write does not
+  duplicate records.
+- `read()` iterates over the saved records, oldest first, without loading
+  them all; `pending` and `written` count the records in the buffer and those
+  written out.
+
+A database storage creates its table on the first use (`init_db()`), with
+`url` unique and indexes on `crawled_at` and `status_code`. A batch is one
+transaction: all of its pages are saved or none. Saving a URL again replaces
+its row. `count()`, `status_counts()` and `get(url)` query the table.
+
+In a crawl, a failed save never stops the crawler: it is logged, the page
+stays in the results, and `crawl_stats()` counts `saved` and `save_failed`.
+`saved` counts the pages actually written out, so pages still in the buffer
+are in neither while the crawl runs; `crawl()` flushes the storage before it
+returns, and what could not be written by then is `save_failed`. Only
+processed pages are saved, not the failed or skipped ones. A storage that
+stays down slows the crawl: once its batch is full, every save tries to
+write it again, retries included; give the storage a `RetryStrategy` with
+fewer retries if that matters.
+
+The database is chosen by a URL: `storage_from_url(url)` takes it as an
+argument, `storage_from_env()` reads it from `CRAWLER_DATABASE_URL` and
+falls back to `sqlite:///crawler.db`.
+
+| URL | Storage |
+|-----|---------|
+| `sqlite:///crawler.db` | SQLite file relative to the working directory |
+| `sqlite:////var/data/crawler.db` | SQLite file at an absolute path |
+| `postgresql://user:password@host:5432/database` (or `postgres://`) | PostgreSQL |
+
+A URL with another scheme, or without one, raises `ValueError`. To start a
+PostgreSQL server for the crawler, use the compose file of the repository:
+
+```bash
+docker compose up -d --wait                  # PostgreSQL 17 on localhost:5432
+export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
+python src/main.py save
+CRAWLER_POSTGRES_PORT=55432 docker compose up -d --wait   # if port 5432 is taken
+```
+
+Another database needs a driver and a few lines of storage: `DatabaseStorage`
+holds the SQL and talks to the database through `DatabaseDriver` (connect,
+execute, fetch, placeholders and column types), and `register_database` makes
+its URL scheme known:
+
+```python
+class MySQLStorage(DatabaseStorage):
+    WRITE_ERRORS = (OSError, aiomysql.OperationalError)   # what a retry can cure
+
+    def __init__(self, url: str, **options) -> None:
+        super().__init__(MySQLDriver(url), **options)      # MySQLDriver(DatabaseDriver)
+
+register_database("mysql", MySQLStorage)
+storage = storage_from_url("mysql://user:password@host/database")
+```
 
 ### Parsed page
 
@@ -681,10 +864,17 @@ keep only links to the page's own host.
 
 ```bash
 pytest                      # unit + integration, no internet needed
-pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, client with a fake session
-pytest tests/integration    # real HTTP, crawls, rate limits, robots.txt, retries and the circuit breaker against a local aiohttp server
+pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, storages, client with a fake session
+pytest tests/integration    # real HTTP, crawls, rate limits, robots.txt, retries, the circuit breaker and saving against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
+pytest -m postgres          # the database tests and the save demo against PostgreSQL
 ```
+
+The database tests run on SQLite by default. With the marker `postgres` the
+same checks run on a PostgreSQL server: start it with `docker compose up -d
+--wait`, or point `CRAWLER_TEST_DATABASE_URL` at another one (the default is
+`postgresql://crawler:crawler@localhost:5432/crawler`). The tests drop and
+create the `pages` table.
 
 ```bash
 ruff format src tests       # format
@@ -695,8 +885,8 @@ ruff check src tests        # lint
 
 ```
 src/
-├── main.py                 # demo CLI: `crawl`, `errors`, `parse` and `benchmark` commands
-├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors`
+├── main.py                 # demo CLI: `crawl`, `errors`, `save`, `parse` and `benchmark` commands
+├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors` and `save`
 └── crawler/
     ├── client.py           # AsyncCrawler: fetching, parsing, crawl()
     ├── queue.py            # CrawlerQueue: URL priority queue and statuses
@@ -709,17 +899,28 @@ src/
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
-    ├── models.py           # FetchResult, ParsedPage, CrawlStats, ErrorStats, RateStats, CircuitStats
-    └── exceptions.py       # FetchError hierarchy
+    ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats
+    ├── exceptions.py       # FetchError hierarchy, StorageError
+    └── storage/
+        ├── base.py         # DataStorage: buffer, batches, retries of failed writes
+        ├── json_file.py    # JSONStorage: JSON Lines or an indented array
+        ├── csv_file.py     # CSVStorage: header, quoting, encodings
+        ├── database.py     # DatabaseStorage and the DatabaseDriver interface: table, indexes, upsert
+        ├── sqlite.py       # SQLiteDriver, SQLiteStorage (aiosqlite)
+        ├── postgres.py     # PostgresDriver, PostgresStorage (asyncpg)
+        ├── composite.py    # CompositeStorage: several storages at once
+        └── factory.py      # storage_from_url, storage_from_env, register_database
+docker-compose.yml          # PostgreSQL for the crawler and its tests
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
-├── helpers.py              # test bot name, crawler options for tests that skip politeness
-├── unit/                   # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, error stats, filters, client
-└── integration/            # local HTTP server; live tests marked `network`
+├── helpers.py              # test bot name, crawler options for tests that skip politeness, page records, a storage in memory
+├── unit/                   # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, error stats, filters, storages, client
+└── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here
 ├── concurrency_control.md  # notes on queues, limits and crawl order
+├── data_storage.md         # notes on saving data: files, databases, batching, failed writes
 ├── error_handling.md       # notes on error kinds, retries, timeouts and circuit breakers
 ├── html_parsing.md         # notes on HTML parsing and URL handling
 └── politeness.md           # notes on rate limiting, robots.txt and backoff
