@@ -37,10 +37,11 @@ class SitemapParser:
     most `MAX_FILES` of them are downloaded for one call. A sitemap listed
     in an index that cannot be downloaded or read is logged and left out.
 
-    Gzipped sitemaps (.xml.gz) are unpacked. A sitemap over `MAX_SIZE`
-    bytes, the limit of the protocol, is rejected, before or after
-    unpacking. Entities are not expanded and nothing outside the document
-    is loaded while parsing it.
+    Gzipped sitemaps (.xml.gz) are unpacked, those made of several gzip
+    members too. A sitemap over `MAX_SIZE` bytes, the limit of the
+    protocol, is rejected, before or after unpacking; the crawler stops
+    downloading one at that size. Entities are not expanded and nothing
+    outside the document is loaded while parsing it.
 
     URLs are returned normalized and without duplicates, in the order they
     are listed; those that are not valid http(s) URLs are dropped. No more
@@ -142,11 +143,19 @@ def _parse(url: str, body: bytes, max_size: int) -> _Sitemap:
 def _unpack(url: str, body: bytes, max_size: int) -> bytes:
     """The XML of a sitemap, unpacked if it is gzipped; told by the content, not by the name or headers."""
     if body.startswith(b"\x1f\x8b"):
+        packed, parts, size = body, [], 0
         try:
-            # Stops at the limit: a small archive can unpack into gigabytes.
-            body = zlib.decompressobj(wbits=31).decompress(body, max_size + 1)
+            # An archive may be several gzip members one after another, which
+            # unpack into one document. Stops at the limit: a small archive
+            # can unpack into gigabytes.
+            while packed.startswith(b"\x1f\x8b") and size <= max_size:
+                member = zlib.decompressobj(wbits=31)
+                parts.append(member.decompress(packed, max_size + 1 - size))
+                size += len(parts[-1])
+                packed = member.unused_data
         except zlib.error as exc:
             raise SitemapError(url, f"broken gzip archive: {exc}") from exc
+        body = b"".join(parts)
     if len(body) > max_size:
         raise SitemapError(url, f"larger than {max_size} bytes")
     return body

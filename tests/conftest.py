@@ -17,6 +17,7 @@ class SiteState:
     body of /robots.txt, served with `robots_status`; None means 404.
     `sitemaps` maps the names of the files under /sitemaps/ to their
     bodies; the first `sitemap_failures` requests for them answer 503.
+    `sitemap_headers` are added to the responses with them.
     """
 
     def __init__(self) -> None:
@@ -29,6 +30,7 @@ class SiteState:
         self.robots_status = 200
         self.sitemaps: dict[str, bytes] = {}
         self.sitemap_failures = 0
+        self.sitemap_headers: dict[str, str] = {}
 
     def record(self, request: web.Request) -> None:
         self.hits[request.path] += 1
@@ -92,7 +94,7 @@ async def sitemap(request: web.Request) -> web.Response:
         raise web.HTTPNotFound()
     # Gzipped files are sent as they are, not as a Content-Encoding the client would undo.
     content_type = "application/gzip" if name.endswith(".gz") else "application/xml"
-    return web.Response(body=state.sitemaps[name], content_type=content_type)
+    return web.Response(body=state.sitemaps[name], content_type=content_type, headers=state.sitemap_headers)
 
 
 async def flaky(request: web.Request) -> web.Response:

@@ -17,7 +17,11 @@ that can be run, configured and watched.
   - XML entities: turn entity resolution and network access off in the
     parser (XXE, "billion laughs").
   - gzip: unpack with a size limit and stop there (a gzip bomb); detect gzip
-    by its magic bytes, not by the file name or headers.
+    by its magic bytes, not by the file name or headers. An archive may be
+    several gzip members in a row: the limit covers them all.
+  - the download itself: the HTTP client undoes `Content-Encoding: gzip`
+    while reading, so read the body in chunks up to the limit rather than
+    whole.
   - indexes: cap the depth or the number of files, remember what was
     fetched (an index may list itself), cap the URLs taken.
 - Real files are sloppy: different namespace versions or none, blank lines

@@ -30,6 +30,7 @@ from crawler.exceptions import (
     ParseError,
     RobotsDisallowedError,
     RobotsUnreachableError,
+    SitemapError,
     StorageError,
     TooManyRedirectsError,
     UnexpectedError,
@@ -341,9 +342,10 @@ class AsyncCrawler:
     ) -> FetchResult:
         """Download a page, checking robots.txt first and retrying transient failures.
 
-        With `raw`, the result has the `body` as it was sent instead of the
-        decoded `content`. With `track_errors`, the attempts count in
-        `error_stats()`.
+        With `raw`, which is how a sitemap is downloaded, the result has the
+        `body` as it was sent instead of the decoded `content`, and a body
+        over the size limit of a sitemap fails with `SitemapError`. With
+        `track_errors`, the attempts count in `error_stats()`.
         """
         # Checked up front as well as in _request(): a closed crawler must
         # report itself even for a URL that robots.txt would block.
@@ -1001,7 +1003,8 @@ class AsyncCrawler:
 
         With `html_only`, the body of a response whose Content-Type is not
         HTML is not read: the content is empty and the size is 0. With
-        `raw`, the body is returned as bytes and the content is empty.
+        `raw`, the body is returned as bytes and the content is empty; it is
+        read up to the size limit of a sitemap (see `_read_sitemap`).
         The size is measured after content decoding (gzip, deflate, ...),
         so it may be larger than the number of bytes sent over the network.
         """
@@ -1032,7 +1035,7 @@ class AsyncCrawler:
                         content_type=content_type,
                         redirected=bool(response.history),
                     )
-                body = await response.read()
+                body = await self._read_sitemap(response, url) if raw else await response.read()
                 return _Response(
                     status=response.status,
                     content="" if raw else _decode(body, response.get_encoding()),
@@ -1060,6 +1063,22 @@ class AsyncCrawler:
             raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
+
+    async def _read_sitemap(self, response: aiohttp.ClientResponse, url: str) -> bytes:
+        """Read the body of a sitemap, giving up once it is over the size limit of a sitemap.
+
+        A response sent with Content-Encoding: gzip is unpacked as it is
+        read, so a few hundred kilobytes may turn into hundreds of
+        megabytes; the rest of such a body is not downloaded.
+        """
+        limit = self.sitemaps.MAX_SIZE
+        chunks, size = [], 0
+        async for chunk in response.content.iter_chunked(64 * 1024):
+            size += len(chunk)
+            if size > limit:
+                raise SitemapError(url, f"larger than {limit} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def _page_record(result: FetchResult, page: ParsedPage, depth: int) -> PageRecord:

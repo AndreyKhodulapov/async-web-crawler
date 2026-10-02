@@ -189,6 +189,28 @@ class TestGzip:
         with pytest.raises(SitemapError, match="larger than 1000 bytes"):
             await fetch(files)
 
+    async def test_archive_of_several_members_is_one_document(self):
+        document = urlset("https://site/a", "https://site/b")
+        archive = gzip.compress(document[:60]) + gzip.compress(document[60:120]) + gzip.compress(document[120:])
+        assert await fetch({"https://site/sitemap.xml": archive}) == ["https://site/a", "https://site/b"]
+
+    async def test_members_that_unpack_over_the_limit_together_are_rejected(self, monkeypatch):
+        document = urlset(*["https://site/page"] * 30)
+        half = len(document) // 2
+        monkeypatch.setattr(SitemapParser, "MAX_SIZE", len(document) - 1)
+        archive = gzip.compress(document[:half]) + gzip.compress(document[half:])
+        with pytest.raises(SitemapError, match="larger than"):
+            await fetch({"https://site/sitemap.xml": archive})
+
+    async def test_broken_member_after_a_good_one(self):
+        archive = gzip.compress(urlset("https://site/page")) + b"\x1f\x8b not an archive"
+        with pytest.raises(SitemapError, match="broken gzip archive"):
+            await fetch({"https://site/sitemap.xml": archive})
+
+    async def test_padding_after_the_archive_is_ignored(self):
+        archive = gzip.compress(urlset("https://site/page")) + bytes(512)
+        assert await fetch({"https://site/sitemap.xml": archive}) == ["https://site/page"]
+
 
 class TestLimits:
     async def test_sitemap_over_the_size_limit_is_rejected(self, monkeypatch):

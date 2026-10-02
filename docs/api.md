@@ -294,7 +294,8 @@ async with AsyncCrawler(max_depth=1) as crawler:
 ```
 
 Sitemaps are read before the first page is fetched: indexes are followed,
-gzipped files unpacked (see `SitemapParser` for the limits). A sitemap is
+gzipped files unpacked (see `SitemapParser` for the limits; a sitemap over
+50 MB is not downloaded to the end). A sitemap is
 downloaded like a page: robots.txt, the rate limit, retries and the circuit
 breaker apply, and its requests count in `crawl_stats().requests`, but not
 in `max_pages` or `error_stats()`. A page a sitemap lists has depth 0, like

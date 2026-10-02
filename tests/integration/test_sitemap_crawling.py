@@ -6,7 +6,7 @@ import logging
 import pytest
 from helpers import BOT, UNTHROTTLED, index, urlset
 
-from crawler import AsyncCrawler, RetryStrategy
+from crawler import AsyncCrawler, RetryStrategy, SitemapParser
 
 SITEMAP = "/sitemaps/sitemap.xml"
 
@@ -206,6 +206,33 @@ async def test_sitemap_download_is_retried(url, site):
     assert list(pages) == [url("/site/c.html")]
     assert site.hits[SITEMAP] == 3
     assert crawler.crawl_stats().retries == 2
+
+
+@pytest.mark.parametrize("headers", [{}, {"Content-Encoding": "gzip"}], ids=["plain", "content-encoding"])
+async def test_oversized_sitemap_is_not_downloaded_whole(url, site, monkeypatch, caplog, headers):
+    monkeypatch.setattr(SitemapParser, "MAX_SIZE", 100_000)
+    document = urlset(*[url(f"/site/{number}.html") for number in range(20_000)])
+    # As a Content-Encoding the client undoes, the megabyte is a few kilobytes on the wire.
+    site.sitemaps = {"sitemap.xml": gzip.compress(document) if headers else document}
+    site.sitemap_headers = headers
+    async with make_crawler() as crawler:
+        with caplog.at_level(logging.INFO, logger="crawler.client"):
+            pages = await crawler.crawl([url("/site/c.html")], sitemap_urls=[url(SITEMAP)])
+
+    assert list(pages) == [url("/site/c.html")]
+    assert crawler.failed_sitemaps == {url(SITEMAP): "SitemapError: larger than 100000 bytes"}
+    assert site.hits[SITEMAP] == 1  # not retried
+    # Given up while reading: the request did not end with the whole body in memory.
+    assert f"Fetched {url(SITEMAP)}" not in caplog.text
+
+
+async def test_sitemap_sent_with_content_encoding_is_read(url, site):
+    site.sitemaps = {"sitemap.xml": gzip.compress(urlset(url("/site/c.html")))}
+    site.sitemap_headers = {"Content-Encoding": "gzip"}
+    async with make_crawler() as crawler:
+        pages = await crawler.crawl([], sitemap_urls=[url(SITEMAP)])
+
+    assert list(pages) == [url("/site/c.html")]
 
 
 async def test_max_pages_caps_the_pages_of_a_sitemap(url, site):
