@@ -4,3 +4,4 @@ beautifulsoup4>=4.12,<5
 lxml>=5
 idna>=3
 aiofiles>=24.1
+aiosqlite>=0.20

@@ -1,6 +1,7 @@
 """Base class of the storages that keep crawled pages."""
 
 import asyncio
+import contextlib
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
@@ -86,8 +87,9 @@ class DataStorage(ABC):
     async def read(self) -> AsyncIterator[PageRecord]:
         """Iterate over the saved records, oldest first; the buffered ones are written out before."""
         await self.flush()
-        async for record in self._read():
-            yield record
+        async with contextlib.aclosing(self._read()) as records:
+            async for record in records:
+                yield record
 
     async def close(self) -> None:
         """Write out the buffered records and release the file or the connection.

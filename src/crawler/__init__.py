@@ -40,7 +40,7 @@ from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
-from crawler.storage import CSVStorage, DataStorage, JSONStorage
+from crawler.storage import CSVStorage, DatabaseDriver, DatabaseStorage, DataStorage, JSONStorage, SQLiteStorage
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
@@ -56,6 +56,8 @@ __all__ = [
     "CrawlerClosedError",
     "CrawlerQueue",
     "DataStorage",
+    "DatabaseDriver",
+    "DatabaseStorage",
     "DomainRate",
     "ErrorStats",
     "FetchError",
@@ -79,6 +81,7 @@ __all__ = [
     "RobotsParser",
     "RobotsRules",
     "RobotsUnreachableError",
+    "SQLiteStorage",
     "SemaphoreManager",
     "StorageError",
     "TooManyRedirectsError",
