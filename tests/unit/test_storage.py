@@ -176,6 +176,16 @@ class TestWriteErrors:
 
         assert storage.attempts == 1
 
+    async def test_batch_of_another_error_is_dropped(self):
+        storage = MemoryStorage(batch_size=2, failures=[TypeError("not serializable")])
+        with pytest.raises(TypeError):
+            await save_pages(storage, "a", "b")
+
+        await save_pages(storage, "c", "d")
+
+        assert (storage.pending, storage.written) == (0, 2)
+        assert storage.urls == [["c", "d"]]
+
     async def test_retries_can_be_turned_off(self):
         storage = MemoryStorage(batch_size=1, failures=[OSError("disk full")], retry_strategy=RetryStrategy(0))
 

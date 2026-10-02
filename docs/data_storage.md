@@ -104,6 +104,10 @@ blocking the event loop, losing pages or writing them twice.
 - When the retries run out, **keep the records** and raise: the next write
   takes them along, and a short outage loses nothing. The cost is memory,
   and a write attempt on every save while the outage lasts.
+- Keep only what a retry can cure. A batch that fails with any other error
+  (a value the database refuses, a record that cannot be serialized) is a
+  **poison batch**: kept in the buffer, it fails every later write. Drop it,
+  log it and raise.
 - **Saving must not kill the crawl**: catch at the boundary of one page, log,
   count, go on. Fetched pages are expensive, a failed save is not a reason to
   throw away the rest.

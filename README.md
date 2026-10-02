@@ -779,7 +779,9 @@ All of them share the behavior of `DataStorage`:
   cure (I/O errors, a locked SQLite database, a lost PostgreSQL connection).
   When the retries run out, `StorageError` is raised and the records stay in
   the buffer, so the next write takes them along. A repeated write does not
-  duplicate records.
+  duplicate records. Any other error (e.g. a value the database refuses) is
+  raised as it is and its batch is dropped, so that one bad record does not
+  fail every later write.
 - `read()` iterates over the saved records, oldest first, without loading
   them all; `pending` and `written` count the records in the buffer and those
   written out.

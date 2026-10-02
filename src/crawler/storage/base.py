@@ -31,7 +31,9 @@ class DataStorage(ABC):
     A failed write is retried as `retry_strategy` says: by default the
     errors in `WRITE_ERRORS`, up to 3 times with exponential backoff from
     0.1 s. When the retries run out, `StorageError` is raised and the
-    records stay in the buffer, so the next write takes them along.
+    records stay in the buffer, so the next write takes them along. Any
+    other error is raised as it is and its batch is dropped: no retry cures
+    it, and kept in the buffer the batch would fail every later write.
 
     A subclass implements `_write_batch`, `_read` and `_close`, and lists in
     `WRITE_ERRORS` the exceptions its writes fail with.
@@ -78,6 +80,8 @@ class DataStorage(ABC):
             StorageError: the storage is closed, or the batch this record
                 completed could not be written. The record is kept either
                 way, unless the storage is closed.
+            Exception: the batch failed with an error outside `WRITE_ERRORS`
+                and is dropped, this record included.
         """
         async with self._lock:
             if self._closed:
@@ -131,6 +135,12 @@ class DataStorage(ABC):
             )
         except self.WRITE_ERRORS as error:
             raise StorageError(f"failed to write {len(batch)} records: {error}") from error
+        except Exception:
+            # No retry cures this error, so the next write of the same batch
+            # would fail too, and every one after it.
+            self._buffer = []
+            logger.error("Dropped %d records that %s cannot write", len(batch), type(self).__name__)
+            raise
         self._buffer = []
         self._written += len(batch)
         logger.debug("Wrote %d records to %s", len(batch), type(self).__name__)
