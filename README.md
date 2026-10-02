@@ -40,6 +40,8 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
   alone for a while, then tested with a single probe request
 - Configurable User-Agent, with optional rotation between variants of the
   same bot name
+- `AdvancedCrawler`: the whole crawler set up by one configuration file,
+  with the storage, the statistics, the reports and the log
 - Configuration file in YAML or JSON (`load_config`, `CrawlerConfig`): start
   URLs, limits, filters, storage, logging and reports, checked on load with
   every problem reported by the path of its key
@@ -814,6 +816,61 @@ no network and no other files to be viewed: the styles are inline, the charts
 methods replace the file if it exists and raise `OSError` if it cannot be
 written.
 
+### AdvancedCrawler
+
+`AdvancedCrawler` puts everything together by a configuration: the crawler
+with its limits, retries and circuit breaker, the sitemaps, the filters, the
+storage, the statistics, the reports and the log.
+
+```python
+import asyncio
+
+from crawler import AdvancedCrawler
+
+
+async def main():
+    crawler = AdvancedCrawler.from_config("config.yaml")
+
+    await crawler.crawl()
+
+    stats = crawler.get_stats()
+    print(f"Processed: {stats['total_pages']} pages")
+    print(f"Successful: {stats['successful']}")
+    print(f"Failed: {stats['failed']}")
+
+    crawler.export_to_html_report("report.html")
+    await crawler.close()
+
+
+asyncio.run(main())
+```
+
+| Member | What it does |
+|--------|--------------|
+| `AdvancedCrawler(config)` | takes a `CrawlerConfig`; the defaults without one |
+| `AdvancedCrawler.from_config(path, overrides)` | reads a YAML or a JSON file, see [Configuration file](#configuration-file) |
+| `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section; returns the pages by URL |
+| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics) |
+| `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
+| `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
+| `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats` |
+
+Directories of the log, the reports and the files of the storage are created
+if they are missing. A configuration with neither `urls` nor `sitemaps.urls`
+makes `crawl()` raise `ConfigError`. A report that cannot be written is
+logged and does not fail the crawl. Logging is set up when the crawler is
+made (see [Logging](#logging)) and belongs to the whole process: with two
+crawlers at once the log is written as the later one says.
+
+To show the progress of the crawl, run it as a task and pass the inner
+crawler to `show_progress`:
+
+```python
+crawl = asyncio.create_task(crawler.crawl())
+await show_progress(crawler.crawler, crawl, crawler.config.crawler.max_pages)
+pages = await crawl
+```
+
 ### Live progress
 
 `show_progress` prints a line about a running crawl every second, until the
@@ -1108,7 +1165,7 @@ keep only links to the page's own host.
 ```bash
 pytest                      # unit + integration, no internet needed
 pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, storages, client with a fake session
-pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker and saving against a local aiohttp server
+pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker, saving and AdvancedCrawler against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
 pytest -m postgres          # the database tests and the save demo against PostgreSQL
 ```
@@ -1131,6 +1188,7 @@ src/
 ├── main.py                 # demo CLI: `crawl`, `errors`, `save`, `parse` and `benchmark` commands
 ├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors` and `save`
 └── crawler/
+    ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
     ├── client.py           # AsyncCrawler: fetching, parsing, crawl()
     ├── queue.py            # CrawlerQueue: URL priority queue and statuses
     ├── semaphores.py       # SemaphoreManager: global and per-domain limits

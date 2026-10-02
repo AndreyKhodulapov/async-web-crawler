@@ -1,5 +1,6 @@
 """Asynchronous web crawler built on asyncio and aiohttp."""
 
+from crawler.advanced import AdvancedCrawler
 from crawler.circuit_breaker import BreakerCall, CircuitBreaker, CircuitState
 from crawler.client import AsyncCrawler
 from crawler.config import CrawlerConfig, load_config
@@ -64,6 +65,7 @@ from crawler.storage import (
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
+    "AdvancedCrawler",
     "AsyncCrawler",
     "BreakerCall",
     "CSVStorage",
