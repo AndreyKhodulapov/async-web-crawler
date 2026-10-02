@@ -131,6 +131,26 @@ class TestBatches:
             assert storage.released == 0
             assert crawler.crawl_stats().saved == 5
 
+    async def test_pages_left_by_an_earlier_crawl_are_not_counted_as_saved(self, url):
+        class FailsAfterOneWrite(MemoryStorage):
+            async def _write_batch(self, records):
+                if self.batches:
+                    raise DISK_FULL
+                await super()._write_batch(records)
+
+        # The first crawl leaves its 5 pages in the buffer; the first page
+        # of the second one completes the batch, the other 4 are not written.
+        storage = FailsAfterOneWrite(batch_size=6, failures=[DISK_FULL] * 4)
+        async with AsyncCrawler(max_depth=2, storage=storage, **UNTHROTTLED) as crawler:
+            await crawler.crawl([url("/site/")], same_domain_only=True)
+            assert (storage.pending, storage.written) == (5, 0)
+
+            await crawler.crawl([url("/site/")], same_domain_only=True)
+
+            assert (storage.pending, storage.written) == (4, 6)
+            stats = crawler.crawl_stats()
+            assert (stats.saved, stats.save_failed) == (1, 4)
+
     async def test_closing_the_crawler_closes_the_storage(self, url):
         storage = MemoryStorage()
         crawler = AsyncCrawler(storage=storage, **UNTHROTTLED)

@@ -189,6 +189,13 @@ def test_save_rejects_bad_storage_options(options):
         parse_args(["save", *options])
 
 
+def test_save_rejects_one_file_for_json_and_csv(tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["save", "--json", str(tmp_path / "pages"), "--csv", str(tmp_path / "pages")])
+
+    assert "--json and --csv must be different files" in capsys.readouterr().err
+
+
 def test_save_options_configure_the_storages(tmp_path):
     database = tmp_path / "pages.db"
     options = ["--json", str(tmp_path / "p.json"), "--indent", "2", "--csv", str(tmp_path / "p.csv")]
@@ -224,6 +231,8 @@ def test_save_shows_the_database_without_its_password():
         ("postgresql://crawler:secret@host/db", "postgresql://crawler:***@host/db"),
         ("postgresql://crawler@host/db", "postgresql://crawler@host/db"),
         ("sqlite:///crawler.db", "sqlite:///crawler.db"),
+        ("postgresql://host/db?user=crawler&password=secret", "postgresql://host/db?user=crawler&password=***"),
+        ("postgresql://host/db?password=secret&sslmode=require", "postgresql://host/db?password=***&sslmode=require"),
     ],
 )
 def test_hide_password(url, shown):

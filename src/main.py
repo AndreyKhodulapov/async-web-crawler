@@ -372,6 +372,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"--retry-delay must be at most {MAX_RETRY_DELAY:g}, got {args.retry_delay:g}")
     if args.user_agent and len({product_token(agent) for agent in args.user_agent}) > 1:
         parser.error("every --user-agent must start with the same bot name, e.g. MyBot/1.0 (...)")
+    if args.command == "save" and args.json.resolve() == args.csv.resolve():
+        parser.error(f"--json and --csv must be different files, got {args.json} for both")
     return args
 
 
@@ -771,7 +773,10 @@ async def run_errors(args: argparse.Namespace) -> None:
 def hide_password(url: str) -> str:
     """A database URL fit to be shown."""
     password = urlsplit(url).password
-    return url if password is None else url.replace(f":{password}@", ":***@", 1)
+    if password is not None:
+        url = url.replace(f":{password}@", ":***@", 1)
+    # PostgreSQL takes the password as a parameter of the URL too.
+    return re.sub(r"(?<=[?&]password=)[^&#]*", "***", url)
 
 
 def open_storages(args: argparse.Namespace) -> dict[str, DataStorage]:

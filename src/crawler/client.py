@@ -200,6 +200,7 @@ class AsyncCrawler:
         self._pages_requested = 0
         self._pages_to_save = 0
         self._written_before = 0
+        self._pending_before = 0
         self._retries = 0
         self._errors = ErrorTracker()
         self._crawl_started: float | None = None
@@ -602,6 +603,7 @@ class AsyncCrawler:
         self._pages_requested = 0
         self._pages_to_save = 0
         self._written_before = self.storage.written if self.storage is not None else 0
+        self._pending_before = self.storage.pending if self.storage is not None else 0
         self._retries = 0
         self._errors = ErrorTracker()
         self.rate_limiter.reset_stats()
@@ -645,8 +647,10 @@ class AsyncCrawler:
         rate = self.rate_limiter.get_stats()
         saved = save_failed = 0
         if self.storage is not None:
-            # Records left by an earlier crawl may be written in this one.
-            saved = min(self.storage.written - self._written_before, self._pages_to_save)
+            # Records left in the buffer by an earlier crawl are written
+            # first and are not pages of this one.
+            written = self.storage.written - self._written_before - self._pending_before
+            saved = min(max(written, 0), self._pages_to_save)
             save_failed = self._pages_to_save - saved
             if self._crawl_finished is None:
                 # Buffered pages are yet to be written.

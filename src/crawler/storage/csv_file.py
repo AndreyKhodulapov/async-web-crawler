@@ -100,11 +100,15 @@ class CSVStorage(DataStorage):
         csv.field_size_limit(2**31 - 1)
         header: list[str] | None = None
         row_lines: list[str] = []
+        inside_quotes = False
         async with aiofiles.open(self.path, encoding=self.encoding, newline="") as file:
             async for line in file:
                 row_lines.append(line)
-                # An odd number of quotes: the line ends inside a quoted value.
-                if sum(row_line.count('"') for row_line in row_lines) % 2:
+                # An odd number of quotes: the line starts or ends a quoted
+                # value that spans several lines.
+                if line.count('"') % 2:
+                    inside_quotes = not inside_quotes
+                if inside_quotes:
                     continue
                 row = next(csv.reader(["".join(row_lines)]))
                 row_lines = []
