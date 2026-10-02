@@ -7,7 +7,7 @@ import logging
 import math
 import ssl
 import time
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from types import TracebackType
 from typing import NamedTuple, Self
 
@@ -440,7 +440,7 @@ class AsyncCrawler:
         call = self.circuit_breaker.call(url)
 
         @contextlib.asynccontextmanager
-        async def gate() -> AsyncIterator[None]:
+        async def gate() -> AsyncGenerator[None, None]:
             # Asked again after the wait for the rate limit, as the circuit
             # may have opened meanwhile; a refused request does not wait for
             # a slot and does not count as sent.
