@@ -49,6 +49,8 @@ class FetchResult:
 class CrawlStats:
     """Progress of a crawl at one moment.
 
+    For the pages of a crawl by status code and domain see `CrawlerStats`.
+
     `skipped` counts pages fetched but left out because they redirected
     outside the crawl scope; `blocked` counts pages robots.txt did not allow
     to fetch, `unreachable` pages left unfetched because robots.txt of their

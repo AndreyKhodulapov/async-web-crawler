@@ -42,6 +42,7 @@ from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
 from crawler.sitemap import SitemapParser
+from crawler.stats import CrawlerStats
 from crawler.storage import (
     CompositeStorage,
     CSVStorage,
@@ -70,6 +71,7 @@ __all__ = [
     "CrawlStats",
     "CrawlerClosedError",
     "CrawlerQueue",
+    "CrawlerStats",
     "DataStorage",
     "DatabaseDriver",
     "DatabaseStorage",

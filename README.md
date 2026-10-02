@@ -20,6 +20,9 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
   filters: same domain only, include and exclude regular expressions
 - Live crawl statistics: pages done, queued, failed, blocked, unreachable,
   requests in flight, requests per second, average gap between requests to a host
+- Statistics of a crawl (`CrawlerStats`): pages in total, successful, failed
+  and skipped, pages by status code and by error, top domains, average
+  speed and response time, running time
 - Rate limiting per host or overall (`RateLimiter`, GCRA): requests per
   second, a minimum delay between requests and random jitter
 - robots.txt support (`RobotsParser`, RFC 9309): rules for the crawler's own
@@ -745,6 +748,7 @@ After a crawl, and during one, the crawler exposes its state:
 | `visited_urls` | every URL taken for fetching, successful or not |
 | `url_depths` | depth of every URL accepted into the queue; 0 for start URLs and pages listed in sitemaps |
 | `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit; pages saved and not saved, see [Saving pages](#saving-pages) |
+| `stats.get_stats()` | the pages by outcome, status code and domain, see [Page statistics](#page-statistics) |
 | `error_stats()` | `ErrorStats`, see [Error statistics](#error-statistics) |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
 | `circuit_breaker.get_stats()` | `{host: CircuitStats}`, see [Circuit breaker](#circuit-breaker) |
@@ -753,6 +757,38 @@ The building blocks can be used on their own: `CrawlerQueue` (priorities,
 deduplication, completion detection), `SemaphoreManager` (global and
 per-domain limits), `RateLimiter`, `RobotsParser`, `SitemapParser`, `RetryStrategy`,
 `CircuitBreaker` and `UrlFilter`.
+
+### Page statistics
+
+`crawler.stats` is a `CrawlerStats`: it counts every page the crawl is done
+with, once, however many attempts it took. `crawl_stats()` tells how the
+crawl is going (the queue, requests in flight, the request rate);
+`stats.get_stats()` tells what it got, as a plain dict ready for a report:
+
+```python
+stats = crawler.stats.get_stats()
+print(f"{stats['successful']} of {stats['total_pages']} pages in {stats['elapsed_seconds']:.1f}s")
+```
+
+| Key | Content |
+|-----|---------|
+| `total_pages` | pages the crawl is done with: `successful + failed + skipped` |
+| `successful` | pages fetched and parsed, the ones `crawl()` returns |
+| `failed` | pages in `failed_urls` |
+| `skipped` | pages in `skipped_urls`: fetched, but redirected out of scope |
+| `elapsed_seconds` | running time of the crawl, up to now while it runs |
+| `pages_per_second` | `total_pages / elapsed_seconds` |
+| `avg_response_time` | average time of a page request (of its last attempt, if retried) |
+| `status_codes` | `{status: pages}`, e.g. `{200: 41, 404: 2}`; pages that got no response are not here |
+| `errors` | `{error class: pages}` for the failed pages, most frequent first |
+| `top_domains` | `{host: pages}`, the 10 hosts with the most pages, largest first |
+| `started_at`, `finished_at` | UTC times in ISO 8601; `finished_at` is `None` while the crawl runs |
+
+Pages that were never requested (disallowed by robots.txt, or of a site
+whose robots.txt is unreachable) are not counted; they are in `blocked_urls`
+and `unreachable_urls`. The statistics are reset when the next `crawl()`
+starts. `CrawlerStats(top_domains=20)` can also be used on its own: `start()`,
+`record_page(url, status=..., elapsed=..., error=..., skipped=...)`, `finish()`.
 
 ### Saving pages
 
@@ -932,6 +968,7 @@ src/
     ├── retry.py            # RetryStrategy: which errors to retry, backoff, Retry-After
     ├── circuit_breaker.py  # CircuitBreaker: blocks a failing host for a while
     ├── error_stats.py      # ErrorTracker: counts errors, retries and their outcomes
+    ├── stats.py            # CrawlerStats: pages by outcome, status code and domain, speed, running time
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
@@ -951,7 +988,7 @@ tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
-├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error stats, filters, storages, client
+├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, filters, storages, client
 └── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here

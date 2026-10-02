@@ -43,6 +43,7 @@ from crawler.retry import RetryStrategy, parse_retry_after
 from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
 from crawler.sitemap import SitemapParser
+from crawler.stats import CrawlerStats
 from crawler.storage.base import DataStorage
 from crawler.urls import get_host, is_valid_http_url, normalize_url
 
@@ -114,6 +115,10 @@ class AsyncCrawler:
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
     counted there, and neither are the requests the circuit breaker refused
     (see `circuit_breaker.get_stats()`).
+
+    `stats` counts the pages of the latest `crawl()` by outcome, status code
+    and domain, with the speed and the running time of the crawl (see
+    `CrawlerStats`); `crawl_stats()` is a snapshot of its progress.
 
     `crawl()` can take the pages to start from out of sitemaps (see
     `SitemapParser`), which are downloaded like pages: robots.txt, the
@@ -206,6 +211,7 @@ class AsyncCrawler:
         self.processed_urls: dict[str, ParsedPage] = {}
         self._start_urls: set[str] = set()
         self._failed_sitemaps: dict[str, str] = {}
+        self.stats = CrawlerStats()
         self._pages_requested = 0
         self._pages_to_save = 0
         self._written_before = 0
@@ -612,7 +618,7 @@ class AsyncCrawler:
         counted in `crawl_stats()`.
         The state of the crawl (`processed_urls`, `visited_urls`,
         `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `failed_sitemaps`, `url_depths`,
-        `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()`) is reset
+        `stats`, `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()`) is reset
         on every call and stays available after it returns. The rate limits, the robots.txt
         cache and the states of the circuit breaker carry over.
 
@@ -665,6 +671,7 @@ class AsyncCrawler:
             "Crawl started: %d start URLs, max_depth=%d, max_pages=%d", len(start_urls), self.max_depth, max_pages
         )
         self._crawl_started, self._crawl_finished = time.perf_counter(), None
+        self.stats.start()
         try:
             if sitemap_urls or robots_sitemaps:
                 await self._queue_sitemap_pages(sitemap_urls, start_urls if robots_sitemaps else [], url_filter)
@@ -674,6 +681,7 @@ class AsyncCrawler:
             await self._flush_storage()
         finally:
             self._crawl_finished = time.perf_counter()
+            self.stats.finish()
         stats = self.crawl_stats()
         logger.info(
             "Crawl finished: %d processed, %d failed, %d skipped, %d blocked, %d unreachable, %d left in queue, %.2fs",
@@ -787,7 +795,7 @@ class AsyncCrawler:
                     elif isinstance(refusal, CircuitOpenError):
                         self._defer_or_fail(url, queue, refusal)
                     else:
-                        queue.mark_failed(url, f"{type(refusal).__name__}: {refusal.message}")
+                        self._fail_page(url, queue, refusal)
                     continue
                 if self._pages_requested >= max_pages:
                     # Taken while another worker was still checking the page
@@ -804,7 +812,7 @@ class AsyncCrawler:
                 # is a bug; it must not kill the worker, and the URL
                 # must leave the in-progress state, or get_next() would wait forever.
                 logger.exception("Unexpected error while crawling %s", url)
-                queue.mark_failed(url, f"UnexpectedError: {type(exc).__name__}: {exc}")
+                self._fail_page(url, queue, UnexpectedError(url, f"{type(exc).__name__}: {exc}"))
 
     async def _crawl_page(self, url: str, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
         depth = queue.depth(url)
@@ -815,7 +823,7 @@ class AsyncCrawler:
             self._defer_or_fail(url, queue, result.error)
             return
         if result.error is not None:
-            queue.mark_failed(url, f"{type(result.error).__name__}: {result.error.message}")
+            self._fail_page(url, queue, result.error, result)
             return
         if result.redirected:
             # Normalized like the links, so that patterns see the same form.
@@ -834,13 +842,14 @@ class AsyncCrawler:
                 # another domain. Such a page is not part of the site.
                 logger.info("Skipped %s: redirected out of scope to %s", url, final_url)
                 queue.mark_skipped(url, f"redirected out of scope: {final_url}")
+                self.stats.record_page(url, status=result.status, elapsed=result.elapsed, skipped=True)
                 return
 
         try:
             page = await self._parse(result)
         except ParseError as error:
             logger.warning("Failed to parse %s: %s", url, error.message)
-            queue.mark_failed(url, f"ParseError: {error.message}")
+            self._fail_page(url, queue, error, result)
             return
         queued = 0
         if depth < self.max_depth:
@@ -849,9 +858,20 @@ class AsyncCrawler:
                     queued += 1
         self.processed_urls[url] = page
         queue.mark_processed(url)
+        self.stats.record_page(url, status=result.status, elapsed=result.elapsed)
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
         if self.storage is not None:
             await self._save_page(_page_record(result, page, depth))
+
+    def _fail_page(self, url: str, queue: CrawlerQueue, error: FetchError, result: FetchResult | None = None) -> None:
+        """Finish a page of the crawl as failed; `result` is that of its request, None if none was sent."""
+        queue.mark_failed(url, f"{type(error).__name__}: {error.message}")
+        self.stats.record_page(
+            url,
+            status=None if result is None else result.status,
+            elapsed=None if result is None else result.elapsed,
+            error=type(error).__name__,
+        )
 
     async def _save_page(self, record: PageRecord) -> None:
         """Hand a page to the storage; a failure is logged and does not stop the crawl."""
@@ -894,7 +914,7 @@ class AsyncCrawler:
         opened = self.circuit_breaker.times_opened(host)
         if opened >= self.MAX_CIRCUIT_OPENINGS:
             logger.info("Gave up on %s: circuit breaker of %s opened %d times", url, host, opened)
-            queue.mark_failed(url, f"CircuitOpenError: {refusal.message}")
+            self._fail_page(url, queue, refusal)
             return
         # Back when the probe may go; a page refused while the probe is in
         # flight comes back a second later.

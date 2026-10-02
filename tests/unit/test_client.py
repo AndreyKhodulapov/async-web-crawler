@@ -723,6 +723,11 @@ class TestCrawlBlockedHost:
         messages = [record.getMessage() for record in caplog.records]
         assert any(message.startswith("Deferred http://a/1 for 0.") for message in messages)
         assert "Gave up on http://a/3: circuit breaker of a opened 3 times" in messages
+        # Deferred pages are counted once, when they are done; a/3 was never requested.
+        stats = crawler.stats.get_stats()
+        assert (stats["total_pages"], stats["successful"], stats["failed"]) == (5, 1, 4)
+        assert stats["errors"] == {"NetworkError": 3, "CircuitOpenError": 1}
+        assert stats["top_domains"] == {"a": 4, "b": 1}
 
     async def test_no_probe_after_the_last_opening(self, make_crawler, fake_session):
         crawler = make_crawler(
@@ -762,6 +767,37 @@ class TestCrawlBlockedHost:
         assert crawler.failed_urls.keys() == {"http://a/1"}
         assert crawler.processed_urls.keys() == {"http://a/2", "http://a/3"}
         assert crawler.crawl_stats().queued == 0
+
+
+class TestCrawlPageStats:
+    async def test_bug_while_crawling_a_page_fails_that_page_only(self, make_crawler, fake_session, monkeypatch):
+        crawler = make_crawler(max_concurrent=1, max_depth=0)
+        crawl_page = crawler._crawl_page
+
+        async def broken(url, queue, url_filter):
+            if url == "http://a/1":
+                raise KeyError("x")
+            await crawl_page(url, queue, url_filter)
+
+        monkeypatch.setattr(crawler, "_crawl_page", broken)
+        await crawler.crawl(["http://a/1", "http://a/2"])
+
+        assert crawler.failed_urls == {"http://a/1": "UnexpectedError: KeyError: 'x'"}
+        assert list(crawler.processed_urls) == ["http://a/2"]
+        stats = crawler.stats.get_stats()
+        assert (stats["total_pages"], stats["successful"], stats["failed"]) == (2, 1, 1)
+        assert stats["errors"] == {"UnexpectedError": 1}
+        assert stats["status_codes"] == {200: 1}
+
+    async def test_retried_page_is_counted_once(self, make_crawler, fake_session):
+        crawler = make_crawler(max_depth=0, retry_strategy=RetryStrategy(max_retries=2, base_delay=0.001))
+        fake_session.routes["http://a/"] = [FakeResponse(status=503), FakeResponse(status=503), FakeResponse()]
+
+        await crawler.crawl(["http://a/"])
+
+        stats = crawler.stats.get_stats()
+        assert (stats["total_pages"], stats["successful"], stats["failed"]) == (1, 1, 0)
+        assert stats["status_codes"] == {200: 1}
 
 
 class TestUserAgents:
