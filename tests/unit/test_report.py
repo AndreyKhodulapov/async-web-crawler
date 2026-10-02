@@ -57,11 +57,11 @@ def test_json_file_is_replaced_and_takes_a_string_path(stats, tmp_path):
 
 
 def test_json_keeps_non_ascii_text_readable():
-    rendered = render_json(empty_stats() | {"top_domains": {"пример.рф": 1}})
+    rendered = render_json(empty_stats() | {"top_domains": {"münchen.example": 1}})
 
-    assert "пример.рф" in rendered
+    assert "münchen.example" in rendered
     assert rendered.endswith("}\n")
-    assert json.loads(rendered)["top_domains"] == {"пример.рф": 1}
+    assert json.loads(rendered)["top_domains"] == {"münchen.example": 1}
 
 
 def test_export_to_a_missing_directory_fails(stats, tmp_path):
