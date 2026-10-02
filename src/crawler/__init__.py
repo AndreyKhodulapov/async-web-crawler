@@ -2,9 +2,11 @@
 
 from crawler.circuit_breaker import BreakerCall, CircuitBreaker, CircuitState
 from crawler.client import AsyncCrawler
+from crawler.config import CrawlerConfig, load_config
 from crawler.exceptions import (
     CertificateError,
     CircuitOpenError,
+    ConfigError,
     CrawlerClosedError,
     FetchError,
     FetchTimeoutError,
@@ -54,6 +56,7 @@ from crawler.storage import (
     SQLiteStorage,
     register_database,
     storage_from_env,
+    storage_from_output,
     storage_from_url,
 )
 from crawler.urls import get_host, is_same_host, is_valid_http_url
@@ -68,8 +71,10 @@ __all__ = [
     "CircuitState",
     "CircuitStats",
     "CompositeStorage",
+    "ConfigError",
     "CrawlStats",
     "CrawlerClosedError",
+    "CrawlerConfig",
     "CrawlerQueue",
     "CrawlerStats",
     "DataStorage",
@@ -113,8 +118,10 @@ __all__ = [
     "get_host",
     "is_same_host",
     "is_valid_http_url",
+    "load_config",
     "product_token",
     "register_database",
     "storage_from_env",
+    "storage_from_output",
     "storage_from_url",
 ]

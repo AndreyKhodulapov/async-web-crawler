@@ -21,6 +21,7 @@ itself, and none is retried.
 pages already crawled.
 """
 
+from collections.abc import Sequence
 from typing import ClassVar, Self
 
 
@@ -127,6 +128,24 @@ class UnexpectedError(FetchError):
 
 class StorageError(Exception):
     """Crawled pages could not be written to a storage, or the storage is closed."""
+
+
+class ConfigError(ValueError):
+    """A configuration cannot be read, or has unknown keys or invalid values.
+
+    `problems` lists them all, each starting with the path of its key, such
+    as "crawler.max_pages"; the message is the same list.
+    """
+
+    def __init__(self, problems: Sequence[str], source: str | None = None) -> None:
+        self.problems = list(problems)
+        self.source = source
+        prefix = f"{source}: " if source else ""
+        if len(self.problems) == 1:
+            super().__init__(f"Invalid configuration: {prefix}{self.problems[0]}")
+        else:
+            lines = "".join(f"\n  - {problem}" for problem in self.problems)
+            super().__init__(f"Invalid configuration: {prefix}{len(self.problems)} problems{lines}")
 
 
 ERROR_KINDS = (TransientError, PermanentError, NetworkError, ParseError)

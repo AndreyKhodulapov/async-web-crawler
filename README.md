@@ -40,6 +40,9 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
   alone for a while, then tested with a single probe request
 - Configurable User-Agent, with optional rotation between variants of the
   same bot name
+- Configuration file in YAML or JSON (`load_config`, `CrawlerConfig`): start
+  URLs, limits, filters, storage, logging and reports, checked on load with
+  every problem reported by the path of its key
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
 - Separate connect, read and total timeouts that grow with every retry
 - Clear error types, all subclasses of `FetchError`, grouped by whether a
@@ -806,6 +809,68 @@ no network and no other files to be viewed: the styles are inline, the charts
 methods replace the file if it exists and raise `OSError` if it cannot be
 written.
 
+### Configuration file
+
+The settings of a crawl can be kept in a YAML or a JSON file.
+[config.example.yaml](config.example.yaml) lists every key with its default
+and a comment; every key is optional.
+
+```yaml
+urls:
+  - https://example.com/
+crawler:
+  max_pages: 500
+  rate_limit: 2.0           # requests per second
+filters:
+  same_domain_only: true
+  exclude: ['\.pdf$']
+storage:
+  outputs: [pages.jsonl]    # files by extension, or database URLs
+```
+
+```python
+from crawler import ConfigError, load_config
+
+try:
+    config = load_config("config.yaml")
+except ConfigError as error:
+    print(error)            # every problem, each with the path of its key
+
+config.crawler.max_pages    # 500
+config.filters.exclude      # ("\\.pdf$",)
+storage = config.storage.build()   # JSONStorage here; None without outputs
+```
+
+| Section | Keys |
+|---------|------|
+| `urls` | the start URLs |
+| `sitemaps` | `urls`, `from_robots`, `max_urls` |
+| `crawler` | `max_pages`, `max_depth`, `max_concurrent`, `max_per_domain`, `rate_limit`, `per_domain_rate`, `min_delay`, `jitter`, `respect_robots`, `user_agent`, `user_agents`, `total_timeout`, `connect_timeout`, `read_timeout`, `timeout_growth` |
+| `retry` | `max_retries`, `backoff_factor`, `base_delay`, `max_delay` |
+| `circuit_breaker` | `failure_threshold`, `min_requests`, `window`, `cooldown` |
+| `filters` | `same_domain_only`, `include`, `exclude` |
+| `storage` | `outputs`, `batch_size`, `csv_encoding` |
+| `logging` | `level`, `file`, `max_bytes`, `backup_count` |
+| `report` | `stats_json`, `html`, `title`, `top_domains` |
+
+The file is checked as it is loaded: an unknown key (with the closest known
+one suggested), a value of the wrong type or out of its limits, an invalid
+URL or regular expression, an output with an unknown extension, a key
+written twice in YAML. `ConfigError` (a `ValueError`) lists all the problems
+at once, in `error.problems` too:
+
+```
+Invalid configuration: config.yaml: 2 problems
+  - crawler.max_page: unknown key; did you mean "max_pages"?
+  - filters.exclude[0]: not a regular expression: missing ), unterminated subpattern at position 0, got "("
+```
+
+`load_config(path, overrides)` applies `overrides`, a mapping shaped like the
+file, over the file key by key: `{"crawler": {"max_pages": 5}}`.
+`CrawlerConfig.from_dict(mapping)` checks a mapping without a file, and
+`config.to_dict()` gives one back. A configuration cannot be changed once
+made. Paths in the file are relative to the working directory.
+
 ### Saving pages
 
 Give the crawler a storage, and `crawl()` saves every page it has processed:
@@ -885,6 +950,11 @@ processed pages are saved, not the failed or skipped ones. A storage that
 stays down does not slow the crawl: after a write runs out of retries, saves
 only buffer for `cooldown` seconds before the storage tries again; the pages
 are written at the end of the crawl, or counted as `save_failed`.
+
+`storage_from_output(output)` chooses the storage by the name of a file:
+`.jsonl` (or `.ndjson`) is JSON Lines, `.json` an indented array, `.csv` CSV,
+`.db` (or `.sqlite`, `.sqlite3`) SQLite; a string with `://` is a database
+URL. This is what the `storage.outputs` of a configuration file go through.
 
 The database is chosen by a URL: `storage_from_url(url)` takes it as an
 argument, `storage_from_env()` reads it from `CRAWLER_DATABASE_URL` and
@@ -986,11 +1056,12 @@ src/
     ├── error_stats.py      # ErrorTracker: counts errors, retries and their outcomes
     ├── stats.py            # CrawlerStats: pages by outcome, status code and domain, speed, running time
     ├── report.py           # the statistics as JSON and as an HTML report with charts
+    ├── config.py           # CrawlerConfig, load_config: YAML or JSON file, defaults, validation
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
     ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats
-    ├── exceptions.py       # FetchError hierarchy, StorageError
+    ├── exceptions.py       # FetchError hierarchy, StorageError, ConfigError
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes
         ├── json_file.py    # JSONStorage: JSON Lines or an indented array
@@ -999,13 +1070,14 @@ src/
         ├── sqlite.py       # SQLiteDriver, SQLiteStorage (aiosqlite)
         ├── postgres.py     # PostgresDriver, PostgresStorage (asyncpg)
         ├── composite.py    # CompositeStorage: several storages at once
-        └── factory.py      # storage_from_url, storage_from_env, register_database
+        └── factory.py      # storage_from_output, storage_from_url, storage_from_env, register_database
+config.example.yaml         # every configuration key with its default
 docker-compose.yml          # PostgreSQL for the crawler and its tests
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
-├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, filters, storages, client
+├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, filters, storages, client
 └── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here

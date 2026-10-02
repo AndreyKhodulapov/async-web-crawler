@@ -9,6 +9,7 @@ from crawler.storage.factory import (
     DEFAULT_DATABASE_URL,
     register_database,
     storage_from_env,
+    storage_from_output,
     storage_from_url,
 )
 from crawler.storage.json_file import JSONStorage
@@ -30,5 +31,6 @@ __all__ = [
     "SQLiteStorage",
     "register_database",
     "storage_from_env",
+    "storage_from_output",
     "storage_from_url",
 ]
