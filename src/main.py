@@ -51,6 +51,7 @@ from crawler import (
     storage_from_url,
 )
 from crawler.logging_setup import configure_logging
+from crawler.progress import show_progress
 from crawler.storage import DATABASE_URL_VARIABLE, DEFAULT_DATABASE_URL
 from demo_site import DemoSite
 
@@ -537,30 +538,6 @@ async def run_parse(args: argparse.Namespace) -> None:
         save_json(args.json, urls, outcomes)
 
 
-def format_progress(stats: CrawlStats) -> str:
-    return (
-        f"pages {stats.processed} | failed {stats.failed} | skipped {stats.skipped} | blocked {stats.blocked} | "
-        f"unreachable {stats.unreachable} | queued {stats.queued} | in progress {stats.in_progress} | in flight {stats.active_requests} | "
-        f"{stats.current_rps:.1f} req/s | gap {stats.avg_delay:.2f}s | {stats.elapsed:.1f}s"
-    )
-
-
-async def show_progress(crawler: AsyncCrawler, crawl_task: asyncio.Task[object], interval: float = 1.0) -> None:
-    """Print crawl progress to stderr every `interval` seconds until the crawl ends."""
-    # In a terminal the line is redrawn in place; in a file or pipe every
-    # update goes on a line of its own.
-    live = sys.stderr.isatty()
-    while not crawl_task.done():
-        await asyncio.wait({crawl_task}, timeout=interval)
-        line = format_progress(crawler.crawl_stats())
-        if live:
-            print(f"\r\033[K{line}", end="", file=sys.stderr, flush=True)
-        else:
-            print(line, file=sys.stderr, flush=True)
-    if live:
-        print(file=sys.stderr)
-
-
 def print_crawl_report(crawler: AsyncCrawler) -> None:
     stats = crawler.crawl_stats()
     print(f"\n=== Crawl ({len(crawler.visited_urls)} pages, {stats.elapsed:.2f}s) ===")
@@ -736,7 +713,7 @@ async def run_crawl(args: argparse.Namespace) -> None:
                 exclude_patterns=args.exclude,
             )
         )
-        await show_progress(crawler, crawl_task)
+        await show_progress(crawler, crawl_task, args.max_pages)
         await crawl_task
 
     print_crawl_report(crawler)

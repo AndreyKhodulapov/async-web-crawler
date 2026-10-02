@@ -43,6 +43,8 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
 - Configuration file in YAML or JSON (`load_config`, `CrawlerConfig`): start
   URLs, limits, filters, storage, logging and reports, checked on load with
   every problem reported by the path of its key
+- Live progress of a crawl (`show_progress`): a bar with the percent of the
+  page limit, the current speed, the time left and the active tasks
 - Logging to the console and to a file (`configure_logging`): JSON Lines,
   a record per line with a UTC timestamp, rotated by size
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
@@ -139,13 +141,14 @@ and web-scraping.dev sets `Crawl-delay: 2`.
 While it runs, a progress line is updated every second:
 
 ```
-pages 9 | failed 0 | skipped 0 | blocked 0 | unreachable 0 | queued 88 | in progress 6 | in flight 2 | 1.6 req/s | gap 1.09s | 7.0s
+[######--------------]  30% | 9/30 pages, 1 failed | 1.6 pages/s | ETA 14s | active 6 (2 in flight) | queued 88 | 7s
 ```
 
-`in progress` counts pages taken by workers; `in flight` counts those actually
+The percent is the share of `--max-pages` done, `pages/s` the speed over the
+last 10 seconds and `ETA` the time the remaining pages take at that speed.
+`active` counts pages taken by workers; `in flight` counts those actually
 being downloaded, which never exceeds `--per-domain` for a single site.
-`req/s` is the request rate over the last 5 seconds, and `gap` the average
-time between two requests to the same host.
+See [Live progress](#live-progress).
 Warnings, such as a failed page, are printed above the line; per-request logs,
 blocked URLs included, are hidden by default, pass `--log-level INFO` to see
 them. At the end it prints every page in the order it was found, and then
@@ -811,6 +814,46 @@ no network and no other files to be viewed: the styles are inline, the charts
 methods replace the file if it exists and raise `OSError` if it cannot be
 written.
 
+### Live progress
+
+`show_progress` prints a line about a running crawl every second, until the
+crawl ends:
+
+```python
+import asyncio
+
+from crawler import AsyncCrawler, show_progress
+
+async with AsyncCrawler() as crawler:
+    crawl = asyncio.create_task(crawler.crawl(["https://example.com/"], max_pages=100))
+    await show_progress(crawler, crawl, max_pages=100)
+    pages = await crawl
+```
+
+```
+[######--------------]  30% | 30/100 pages, 1 failed | 1.6 pages/s | ETA 44s | active 6 (2 in flight) | queued 88 | 19s
+```
+
+| Part | Meaning |
+|------|---------|
+| bar, percent | pages done of `max_pages`, rounded down |
+| `30/100 pages, 1 failed` | pages requested and finished (processed, failed, skipped), and the failed among them |
+| `pages/s` | the speed over the last 10 seconds |
+| `ETA` | the time the remaining pages take at that speed; `--` while the speed is 0, `done` once the crawl has ended |
+| `active`, `in flight` | pages taken by workers, and the HTTP requests being made |
+| `queued` | pages waiting in the queue |
+| the last value | the time since the crawl started |
+
+The percent and the time left are measured against `max_pages`: a site with
+fewer pages ends sooner, with the last line below 100%. The line goes to
+stderr (or to `stream`). In a terminal it is redrawn in place, and log
+records are printed above it; in a file or a pipe every update takes a line.
+
+For another output, `ProgressTracker(max_pages).update(crawler.crawl_stats())`
+returns the same numbers as a `Progress` (`done`, `total`, `percent`,
+`pages_per_second`, `eta`, `active`, ...), and `format_progress` makes the
+line of it.
+
 ### Configuration file
 
 The settings of a crawl can be kept in a YAML or a JSON file.
@@ -1101,6 +1144,7 @@ src/
     ├── report.py           # the statistics as JSON and as an HTML report with charts
     ├── config.py           # CrawlerConfig, load_config: YAML or JSON file, defaults, validation
     ├── logging_setup.py    # configure_logging: text on the console, JSON Lines in a rotated file
+    ├── progress.py         # ProgressTracker, show_progress: percent, speed, time left, active tasks
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
@@ -1121,7 +1165,7 @@ tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
-├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, logging, filters, storages, client
+├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, logging, progress, filters, storages, client
 └── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here

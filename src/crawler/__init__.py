@@ -39,6 +39,7 @@ from crawler.models import (
     RateStats,
 )
 from crawler.parser import HTMLParser
+from crawler.progress import Progress, ProgressTracker, format_progress, show_progress
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryRule, RetryStrategy
@@ -97,6 +98,8 @@ __all__ = [
     "PermanentError",
     "PermanentHTTPError",
     "PostgresStorage",
+    "Progress",
+    "ProgressTracker",
     "RateLimiter",
     "RateStats",
     "RetryRule",
@@ -117,12 +120,14 @@ __all__ = [
     "UrlFilter",
     "configure_logging",
     "error_kind",
+    "format_progress",
     "get_host",
     "is_same_host",
     "is_valid_http_url",
     "load_config",
     "product_token",
     "register_database",
+    "show_progress",
     "storage_from_env",
     "storage_from_output",
     "storage_from_url",
