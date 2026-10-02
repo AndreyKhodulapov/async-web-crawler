@@ -14,7 +14,6 @@ import codecs
 import contextlib
 import dataclasses
 import json
-import logging
 import math
 import os
 import re
@@ -51,6 +50,7 @@ from crawler import (
     product_token,
     storage_from_url,
 )
+from crawler.logging_setup import configure_logging
 from crawler.storage import DATABASE_URL_VARIABLE, DEFAULT_DATABASE_URL
 from demo_site import DemoSite
 
@@ -894,37 +894,9 @@ async def run_save(args: argparse.Namespace) -> None:
             await saved.close()
 
 
-class ProgressAwareHandler(logging.StreamHandler):
-    """Writes log records to stderr, erasing the live progress line first.
-
-    The progress line ends with "\r" instead of a newline, so a record would
-    otherwise be glued to its end. The next progress update redraws it below.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(sys.stderr)
-        self._live = sys.stderr.isatty()
-
-    def emit(self, record: logging.LogRecord) -> None:
-        if self._live:
-            # Like StreamHandler.emit: a failed write (closed terminal, broken
-            # pipe) must not raise into the code that logged the record.
-            try:
-                self.stream.write("\r\033[K")
-            except (OSError, ValueError):
-                self.handleError(record)
-                return
-        super().emit(record)
-
-
 async def main() -> None:
     args = parse_args()
-    logging.basicConfig(
-        level=args.log_level,
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=[ProgressAwareHandler()],
-    )
+    configure_logging(args.log_level)
     commands = {
         "benchmark": run_benchmark,
         "parse": run_parse,

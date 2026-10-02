@@ -155,7 +155,7 @@ class LoggingOptions:
     level: str = _option("INFO", check=_log_level, normalize=str.upper)
     file: str | None = _option(None, check=_not_blank)
     max_bytes: int = _option(10 * 1024 * 1024, minimum=0)  # the file is rotated at this size; 0 never rotates it
-    backup_count: int = _option(5, minimum=0)  # rotated files that are kept
+    backup_count: int = _option(5, minimum=0)  # rotated files that are kept; 0 never rotates the file
 
 
 @dataclass(frozen=True)

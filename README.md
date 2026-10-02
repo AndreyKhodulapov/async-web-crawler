@@ -43,6 +43,8 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
 - Configuration file in YAML or JSON (`load_config`, `CrawlerConfig`): start
   URLs, limits, filters, storage, logging and reports, checked on load with
   every problem reported by the path of its key
+- Logging to the console and to a file (`configure_logging`): JSON Lines,
+  a record per line with a UTC timestamp, rotated by size
 - Connection pooling and keep-alive via a single `aiohttp.ClientSession`
 - Separate connect, read and total timeouts that grow with every retry
 - Clear error types, all subclasses of `FetchError`, grouped by whether a
@@ -871,6 +873,47 @@ file, over the file key by key: `{"crawler": {"max_pages": 5}}`.
 `config.to_dict()` gives one back. A configuration cannot be changed once
 made. Paths in the file are relative to the working directory.
 
+### Logging
+
+Every module logs to a logger named after it (`crawler.client`,
+`crawler.retry`, ...). `configure_logging` sends the records to the console
+and, given a file, to that file as well:
+
+```python
+from crawler import configure_logging
+
+configure_logging("INFO", "crawler.log", max_bytes=10 * 1024 * 1024, backup_count=5)
+```
+
+The console (stderr) gets a line of text per record:
+
+```
+19:41:40 | INFO    | crawler.client | Fetched https://example.com/: status=200 size=1256B elapsed=0.10s
+```
+
+The file gets JSON Lines, an object per record, so it can be read by
+`jq` or loaded by a log collector as it is:
+
+```json
+{"time": "2026-10-02T16:41:40.438+00:00", "level": "INFO", "logger": "crawler.client", "message": "Fetched https://example.com/: status=200 size=1256B elapsed=0.10s"}
+```
+
+`time` is UTC in ISO 8601; a record logged with an exception has its
+traceback under `exception`. The file is appended to. Once it reaches
+`max_bytes` it becomes `crawler.log.1` (the older ones `crawler.log.2` and
+so on, `backup_count` of them are kept) and a new one is started; with
+either of the two set to 0 the file is never rotated. A record is never
+split between files, so one longer than `max_bytes` makes a file larger
+than that.
+
+The level is `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` and applies
+to both the console and the file. The root logger is configured, so the
+records of other libraries are written too. A second call replaces the
+handlers of the first; handlers added by other code are left alone. The
+directory of the file is not created: `OSError` is raised if the file cannot
+be opened, and the logging stays as it was. The arguments are the keys of
+the `logging` section of the configuration file.
+
 ### Saving pages
 
 Give the crawler a storage, and `crawl()` saves every page it has processed:
@@ -1057,6 +1100,7 @@ src/
     ├── stats.py            # CrawlerStats: pages by outcome, status code and domain, speed, running time
     ├── report.py           # the statistics as JSON and as an HTML report with charts
     ├── config.py           # CrawlerConfig, load_config: YAML or JSON file, defaults, validation
+    ├── logging_setup.py    # configure_logging: text on the console, JSON Lines in a rotated file
     ├── filters.py          # UrlFilter: host and pattern rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
@@ -1077,7 +1121,7 @@ tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
-├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, filters, storages, client
+├── unit/                   # parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, logging, filters, storages, client
 └── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── asyncio_concepts.md     # notes on async concepts used here

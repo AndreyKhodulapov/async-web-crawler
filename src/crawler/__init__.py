@@ -27,6 +27,7 @@ from crawler.exceptions import (
     error_kind,
 )
 from crawler.filters import UrlFilter
+from crawler.logging_setup import configure_logging
 from crawler.models import (
     CircuitStats,
     CrawlStats,
@@ -114,6 +115,7 @@ __all__ = [
     "TransientHTTPError",
     "UnexpectedError",
     "UrlFilter",
+    "configure_logging",
     "error_kind",
     "get_host",
     "is_same_host",
