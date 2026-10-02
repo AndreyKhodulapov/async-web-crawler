@@ -42,6 +42,9 @@ goes: to a JSON or CSV file, to SQLite or PostgreSQL.
   same bot name
 - `AdvancedCrawler`: the whole crawler set up by one configuration file,
   with the storage, the statistics, the reports and the log
+- Command line (`src/main.py`): a crawl by a configuration file, by options
+  or both, with live progress, a summary, exit codes for scripts and a clean
+  stop on Ctrl-C that keeps the pages fetched so far
 - Configuration file in YAML or JSON (`load_config`, `CrawlerConfig`): start
   URLs, limits, filters, storage, logging and reports, checked on load with
   every problem reported by the path of its key
@@ -101,7 +104,68 @@ pip install -r requirements-dev.txt    # runtime + test and lint tools
 pip install -e .                       # or: the package alone, runtime deps only
 ```
 
+## Command line
+
+```bash
+python src/main.py --config config.yaml
+python src/main.py --urls https://example.com --max-pages 100 --output results.json
+python src/main.py --config config.yaml --max-pages 500 --report report.html
+```
+
+A crawl is set up by a configuration file (see
+[Configuration file](#configuration-file) and
+[`config.example.yaml`](config.example.yaml)), by options, or by both. An
+option wins over the file; an option left out keeps the value of the file, or
+the default without a file.
+
+| Option | Configuration key | Effect |
+|--------|-------------------|--------|
+| `--config PATH` | | configuration file, YAML or JSON |
+| `--urls URL [URL ...]` | `urls` | start URLs, in place of those of the file |
+| `--max-pages N` | `crawler.max_pages` | pages to request, failed ones included |
+| `--max-depth N` | `crawler.max_depth` | links followed from a start URL; 0 crawls the start URLs only |
+| `--output PATH` | `storage.outputs` | where to save the pages: a `.jsonl`, `.json`, `.csv` or `.db` file, or a database URL; repeat for several, in place of those of the file |
+| `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, or do not |
+| `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
+| `--stats-json PATH` | `report.stats_json` | write the statistics of the crawl to a JSON file |
+| `--report PATH` | `report.html` | write an HTML report with charts |
+| `--log-level LEVEL` | `logging.level` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
+| `--log-file PATH` | `logging.file` | also write the log to a file, as JSON Lines |
+| `--no-progress` | | do not show the progress line |
+
+Everything else (sitemaps, filters, retries, the circuit breaker, timeouts)
+is set in the file. The log and the [progress line](#live-progress) go to
+stderr, the summary to stdout:
+
+```
+[####################] 100% | 8/8 pages, 0 failed | 1.1 pages/s | done | active 0 (0 in flight) | queued 66 | 8s
+
+=== Crawl finished (8.06s) ===
+Pages: 8 (8 successful, 0 failed, 0 skipped), 1.0 pages/s, average response time 2.37s
+Status codes: 200: 8
+Top domains: books.toscrape.com: 8
+Saved: 8 pages to out/pages.jsonl, out/pages.csv
+Reports: out/stats.json, out/report.html
+Log: out/crawler.log
+```
+
+At the default level `INFO` the log has a line per request; `--log-level
+WARNING` leaves the progress line and the failures. A password in a database
+URL is shown as `***`.
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | the crawl ran and fetched at least one page |
+| 1 | no page was fetched, or a directory or the log file could not be opened |
+| 2 | wrong options or configuration; nothing was requested or written |
+| 130 | interrupted with Ctrl-C |
+
+A crawl interrupted with Ctrl-C stops its requests, saves the pages fetched
+by then, writes the reports of them and prints the summary.
+
 ## Demo
+
+The demo commands show the parts of the crawler one by one.
 
 The demo has five commands: `crawl` follows links from start pages, `errors`
 crawls a local site that fails on purpose, `save` writes crawled pages to
@@ -854,6 +918,7 @@ asyncio.run(main())
 | `AdvancedCrawler(config)` | takes a `CrawlerConfig`; the defaults without one |
 | `AdvancedCrawler.from_config(path, overrides)` | reads a YAML or a JSON file, see [Configuration file](#configuration-file) |
 | `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section; returns the pages by URL |
+| `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
 | `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics) |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
@@ -1169,7 +1234,7 @@ keep only links to the page's own host.
 ```bash
 pytest                      # unit + integration, no internet needed
 pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, storages, client with a fake session
-pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker, saving and AdvancedCrawler against a local aiohttp server
+pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker, saving, AdvancedCrawler and the command line against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
 pytest -m postgres          # the database tests and the save demo against PostgreSQL
 ```
@@ -1189,6 +1254,8 @@ ruff check src tests        # lint
 
 ```
 src/
+├── main.py                 # command line of the crawler: a configuration file and options over it
+├── cli_options.py          # checks of command-line values shared by main.py and demo_main.py
 ├── demo_main.py            # demo CLI: `crawl`, `errors`, `save`, `parse` and `benchmark` commands
 ├── demo_urls.yaml          # URLs the demo commands use when none are given
 ├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors` and `save`

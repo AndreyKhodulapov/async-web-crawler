@@ -151,9 +151,20 @@ class AdvancedCrawler:
             sitemap_urls=config.sitemaps.urls,
             robots_sitemaps=config.sitemaps.from_robots,
         )
+        self.write_reports()
+        return pages
+
+    def write_reports(self) -> list[Path]:
+        """Write the statistics to the files of the `report` section; return those written.
+
+        `crawl()` does it when the crawl ends; call it yourself after a
+        crawl that was cancelled. A report that cannot be written is logged
+        and left out.
+        """
+        written = []
         for path, export in (
-            (config.report.stats_json, self.export_to_json),
-            (config.report.html, self.export_to_html_report),
+            (self.config.report.stats_json, self.export_to_json),
+            (self.config.report.html, self.export_to_html_report),
         ):
             if path is None:
                 continue
@@ -163,7 +174,8 @@ class AdvancedCrawler:
                 logger.error("Failed to write the report %s: %s", path, error)
             else:
                 logger.info("Report written to %s", path)
-        return pages
+                written.append(Path(path))
+        return written
 
     def get_stats(self) -> dict[str, Any]:
         """The statistics of the latest crawl: `total_pages`, `successful`, `failed` and the rest of `CrawlerStats.get_stats`."""

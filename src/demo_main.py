@@ -10,13 +10,10 @@ Usage:
 
 import argparse
 import asyncio
-import codecs
 import contextlib
 import dataclasses
 import json
-import math
 import os
-import re
 import sys
 import textwrap
 import time
@@ -24,10 +21,19 @@ from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 import yaml
 
+from cli_options import (
+    at_least_one,
+    database_url,
+    encoding,
+    hide_password,
+    http_url,
+    positive,
+    regex,
+    share,
+)
 from crawler import (
     AsyncCrawler,
     CircuitBreaker,
@@ -64,69 +70,6 @@ MAX_RETRY_DELAY = 30.0
 DEMO_URLS_FILE = Path(__file__).with_name("demo_urls.yaml")
 # The other commands crawl a local site.
 DEFAULT_URL_COMMANDS = ("benchmark", "parse", "crawl")
-
-
-def number(raw: str, number_type: type[int] | type[float] = float) -> int | float:
-    """`raw` as a finite number of `number_type`; the checks every numeric option shares."""
-    try:
-        value = number_type(raw)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"not a number: {raw!r}") from None
-    if not math.isfinite(value):
-        raise argparse.ArgumentTypeError(f"must be a finite number, got {raw}")
-    return value
-
-
-def positive(number_type: type[int] | type[float], *, allow_zero: bool = False) -> Callable[[str], int | float]:
-    def parse(raw: str) -> int | float:
-        value = number(raw, number_type)
-        if value < 0 or (value == 0 and not allow_zero):
-            raise argparse.ArgumentTypeError(f"must be {'non-negative' if allow_zero else 'positive'}, got {raw}")
-        return value
-
-    return parse
-
-
-def at_least_one(raw: str) -> float:
-    if (value := number(raw)) < 1:
-        raise argparse.ArgumentTypeError(f"must be >= 1, got {raw}")
-    return value
-
-
-def share(raw: str) -> float:
-    if not 0 < (value := number(raw)) <= 1:
-        raise argparse.ArgumentTypeError(f"must be in (0, 1], got {raw}")
-    return value
-
-
-def http_url(raw: str) -> str:
-    if not is_valid_http_url(raw):
-        raise argparse.ArgumentTypeError(f"not an absolute http(s) URL: {raw!r}")
-    return raw
-
-
-def regex(raw: str) -> str:
-    try:
-        re.compile(raw)
-    except re.error as exc:
-        raise argparse.ArgumentTypeError(f"invalid regular expression {raw!r}: {exc}") from None
-    return raw
-
-
-def database_url(raw: str) -> str:
-    try:
-        storage_from_url(raw)  # opens nothing
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(str(error)) from None
-    return raw
-
-
-def encoding(raw: str) -> str:
-    try:
-        codecs.lookup(raw)
-    except LookupError:
-        raise argparse.ArgumentTypeError(f"unknown encoding: {raw!r}") from None
-    return raw
 
 
 def default_urls(command: str) -> list[str]:
@@ -759,15 +702,6 @@ async def run_errors(args: argparse.Namespace) -> None:
     print_crawl_report(crawler)
     print_error_report(crawler)
     save_error_report(args.json, crawler)
-
-
-def hide_password(url: str) -> str:
-    """A database URL fit to be shown."""
-    password = urlsplit(url).password
-    if password is not None:
-        url = url.replace(f":{password}@", ":***@", 1)
-    # PostgreSQL takes the password as a parameter of the URL too.
-    return re.sub(r"(?<=[?&]password=)[^&#]*", "***", url)
 
 
 def open_storages(args: argparse.Namespace) -> dict[str, DataStorage]:

@@ -1,0 +1,184 @@
+"""Command-line interface of the crawler.
+
+Usage:
+    python src/main.py --config config.yaml
+    python src/main.py --urls https://example.com --max-pages 100 --output results.json
+    python src/main.py --config config.yaml --max-pages 500 --report report.html
+
+A crawl is set up by a configuration file (see config.example.yaml), by
+options, or by both: an option wins over the file. Logs and progress go to
+stderr, the summary to stdout.
+
+Exit codes: 0 - the crawl ran and fetched pages, 1 - no page was fetched or
+a file could not be opened, 2 - wrong options or configuration,
+130 - interrupted (Ctrl-C); the pages fetched by then are saved and reported.
+"""
+
+import argparse
+import asyncio
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
+
+from cli_options import hide_password, http_url, positive
+from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, load_config, show_progress
+from crawler.config import LOG_LEVELS
+
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_INTERRUPTED = 0, 1, 2, 130
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Crawl websites: follow links from start URLs, save the pages, report statistics.",
+        epilog="An option left out keeps the value of the configuration file, or the default without a file.",
+    )
+    parser.add_argument("--config", metavar="PATH", help="configuration file, YAML or JSON; see config.example.yaml")
+    parser.add_argument(
+        "--urls", nargs="+", type=http_url, metavar="URL", help="start URLs, in place of those of the configuration"
+    )
+    parser.add_argument("--max-pages", type=positive(int), metavar="N", help="pages to request, failed ones included")
+    parser.add_argument(
+        "--max-depth",
+        type=positive(int, allow_zero=True),
+        metavar="N",
+        help="links followed from a start URL; 0 = start URLs only",
+    )
+    parser.add_argument(
+        "--output",
+        action="append",
+        metavar="PATH",
+        help="where to save the pages: a .jsonl, .json, .csv or .db file, or a database URL; "
+        "repeat for several, in place of those of the configuration",
+    )
+    parser.add_argument(
+        "--respect-robots",
+        action=argparse.BooleanOptionalAction,
+        help="follow robots.txt, or do not",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=positive(float, allow_zero=True),
+        metavar="RPS",
+        help="max requests per second to one host; 0 = no limit",
+    )
+    reports = parser.add_argument_group("reports and log")
+    reports.add_argument("--stats-json", metavar="PATH", help="write the statistics of the crawl to a JSON file")
+    reports.add_argument("--report", metavar="PATH", help="write an HTML report with charts")
+    reports.add_argument("--log-level", type=str.upper, choices=LOG_LEVELS, help="level of the log")
+    reports.add_argument("--log-file", metavar="PATH", help="also write the log to a file, as JSON Lines")
+    reports.add_argument("--no-progress", action="store_true", help="do not show the progress line")
+    return parser.parse_args(argv)
+
+
+def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """The options that were given, shaped like the configuration file."""
+    # (section, key, value); a value of None is an option that was not given.
+    options = [
+        (None, "urls", args.urls),
+        ("crawler", "max_pages", args.max_pages),
+        ("crawler", "max_depth", args.max_depth),
+        ("crawler", "respect_robots", args.respect_robots),
+        ("storage", "outputs", args.output),
+        ("report", "stats_json", args.stats_json),
+        ("report", "html", args.report),
+        ("logging", "level", args.log_level),
+        ("logging", "file", args.log_file),
+    ]
+    overrides: dict[str, Any] = {}
+    for section, key, value in options:
+        if value is not None:
+            target = overrides if section is None else overrides.setdefault(section, {})
+            target[key] = value
+    if args.rate_limit is not None:
+        # The configuration spells "no limit" as null.
+        overrides.setdefault("crawler", {})["rate_limit"] = args.rate_limit or None
+    return overrides
+
+
+def build_config(args: argparse.Namespace) -> CrawlerConfig:
+    """The configuration of the crawl: the file, if one is given, with the options over it.
+
+    Raises:
+        ConfigError: the file or an option is invalid, or there is nothing to crawl.
+    """
+    overrides = config_overrides(args)
+    config = CrawlerConfig.from_dict(overrides) if args.config is None else load_config(args.config, overrides)
+    if not config.urls and not config.sitemaps.urls:
+        where = "--urls" if args.config is None else "--urls, or `urls` or `sitemaps.urls` in the configuration"
+        raise ConfigError([f"nothing to crawl: give {where}"])
+    return config
+
+
+def print_summary(crawler: AdvancedCrawler, reports: Sequence[str | Path], *, interrupted: bool = False) -> None:
+    stats = crawler.get_stats()
+    state = "interrupted" if interrupted else "finished"
+    print(f"\n=== Crawl {state} ({stats['elapsed_seconds']:.2f}s) ===")
+    print(
+        f"Pages: {stats['total_pages']} ({stats['successful']} successful, {stats['failed']} failed, "
+        f"{stats['skipped']} skipped), {stats['pages_per_second']:.1f} pages/s, "
+        f"average response time {stats['avg_response_time']:.2f}s"
+    )
+    for title, counts in (
+        ("Status codes", stats["status_codes"]),
+        ("Top domains", stats["top_domains"]),
+        ("Errors", stats["errors"]),
+    ):
+        if counts:
+            print(f"{title}: {', '.join(f'{name}: {pages}' for name, pages in counts.items())}")
+    outputs = crawler.config.storage.outputs
+    if outputs:
+        saving = crawler.crawler.crawl_stats()
+        not_saved = f", {saving.save_failed} not saved" if saving.save_failed else ""
+        print(f"Saved: {saving.saved} pages to {', '.join(map(hide_password, outputs))}{not_saved}")
+    if reports:
+        print(f"Reports: {', '.join(map(str, reports))}")
+    if crawler.config.logging.file is not None:
+        print(f"Log: {crawler.config.logging.file}")
+
+
+async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
+    """Crawl by the configuration, print the summary; return the exit code.
+
+    Cancelled (Ctrl-C), it stops the crawl, writes the reports of the pages
+    fetched so far and saves those pages before the cancellation goes on.
+
+    Raises:
+        OSError: a directory cannot be created, or the log file cannot be opened.
+    """
+    async with AdvancedCrawler(config) as crawler:
+        crawl = asyncio.create_task(crawler.crawl())
+        try:
+            if progress:
+                await show_progress(crawler.crawler, crawl, config.crawler.max_pages)
+            await crawl
+        except asyncio.CancelledError:
+            crawl.cancel()
+            await asyncio.gather(crawl, return_exceptions=True)
+            reports = crawler.write_reports()
+            await crawler.close()  # writes the pages the storage still holds, so the summary counts them
+            print_summary(crawler, reports, interrupted=True)
+            raise
+        reports = [path for path in (config.report.stats_json, config.report.html) if path is not None]
+        print_summary(crawler, reports)
+        return EXIT_OK if crawler.get_stats()["successful"] else EXIT_FAILED
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        config = build_config(args)
+    except ConfigError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    try:
+        return asyncio.run(run(config, progress=not args.no_progress))
+    except OSError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return EXIT_FAILED
+    except KeyboardInterrupt:
+        return EXIT_INTERRUPTED
+
+
+if __name__ == "__main__":
+    sys.exit(main())
