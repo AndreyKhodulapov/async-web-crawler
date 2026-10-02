@@ -172,6 +172,17 @@ class TestValues:
     def test_section_without_keys_keeps_its_defaults(self):
         assert CrawlerConfig.from_dict({"crawler": None, "filters": {}}) == CrawlerConfig()
 
+    def test_user_agent_loses_the_space_around_it(self):
+        # A folded YAML scalar (`user_agent: >`) ends with a line break, which no header may hold.
+        data = {
+            "crawler": {"user_agent": "MyBot/1.0 (+https://example.com/bot)\n", "user_agents": [" MyBot/1.0 (a)\n"]}
+        }
+
+        options = CrawlerConfig.from_dict(data).crawler
+
+        assert options.user_agent == "MyBot/1.0 (+https://example.com/bot)"
+        assert options.user_agents == ("MyBot/1.0 (a)",)
+
     def test_log_level_in_any_case(self):
         assert CrawlerConfig.from_dict({"logging": {"level": "debug"}}).logging.level == "DEBUG"
 
@@ -247,7 +258,7 @@ class TestInvalid:
             ({"crawler": {"jitter": -0.5}}, "crawler.jitter: must be >= 0, got -0.5"),
             ({"crawler": {"read_timeout": 0}}, "crawler.read_timeout: must be > 0, got 0.0"),
             ({"crawler": {"timeout_growth": 0.5}}, "crawler.timeout_growth: must be >= 1, got 0.5"),
-            ({"crawler": {"user_agent": "  "}}, 'crawler.user_agent: must not be empty, got "  "'),
+            ({"crawler": {"user_agent": "  "}}, 'crawler.user_agent: must not be empty, got ""'),
             ({"sitemaps": {"max_urls": 0}}, "sitemaps.max_urls: must be >= 1, got 0"),
             ({"retry": {"max_retries": -1}}, "retry.max_retries: must be >= 0, got -1"),
             ({"retry": {"backoff_factor": 0.9}}, "retry.backoff_factor: must be >= 1, got 0.9"),
@@ -301,6 +312,55 @@ class TestInvalid:
         assert problems({"storage": {"csv_encoding": "utf-99"}}) == [
             'storage.csv_encoding: unknown encoding, got "utf-99"'
         ]
+
+    @pytest.mark.parametrize("encoding", ["undefined", "utf-8\0"])
+    def test_csv_encoding_that_cannot_be_used(self, encoding):
+        (problem,) = problems({"storage": {"csv_encoding": encoding}})
+
+        assert problem.startswith("storage.csv_encoding: unknown encoding, got ")
+
+    @pytest.mark.parametrize(
+        "data, key",
+        [
+            ({"storage": {"outputs": ["~no-such-user-here/pages.jsonl"]}}, "storage.outputs[0]"),
+            ({"logging": {"file": "~no-such-user-here/crawler.log"}}, "logging.file"),
+            ({"report": {"html": "~no-such-user-here/report.html"}}, "report.html"),
+            ({"report": {"stats_json": "~no-such-user-here/stats.json"}}, "report.stats_json"),
+        ],
+    )
+    def test_path_in_the_home_of_an_unknown_user(self, data, key):
+        (problem,) = problems(data)
+
+        assert problem.startswith(f"{key}: the home directory of the user is unknown, got ")
+
+    @pytest.mark.parametrize(
+        "data, key",
+        [
+            ({"storage": {"outputs": ["pages\0.jsonl"]}}, "storage.outputs[0]"),
+            ({"logging": {"file": "crawler\0.log"}}, "logging.file"),
+            ({"report": {"html": "report\0.html"}}, "report.html"),
+        ],
+    )
+    def test_path_with_a_null_character(self, data, key):
+        (problem,) = problems(data)
+
+        assert problem.startswith(f"{key}: must not contain a null character, got ")
+        assert "\0" not in problem
+
+    def test_whole_number_too_large_for_a_fraction(self):
+        (problem,) = problems({"crawler": {"total_timeout": 10**400}})
+
+        assert problem.startswith("crawler.total_timeout: expected a number, got 1000")
+
+    @pytest.mark.parametrize("agent", ["MyBot/1.0\r\nX-Injected: 1", "MyBot/1.0 \x00", "My\x7fBot/1.0"])
+    def test_user_agent_with_a_control_character(self, agent):
+        found = problems({"crawler": {"user_agent": agent, "user_agents": [agent]}})
+
+        assert [problem.partition(",")[0] for problem in found] == [
+            "crawler.user_agent: must be one line without control characters",
+            "crawler.user_agents[0]: must be one line without control characters",
+        ]
+        assert all("\n" not in problem and "\0" not in problem for problem in found)
 
     def test_robots_sitemaps_need_robots(self):
         assert problems({"sitemaps": {"from_robots": True}, "crawler": {"respect_robots": False}}) == [

@@ -65,6 +65,23 @@ def _not_blank(value: str) -> str | None:
     return None if value.strip() else "must not be empty"
 
 
+def _header_value(value: str) -> str | None:
+    if not value:
+        return "must not be empty"
+    # A line break would end the header and start another one; aiohttp refuses to send it.
+    return None if value.isprintable() else "must be one line without control characters"
+
+
+def _file_path(value: str) -> str | None:
+    if "\0" in value:
+        return "must not contain a null character"
+    try:
+        Path(value).expanduser()
+    except RuntimeError:  # "~name/..." of a user the system does not know
+        return "the home directory of the user is unknown"
+    return _not_blank(value)
+
+
 @dataclass(frozen=True)
 class CrawlOptions:
     """Section `crawler`: how much to crawl and how fast. Times are in seconds."""
@@ -78,8 +95,10 @@ class CrawlOptions:
     min_delay: float = _option(0.0, minimum=0)
     jitter: float = _option(0.0, minimum=0)
     respect_robots: bool = True
-    user_agent: str = _option(AsyncCrawler.DEFAULT_USER_AGENT, check=_not_blank)
-    user_agents: tuple[str, ...] = _option((), check=_not_blank)  # rotated; same robots.txt name as `user_agent`
+    user_agent: str = _option(AsyncCrawler.DEFAULT_USER_AGENT, check=_header_value, normalize=str.strip)
+    user_agents: tuple[str, ...] = _option(
+        (), check=_header_value, normalize=str.strip
+    )  # rotated; same robots.txt name as `user_agent`
     total_timeout: float = _option(30.0, above=0)
     connect_timeout: float = _option(10.0, above=0)
     read_timeout: float = _option(20.0, above=0)
@@ -129,7 +148,7 @@ class FilterOptions:
 class StorageOptions:
     """Section `storage`: where the crawled pages are saved, see `storage_from_output`."""
 
-    outputs: tuple[str, ...] = _option((), check=_not_blank)  # files by extension, or database URLs
+    outputs: tuple[str, ...] = _option((), check=_file_path)  # files by extension, or database URLs
     batch_size: int = _option(100, minimum=1)
     csv_encoding: str = "utf-8"
 
@@ -154,7 +173,7 @@ class LoggingOptions:
     """Section `logging`: the level of the log and the file it is also written to."""
 
     level: str = _option("INFO", check=_log_level, normalize=str.upper)
-    file: str | None = _option(None, check=_not_blank)
+    file: str | None = _option(None, check=_file_path)
     max_bytes: int = _option(10 * 1024 * 1024, minimum=0)  # the file is rotated at this size; 0 never rotates it
     backup_count: int = _option(5, minimum=0)  # rotated files that are kept; 0 never rotates the file
 
@@ -163,8 +182,8 @@ class LoggingOptions:
 class ReportOptions:
     """Section `report`: files the statistics are written to after the crawl."""
 
-    stats_json: str | None = _option(None, check=_not_blank)
-    html: str | None = _option(None, check=_not_blank)
+    stats_json: str | None = _option(None, check=_file_path)
+    html: str | None = _option(None, check=_file_path)
     title: str = "Crawl report"
     top_domains: int = _option(10, minimum=1)
 
@@ -328,7 +347,10 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
     # True is an int in Python, but "max_pages: yes" is a mistake.
     fits = isinstance(value, bool) if hint is bool else isinstance(value, hint) and not isinstance(value, bool)
     if hint is float and isinstance(value, int) and not isinstance(value, bool):
-        value, fits = float(value), True
+        try:
+            value, fits = float(value), True
+        except OverflowError:  # a whole number above 1e308
+            fits = False
     if not fits or (hint is float and not math.isfinite(value)):
         problems.append(f"{path}: expected {expected}, got {_show(value)}")
         return _INVALID
@@ -367,7 +389,7 @@ def _check_together(config: CrawlerConfig, problems: list[str]) -> None:
             )
     try:
         "".encode(config.storage.csv_encoding)
-    except LookupError:
+    except (LookupError, ValueError):  # ValueError: a name with a null character, or the codec "undefined"
         problems.append(f"storage.csv_encoding: unknown encoding, got {_show(config.storage.csv_encoding)}")
         return
     for index, output in enumerate(config.storage.outputs):
@@ -383,7 +405,7 @@ def _show(value: Any) -> str:
     if isinstance(value, bool):
         return str(value).lower()
     if isinstance(value, str):
-        return f'"{value}"'
+        return f'"{value}"' if value.isprintable() else json.dumps(value)
     if isinstance(value, Mapping):
         return "a mapping"
     if isinstance(value, list):

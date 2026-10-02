@@ -74,7 +74,7 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `min_delay` | number, >= 0 | `0.0` | pause between two requests to a host |
 | `jitter` | number, >= 0 | `0.0` | random addition to the pause, up to this much |
 | `respect_robots` | true or false | `true` | check robots.txt before every request |
-| `user_agent` | string | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name |
+| `user_agent` | string, one line | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name; spaces and line breaks around it are dropped |
 | `user_agents` | list of strings | `[]` | variants to rotate; each must have the same name as `user_agent` |
 | `total_timeout` | number, > 0 | `30.0` | the whole request, body included |
 | `connect_timeout` | number, > 0 | `10.0` | DNS, TCP and TLS |
@@ -171,6 +171,8 @@ written. A problem is reported by the path of its key:
   not one either) or out of its limits;
 - an invalid URL or regular expression, an unknown log level or encoding;
 - an output with an unknown extension, or a URL of an unknown database;
+- a User-Agent with a line break or another control character in it, a path
+  with a null character or in the home directory of an unknown user;
 - a key written twice in YAML (plain YAML would keep the last one silently);
 - keys that do not go together: `sitemaps.from_robots` without
   `crawler.respect_robots`, a `user_agents` entry with another bot name;
