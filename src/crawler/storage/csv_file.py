@@ -50,9 +50,10 @@ class CSVStorage(DataStorage):
         encoding: str = "utf-8",
         batch_size: int = 100,
         retry_strategy: RetryStrategy | None = None,
+        cooldown: float = 5.0,
     ) -> None:
         "".encode(encoding)  # an unknown encoding fails here, not on the first write
-        super().__init__(batch_size, retry_strategy=retry_strategy)
+        super().__init__(batch_size, retry_strategy=retry_strategy, cooldown=cooldown)
         self.path = Path(path)
         self.encoding = encoding
         self._file: AsyncBufferedReader | None = None

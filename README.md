@@ -779,7 +779,9 @@ All of them share the behavior of `DataStorage`:
   cure (I/O errors, a locked SQLite database, a lost PostgreSQL connection).
   When the retries run out, `StorageError` is raised and the records stay in
   the buffer, so the next write takes them along. A repeated write does not
-  duplicate records. Any other error (e.g. a value the database refuses) is
+  duplicate records. For `cooldown` seconds after that (5 by default)
+  `save()` only buffers, so a storage that is down does not slow the crawl
+  down; `flush()` and `close()` write at once all the same. Any other error (e.g. a value the database refuses) is
   raised as it is and its batch is dropped, so that one bad record does not
   fail every later write.
 - `read()` iterates over the saved records, oldest first, without loading

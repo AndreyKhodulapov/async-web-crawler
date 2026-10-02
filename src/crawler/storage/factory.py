@@ -11,7 +11,7 @@ from crawler.storage.sqlite import SQLiteStorage
 DATABASE_URL_VARIABLE = "CRAWLER_DATABASE_URL"
 DEFAULT_DATABASE_URL = "sqlite:///crawler.db"
 
-# Takes the URL and the options of the storage (`batch_size`, `retry_strategy`).
+# Takes the URL and the options of the storage (`batch_size`, `retry_strategy`, `cooldown`).
 StorageBuilder = Callable[..., DatabaseStorage]
 
 _builders: dict[str, StorageBuilder] = {}
@@ -32,7 +32,7 @@ def storage_from_url(url: str, **options: Any) -> DatabaseStorage:
 
     Out of the box: "sqlite:///crawler.db" (see `SQLiteStorage.from_url`)
     and "postgresql://user:password@host:5432/database" (or "postgres://").
-    `options` go to the storage: `batch_size`, `retry_strategy`.
+    `options` go to the storage: `batch_size`, `retry_strategy`, `cooldown`.
 
     Raises:
         ValueError: it is not a URL, or no database is registered for its

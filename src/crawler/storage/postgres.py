@@ -60,5 +60,12 @@ class PostgresStorage(DatabaseStorage):
         asyncpg.DeadlockDetectedError,
     )
 
-    def __init__(self, dsn: str, *, batch_size: int = 100, retry_strategy: RetryStrategy | None = None) -> None:
-        super().__init__(PostgresDriver(dsn), batch_size=batch_size, retry_strategy=retry_strategy)
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        batch_size: int = 100,
+        retry_strategy: RetryStrategy | None = None,
+        cooldown: float = 5.0,
+    ) -> None:
+        super().__init__(PostgresDriver(dsn), batch_size=batch_size, retry_strategy=retry_strategy, cooldown=cooldown)

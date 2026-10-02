@@ -3,8 +3,9 @@
 import asyncio
 import contextlib
 import logging
+import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from types import TracebackType
 from typing import ClassVar, Self
 
@@ -31,7 +32,10 @@ class DataStorage(ABC):
     A failed write is retried as `retry_strategy` says: by default the
     errors in `WRITE_ERRORS`, up to 3 times with exponential backoff from
     0.1 s. When the retries run out, `StorageError` is raised and the
-    records stay in the buffer, so the next write takes them along. Any
+    records stay in the buffer, so the next write takes them along. For
+    `cooldown` seconds after that `save` only buffers the records, so that
+    a storage that is down does not make every save wait for the retries;
+    `flush` and `close` write at once all the same. Any
     other error is raised as it is and its batch is dropped: no retry cures
     it, and kept in the buffer the batch would fail every later write.
 
@@ -41,10 +45,22 @@ class DataStorage(ABC):
 
     WRITE_ERRORS: ClassVar[tuple[type[Exception], ...]] = (OSError,)
 
-    def __init__(self, batch_size: int = 100, *, retry_strategy: RetryStrategy | None = None) -> None:
+    def __init__(
+        self,
+        batch_size: int = 100,
+        *,
+        retry_strategy: RetryStrategy | None = None,
+        cooldown: float = 5.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         if batch_size < 1:
             raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+        if cooldown < 0:
+            raise ValueError(f"cooldown must be >= 0, got {cooldown}")
         self.batch_size = batch_size
+        self.cooldown = cooldown
+        self._clock = clock
+        self._paused_until = 0.0
         self.retry_strategy = retry_strategy or RetryStrategy(retry_on=self.WRITE_ERRORS, base_delay=0.1)
         self._buffer: list[PageRecord] = []
         # Keeps the batches in order and a record out of two writes at once.
@@ -79,7 +95,8 @@ class DataStorage(ABC):
         Raises:
             StorageError: the storage is closed, or the batch this record
                 completed could not be written. The record is kept either
-                way, unless the storage is closed.
+                way, unless the storage is closed. During the `cooldown`
+                after a failed write nothing is written and nothing raised.
             Exception: the batch failed with an error outside `WRITE_ERRORS`
                 and is dropped, this record included.
         """
@@ -87,7 +104,7 @@ class DataStorage(ABC):
             if self._closed:
                 raise StorageError(f"{type(self).__name__} is closed")
             self._buffer.append(record)
-            if len(self._buffer) >= self.batch_size:
+            if len(self._buffer) >= self.batch_size and self._clock() >= self._paused_until:
                 await self._flush_buffer()
 
     async def flush(self) -> None:
@@ -134,6 +151,7 @@ class DataStorage(ABC):
                 target=f"write of {len(batch)} records to {type(self).__name__}",
             )
         except self.WRITE_ERRORS as error:
+            self._paused_until = self._clock() + self.cooldown
             raise StorageError(f"failed to write {len(batch)} records: {error}") from error
         except Exception:
             # No retry cures this error, so the next write of the same batch
@@ -142,6 +160,7 @@ class DataStorage(ABC):
             logger.error("Dropped %d records that %s cannot write", len(batch), type(self).__name__)
             raise
         self._buffer = []
+        self._paused_until = 0.0
         self._written += len(batch)
         logger.debug("Wrote %d records to %s", len(batch), type(self).__name__)
 

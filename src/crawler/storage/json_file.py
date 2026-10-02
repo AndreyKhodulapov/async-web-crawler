@@ -48,8 +48,9 @@ class JSONStorage(DataStorage):
         indent: int | None = None,
         batch_size: int = 100,
         retry_strategy: RetryStrategy | None = None,
+        cooldown: float = 5.0,
     ) -> None:
-        super().__init__(batch_size, retry_strategy=retry_strategy)
+        super().__init__(batch_size, retry_strategy=retry_strategy, cooldown=cooldown)
         self.path = Path(path)
         self.indent = indent
         # Closes the array; written after the records and overwritten by the next ones.

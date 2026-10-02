@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 import pytest
-from helpers import MemoryStorage, make_record
+from helpers import FakeClock, MemoryStorage, make_record
 
 from crawler import DataStorage, RetryStrategy, StorageError
 
@@ -202,3 +202,65 @@ class TestWriteErrors:
 
         assert strategy.retry_on == (OSError, KeyError)
         assert strategy.max_retries == 3
+
+
+class TestCooldown:
+    """After a write that ran out of retries `save` only buffers for `cooldown` seconds."""
+
+    @staticmethod
+    async def failed_storage(clock: FakeClock, failures: int = 4) -> MemoryStorage:
+        storage = MemoryStorage(batch_size=1, failures=[OSError("disk full")] * failures, cooldown=5, clock=clock)
+        with pytest.raises(StorageError):
+            await storage.save(make_record("a"))
+        return storage
+
+    async def test_save_does_not_write_during_the_cooldown(self):
+        clock = FakeClock()
+        storage = await self.failed_storage(clock)
+        clock.now += 4.9
+
+        await save_pages(storage, "b", "c")
+
+        assert storage.attempts == 4
+        assert (storage.pending, storage.written) == (3, 0)
+
+    async def test_save_writes_again_after_the_cooldown(self):
+        clock = FakeClock()
+        storage = await self.failed_storage(clock)
+        await save_pages(storage, "b")
+        clock.now += 5
+
+        await save_pages(storage, "c")
+
+        assert storage.urls == [["a", "b", "c"]]
+
+    async def test_flush_writes_during_the_cooldown(self):
+        storage = await self.failed_storage(FakeClock())
+
+        await storage.flush()
+
+        assert storage.urls == [["a"]]
+
+    async def test_successful_write_ends_the_cooldown(self):
+        storage = await self.failed_storage(FakeClock())
+        await storage.flush()
+
+        await save_pages(storage, "b")
+
+        assert storage.urls == [["a"], ["b"]]
+
+    async def test_another_failure_starts_the_cooldown_anew(self):
+        clock = FakeClock()
+        storage = await self.failed_storage(clock, failures=8)
+        clock.now += 5
+        with pytest.raises(StorageError):
+            await storage.save(make_record("b"))
+        clock.now += 4.9
+
+        await save_pages(storage, "c")
+
+        assert storage.attempts == 8
+
+    def test_negative_cooldown_is_refused(self):
+        with pytest.raises(ValueError, match="cooldown"):
+            MemoryStorage(cooldown=-1)

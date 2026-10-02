@@ -73,8 +73,9 @@ class SQLiteStorage(DatabaseStorage):
         *,
         batch_size: int = 100,
         retry_strategy: RetryStrategy | None = None,
+        cooldown: float = 5.0,
     ) -> None:
-        super().__init__(SQLiteDriver(path), batch_size=batch_size, retry_strategy=retry_strategy)
+        super().__init__(SQLiteDriver(path), batch_size=batch_size, retry_strategy=retry_strategy, cooldown=cooldown)
         self.path = Path(path)
 
     @classmethod

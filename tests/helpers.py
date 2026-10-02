@@ -49,6 +49,8 @@ class MemoryStorage(DataStorage):
 
     def __init__(self, batch_size: int = 100, *, failures: Sequence[Exception] = (), **options) -> None:
         options.setdefault("retry_strategy", RetryStrategy(retry_on=(OSError,), base_delay=0.001, max_delay=0.001))
+        # No pause after a failed write, unless a test asks for one.
+        options.setdefault("cooldown", 0)
         super().__init__(batch_size, **options)
         self.batches: list[list[PageRecord]] = []
         self.failures = list(failures)

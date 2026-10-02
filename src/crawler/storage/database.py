@@ -81,8 +81,9 @@ class DatabaseStorage(DataStorage):
         *,
         batch_size: int = 100,
         retry_strategy: RetryStrategy | None = None,
+        cooldown: float = 5.0,
     ) -> None:
-        super().__init__(batch_size, retry_strategy=retry_strategy)
+        super().__init__(batch_size, retry_strategy=retry_strategy, cooldown=cooldown)
         self._driver = driver
         self._connected = False
         self._initialized = False
