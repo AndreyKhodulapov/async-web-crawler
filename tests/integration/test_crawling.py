@@ -241,6 +241,14 @@ async def test_start_url_redirect_to_other_host_keeps_that_host(server, url):
     assert f"http://localhost:{server.port}/site/a.html" in crawler.processed_urls
 
 
+async def test_start_url_redirect_keeps_the_host_it_ends_on_only(server, url):
+    crawler = await crawl(url("/site/bounce"), max_depth=1, same_domain_only=True)
+
+    assert url("/site/a.html") in crawler.processed_urls
+    # The home page links to the same site on localhost, which the redirect only passed through.
+    assert not [page for page in crawler.visited_urls if page.startswith("http://localhost")]
+
+
 async def test_redirect_out_of_the_start_hosts_is_skipped(url, server, site):
     crawler = await crawl(url("/site/exits.html"), max_depth=1, same_domain_only=True)
 

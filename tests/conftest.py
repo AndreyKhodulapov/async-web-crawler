@@ -206,6 +206,11 @@ async def site_page(request: web.Request) -> web.Response:
         raise web.HTTPFound("/site/c.html")
     if request.path == "/site/to-other-host":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/")
+    if request.path == "/site/bounce":
+        # Through a page of another host, like a consent page, and back.
+        raise web.HTTPFound(f"http://localhost:{request.url.port}/site/bounce-back")
+    if request.path == "/site/bounce-back":
+        raise web.HTTPFound(f"http://127.0.0.1:{request.url.port}/site/")
     if request.path == "/site/go":
         raise web.HTTPFound("/site/private/secret")
     if request.path == "/site/lang" and "hl" not in request.query:

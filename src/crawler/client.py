@@ -1089,6 +1089,14 @@ class AsyncCrawler:
         if result.error is not None:
             self._fail_page(url, queue, result.error, result)
             return
+        if url in self._start_urls and result.redirected and skip_reason is None:
+            # A start URL that redirects ("example.com" -> "www.example.com")
+            # defines the site as much as the URL itself; the hosts the chain
+            # only passed through (a consent page) do not. A page from a
+            # sitemap has depth 0 too, but is filtered like a link.
+            assert result.final_url is not None
+            url_filter.allow_host_of(result.final_url)
+            self._queue_sitemap_pages_in_scope(queue, url_filter)
         if skip_reason is None and not is_html_content_type(result.content_type):
             # A link without a file extension may still lead to a PDF or an
             # image. Not a failure: the page is fine, just not one to parse.
@@ -1176,15 +1184,11 @@ class AsyncCrawler:
         Asked before the target is requested, so a redirect out of the crawl
         scope costs no request to another site.
         """
-        if url in self._start_urls:
-            # A start URL that redirects ("example.com" -> "www.example.com")
-            # defines the site as much as the URL itself. A page from a
-            # sitemap has depth 0 too, but is filtered like a link.
-            url_filter.allow_host_of(target)
-            self._queue_sitemap_pages_in_scope(queue, url_filter)
-        elif not url_filter.allows(target):
-            # A link inside the crawl scope can lead out of it, e.g. to a
-            # sign-in page on another domain. Such a page is not part of the site.
+        # A link inside the crawl scope can lead out of it, e.g. to a sign-in
+        # page on another domain. Such a page is not part of the site. A start
+        # URL may lead anywhere: the host it ends on joins the crawl scope
+        # once the chain is over (see _crawl_page).
+        if url not in self._start_urls and not url_filter.allows(target):
             return f"redirected out of scope: {target}"
         # A page is crawled under one URL: a later link to the target is not
         # fetched, and a redirect to a page already seen is not followed.

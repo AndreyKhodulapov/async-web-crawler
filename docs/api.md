@@ -324,7 +324,7 @@ both. An `X-Robots-Tag` header that names another crawler is ignored.
 | `AsyncCrawler(max_depth=2)` | how far from the start pages to go; 0 fetches the start pages only |
 | `AsyncCrawler(max_per_domain=None)` | parallel requests to one host; `None` means only `max_concurrent` applies |
 | `max_pages_per_host=None` | pages requested from one host; `None` means only `max_pages` applies |
-| `same_domain_only=False` | follow links on the start hosts only (and on the hosts they redirect to); the configuration turns it on by default |
+| `same_domain_only=False` | follow links on the start hosts only (and on the hosts their redirects end on, not those they pass through); the configuration turns it on by default |
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
 | `exclude_extensions=()` | file extensions such as `"pdf"`; a link to such a file is skipped. Only the last extension of the URL path counts, in any case, the query does not. The configuration sets a list of documents, images, archives and media by default |
