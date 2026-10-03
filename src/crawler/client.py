@@ -95,8 +95,8 @@ class AsyncCrawler:
       transient and network errors, such as a timeout or HTTP 503, up to 3
       times with exponential backoff (see `RetryStrategy`). The pause before
       a retry is spent in the rate limiter: the whole host waits with it; so
-      it does after a Retry-After header, even when the request is not
-      retried.
+      it does for as long as a Retry-After header asks, up to
+      `MAX_RETRY_AFTER` seconds, even when the request is not retried.
     - A host whose requests keep failing is left alone for a while, as
       `circuit_breaker` says: by default once half of at least 5 requests
       in a minute have failed with a transient or network error, its
@@ -161,6 +161,10 @@ class AsyncCrawler:
     MAX_REDIRECTS = 10
     REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
     MAX_CIRCUIT_OPENINGS = 3
+    # The longest Retry-After a host is held back for, in seconds.
+    MAX_RETRY_AFTER = 600.0
+    # In crawl(), a page whose host is held back longer than this is put off.
+    MIN_PENALTY_TO_DEFER = 1.0
 
     def __init__(
         self,
@@ -493,9 +497,13 @@ class AsyncCrawler:
             assert last is not None and last.error is error
             host = get_host(url)
             # The server asked to wait: the other requests to the host wait
-            # even when this one is not retried, up to the longest retry pause.
+            # as long as it asked, even when this one is not retried.
             if isinstance(error, HTTPStatusError) and error.retry_after and host is not None:
-                self.rate_limiter.penalize(host, min(error.retry_after, self.retry_strategy.max_delay))
+                if error.retry_after > self.MAX_RETRY_AFTER:
+                    logger.warning(
+                        "%s asked to wait %gs (Retry-After), waiting %gs", host, error.retry_after, self.MAX_RETRY_AFTER
+                    )
+                self.rate_limiter.penalize(host, min(error.retry_after, self.MAX_RETRY_AFTER))
             return last, attempts
         return result, attempts
 
@@ -706,7 +714,10 @@ class AsyncCrawler:
         the circuit of a host has opened `MAX_CIRCUIT_OPENINGS` times in
         the crawl, its refused pages go to `failed_urls` with
         `CircuitOpenError`, so a host that stays down holds the crawl for
-        about two cooldowns of the breaker.
+        about two cooldowns of the breaker. A page whose host is held back
+        for longer than `MIN_PENALTY_TO_DEFER` seconds, by a Retry-After or
+        the pause before a retry, is put off until the host may be asked
+        again, without counting toward `max_pages` before then.
 
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
@@ -928,6 +939,13 @@ class AsyncCrawler:
     async def _crawl_worker(self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int) -> None:
         while (url := await queue.get_next()) is not None:
             try:
+                # A host that asked to wait (Retry-After) or waits out the
+                # pause before a retry: the worker takes pages of other hosts
+                # meanwhile instead of waiting in the rate limiter.
+                if (penalty := self._penalty_left(url)) > self.MIN_PENALTY_TO_DEFER:
+                    logger.info("Deferred %s for %.1fs: its host is held back", url, penalty)
+                    queue.defer(url, penalty, priority=queue.depth(url))
+                    continue
                 # robots.txt and the circuit breaker are checked before the
                 # page counts toward max_pages: a refused page costs no request.
                 refusal = await self._check_robots(url) or self._check_circuit(url) or self._check_probes_left(url)
@@ -1083,6 +1101,11 @@ class AsyncCrawler:
         if opened < self.MAX_CIRCUIT_OPENINGS:
             return None
         return CircuitOpenError(url, f"circuit breaker of {host} opened {opened} times, no more probes in this crawl")
+
+    def _penalty_left(self, url: str) -> float:
+        """Seconds the host of `url` is still held back for, after Retry-After or before a retry."""
+        host = get_host(url)
+        return 0.0 if host is None else self.rate_limiter.penalty_left(host)
 
     def _defer_or_fail(self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError) -> None:
         """Put off a page the circuit breaker refused until its host may be probed, or give up on it.

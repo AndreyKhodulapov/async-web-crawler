@@ -135,7 +135,14 @@ sites it visits and follows their rules.
 - A 429 or a timeout usually means the **whole site** is struggling:
   penalize the host in the rate limiter, so that every worker slows down,
   not only the one that failed. A Retry-After is a request to the whole
-  crawler: it holds back the host even when the failed URL is not retried.
+  crawler: it holds back the host for as long as it asks, even when the
+  failed URL is not retried and the wait is longer than any retry pause.
+  Coming back after 30 seconds when asked for 2 minutes is what gets a bot
+  blocked. Cap it all the same (here 10 minutes): a misconfigured server
+  must not stop the crawl for a day.
+- While a host is held back for long, put its pages aside rather than let
+  workers wait for it: otherwise one host blocks the crawl of all the
+  others (head-of-line blocking).
   Scrapy's AutoThrottle adapts the delay to latency the same way.
 
 ## User-Agent

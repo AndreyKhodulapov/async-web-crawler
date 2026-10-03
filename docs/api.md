@@ -105,9 +105,11 @@ robots.txt of its own site and waits for the rate limit of its own host, as
 a link to it would. A disallowed target fails the request with
 `RobotsDisallowedError` before it is sent. Crawl-delay is capped at 30 seconds. While
 a retry waits, the whole host waits with it, since a timeout or a 429 usually
-means the site is overloaded. A Retry-After header holds back the host even
-when the request is not retried, for at most `max_delay` seconds of the
-retry strategy; a request whose Retry-After is longer than that is not retried.
+means the site is overloaded. A Retry-After header holds back the host for
+as long as it asks, up to `AsyncCrawler.MAX_RETRY_AFTER` (10 minutes), even
+when the request is not retried; a request whose Retry-After is longer than
+`max_delay` of the retry strategy is not retried. Later `fetch_url()` calls
+to the host wait for that time too.
 
 ## Retries
 
@@ -201,6 +203,12 @@ are fetched once it is back. After the circuit of a host has opened
 `AsyncCrawler.MAX_CIRCUIT_OPENINGS` (3) times in the crawl, no more probes
 are sent: its remaining pages go to `failed_urls` with `CircuitOpenError`,
 and a host that stays down holds the crawl for about two cooldowns.
+
+The same goes for a host held back longer than
+`AsyncCrawler.MIN_PENALTY_TO_DEFER` (1 second), by a Retry-After or the
+pause before a retry: its pages are put off until the host may be asked
+again, instead of holding workers in the rate limiter, and count toward
+`max_pages` only when they are taken again.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|

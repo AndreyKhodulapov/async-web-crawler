@@ -130,6 +130,14 @@ class TestDomainDelays:
         limiter.penalize("a", 5.0)
         assert waits(limiter, ["a", "b"]) == [5.0, 0.0]
 
+    def test_penalty_left(self, clock):
+        limiter = RateLimiter(2.0, clock=clock)
+        limiter.penalize("a", 5.0)
+        clock.now += 2.0
+        assert (limiter.penalty_left("a"), limiter.penalty_left("b")) == (3.0, 0.0)
+        clock.now += 4.0
+        assert limiter.penalty_left("a") == 0.0
+
     def test_penalty_never_brings_a_start_forward(self, clock):
         limiter = RateLimiter(0.1, clock=clock)  # one request per 10 s
         limiter.reserve("a")

@@ -71,7 +71,9 @@ load under control.
   ones countable.
 - **Head-of-line blocking**: when every worker holds a URL for the same busy
   host, URLs for other hosts wait in the queue. Fixes include more workers than
-  slots, or one queue per host (as in large crawlers).
+  slots, putting off the URLs of a host that cannot be asked now (here: an
+  open circuit breaker, a Retry-After), or one queue per host (as in large
+  crawlers).
 
 ## Traversal order and depth
 

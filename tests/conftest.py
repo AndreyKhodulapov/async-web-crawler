@@ -17,7 +17,7 @@ class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
-    sitemaps and robots.txt, in the order they arrived. `robots` is the
+    /busy/, sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404.
     With `robots_endless`, comment lines follow the body for as long as
     the client reads them. `robots_by_host` gives other hosts of the server
@@ -147,6 +147,12 @@ async def flaky(request: web.Request) -> web.Response:
     return web.Response(text="<title>Recovered</title>", content_type="text/html")
 
 
+async def busy(request: web.Request) -> web.Response:
+    """Answers 429 with Retry-After of `seconds`."""
+    request.app[SITE_STATE].record(request)
+    raise web.HTTPTooManyRequests(headers={"Retry-After": request.match_info["seconds"]})
+
+
 async def site_page(request: web.Request) -> web.Response:
     state = request.app[SITE_STATE]
     state.record(request)
@@ -202,6 +208,7 @@ async def server(aiohttp_server):
     app.router.add_get("/robots.txt", robots_txt)
     app.router.add_get("/sitemaps/{name}", sitemap)
     app.router.add_get("/flaky/{fails}", flaky)
+    app.router.add_get("/busy/{seconds}", busy)
     return await aiohttp_server(app)
 
 

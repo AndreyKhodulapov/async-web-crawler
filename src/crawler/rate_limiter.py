@@ -118,6 +118,10 @@ class RateLimiter:
         self._penalized_until[domain] = max(self._penalized_until.get(domain, 0.0), until)
         self._next_start[domain] = max(self._next_start.get(domain, 0.0), until)
 
+    def penalty_left(self, domain: str) -> float:
+        """Seconds until the penalty of `domain` ends; 0 if it has none."""
+        return max(0.0, self._penalty_end(domain) - self._clock())
+
     def reserve(self, domain: str | None = None) -> float:
         """Book the next start time for `domain`; return the seconds to wait for it.
 

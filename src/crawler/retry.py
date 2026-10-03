@@ -65,7 +65,8 @@ class RetryStrategy:
     back, as "full jitter" (0..delay) can. A Retry-After header is honored
     when it asks for longer. A server that asks to wait longer than
     `max_delay` is not retried at all: coming back early would only earn
-    another refusal.
+    another refusal. (`AsyncCrawler` still holds the host back for as long
+    as it asked.)
 
     `rules` tune kinds of errors, keyed by an HTTP status or an exception
     class; for a class, the rule of its closest base class applies. The

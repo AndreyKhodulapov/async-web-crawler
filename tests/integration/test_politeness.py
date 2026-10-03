@@ -249,6 +249,24 @@ class TestRetries:
         assert min(gaps(starts)) >= 0.1 - EPSILON
 
 
+class TestRetryAfter:
+    async def test_crawl_puts_off_the_pages_of_a_host_that_asked_to_wait(self, url, site):
+        # The host asks for 2 s, longer than a retry may wait: the request is
+        # not retried, yet the host is left alone for the whole 2 s, and the
+        # crawl goes on to another host meanwhile.
+        other_host = url("/site/b.html", "localhost")
+        options = {"max_concurrent": 1, "max_depth": 0, "retry_strategy": RetryStrategy(max_retries=1, max_delay=0.5)}
+        async with polite(**options) as crawler:
+            await crawler.crawl([url("/busy/2"), url("/site/a.html"), other_host])
+
+        (busy, asked), (other, _), (page, requested) = site.log
+        assert [busy, other, page] == ["/busy/2", "/site/b.html", "/site/a.html"]
+        assert requested - asked >= 2 - EPSILON
+        assert list(crawler.failed_urls) == [url("/busy/2")]
+        assert set(crawler.processed_urls) == {url("/site/a.html"), other_host}
+        assert crawler.crawl_stats().requests == 3
+
+
 class TestCircuitBreaker:
     async def test_failing_host_is_left_alone_until_the_cooldown(self, url, site):
         clock = FakeClock()

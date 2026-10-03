@@ -463,8 +463,17 @@ class TestRetries:
             await crawler.fetch_url("http://a")
 
         assert fake_session.requested == ["http://a"]
-        # The host waits as long as a retry could, not the two minutes asked for.
-        assert crawler.rate_limiter.reserve("a") == pytest.approx(5.0, abs=0.1)
+        # The host waits the two minutes asked for, though a retry could not.
+        assert crawler.rate_limiter.reserve("a") == pytest.approx(120.0, abs=0.1)
+
+    async def test_retry_after_is_capped(self, make_crawler, fake_session, caplog):
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=0))
+        fake_session.routes["http://a"] = FakeResponse(status=429, retry_after="86400")
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_url("http://a")
+
+        assert crawler.rate_limiter.reserve("a") == pytest.approx(AsyncCrawler.MAX_RETRY_AFTER, abs=0.1)
+        assert "a asked to wait 86400s (Retry-After), waiting 600s" in caplog.text
 
     async def test_timeouts_grow_with_every_retry(self, make_crawler, fake_session):
         crawler = make_crawler(
