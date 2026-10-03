@@ -63,7 +63,12 @@ FULL = {
         "exclude": ["\\.pdf$"],
         "exclude_extensions": ["zip", "mp4"],
     },
-    "storage": {"outputs": ["pages.jsonl", "pages.csv"], "batch_size": 50, "csv_encoding": "utf-8-sig"},
+    "storage": {
+        "outputs": ["pages.jsonl", "pages.csv"],
+        "batch_size": 50,
+        "csv_encoding": "utf-8-sig",
+        "overwrite": True,
+    },
     "logging": {"level": "DEBUG", "file": "crawler.log", "max_bytes": 1000, "backup_count": 2},
     "report": {"stats_json": "stats.json", "html": "report.html", "title": "Blog crawl", "top_domains": 5},
 }
@@ -106,7 +111,7 @@ class TestDefaults:
             same_domain_only=True, include=(), exclude=(), exclude_extensions=EXCLUDED_EXTENSIONS
         )
         assert {"pdf", "jpg", "zip", "mp4"} <= set(EXCLUDED_EXTENSIONS)
-        assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8")
+        assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8", overwrite=False)
         assert config.logging == LoggingOptions(level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5)
         assert config.report == ReportOptions(stats_json=None, html=None, title="Crawl report", top_domains=10)
 
@@ -232,6 +237,12 @@ class TestStorage:
         first, second = storage.storages
         assert isinstance(first, JSONStorage) and isinstance(second, CSVStorage)
         assert (second.encoding, first.batch_size, second.batch_size) == ("utf-8-sig", 7, 7)
+
+    def test_overwrite_reaches_the_files(self):
+        storage = StorageOptions(outputs=("pages.jsonl", "pages.csv", "pages.db"), overwrite=True).build()
+
+        first, second, _ = storage.storages
+        assert first.overwrite is True and second.overwrite is True
 
     def test_validation_opens_nothing(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

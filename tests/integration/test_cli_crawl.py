@@ -82,6 +82,28 @@ async def test_options_limit_the_crawl_of_the_file(url, site, config_file, capsy
     assert captured.err == ""
 
 
+async def test_second_run_adds_to_the_file_unless_overwrite(url, config_file, tmp_path, capsys):
+    output = tmp_path / "pages.jsonl"
+    argv = ["--config", config_file(), "--max-depth", "0", "--output", str(output)]
+
+    def saved() -> list[str]:
+        return [json.loads(line)["url"] for line in output.read_text(encoding="utf-8").splitlines()]
+
+    await run(build_config(parse_args(argv)), progress=False)
+    capsys.readouterr()
+
+    await run(build_config(parse_args(argv)), progress=False)
+
+    # The page of the first run is kept and comes again, and the log says so.
+    assert saved() == [url("/site/")] * 2
+    assert f"{output} already has" in capsys.readouterr().err
+
+    await run(build_config(parse_args([*argv, "--overwrite"])), progress=False)
+
+    assert saved() == [url("/site/")]
+    assert "already has" not in capsys.readouterr().err
+
+
 async def test_password_of_a_database_is_not_shown(url, config_file, capsys, monkeypatch):
     class NoStorage(AdvancedCrawler):
         def __init__(self, config):

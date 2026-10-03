@@ -67,6 +67,7 @@ storage:
   outputs: []           # e.g. [pages.jsonl, pages.csv]
   batch_size: 100       # pages written at once
   csv_encoding: utf-8   # utf-8-sig for Excel
+  overwrite: false      # true starts the files anew; false adds to them (databases keep a row per URL)
 
 logging:
   level: INFO           # DEBUG, INFO, WARNING, ERROR or CRITICAL

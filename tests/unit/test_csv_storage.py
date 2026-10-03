@@ -1,9 +1,10 @@
-"""Unit tests for CSVStorage: header, quoting, encodings, appending, reading back."""
+"""Unit tests for CSVStorage: header, quoting, encodings, appending, overwriting, reading back."""
 
 import codecs
 import csv
 import io
 import json
+import logging
 
 import pytest
 from helpers import make_record
@@ -290,3 +291,64 @@ class TestBrokenFiles:
             await CSVStorage(path, batch_size=1).save(make_record())
 
         assert path.read_bytes() == written
+
+
+class TestOverwrite:
+    async def test_file_of_an_earlier_run_is_replaced_with_its_header(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        path.write_text("status_code,url\r\n404,https://site/old\r\n", encoding="utf-8")
+        records = make_records(3)
+
+        async with CSVStorage(path, overwrite=True, batch_size=1) as storage:
+            await save_all(storage, records)
+
+            assert await read_all(storage) == records
+        assert parse_csv(path)[0] == FIELDS
+
+    async def test_file_that_cannot_be_added_to_is_replaced(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        path.write_bytes(b"\r\nurl,title\r\nhttps://site/a,A")
+        record = make_record()
+
+        async with CSVStorage(path, overwrite=True) as storage:
+            await storage.save(record)
+
+            assert await read_all(storage) == [record]
+
+    async def test_byte_order_mark_is_written_once(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        async with CSVStorage(path, encoding="utf-8-sig") as storage:
+            await save_all(storage, make_records(2))
+
+        async with CSVStorage(path, encoding="utf-8-sig", overwrite=True, batch_size=1) as storage:
+            await save_all(storage, make_records(2))
+
+        assert path.read_bytes().count(codecs.BOM_UTF8) == 1
+        assert len(parse_csv(path, "utf-8-sig")) == 3
+
+    async def test_file_is_kept_until_the_first_write(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        path.write_bytes(b"url\r\nhttps://site/kept\r\n")
+
+        async with CSVStorage(path, overwrite=True) as storage:
+            await storage.flush()
+
+        assert path.read_bytes() == b"url\r\nhttps://site/kept\r\n"
+
+    async def test_adding_to_a_file_is_logged(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger="crawler.storage")
+        path = tmp_path / "pages.csv"
+        path.touch()
+        async with CSVStorage(path) as storage:
+            await storage.save(make_record("https://site/a"))
+        async with CSVStorage(path, overwrite=True) as storage:
+            await storage.save(make_record("https://site/b"))
+        assert caplog.records == []
+        size = path.stat().st_size
+
+        async with CSVStorage(path) as storage:
+            await storage.save(make_record("https://site/c"))
+
+        [warning] = caplog.records
+        assert warning.levelno == logging.WARNING
+        assert warning.getMessage().startswith(f"{path} already has {size} bytes: adding the pages to it;")

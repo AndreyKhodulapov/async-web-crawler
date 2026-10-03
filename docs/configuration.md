@@ -143,6 +143,7 @@ Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
 | `outputs` | list of strings | `[]` | files or database URLs; the pages go to each of them; empty saves nothing |
 | `batch_size` | whole number, >= 1 | `100` | pages written at once |
 | `csv_encoding` | string | `utf-8` | encoding of CSV files, e.g. `utf-8-sig` for Excel |
+| `overwrite` | true or false | `false` | true starts the files anew on the first write; false adds to them and logs a warning if a file is not empty. A database keeps a row per URL either way |
 
 | Output | Storage |
 |--------|---------|

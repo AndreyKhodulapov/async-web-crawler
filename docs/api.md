@@ -622,8 +622,8 @@ the same types:
 
 | Storage | Keeps the pages in | Notes |
 |---------|--------------------|-------|
-| `JSONStorage(path, indent=None)` | a JSON Lines file, or one indented array with `indent` | records are added without reading the file, and read back in pieces; the array is valid JSON after every write |
-| `CSVStorage(path, encoding="utf-8")` | a CSV file with a header row | the header comes from the first record, or from the file if it exists; `links` and `metadata` are JSON in a cell; quoting per RFC 4180; a character the encoding lacks is written as `?` |
+| `JSONStorage(path, indent=None, overwrite=False)` | a JSON Lines file, or one indented array with `indent` | records are added without reading the file, and read back in pieces; the array is valid JSON after every write |
+| `CSVStorage(path, encoding="utf-8", overwrite=False)` | a CSV file with a header row | the header comes from the first record, or from the file if it exists; `links` and `metadata` are JSON in a cell; quoting per RFC 4180; a character the encoding lacks is written as `?` |
 | `SQLiteStorage(path)` | the `pages` table of an SQLite file | `links` and `metadata` as JSON text, `crawled_at` as ISO 8601 in UTC |
 | `PostgresStorage(dsn)` | the `pages` table of a PostgreSQL database | `links` and `metadata` as `JSONB`, `crawled_at` as `TIMESTAMPTZ`; a connection pool |
 | `CompositeStorage(*storages)` | each of the storages | a page counts as written once all of them have it; one failing does not stop the others |
@@ -652,6 +652,14 @@ A database storage creates its table on the first use (`init_db()`), with
 transaction: all of its pages are saved or none. Saving a URL again replaces
 its row. `count()`, `status_counts()` and `get(url)` query the table.
 
+A file storage adds to the file if it exists, so a second crawl with the
+same file keeps the pages of the first one, and a page fetched by both is
+in the file twice; adding to a file that is not empty is logged as a
+warning. With `overwrite=True` the file is started anew: what it held is
+dropped on the first write (a crawl that saves nothing leaves it as it
+was), and a file that could not be added to, such as one of the other JSON
+layout, is replaced too.
+
 In a crawl, a failed save never stops the crawler: it is logged, the page
 stays in the results, and `crawl_stats()` counts `saved` and `save_failed`.
 `saved` counts the pages actually written out, so pages still in the buffer
@@ -665,7 +673,8 @@ are written at the end of the crawl, or counted as `save_failed`.
 `storage_from_output(output)` chooses the storage by the name of a file:
 `.jsonl` (or `.ndjson`) is JSON Lines, `.json` an indented array, `.csv` CSV,
 `.db` (or `.sqlite`, `.sqlite3`) SQLite; a string with `://` is a database
-URL. This is what the `storage.outputs` of a configuration file go through.
+URL. `overwrite=True` reaches the file storages only. This is what the
+`storage.outputs` of a configuration file go through.
 
 The database is chosen by a URL: `storage_from_url(url)` takes it as an
 argument, `storage_from_env()` reads it from `CRAWLER_DATABASE_URL` and

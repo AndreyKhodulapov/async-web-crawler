@@ -52,15 +52,18 @@ def storage_from_url(url: str, **options: Any) -> DatabaseStorage:
     return builder(url, **options)
 
 
-def storage_from_output(output: str | Path, *, csv_encoding: str = "utf-8", **options: Any) -> DataStorage:
+def storage_from_output(
+    output: str | Path, *, csv_encoding: str = "utf-8", overwrite: bool = False, **options: Any
+) -> DataStorage:
     """The storage for an output: a file, chosen by its extension, or a database URL.
 
     "pages.jsonl" (or ".ndjson") is JSON Lines, "pages.json" an indented
     JSON array, "pages.csv" CSV in `csv_encoding`, "pages.db" (or ".sqlite",
     ".sqlite3") an SQLite database; "~" at the start of a path is the home
     directory. A string with "://" is a database URL, see
-    `storage_from_url`. `options` go to the storage: `batch_size`,
-    `retry_strategy`, `cooldown`.
+    `storage_from_url`. `overwrite` starts a file anew instead of adding
+    to it; a database is left as it is (it keeps a row per URL anyway).
+    `options` go to the storage: `batch_size`, `retry_strategy`, `cooldown`.
 
     Raises:
         ValueError: the extension is unknown, or as `storage_from_url`.
@@ -71,11 +74,11 @@ def storage_from_output(output: str | Path, *, csv_encoding: str = "utf-8", **op
     path = Path(output).expanduser()
     extension = path.suffix.lower()
     if extension == ".csv":
-        return CSVStorage(path, encoding=csv_encoding, **options)
+        return CSVStorage(path, encoding=csv_encoding, overwrite=overwrite, **options)
     if extension == ".json":
-        return JSONStorage(path, indent=2, **options)
+        return JSONStorage(path, indent=2, overwrite=overwrite, **options)
     if extension in (".jsonl", ".ndjson"):
-        return JSONStorage(path, **options)
+        return JSONStorage(path, overwrite=overwrite, **options)
     if extension in (".db", ".sqlite", ".sqlite3"):
         return SQLiteStorage(path, **options)
     problem = f'unknown extension "{path.suffix}"' if path.suffix else "it has no extension"

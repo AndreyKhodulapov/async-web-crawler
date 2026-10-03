@@ -16,21 +16,26 @@ from aiofiles.threadpool.binary import AsyncBufferedReader
 from crawler.exceptions import StorageError
 from crawler.models import PageRecord
 from crawler.retry import RetryStrategy
-from crawler.storage.base import DataStorage
+from crawler.storage.base import DataStorage, warn_adding_to_file
 
 
 class CSVStorage(DataStorage):
     """Keeps pages in a CSV file, a row per page, adding to the file if it exists.
 
+    With `overwrite` the file is started anew instead: what it held,
+    header included, is dropped on the first write. Adding to a file that
+    is not empty is logged as a warning, since a second run with the same
+    file keeps the pages of the first one too.
+
     The header row is made of the fields of the first record; a file that
     exists keeps the header it has, and its columns decide the order. A
     record with a field the header lacks is refused with `ValueError`.
 
-    A file that is not what this storage writes is left alone and reported
-    with `StorageError`: on the first write, if it starts with an empty
-    line or does not end with a line break (a write that was cut short);
-    on `read`, if a row does not fit the header or the file is not in
-    `encoding`.
+    A file that is not what this storage writes is reported with
+    `StorageError`: on the first write (and left alone), unless
+    `overwrite`, if it starts with an empty line or does not end with a
+    line break (a write that was cut short); on `read`, if a row does not
+    fit the header or the file is not in `encoding`.
 
     Commas, quotes and line breaks in a value are quoted as RFC 4180 says,
     so a row may span several lines. `links` and `metadata` are written as
@@ -52,6 +57,7 @@ class CSVStorage(DataStorage):
         path: str | Path,
         *,
         encoding: str = "utf-8",
+        overwrite: bool = False,
         batch_size: int = 100,
         retry_strategy: RetryStrategy | None = None,
         cooldown: float = 5.0,
@@ -60,6 +66,7 @@ class CSVStorage(DataStorage):
         super().__init__(batch_size, retry_strategy=retry_strategy, cooldown=cooldown)
         self.path = Path(path)
         self.encoding = encoding
+        self.overwrite = overwrite
         self._file: AsyncBufferedReader | None = None
         self._header: list[str] | None = None
         self._end = 0  # where the next row goes
@@ -84,7 +91,7 @@ class CSVStorage(DataStorage):
         self._header = list(writer.fieldnames)
 
     async def _open(self) -> AsyncBufferedReader:
-        if await aiofiles.os.path.exists(self.path):
+        if not self.overwrite and await aiofiles.os.path.exists(self.path):
             try:
                 async with aiofiles.open(self.path, encoding=self.encoding, newline="") as file:
                     first_line = await file.readline()
@@ -104,6 +111,7 @@ class CSVStorage(DataStorage):
                 # A write that was cut short: the next row would be glued to its last line.
                 await file.close()
                 raise StorageError(f"{self.path} does not end with a line break: its last row may be broken")
+            warn_adding_to_file(self.path, self._end)
         self._file = file
         return file
 

@@ -38,7 +38,8 @@ configuration file, by command-line options, or from Python.
   worker thread
 - **Storage** behind one interface: JSON Lines or a JSON array, CSV,
   SQLite, PostgreSQL, or several at once; asynchronous writes in batches
-  with retries
+  with retries; a file is added to by the next run, or started anew with
+  `--overwrite`
 - **Configuration file** in YAML or JSON, checked on load with every
   problem reported by the path of its key
 - **Command line** with live progress, a summary, exit codes for scripts
@@ -113,6 +114,7 @@ or the default without a file.
 | `--max-pages N` | `crawler.max_pages` | pages to request, failed ones included |
 | `--max-depth N` | `crawler.max_depth` | links followed from a start URL; 0 crawls the start URLs only |
 | `--output PATH` | `storage.outputs` | where to save the pages: a `.jsonl`, `.json`, `.csv` or `.db` file, or a database URL; repeat for several, in place of those of the file |
+| `--overwrite`, `--no-overwrite` | `storage.overwrite` | start output files anew, or add to them (the default; the log warns about a file that is not empty); a database keeps a row per URL either way |
 | `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, `nofollow` and `noindex`, or do not |
 | `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |

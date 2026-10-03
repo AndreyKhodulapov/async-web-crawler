@@ -170,6 +170,7 @@ class StorageOptions:
     outputs: tuple[str, ...] = _option((), check=_file_path)  # files by extension, or database URLs
     batch_size: int = _option(100, minimum=1)
     csv_encoding: str = "utf-8"
+    overwrite: bool = False  # files are started anew instead of added to; databases keep a row per URL anyway
 
     def build(self) -> DataStorage | None:
         """The storage of the pages; None if there are no outputs.
@@ -179,7 +180,9 @@ class StorageOptions:
             LookupError: `csv_encoding` is unknown.
         """
         storages = [
-            storage_from_output(output, csv_encoding=self.csv_encoding, batch_size=self.batch_size)
+            storage_from_output(
+                output, csv_encoding=self.csv_encoding, overwrite=self.overwrite, batch_size=self.batch_size
+            )
             for output in self.outputs
         ]
         if not storages:

@@ -53,6 +53,11 @@ blocking the event loop, losing pages or writing them twice.
 - **Append without reading**: a JSON array can still be appended in O(1):
   write `\n]\n` after the records, remember where it starts, and overwrite it
   with `,\n<record>\n]\n` next time. The file is valid JSON after every write.
+- **A second run**: an append-only file gets the pages of the first run
+  again, and nothing tells the user until they read it. Offer a mode that
+  starts the file anew (truncate on the first write, not on open, so a
+  failed start keeps the old data) and warn when adding to a file that is
+  not empty. A database with an upsert by URL has no such problem.
 - **Read without loading**: iterate (an async generator) instead of returning
   a list. For JSON, `JSONDecoder.raw_decode` takes one value off the front of
   a buffer that is refilled in chunks.
