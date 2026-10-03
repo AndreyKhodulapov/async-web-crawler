@@ -287,7 +287,9 @@ fetched at most once. The target of a redirect is remembered before it is
 requested: a later link to it is not fetched, and a redirect to a page
 already seen is not followed (the page is listed in `skipped_urls` as
 `redirected to a page already seen`), so a page is never saved under two
-URLs. A page whose redirect leads to a URL robots.txt disallows is listed in
+URLs. If the page fails on the way (the target answers an error, the chain
+is too long), its targets are forgotten: a later link to one of them is
+fetched as any other. A page whose redirect leads to a URL robots.txt disallows is listed in
 `blocked_urls`; it counts toward `max_pages`, as its own request was sent.
 
 Some sites have endless URL spaces: a listing under every sort order and

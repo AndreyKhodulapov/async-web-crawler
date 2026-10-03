@@ -1095,11 +1095,14 @@ class AsyncCrawler:
         depth = queue.depth(url)
         skip_reason: str | None = None
         sent = False  # a request of the page got an answer: a redirect
+        targets: list[str] = []  # the redirects followed, remembered as seen for this page
 
         def follow(target: str) -> bool:
             nonlocal skip_reason, sent
             sent = True
             skip_reason = self._redirect_refusal(url, target, queue, url_filter)
+            if skip_reason is None:
+                targets.append(target)
             return skip_reason is None
 
         result = await self._fetch(url, html_only=True, check_robots=False, follow=follow)
@@ -1115,8 +1118,13 @@ class AsyncCrawler:
                     # back under the limit, and this worker goes on to crawl it,
                     # or the page that takes its place, even if the others have stopped.
                     queue.reopen()
-            self._defer_or_fail(url, queue, result.error)
+            if not self._defer_or_fail(url, queue, result.error):
+                self._forget_redirects(url, targets, queue)
             return
+        if result.error is not None:
+            # The page is not crawled: its redirect targets are no longer
+            # seen, so that a direct link to one of them is still followed.
+            self._forget_redirects(url, targets, queue)
         # The worker has checked robots.txt for the page; these are about the target of its redirect.
         if isinstance(result.error, RobotsDisallowedError):
             queue.mark_blocked(url, f"redirects to {result.error.url}, {result.error.message}")
@@ -1235,6 +1243,14 @@ class AsyncCrawler:
             self._redirect_sources[page] = url
         return None
 
+    def _forget_redirects(self, url: str, targets: Iterable[str], queue: CrawlerQueue) -> None:
+        """Let the redirect targets of the page `url` be queued again: the page failed, so they were not crawled."""
+        for target in targets:
+            page = strip_tracking_params(target)
+            if self._redirect_sources.get(page) == url:
+                del self._redirect_sources[page]
+                queue.forget(page)
+
     def _fail_page(self, url: str, queue: CrawlerQueue, error: FetchError, result: FetchResult | None = None) -> None:
         """Finish a page of the crawl as failed; `result` is that of its request, None if none was sent."""
         queue.mark_failed(url, f"{type(error).__name__}: {error.message}")
@@ -1309,10 +1325,11 @@ class AsyncCrawler:
         host = get_host(url)
         return 0.0 if host is None else self.rate_limiter.penalty_left(host)
 
-    def _defer_or_fail(self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError) -> None:
+    def _defer_or_fail(self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError) -> bool:
         """Put off a page the circuit breaker refused until its host may be probed, or give up on it.
 
         The host is that of the refusal: the page may redirect to another one.
+        Returns whether the page was put off rather than failed.
         """
         host = get_host(refusal.url)
         assert host is not None  # a URL without a host has no circuit
@@ -1320,12 +1337,13 @@ class AsyncCrawler:
         if opened >= self.MAX_CIRCUIT_OPENINGS:
             logger.info("Gave up on %s: circuit breaker of %s opened %d times", url, host, opened)
             self._fail_page(url, queue, refusal)
-            return
+            return False
         # Back when the probe may go; a page refused while the probe is in
         # flight comes back a second later.
         delay = self.circuit_breaker.probe_in(refusal.url) or 1.0
         logger.info("Deferred %s for %.1fs: %s", url, delay, refusal.message)
         queue.defer(url, delay, priority=queue.depth(url))
+        return True
 
     async def close(self) -> None:
         """Close the underlying session and the storage. Safe to call more than once.

@@ -204,6 +204,8 @@ async def site_page(request: web.Request) -> web.Response:
         state.in_flight -= 1
     if request.path == "/site/moved":
         raise web.HTTPFound("/site/c.html")
+    if request.path == "/site/to-missing":
+        raise web.HTTPFound("/site/missing.html")
     if request.path == "/site/to-other-host":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/")
     if request.path == "/site/bounce":

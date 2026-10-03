@@ -92,6 +92,12 @@ class CrawlerQueue:
         normalized = queue_form(url)
         return normalized is not None and normalized in self._seen
 
+    def forget(self, url: str) -> None:
+        """Undo `mark_seen`: the URL may be queued again. An accepted URL stays seen."""
+        normalized = queue_form(url)
+        if normalized is not None and normalized not in self._depths:
+            self._seen.discard(normalized)
+
     async def get_next(self) -> str | None:
         """Take the next URL, waiting while the queue is empty but work is in progress.
 

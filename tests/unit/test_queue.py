@@ -76,6 +76,18 @@ class TestAddUrl:
         queue.mark_seen("http://site/redirect-target")
         assert queue.add_url("http://site/redirect-target") is False
 
+    def test_forgotten_url_is_queued_again_unless_accepted(self):
+        queue = CrawlerQueue()
+        queue.mark_seen("http://site/redirect-target")
+        queue.add_url("http://site/page")
+
+        queue.forget("http://site/redirect-target?utm_source=x")
+        queue.forget("http://site/page")
+        queue.forget("not a url")
+
+        assert queue.add_url("http://site/redirect-target") is True
+        assert queue.add_url("http://site/page") is False
+
 
 class TestGetNext:
     async def test_returns_none_when_empty_and_idle(self):

@@ -103,6 +103,16 @@ async def test_redirect_to_a_page_already_seen_is_not_followed(url, site):
     assert site.hits["/site/c.html"] == 1
 
 
+async def test_target_of_a_redirect_that_failed_is_crawled_when_linked(url, site):
+    # One worker: "to-missing" fails at missing.html, then the home page links to missing.html itself.
+    async with AsyncCrawler(max_concurrent=1, max_depth=1, **UNTHROTTLED) as crawler:
+        await crawler.crawl([url("/site/to-missing"), url("/site/")], same_domain_only=True)
+
+    # The target is requested under its own URL, not taken for a page already seen.
+    assert {url("/site/to-missing"), url("/site/missing.html")} <= set(crawler.failed_urls)
+    assert site.hits["/site/missing.html"] == 2
+
+
 async def test_page_that_redirects_to_itself_is_crawled(url, site):
     # The first answer sets a cookie and sends the client back to the same URL.
     # (Cookies are not kept for an IP address, hence localhost.)

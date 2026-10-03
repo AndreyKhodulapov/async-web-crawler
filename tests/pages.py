@@ -57,8 +57,9 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 # links redirect to another host (to-other-host) or to c.html (moved).
 # /site/names.html links to pages whose URLs need percent-encoding, one of
 # them twice: as raw text and already encoded.
-# Not linked either: /site/go redirects to private/secret, and
-# /site/cookie-check redirects to itself once to set a cookie.
+# Not linked either: /site/go redirects to private/secret, /site/to-missing
+# to missing.html (a 404), and /site/cookie-check redirects to itself once to
+# set a cookie.
 # /site/bounce redirects to the home page through bounce-back on the other host.
 # /site/robots.html links to pages that ask crawlers, by rel="nofollow",
 # <meta name="robots"> or X-Robots-Tag, not to follow links or keep pages.

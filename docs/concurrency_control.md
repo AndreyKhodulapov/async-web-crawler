@@ -102,7 +102,9 @@ load under control.
   followed, a new one joins the seen set at once: a page is downloaded and
   saved under one URL only. Leave out of that check the page itself and the
   earlier targets of its own chain: a cookie check redirects a page to
-  itself, and a real loop ends at the redirect limit.
+  itself, and a real loop ends at the redirect limit. Forget the targets of
+  a page that fails: they were not crawled, and a direct link to one of
+  them must still be followed.
 - Tracking parameters (`utm_source`, `fbclid`) do not change the page: drop
   them before the check. Do not sort or drop the other parameters: for some
   sites their order or presence matters.
