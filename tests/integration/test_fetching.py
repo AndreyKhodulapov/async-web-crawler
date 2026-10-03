@@ -51,8 +51,9 @@ async def test_redirect_loop_is_not_retried(server):
     async with AsyncCrawler(**{**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=2)}) as crawler:
         with pytest.raises(TooManyRedirectsError, match="too many redirects"):
             await crawler.fetch_url(str(server.make_url("/redirect-loop")))
-        # Ten redirects, each waiting for its turn in the rate limiter; no retries.
-        assert crawler.rate_limiter.get_stats().requests == 10
+        # The page and the ten redirects followed, each waiting for its turn
+        # in the rate limiter; the eleventh is not. No retries.
+        assert crawler.rate_limiter.get_stats().requests == 11
         assert crawler.error_stats().retries == 0
 
 

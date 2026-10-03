@@ -403,12 +403,7 @@ class AsyncCrawler:
         `track_errors`, the attempts count in `error_stats()`.
         """
         target, elapsed, retried, attempts = url, 0.0, False, 0
-        for redirects in range(self.MAX_REDIRECTS + 1):
-            if redirects == self.MAX_REDIRECTS:
-                result = FetchResult.failure(
-                    url, TooManyRedirectsError(url, f"too many redirects ({redirects})"), elapsed
-                )
-                break
+        for redirects in itertools.count():
             result, attempts = await self._fetch_hop(
                 target,
                 html_only=html_only,
@@ -421,6 +416,11 @@ class AsyncCrawler:
             elapsed += result.elapsed
             retried = retried or attempts > 1
             if not result.redirected:
+                break
+            if redirects == self.MAX_REDIRECTS:
+                # Checked before the target is asked about: it is not reached.
+                error = TooManyRedirectsError(url, f"too many redirects (more than {self.MAX_REDIRECTS})")
+                result = FetchResult.failure(url, error, elapsed)
                 break
             assert result.final_url is not None
             location = resolve_url(result.final_url, target)

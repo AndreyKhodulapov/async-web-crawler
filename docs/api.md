@@ -102,7 +102,9 @@ the site did not forbid them. A crawl does not queue them again, so only
 the pages found after the 60 seconds are fetched. Redirects are followed by
 the crawler, one request at a time: the target of each is checked against
 robots.txt of its own site and waits for the rate limit of its own host, as
-a link to it would. A disallowed target fails the request with
+a link to it would. Up to `AsyncCrawler.MAX_REDIRECTS` (10) redirects in a
+row are followed; one more fails with `TooManyRedirectsError`, its target
+not requested. A disallowed target fails the request with
 `RobotsDisallowedError` before it is sent. Crawl-delay is capped at 30 seconds. While
 a retry waits, the whole host waits with it, since a timeout or a 429 usually
 means the site is overloaded. A Retry-After header holds back the host for

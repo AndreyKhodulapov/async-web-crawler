@@ -824,6 +824,34 @@ class TestCrawlBlockedHost:
         assert crawler.crawl_stats().queued == 0
 
 
+class TestRedirectLimit:
+    @staticmethod
+    def chain(fake_session: FakeSession, redirects: int) -> None:
+        for hop in range(redirects):
+            fake_session.routes[f"http://a/{hop}"] = FakeResponse(status=302, location=f"http://a/{hop + 1}")
+
+    async def test_max_redirects_are_followed(self, crawler, fake_session):
+        self.chain(fake_session, AsyncCrawler.MAX_REDIRECTS)
+
+        result = await crawler.fetch_result("http://a/0")
+
+        assert result.ok
+        assert result.final_url == "http://a/10"
+        assert len(fake_session.requested) == 11
+
+    async def test_one_more_fails_without_asking_for_its_target(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=1, max_depth=1)
+        self.chain(fake_session, AsyncCrawler.MAX_REDIRECTS + 1)
+        fake_session.routes["http://b/"] = FakeResponse(b'<a href="http://a/11">11</a>')
+
+        await crawler.crawl(["http://a/0", "http://b/"])
+
+        assert crawler.failed_urls == {"http://a/0": "TooManyRedirectsError: too many redirects (more than 10)"}
+        # The target the chain did not reach is not taken for a page already seen.
+        assert crawler.processed_urls.keys() == {"http://b/", "http://a/11"}
+        assert fake_session.requested.count("http://a/11") == 1
+
+
 class TestCrawlDuplicates:
     async def test_variant_of_a_page_that_failed_is_kept(self, make_crawler, fake_session):
         crawler = make_crawler(max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=0))
