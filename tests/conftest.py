@@ -17,7 +17,7 @@ class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
-    /busy/, sitemaps and robots.txt, in the order they arrived. `robots` is the
+    /busy/, /shop/, sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404.
     With `robots_endless`, comment lines follow the body for as long as
     the client reads them. `robots_by_host` gives other hosts of the server
@@ -153,6 +153,35 @@ async def busy(request: web.Request) -> web.Response:
     raise web.HTTPTooManyRequests(headers={"Retry-After": request.match_info["seconds"]})
 
 
+SHOP_PAGES = 20
+SHOP_SORTS = ("price", "name", "date")
+
+
+async def shop_list(request: web.Request) -> web.Response:
+    """Page N of a listing, under every sort order: an endless-looking URL space.
+
+    /shop/list?page=N, with or without &sort=S, links to every sort order of
+    the page, to the next page in the same order, to item N and, as a share
+    button, to itself with utm_source. Its canonical URL is /shop/list?page=N.
+    """
+    request.app[SITE_STATE].record(request)
+    page = int(request.query.get("page", "1"))
+    sort = request.query.get("sort")
+    order = "" if sort is None else f"&sort={sort}"
+    links = [f"list?page={page}&sort={each}" for each in SHOP_SORTS]
+    links += [f"item/{page}", f"list?page={page}{order}&utm_source=share"]
+    if page < SHOP_PAGES:
+        links.append(f"list?page={page + 1}{order}")
+    html = f'<link rel="canonical" href="/shop/list?page={page}"><title>Page {page}</title>'
+    html += " ".join(f'<a href="{link}">{link}</a>' for link in links)
+    return web.Response(text=html, content_type="text/html")
+
+
+async def shop_item(request: web.Request) -> web.Response:
+    request.app[SITE_STATE].record(request)
+    return web.Response(text=f"<title>Item {request.match_info['n']}</title>", content_type="text/html")
+
+
 async def site_page(request: web.Request) -> web.Response:
     state = request.app[SITE_STATE]
     state.record(request)
@@ -209,6 +238,8 @@ async def server(aiohttp_server):
     app.router.add_get("/sitemaps/{name}", sitemap)
     app.router.add_get("/flaky/{fails}", flaky)
     app.router.add_get("/busy/{seconds}", busy)
+    app.router.add_get("/shop/list", shop_list)
+    app.router.add_get("/shop/item/{n}", shop_item)
     return await aiohttp_server(app)
 
 

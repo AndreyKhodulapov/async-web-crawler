@@ -97,8 +97,16 @@ load under control.
   saved under one URL only. Leave out of that check the page itself and the
   earlier targets of its own chain: a cookie check redirects a page to
   itself, and a real loop ends at the redirect limit.
-- Some duplicates cannot be detected by URL at all (`/` and `/index.html`).
-  `<link rel="canonical">` or content hashing handles those.
+- Tracking parameters (`utm_source`, `fbclid`) do not change the page: drop
+  them before the check. Do not sort or drop the other parameters: for some
+  sites their order or presence matters.
+- Some duplicates cannot be detected by URL at all (`/` and `/index.html`,
+  `/list?sort=price` and `/list`). `<link rel="canonical">` or content
+  hashing handles those. Trust a canonical URL only as far as it is cheap to
+  be wrong: here only one that differs in the query, so a site that points
+  every page to its home page does not lose them all.
+- Crawler traps (calendars, endless filters) need limits that do not depend
+  on URLs at all: depth, URL length, pages per host.
 
 ## URL filters
 

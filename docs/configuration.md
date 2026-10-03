@@ -65,6 +65,7 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `max_pages` | whole number, >= 1 | `100` | pages requested, failed ones included |
+| `max_pages_per_host` | whole number, >= 1, or `null` | `null` | pages requested from one host; the others of that host are skipped without a request; `null` for no limit of its own |
 | `max_depth` | whole number, >= 0 | `2` | links followed from a start URL; 0 crawls the start URLs only |
 | `max_concurrent` | whole number, >= 1 | `10` | requests in flight |
 | `max_per_domain` | whole number, >= 1, or `null` | `null` | requests in flight to one host; `null` for no limit of its own |

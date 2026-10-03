@@ -6,16 +6,17 @@ import itertools
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from crawler.urls import normalize_url
+from crawler.urls import normalize_url, strip_tracking_params
 
 
 class CrawlerQueue:
     """URLs waiting to be crawled, ordered by priority, plus their outcomes.
 
     A lower `priority` value is served first; URLs with equal priority come
-    out in the order they were added. Every URL is normalized and accepted
-    at most once, so a page is never queued twice, whether it is still
-    waiting, being fetched or already done.
+    out in the order they were added. Every URL is normalized, stripped of
+    tracking parameters such as "utm_source" (see `strip_tracking_params`)
+    and accepted at most once, so a page is never queued twice, whether it
+    is still waiting, being fetched or already done.
 
     Lifecycle of a URL: `add_url` -> `get_next` (in progress) ->
     `mark_processed`, `mark_failed`, `mark_skipped`, `mark_blocked` or
@@ -54,7 +55,7 @@ class CrawlerQueue:
 
     def add_url(self, url: str, priority: int = 0, *, depth: int = 0) -> bool:
         """Queue a URL; return False if it is invalid, already seen, or the queue is closed."""
-        normalized = normalize_url(url)
+        normalized = _queue_form(url)
         if normalized is None or normalized in self._seen or self._closed:
             return False
         self._seen.add(normalized)
@@ -65,13 +66,13 @@ class CrawlerQueue:
 
     def mark_seen(self, url: str) -> None:
         """Remember a URL without queuing it, e.g. the target of a redirect."""
-        normalized = normalize_url(url)
+        normalized = _queue_form(url)
         if normalized is not None:
             self._seen.add(normalized)
 
     def is_seen(self, url: str) -> bool:
         """Whether a URL was accepted or remembered with `mark_seen`."""
-        normalized = normalize_url(url)
+        normalized = _queue_form(url)
         return normalized is not None and normalized in self._seen
 
     async def get_next(self) -> str | None:
@@ -184,3 +185,9 @@ class CrawlerQueue:
         self._in_progress.remove(url)
         # The last finished URL may mean the crawl is over: waiters must re-check.
         self._wakeup.set()
+
+
+def _queue_form(url: str) -> str | None:
+    """The form in which the queue keeps a URL; None if the URL is invalid."""
+    normalized = normalize_url(url)
+    return None if normalized is None else strip_tracking_params(normalized)

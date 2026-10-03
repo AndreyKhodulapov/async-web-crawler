@@ -101,6 +101,7 @@ class CrawlOptions:
     """Section `crawler`: how much to crawl and how fast. Times are in seconds."""
 
     max_pages: int = _option(100, minimum=1)
+    max_pages_per_host: int | None = _option(None, minimum=1)  # null: as many as max_pages
     max_depth: int = _option(2, minimum=0)
     max_concurrent: int = _option(10, minimum=1)
     max_per_domain: int | None = _option(None, minimum=1)

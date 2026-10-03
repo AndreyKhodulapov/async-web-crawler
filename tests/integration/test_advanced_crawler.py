@@ -146,6 +146,15 @@ async def test_links_to_other_hosts_are_not_followed_by_default(url, server, fil
     assert (other_host in crawler.crawler.processed_urls) is leaves
 
 
+async def test_max_pages_per_host_reaches_the_crawl(url, site):
+    config = make_config(urls=[url("/site/")], crawler={"max_pages_per_host": 2})
+    async with AdvancedCrawler(config) as crawler:
+        await crawler.crawl()
+
+    assert site.hits.total() == 2
+    assert crawler.crawler.skipped_urls
+
+
 async def test_close_stops_logging_to_the_file_and_closes_the_crawler(url, tmp_path):
     crawler = AdvancedCrawler(make_config(urls=[url("/site/c.html")], logging={"file": str(tmp_path / "crawler.log")}))
     assert len(file_handlers()) == 1

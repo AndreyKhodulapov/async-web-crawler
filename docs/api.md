@@ -285,6 +285,27 @@ already seen is not followed (the page is listed in `skipped_urls` as
 URLs. A page whose redirect leads to a URL robots.txt disallows is listed in
 `blocked_urls`; it counts toward `max_pages`, as its own request was sent.
 
+Some sites have endless URL spaces: a listing under every sort order and
+filter, a calendar, a session ID in every link. Against them a crawl:
+
+- drops tracking parameters (`utm_*`, `fbclid`, `gclid`, `dclid`,
+  `msclkid`, `yclid`) from every URL it queues, so `/a?utm_source=x` is
+  requested as `/a` and is the same page; the other parameters are kept as
+  they are (`strip_tracking_params`);
+- does not follow a link longer than `MAX_URL_LENGTH` (2048 characters);
+- skips a page whose `<link rel="canonical">` is the same URL with another
+  query and has been seen already, such as `/list?page=2&sort=price` with
+  the canonical `/list?page=2`: it is listed in `skipped_urls` as
+  `duplicate of <canonical>`, not returned or saved, and its links, being
+  variants too, are not followed. A canonical URL with another path is not
+  trusted: a site that points every page to its home page would lose them all;
+- with `max_pages_per_host`, requests at most that many pages of one host:
+  the other pages of the host are listed in `skipped_urls` without a
+  request and do not count toward `max_pages`.
+
+The first two happen before a request, the canonical URL is known only
+after it: a variant of a page still counts toward `max_pages`.
+
 With `respect_robots`, a crawl also does what pages ask of crawlers, see
 [politeness.md](politeness.md#robots-directives-of-pages-and-links): links
 marked `rel="nofollow"` are not followed, nor are the links of a page whose
@@ -298,6 +319,7 @@ both. An `X-Robots-Tag` header that names another crawler is ignored.
 |--------|--------|
 | `AsyncCrawler(max_depth=2)` | how far from the start pages to go; 0 fetches the start pages only |
 | `AsyncCrawler(max_per_domain=None)` | parallel requests to one host; `None` means only `max_concurrent` applies |
+| `max_pages_per_host=None` | pages requested from one host; `None` means only `max_pages` applies |
 | `same_domain_only=False` | follow links on the start hosts only (and on the hosts they redirect to); the configuration turns it on by default |
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
@@ -351,7 +373,7 @@ After a crawl, and during one, the crawler exposes its state:
 |-----------|---------|
 | `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()`; empty with `keep_pages=False` |
 | `failed_urls` | `{url: "ErrorType: message"}` |
-| `skipped_urls` | `{url: reason}` for pages fetched but left out: not HTML, redirected out of scope or to a page already seen, or `noindex` |
+| `skipped_urls` | `{url: reason}` for pages fetched but left out: not HTML, redirected out of scope or to a page already seen, `noindex`, or a duplicate by the canonical URL; also pages not requested over `max_pages_per_host` |
 | `blocked_urls` | `{url: reason}` for pages robots.txt did not allow to fetch |
 | `unreachable_urls` | `{url: reason}` for pages not fetched because robots.txt of their site was unreachable |
 | `failed_sitemaps` | `{sitemap url: "ErrorType: message"}` for sitemaps that could not be read |
@@ -385,7 +407,7 @@ print(f"{stats['successful']} of {stats['total_pages']} pages in {stats['elapsed
 | `total_pages` | pages the crawl is done with: `successful + failed + skipped` |
 | `successful` | pages fetched and parsed, the ones `crawl()` returns |
 | `failed` | pages in `failed_urls` |
-| `skipped` | pages in `skipped_urls`: fetched, but not HTML, redirected out of scope or to a page already seen, or `noindex` |
+| `skipped` | pages in `skipped_urls`: fetched, but not HTML, redirected out of scope or to a page already seen, `noindex`, or a duplicate by the canonical URL; or not requested over `max_pages_per_host` |
 | `elapsed_seconds` | running time of the crawl, up to now while it runs |
 | `pages_per_second` | `total_pages / elapsed_seconds` |
 | `avg_response_time` | average time of a page request (of its last attempt, if retried) |

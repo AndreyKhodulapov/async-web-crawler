@@ -64,6 +64,13 @@ class TestAddUrl:
         assert dict(queue.depths) == {"http://site/": 3}
         assert queue.depth("http://site/") == 3
 
+    async def test_tracking_parameters_are_dropped(self):
+        queue = CrawlerQueue()
+        assert queue.add_url("http://site/a?id=1&utm_source=mail") is True
+        assert queue.add_url("http://site/a?fbclid=x&id=1") is False
+        assert queue.is_seen("http://site/a?id=1&gclid=y")
+        assert await take(queue) == "http://site/a?id=1"
+
     def test_marked_seen_url_is_not_queued(self):
         queue = CrawlerQueue()
         queue.mark_seen("http://site/redirect-target")

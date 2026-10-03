@@ -78,6 +78,29 @@ def resolve_url(href: str, base_url: str) -> str | None:
     return normalize_url(absolute)
 
 
+# Click IDs of ad networks; parameters starting with "utm_" go too.
+TRACKING_PARAMS = frozenset({"fbclid", "gclid", "dclid", "msclkid", "yclid"})
+
+
+def strip_tracking_params(url: str) -> str:
+    """Drop tracking parameters ("utm_*", "fbclid", "gclid", ...) from the query of a normalized URL.
+
+    They tell the site where a visitor came from, not which page to show:
+    "/a?utm_source=x&id=1" and "/a?id=1" are the same page. The other
+    parameters keep their order and spelling; a query left empty is dropped.
+    """
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    kept = [param for param in parts.query.split("&") if not _is_tracking_param(param)]
+    return urlunsplit(parts._replace(query="&".join(kept)))
+
+
+def _is_tracking_param(param: str) -> bool:
+    name = param.partition("=")[0]
+    return name.startswith("utm_") or name in TRACKING_PARAMS
+
+
 @functools.lru_cache(maxsize=4096)
 def get_host(url: str) -> str | None:
     """Return the normalized host of an http(s) URL, or None if the URL is invalid.

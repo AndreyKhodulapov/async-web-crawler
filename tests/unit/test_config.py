@@ -37,6 +37,7 @@ FULL = {
     "sitemaps": {"urls": ["https://example.com/sitemap.xml"], "from_robots": True, "max_urls": 200},
     "crawler": {
         "max_pages": 500,
+        "max_pages_per_host": 50,
         "max_depth": 3,
         "max_concurrent": 20,
         "max_per_domain": 4,
@@ -87,7 +88,13 @@ class TestDefaults:
         assert config == CrawlerConfig()
         assert config.urls == ()
         assert config.crawler == CrawlOptions(
-            max_pages=100, max_depth=2, max_concurrent=10, max_per_domain=None, rate_limit=1.0, respect_robots=True
+            max_pages=100,
+            max_pages_per_host=None,
+            max_depth=2,
+            max_concurrent=10,
+            max_per_domain=None,
+            rate_limit=1.0,
+            respect_robots=True,
         )
         assert config.crawler.user_agent == AsyncCrawler.DEFAULT_USER_AGENT
         assert config.sitemaps == SitemapOptions(urls=(), from_robots=False, max_urls=50_000)
@@ -112,6 +119,7 @@ class TestDefaults:
         crawler, crawl = defaults(AsyncCrawler.__init__), defaults(AsyncCrawler.crawl)
         options = CrawlOptions()
         assert options.max_pages == crawl["max_pages"]
+        assert options.max_pages_per_host == crawl["max_pages_per_host"]
         assert options.rate_limit == crawler["requests_per_second"]
         for name in ("max_depth", "max_concurrent", "max_per_domain", "per_domain_rate", "min_delay", "jitter"):
             assert getattr(options, name) == crawler[name], name
@@ -270,6 +278,7 @@ class TestInvalid:
         ("data", "problem"),
         [
             ({"crawler": {"max_pages": 0}}, "crawler.max_pages: must be >= 1, got 0"),
+            ({"crawler": {"max_pages_per_host": 0}}, "crawler.max_pages_per_host: must be >= 1, got 0"),
             ({"crawler": {"max_depth": -1}}, "crawler.max_depth: must be >= 0, got -1"),
             ({"crawler": {"max_concurrent": 0}}, "crawler.max_concurrent: must be >= 1, got 0"),
             ({"crawler": {"max_per_domain": 0}}, "crawler.max_per_domain: must be >= 1, got 0"),

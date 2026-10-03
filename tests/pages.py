@@ -61,6 +61,11 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 # /site/cookie-check redirects to itself once to set a cookie.
 # /site/robots.html links to pages that ask crawlers, by rel="nofollow",
 # <meta name="robots"> or X-Robots-Tag, not to follow links or keep pages.
+# /site/long.html links to a page with a query of LONG_QUERY characters.
+# /site/variant.html names itself as canonical, so with any query it is a
+# variant; /site/points-home.html names the home page, a canonical URL
+# with another path.
+LONG_QUERY = 3000
 SITE_PAGES: dict[str, str] = {
     "/site/": """
         <title>Home</title>
@@ -91,6 +96,9 @@ SITE_PAGES: dict[str, str] = {
     "/site/noindex.html": '<meta name="robots" content="noindex"><title>Noindex</title><a href="b.html">B</a>',
     "/site/nofollow.html": '<meta name="robots" content="nofollow"><title>Nofollow</title><a href="c.html">C</a>',
     "/site/tagged.html": '<title>Tagged</title><a href="a/deeper.html">Deeper</a>',
+    "/site/variant.html": '<link rel="canonical" href="variant.html"><title>Variant</title><a href="c.html">C</a>',
+    "/site/points-home.html": '<link rel="canonical" href="/site/"><title>Points home</title>',
+    "/site/long.html": f'<title>Long</title><a href="c.html?q={"x" * LONG_QUERY}">Long</a> <a href="b.html">B</a>',
 }
 # Response headers of some of SITE_PAGES.
 SITE_HEADERS: dict[str, dict[str, str]] = {"/site/tagged.html": {"X-Robots-Tag": "none"}}

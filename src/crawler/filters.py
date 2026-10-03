@@ -19,6 +19,9 @@ class UrlFilter:
     - `exclude_extensions`: a URL whose path ends in a file with one of these
       extensions ("pdf" or ".pdf", any case) is rejected; the query is not
       looked at, so "/report.pdf?v=2" is rejected and "/view?file=a.pdf" is not.
+    - `max_url_length`: if given, a normalized URL longer than this many
+      characters is rejected: such URLs are mostly generated ones, such as
+      a filter or a session piled up in the query.
 
     Patterns are searched anywhere in the normalized URL (`re.search`), so
     anchor them when needed: r"\\.pdf$", r"^https://example\\.com/blog/".
@@ -33,11 +36,15 @@ class UrlFilter:
         include_patterns: Iterable[str] = (),
         exclude_patterns: Iterable[str] = (),
         exclude_extensions: Iterable[str] = (),
+        max_url_length: int | None = None,
     ) -> None:
+        if max_url_length is not None and max_url_length < 1:
+            raise ValueError(f"max_url_length must be >= 1 or None, got {max_url_length}")
         self.allowed_hosts = None if allowed_hosts is None else set(allowed_hosts)
         self._include = _compile(include_patterns)
         self._exclude = _compile(exclude_patterns)
         self._extensions = _extensions(exclude_extensions)
+        self.max_url_length = max_url_length
 
     def allow_host_of(self, url: str) -> None:
         """Add the host of `url` to `allowed_hosts`; does nothing when hosts are not restricted."""
@@ -46,6 +53,8 @@ class UrlFilter:
             self.allowed_hosts.add(host)
 
     def allows(self, url: str) -> bool:
+        if self.max_url_length is not None and len(url) > self.max_url_length:
+            return False
         if self.allowed_hosts is not None and get_host(url) not in self.allowed_hosts:
             return False
         if self._extensions and _file_extension(url) in self._extensions:

@@ -57,6 +57,19 @@ def test_exclude_extensions():
     assert url_filter.allows("https://site/pdf")
 
 
+def test_max_url_length():
+    url_filter = UrlFilter(max_url_length=30)
+    assert url_filter.allows("https://site/" + "a" * 17)  # 30 characters
+    assert not url_filter.allows("https://site/" + "a" * 18)
+    assert UrlFilter().allows("https://site/?q=" + "a" * 100_000)
+
+
+@pytest.mark.parametrize("length", [0, -1])
+def test_invalid_max_url_length_is_rejected(length):
+    with pytest.raises(ValueError, match="max_url_length must be >= 1"):
+        UrlFilter(max_url_length=length)
+
+
 def test_patterns_match_both_encoded_and_decoded_url():
     # Links are normalized to the percent-encoded form.
     url = "https://site/caf%C3%A9/a%20b"

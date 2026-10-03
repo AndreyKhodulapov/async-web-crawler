@@ -15,6 +15,7 @@ sitemaps:
 
 crawler:
   max_pages: 100        # pages requested, failed ones included
+  max_pages_per_host: null  # pages requested from one host; null for no limit of its own
   max_depth: 2          # links followed from a start URL; 0 crawls only the start URLs
   max_concurrent: 10    # requests in flight
   max_per_domain: null  # requests in flight to one host; null for no limit of its own

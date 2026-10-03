@@ -14,7 +14,10 @@ configuration file, by command-line options, or from Python.
 - **Crawling**: a priority queue of URLs and a pool of workers, depth and
   page limits, deduplication of normalized URLs, filters by domain, by
   regular expressions and by file extension (by default the crawl stays on
-  the start hosts, and documents, images and archives are not followed)
+  the start hosts, and documents, images and archives are not followed);
+  guards against endless URL spaces: tracking parameters dropped, a URL
+  length limit, `<link rel="canonical">` for variants of a page, a page
+  limit per host
 - **Sitemaps** as a source of pages: plain and index sitemaps, gzip, the
   sitemaps named in robots.txt
 - **Concurrency**: one connection pool, a global limit of requests in

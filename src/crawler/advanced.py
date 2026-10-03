@@ -152,6 +152,7 @@ class AdvancedCrawler:
         pages = await self.crawler.crawl(
             config.urls,
             max_pages=config.crawler.max_pages,
+            max_pages_per_host=config.crawler.max_pages_per_host,
             same_domain_only=config.filters.same_domain_only,
             include_patterns=config.filters.include,
             exclude_patterns=config.filters.exclude,

@@ -9,10 +9,12 @@ import logging
 import math
 import ssl
 import time
+from collections import Counter
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import NamedTuple, Self
+from urllib.parse import urlsplit
 
 import aiohttp
 import certifi
@@ -49,7 +51,7 @@ from crawler.semaphores import SemaphoreManager
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
 from crawler.storage.base import DataStorage
-from crawler.urls import get_host, is_valid_http_url, normalize_url, resolve_url
+from crawler.urls import get_host, is_valid_http_url, normalize_url, resolve_url, strip_tracking_params
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +169,8 @@ class AsyncCrawler:
     MAX_RETRY_AFTER = 600.0
     # In crawl(), a page whose host is held back longer than this is put off.
     MIN_PENALTY_TO_DEFER = 1.0
+    # In crawl(), longer links are not followed: they are mostly generated ones.
+    MAX_URL_LENGTH = 2048
 
     def __init__(
         self,
@@ -249,6 +253,7 @@ class AsyncCrawler:
         self._failed_sitemaps: dict[str, str] = {}
         self.stats = CrawlerStats()
         self._pages_requested = 0
+        self._host_pages: Counter[str] = Counter()  # pages requested by host
         self._pages_to_save = 0
         self._written_before = 0
         self._pending_before = 0
@@ -284,7 +289,10 @@ class AsyncCrawler:
 
     @property
     def skipped_urls(self) -> dict[str, str]:
-        """URL -> reason for pages the latest crawl fetched but left out, e.g. not HTML. Do not modify."""
+        """URL -> reason for pages the latest crawl left out, e.g. not HTML. Do not modify.
+
+        All of them were fetched, except those over `max_pages_per_host`.
+        """
         return self._queue.skipped
 
     @property
@@ -694,6 +702,7 @@ class AsyncCrawler:
         start_urls: Iterable[str],
         max_pages: int = 100,
         *,
+        max_pages_per_host: int | None = None,
         same_domain_only: bool = False,
         include_patterns: Iterable[str] = (),
         exclude_patterns: Iterable[str] = (),
@@ -743,6 +752,15 @@ class AsyncCrawler:
         is not HTML is skipped too, with its body left undownloaded; it counts
         toward `max_pages` as well.
 
+        Against endless URL spaces (sort orders, filters, session IDs):
+        tracking parameters such as "utm_source" are dropped from every URL
+        queued (see `CrawlerQueue`); a link longer than `MAX_URL_LENGTH` is
+        not followed; a page whose canonical URL differs from its own in the
+        query alone and has been seen already is skipped as a duplicate, and
+        its links are not followed. `max_pages_per_host` caps the pages
+        requested from one host; the others are skipped without a request
+        and do not count toward `max_pages`.
+
         The pages listed in the sitemaps `sitemap_urls` are crawled too, and
         with `robots_sitemaps` so are those of the sitemaps that robots.txt
         of the start URLs' sites names. The sitemaps are read before the
@@ -767,14 +785,17 @@ class AsyncCrawler:
 
         Raises:
             TypeError: a single string is passed instead of a list of URLs, patterns or extensions.
-            ValueError: `max_pages` is not positive, a start URL, a sitemap URL, a pattern or an extension
-                is invalid, `robots_sitemaps` is asked of a crawler that does not read robots.txt.
+            ValueError: `max_pages` or `max_pages_per_host` is not positive, a start URL, a sitemap URL,
+                a pattern or an extension is invalid, `robots_sitemaps` is asked of a crawler that does not
+                read robots.txt.
             RuntimeError: another crawl is running on this crawler.
         """
         if isinstance(start_urls, str):
             raise TypeError(f"expected a list of start URLs, got a string: {start_urls!r}")
         if max_pages < 1:
             raise ValueError(f"max_pages must be >= 1, got {max_pages}")
+        if max_pages_per_host is not None and max_pages_per_host < 1:
+            raise ValueError(f"max_pages_per_host must be >= 1 or None, got {max_pages_per_host}")
         start_urls = list(start_urls)
         invalid = [url for url in start_urls if not is_valid_http_url(url)]
         if invalid:
@@ -795,6 +816,7 @@ class AsyncCrawler:
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             exclude_extensions=exclude_extensions,
+            max_url_length=self.MAX_URL_LENGTH,
         )
         self._queue = CrawlerQueue()
         self.processed_urls = {}
@@ -802,6 +824,7 @@ class AsyncCrawler:
         self._sitemap_pages_out_of_scope = []
         self._redirect_sources = {}
         self._pages_requested = 0
+        self._host_pages = Counter()
         self._pages_to_save = 0
         self._written_before = self.storage.written if self.storage is not None else 0
         self._pending_before = self.storage.pending if self.storage is not None else 0
@@ -823,7 +846,7 @@ class AsyncCrawler:
                 await self._queue_sitemap_pages(sitemap_urls, start_urls if robots_sitemaps else [], url_filter)
             async with asyncio.TaskGroup() as group:
                 for _ in range(self.max_concurrent):
-                    group.create_task(self._crawl_worker(self._queue, url_filter, max_pages))
+                    group.create_task(self._crawl_worker(self._queue, url_filter, max_pages, max_pages_per_host))
             await self._flush_storage()
         finally:
             self._crawl_finished = time.perf_counter()
@@ -946,7 +969,9 @@ class AsyncCrawler:
         """Errors of page requests since the latest crawl() started, or since the crawler was created."""
         return self._errors.get_stats()
 
-    async def _crawl_worker(self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int) -> None:
+    async def _crawl_worker(
+        self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int, max_pages_per_host: int | None
+    ) -> None:
         while (url := await queue.get_next()) is not None:
             try:
                 # A host that asked to wait (Retry-After) or waits out the
@@ -974,7 +999,17 @@ class AsyncCrawler:
                     # that reached the limit: it goes back to the queue.
                     queue.requeue(url, priority=queue.depth(url))
                     continue
+                host = get_host(url)
+                assert host is not None  # the queue holds valid URLs only
+                if max_pages_per_host is not None and self._host_pages[host] >= max_pages_per_host:
+                    # Not requested, so not counted toward max_pages.
+                    reason = f"max_pages_per_host reached: {max_pages_per_host} pages of {host}"
+                    logger.info("Skipped %s: %s", url, reason)
+                    queue.mark_skipped(url, reason)
+                    self.stats.record_page(url, skipped=True)
+                    continue
                 self._pages_requested += 1
+                self._host_pages[host] += 1
                 if self._pages_requested >= max_pages:
                     # This URL is the last one allowed: the others stop taking new ones.
                     queue.close()
@@ -1000,6 +1035,7 @@ class AsyncCrawler:
             # Not sent: the circuit of the host, or of the host a redirect
             # leads to, opened while the page waited for its turn.
             self._pages_requested -= 1
+            self._host_pages[get_host(url)] -= 1
             self._defer_or_fail(url, queue, result.error)
             return
         # The worker has checked robots.txt for the page; these are about the target of its redirect.
@@ -1028,6 +1064,15 @@ class AsyncCrawler:
             logger.warning("Failed to parse %s: %s", url, error.message)
             self._fail_page(url, queue, error, result)
             return
+        duplicate = self._duplicate_of(result.final_url or url, page, queue)
+        if duplicate is not None:
+            # A variant of a page already seen ("?sort=price" of "/list"):
+            # its links are variants too, so they are not followed.
+            reason = f"duplicate of {duplicate}"
+            logger.info("Skipped %s: %s", url, reason)
+            queue.mark_skipped(url, reason)
+            self.stats.record_page(url, status=result.status, elapsed=result.elapsed, skipped=True)
+            return
         noindex, nofollow = self._robots_directives(result, page)
         queued = 0
         if depth < self.max_depth and not nofollow:
@@ -1047,6 +1092,25 @@ class AsyncCrawler:
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
         if self.storage is not None:
             await self._save_page(_page_record(result, page, depth))
+
+    @staticmethod
+    def _duplicate_of(url: str, page: ParsedPage, queue: CrawlerQueue) -> str | None:
+        """The canonical URL of the page at `url` if it is another page of the crawl it is a variant of; else None.
+
+        Only a canonical URL that differs from `url` in the query alone and
+        is already seen counts: a page with "?sort=price" or "?sessionid=1"
+        whose canonical URL is the plain one. A canonical URL elsewhere is
+        not trusted, as a site that gets it wrong (every page pointing to
+        the home page) would lose all its pages.
+        """
+        canonical = page["metadata"]["canonical"]
+        if canonical is None:
+            return None
+        target, parts = urlsplit(canonical), urlsplit(url)
+        same_page = (target.netloc, target.path) == (parts.netloc, parts.path)
+        if not same_page or strip_tracking_params(canonical) == strip_tracking_params(url):
+            return None
+        return canonical if queue.is_seen(canonical) else None
 
     def _robots_directives(self, result: FetchResult, page: ParsedPage) -> tuple[str | None, bool]:
         """Whether the page asks not to be kept, and why (None if it does not); whether not to follow its links.
@@ -1080,11 +1144,13 @@ class AsyncCrawler:
         # fetched, and a redirect to a page already seen is not followed.
         # The redirects of one page may lead back to it (a cookie check) or
         # loop; they are followed up to MAX_REDIRECTS.
-        if target != url and self._redirect_sources.get(target) != url:
-            if queue.is_seen(target):
+        # Compared without tracking parameters, as the queue keeps URLs.
+        page = strip_tracking_params(target)
+        if page != url and self._redirect_sources.get(page) != url:
+            if queue.is_seen(page):
                 return f"redirected to a page already seen: {target}"
-            queue.mark_seen(target)
-            self._redirect_sources[target] = url
+            queue.mark_seen(page)
+            self._redirect_sources[page] = url
         return None
 
     def _fail_page(self, url: str, queue: CrawlerQueue, error: FetchError, result: FetchResult | None = None) -> None:

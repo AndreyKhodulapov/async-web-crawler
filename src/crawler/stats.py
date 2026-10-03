@@ -26,8 +26,9 @@ class CrawlerStats:
 
     A page is counted once, however many attempts it took. It is
     successful, failed (`error` names the class of its error) or skipped:
-    fetched fine but left out of the results. Pages that were never
-    requested, such as those robots.txt disallows, are not recorded here.
+    fetched fine but left out of the results, or not requested over the
+    page limit of its host. Other pages that were never requested, such as
+    those robots.txt disallows, are not recorded here.
 
     Not to be confused with `CrawlStats`, the snapshot of the progress of a
     crawl (the queue, requests in flight, the request rate) that

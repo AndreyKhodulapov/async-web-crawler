@@ -53,8 +53,10 @@ class CrawlStats:
 
     For the pages of a crawl by status code and domain see `CrawlerStats`.
 
-    `skipped` counts pages fetched but left out because they were not HTML
-    or redirected outside the crawl scope or to a page already seen; `blocked` counts
+    `skipped` counts pages fetched but left out because they were not HTML,
+    redirected outside the crawl scope or to a page already seen, asked not
+    to be indexed or were variants of a page already seen (by their
+    canonical URL), and pages not requested over `max_pages_per_host`; `blocked` counts
     pages robots.txt did not allow to fetch, `unreachable` pages left unfetched because robots.txt of their
     site could not be read. `in_progress` counts pages taken by workers:
     waiting for a free slot, being fetched or parsed. `active_requests` counts only HTTP requests
