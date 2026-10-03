@@ -1072,6 +1072,11 @@ class AsyncCrawler:
             # leads to, opened while the page waited for its turn.
             self._pages_requested -= 1
             self._host_pages[get_host(url)] -= 1
+            if queue.closed:
+                # The page reached max_pages and closed the queue; now it is
+                # back under the limit, and this worker goes on to crawl it,
+                # or the page that takes its place, even if the others have stopped.
+                queue.reopen()
             self._defer_or_fail(url, queue, result.error)
             return
         # The worker has checked robots.txt for the page; these are about the target of its redirect.

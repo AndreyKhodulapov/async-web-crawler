@@ -199,7 +199,8 @@ In a crawl, a page the breaker refuses does not count toward `max_pages`
 and is not failed: it is put off until the circuit may let a probe through,
 or for a second while the probe is in flight, and the workers go on with
 other pages meanwhile. So the pages of a host that went down for a moment
-are fetched once it is back. After the circuit of a host has opened
+are fetched once it is back, even when the page refused was the last one
+`max_pages` allowed. After the circuit of a host has opened
 `AsyncCrawler.MAX_CIRCUIT_OPENINGS` (3) times in the crawl, no more probes
 are sent: its remaining pages go to `failed_urls` with `CircuitOpenError`,
 and a host that stays down holds the crawl for about two cooldowns.
@@ -478,8 +479,8 @@ asyncio.run(main())
 
 | Member | What it does |
 |--------|--------------|
-| `AdvancedCrawler(config)` | takes a `CrawlerConfig`; the defaults without one |
-| `AdvancedCrawler.from_config(path, overrides)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
+| `AdvancedCrawler(config, configure_logging=True)` | takes a `CrawlerConfig`; the defaults without one |
+| `AdvancedCrawler.from_config(path, overrides, configure_logging=True)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
 | `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section; returns the pages by URL |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
 | `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics) |
@@ -493,7 +494,9 @@ if they are missing. A configuration with neither `urls` nor `sitemaps.urls`
 makes `crawl()` raise `ConfigError`. A report that cannot be written is
 logged and does not fail the crawl. Logging is set up when the crawler is
 made (see [Logging](#logging)) and belongs to the whole process: with two
-crawlers at once the log is written as the later one says.
+crawlers at once the log is written as the later one says. A program that
+sets up logging itself passes `configure_logging=False`: the crawler then
+leaves logging alone, `close()` too, and the `logging` section is ignored.
 
 To show the progress of the crawl, run it as a task and pass the inner
 crawler to `show_progress`:

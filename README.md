@@ -190,6 +190,7 @@ with live progress, ready to run:
 
 ```bash
 python examples/advanced_usage.py      # crawls by examples/config.yaml, writes to out/
+PYTHONPATH=src python examples/advanced_usage.py   # the same without `pip install -e .`
 ```
 
 `AsyncCrawler` is the crawler itself, without files or configuration:

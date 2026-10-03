@@ -22,7 +22,7 @@ class CrawlerQueue:
     `mark_processed`, `mark_failed`, `mark_skipped`, `mark_blocked` or
     `mark_unreachable`; `requeue` and `defer` put it back unfetched.
     Workers loop until `get_next` returns None, which happens when there is
-    nothing left to do (see `get_next`) or after `close`.
+    nothing left to do (see `get_next`) or after `close`, until `reopen`.
     """
 
     def __init__(self) -> None:
@@ -86,7 +86,7 @@ class CrawlerQueue:
         An empty queue does not mean the crawl is over: a page that is still
         being fetched may add new links, and a deferred URL comes back. None
         is returned only when the queue is empty and no URL is in progress
-        or deferred, or after `close`.
+        or deferred, or while the queue is closed.
         """
         while not self._closed:
             if self._heap:
@@ -165,6 +165,15 @@ class CrawlerQueue:
         for url, (_, timer) in list(self._deferred.items()):
             timer.cancel()
             self._undefer(url)
+        self._wakeup.set()
+
+    def reopen(self) -> None:
+        """Undo `close`: URLs are handed out and accepted again.
+
+        Workers that `get_next` has already given None to have stopped;
+        the queue does not bring them back.
+        """
+        self._closed = False
         self._wakeup.set()
 
     def get_stats(self) -> dict[str, int]:

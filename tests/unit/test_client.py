@@ -805,6 +805,24 @@ class TestCrawlBlockedHost:
         assert crawler.processed_urls.keys() == {"http://a/2", "http://a/3"}
         assert crawler.crawl_stats().queued == 0
 
+    async def test_last_page_of_max_pages_refused_after_its_wait_is_crawled_later(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            max_concurrent=2,
+            max_depth=0,
+            requests_per_second=20,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.1),
+        )
+        fake_session.routes["http://a/1"] = aiohttp.ClientConnectionError("refused")
+
+        # a/2 reaches max_pages and closes the queue, then waits for its turn
+        # while a/1 opens the circuit: it is refused, deferred and probes the host later.
+        await crawler.crawl(["http://a/1", "http://a/2"], max_pages=2)
+
+        assert fake_session.requested == ["http://a/1", "http://a/2"]
+        assert crawler.failed_urls.keys() == {"http://a/1"}
+        assert crawler.processed_urls.keys() == {"http://a/2"}
+        assert crawler.crawl_stats().queued == 0
+
 
 class TestCrawlPageStats:
     async def test_bug_while_crawling_a_page_fails_that_page_only(self, make_crawler, fake_session, monkeypatch):

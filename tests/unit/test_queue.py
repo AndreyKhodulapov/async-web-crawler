@@ -117,6 +117,22 @@ class TestGetNext:
         queue.mark_processed(page)  # pages in progress can still finish
         assert queue.get_stats()["queued"] == 1
 
+    async def test_reopen_hands_out_and_accepts_urls_again(self):
+        queue = CrawlerQueue()
+        queue.add_url("http://site/a")
+        page = await take(queue)
+        queue.close()
+        waiter = asyncio.create_task(queue.get_next())
+        await asyncio.sleep(0)
+
+        queue.reopen()
+        queue.defer(page, 0.01)
+
+        assert waiter.done() and waiter.result() is None  # stopped before the reopen
+        assert queue.get_stats()["queued"] == 1  # deferred, not queued at once
+        assert await queue.get_next() == page
+        assert queue.add_url("http://site/b") is True
+
 
 class TestDefer:
     async def test_deferred_url_comes_back_after_the_delay(self):
