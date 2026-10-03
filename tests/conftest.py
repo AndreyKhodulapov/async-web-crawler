@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import gzip
 import logging
 import time
 from collections import Counter
@@ -17,6 +19,8 @@ class SiteState:
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
     sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404.
+    With `robots_endless`, comment lines follow the body for as long as
+    the client reads them.
     `sitemaps` maps the names of the files under /sitemaps/ to their
     bodies; the first `sitemap_failures` requests for them answer 503.
     `sitemap_headers` are added to the responses with them.
@@ -30,6 +34,7 @@ class SiteState:
         self.peak_in_flight = 0
         self.robots: str | None = None
         self.robots_status = 200
+        self.robots_endless = False
         self.sitemaps: dict[str, bytes] = {}
         self.sitemap_failures = 0
         self.sitemap_headers: dict[str, str] = {}
@@ -77,12 +82,42 @@ async def encoding_page(request: web.Request) -> web.Response:
     return web.Response(body=body, headers={"Content-Type": content_type})
 
 
-async def robots_txt(request: web.Request) -> web.Response:
+async def robots_txt(request: web.Request) -> web.StreamResponse:
     state = request.app[SITE_STATE]
     state.record(request)
     if state.robots is None:
         raise web.HTTPNotFound()
-    return web.Response(text=state.robots, status=state.robots_status)
+    if not state.robots_endless:
+        return web.Response(text=state.robots, status=state.robots_status)
+    response = web.StreamResponse(status=state.robots_status, headers={"Content-Type": "text/plain"})
+    await response.prepare(request)
+    await response.write(state.robots.encode())
+    with contextlib.suppress(ConnectionResetError):  # the client stops reading
+        while True:
+            await response.write(b"# padding\n" * 1000)
+    return response
+
+
+async def endless_page(request: web.Request) -> web.StreamResponse:
+    """An HTML page that never ends, sent without Content-Length."""
+    response = web.StreamResponse(headers={"Content-Type": "text/html"})
+    await response.prepare(request)
+    await response.write(b"<title>Endless</title>")
+    with contextlib.suppress(ConnectionResetError):  # the client stops reading
+        while True:
+            await response.write(b"<p>" + b"x" * 65536 + b"</p>")
+    return response
+
+
+async def large_page(request: web.Request) -> web.Response:
+    """A 2 MB page; its Content-Length tells the size before the body."""
+    return web.Response(body=b"<title>Large</title>" + b"x" * 2_000_000, content_type="text/html")
+
+
+async def gzip_bomb(request: web.Request) -> web.Response:
+    """A few kilobytes on the wire that the client unpacks into 20 MB of HTML."""
+    body = gzip.compress(b"<title>Bomb</title>" + b" " * 20_000_000)
+    return web.Response(body=body, headers={"Content-Type": "text/html", "Content-Encoding": "gzip"})
 
 
 async def sitemap(request: web.Request) -> web.Response:
@@ -148,6 +183,9 @@ async def server(aiohttp_server):
     app.router.add_get("/catalog/tools/", catalog)
     app.router.add_get("/moved", moved)
     app.router.add_get("/data.json", json_data)
+    app.router.add_get("/huge/endless", endless_page)
+    app.router.add_get("/huge/large", large_page)
+    app.router.add_get("/huge/gzip", gzip_bomb)
     app.router.add_get("/encoding/{name}", encoding_page)
     app.router.add_get("/site/{path:.*}", site_page)
     app.router.add_get("/robots.txt", robots_txt)

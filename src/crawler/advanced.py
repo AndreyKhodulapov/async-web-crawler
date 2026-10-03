@@ -77,6 +77,7 @@ class AdvancedCrawler:
             connect_timeout=options.connect_timeout,
             read_timeout=options.read_timeout,
             timeout_growth=options.timeout_growth,
+            max_page_size=options.max_page_size,
             user_agent=options.user_agent,
             user_agents=options.user_agents,
             storage=self.storage,

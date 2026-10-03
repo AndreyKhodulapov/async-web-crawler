@@ -50,6 +50,7 @@ FULL = {
         "connect_timeout": 5.0,
         "read_timeout": 15.0,
         "timeout_growth": 2.0,
+        "max_page_size": 1_000_000,
         "keep_pages": False,
     },
     "retry": {"max_retries": 5, "backoff_factor": 3.0, "base_delay": 0.5, "max_delay": 10.0},
@@ -111,6 +112,7 @@ class TestDefaults:
             "connect_timeout",
             "read_timeout",
             "timeout_growth",
+            "max_page_size",
             "keep_pages",
         ):
             assert getattr(options, name) == crawler[name], name
@@ -163,10 +165,14 @@ class TestValues:
 
     def test_null_turns_a_limit_off(self):
         config = CrawlerConfig.from_dict(
-            {"crawler": {"rate_limit": None, "max_per_domain": None}, "circuit_breaker": {"failure_threshold": None}}
+            {
+                "crawler": {"rate_limit": None, "max_per_domain": None, "max_page_size": None},
+                "circuit_breaker": {"failure_threshold": None},
+            }
         )
 
         assert config.crawler.rate_limit is None
+        assert config.crawler.max_page_size is None
         assert config.circuit_breaker.failure_threshold is None
 
     def test_section_without_keys_keeps_its_defaults(self):

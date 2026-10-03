@@ -1,6 +1,7 @@
 """Asynchronous HTTP client that downloads many pages concurrently."""
 
 import asyncio
+import codecs
 import contextlib
 import itertools
 import logging
@@ -27,6 +28,7 @@ from crawler.exceptions import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    PageTooLargeError,
     ParseError,
     RobotsDisallowedError,
     RobotsUnreachableError,
@@ -107,6 +109,11 @@ class AsyncCrawler:
     `MAX_TIMEOUT_GROWTH`: a server that is merely slow gets a chance to
     answer, and a dead one is not waited for forever.
 
+    A page body over `max_page_size` bytes (None for no limit) fails with
+    `PageTooLargeError`; the rest of it is not downloaded. The limit is on
+    the unpacked body, so a small gzipped response that unpacks into
+    gigabytes fails too.
+
     `user_agent` identifies the crawler, and robots.txt rules are looked up
     by its name ("MyBot/1.0 (+url)" is "mybot"). `user_agents` rotates
     several User-Agent strings between requests; they must all carry that
@@ -145,6 +152,7 @@ class AsyncCrawler:
     # Sites such as Wikipedia ask bots to identify themselves with a contact
     # URL and may block generic user agents.
     DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
+    DEFAULT_MAX_PAGE_SIZE = 10 * 1024 * 1024
     MAX_TIMEOUT_GROWTH = 4.0
     MAX_CIRCUIT_OPENINGS = 3
 
@@ -165,6 +173,7 @@ class AsyncCrawler:
         connect_timeout: float = 10.0,
         read_timeout: float = 20.0,
         timeout_growth: float = 1.5,
+        max_page_size: int | None = DEFAULT_MAX_PAGE_SIZE,
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
         parser: HTMLParser | None = None,
@@ -182,6 +191,8 @@ class AsyncCrawler:
                 raise ValueError(f"{name} must be positive, got {value}")
         if not (math.isfinite(timeout_growth) and timeout_growth >= 1):
             raise ValueError(f"timeout_growth must be a number >= 1, got {timeout_growth}")
+        if max_page_size is not None and max_page_size < 1:
+            raise ValueError(f"max_page_size must be >= 1 or None, got {max_page_size}")
         if isinstance(user_agents, str):
             raise TypeError(f"expected a list of user agents, got a string: {user_agents!r}")
         robots_name = product_token(user_agent)
@@ -208,6 +219,7 @@ class AsyncCrawler:
             sock_read=read_timeout,
         )
         self.timeout_growth = timeout_growth
+        self.max_page_size = max_page_size
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
         self._parser = parser or HTMLParser()
@@ -336,6 +348,7 @@ class AsyncCrawler:
         *,
         html_only: bool = False,
         raw: bool = False,
+        truncate_at: int | None = None,
         check_robots: bool = True,
         failure_level: int = logging.WARNING,
         track_errors: bool = True,
@@ -345,6 +358,8 @@ class AsyncCrawler:
         With `raw`, which is how a sitemap is downloaded, the result has the
         `body` as it was sent instead of the decoded `content`, and a body
         over the size limit of a sitemap fails with `SitemapError`. With
+        `truncate_at`, which is how robots.txt is downloaded, the body is
+        cut to that many bytes instead of failing over `max_page_size`. With
         `track_errors`, the attempts count in `error_stats()`.
         """
         # Checked up front as well as in _request(): a closed crawler must
@@ -367,7 +382,7 @@ class AsyncCrawler:
             nonlocal last, attempts, failed_at
             timeout = self._timeout_for(retries=attempts)
             attempts += 1
-            result = await self._fetch_once(url, html_only=html_only, raw=raw, timeout=timeout)
+            result = await self._fetch_once(url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout)
             if isinstance(result.error, CircuitOpenError):
                 # Not sent. A retry fails as the attempt before it did: the
                 # strategy sees the circuit open and stops, and the failure
@@ -473,7 +488,13 @@ class AsyncCrawler:
     async def _download_robots(self, url: str) -> tuple[int, str]:
         """Fetcher for RobotsParser: robots.txt goes through the same limits and retries as a page."""
         # Many sites have no robots.txt; RobotsParser logs the outcomes that matter.
-        result = await self._fetch(url, check_robots=False, failure_level=logging.INFO, track_errors=False)
+        result = await self._fetch(
+            url,
+            truncate_at=RobotsParser.MAX_SIZE,
+            check_robots=False,
+            failure_level=logging.INFO,
+            track_errors=False,
+        )
         if isinstance(result.error, HTTPStatusError):
             return result.error.status, ""
         if result.error is not None:
@@ -490,7 +511,9 @@ class AsyncCrawler:
         assert result.body is not None
         return result.body
 
-    async def _fetch_once(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
+    async def _fetch_once(
+        self, url: str, *, html_only: bool, raw: bool, truncate_at: int | None, timeout: aiohttp.ClientTimeout
+    ) -> FetchResult:
         """Make one request, unless the circuit breaker of the host refuses it."""
         host = get_host(url)
         call = self.circuit_breaker.call(url)
@@ -515,18 +538,22 @@ class AsyncCrawler:
                 # so a request waiting for its host does not hold a slot another
                 # host could use; inside the slot the interval is checked once more.
                 async with gate() if host is None else self.rate_limiter.slot(host, gate):
-                    result = await self._send(url, html_only=html_only, raw=raw, timeout=timeout)
+                    result = await self._send(
+                        url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout
+                    )
                     call.record(result.error)
                     return result
         except CircuitOpenError as error:
             return FetchResult.failure(url, error, 0.0)
 
-    async def _send(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
+    async def _send(
+        self, url: str, *, html_only: bool, raw: bool, truncate_at: int | None, timeout: aiohttp.ClientTimeout
+    ) -> FetchResult:
         """Send the request and report its outcome, whatever it is, as a FetchResult."""
         logger.info("Fetching %s", url)
         started = time.perf_counter()
         try:
-            response = await self._request(url, html_only=html_only, raw=raw, timeout=timeout)
+            response = await self._request(url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout)
         except FetchError as error:
             elapsed = time.perf_counter() - started
             # RetryStrategy logs the failure along with what comes next.
@@ -995,16 +1022,19 @@ class AsyncCrawler:
             connector=connector,
             timeout=self._timeout,
             headers={"User-Agent": self._user_agent},
-            fallback_charset_resolver=_sniff_charset,
         )
 
-    async def _request(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> _Response:
-        """Perform the GET request and read the whole body.
+    async def _request(
+        self, url: str, *, html_only: bool, raw: bool, truncate_at: int | None, timeout: aiohttp.ClientTimeout
+    ) -> _Response:
+        """Perform the GET request and read the body up to its size limit.
 
         With `html_only`, the body of a response whose Content-Type is not
         HTML is not read: the content is empty and the size is 0. With
-        `raw`, the body is returned as bytes and the content is empty; it is
-        read up to the size limit of a sitemap (see `_read_sitemap`).
+        `raw`, the body is returned as bytes and the content is empty; over
+        the size limit of a sitemap it fails with `SitemapError`. With
+        `truncate_at`, the body is cut to that many bytes. Otherwise a body
+        over `max_page_size` fails with `PageTooLargeError`.
         The size is measured after content decoding (gzip, deflate, ...),
         so it may be larger than the number of bytes sent over the network.
         """
@@ -1035,10 +1065,10 @@ class AsyncCrawler:
                         content_type=content_type,
                         redirected=bool(response.history),
                     )
-                body = await self._read_sitemap(response, url) if raw else await response.read()
+                body = await self._read_body(response, url, raw=raw, truncate_at=truncate_at)
                 return _Response(
                     status=response.status,
-                    content="" if raw else _decode(body, response.get_encoding()),
+                    content="" if raw else _decode(body, _encoding(response, body)),
                     size=len(body),
                     final_url=str(response.url),
                     content_type=content_type,
@@ -1064,20 +1094,32 @@ class AsyncCrawler:
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
 
-    async def _read_sitemap(self, response: aiohttp.ClientResponse, url: str) -> bytes:
-        """Read the body of a sitemap, giving up once it is over the size limit of a sitemap.
+    async def _read_body(
+        self, response: aiohttp.ClientResponse, url: str, *, raw: bool, truncate_at: int | None
+    ) -> bytes:
+        """Read the body, giving up once it is over its size limit; the rest is not downloaded.
 
         A response sent with Content-Encoding: gzip is unpacked as it is
-        read, so a few hundred kilobytes may turn into hundreds of
-        megabytes; the rest of such a body is not downloaded.
+        read, so a few hundred kilobytes may turn into gigabytes: the limit
+        is on the unpacked body.
         """
-        limit = self.sitemaps.MAX_SIZE
+        limit = truncate_at or (self.sitemaps.MAX_SIZE if raw else self.max_page_size)
+        if limit is None:
+            return await response.read()
+        too_large = SitemapError if raw else PageTooLargeError
+        # Content-Length counts the packed bytes, never more than the unpacked ones.
+        if truncate_at is None and response.content_length is not None and response.content_length > limit:
+            raise too_large(url, f"larger than {limit} bytes")
         chunks, size = [], 0
         async for chunk in response.content.iter_chunked(64 * 1024):
-            size += len(chunk)
-            if size > limit:
-                raise SitemapError(url, f"larger than {limit} bytes")
+            if size + len(chunk) > limit:
+                if truncate_at is None:
+                    raise too_large(url, f"larger than {limit} bytes")
+                chunks.append(chunk[: limit - size])
+                logger.info("Cut the body of %s to %d bytes", url, limit)
+                break
             chunks.append(chunk)
+            size += len(chunk)
         return b"".join(chunks)
 
 
@@ -1108,11 +1150,23 @@ def _describe_timeout(exc: TimeoutError, timeout: aiohttp.ClientTimeout) -> str:
     return f"total timeout ({timeout.total:.1f}s)"
 
 
+def _encoding(response: aiohttp.ClientResponse, body: bytes) -> str:
+    """The charset of the Content-Type header if Python knows it, else the one the markup declares.
+
+    `response.get_encoding()` does the same with a resolver, but only for a
+    body read whole with `read()`, not in chunks.
+    """
+    if response.charset:
+        with contextlib.suppress(LookupError, ValueError):
+            return codecs.lookup(response.charset).name
+    return _sniff_charset(response, body)
+
+
 def _sniff_charset(response: aiohttp.ClientResponse, body: bytes) -> str:
     """Pick an encoding when the Content-Type header has no charset.
 
-    aiohttp calls this only in that case and would otherwise assume UTF-8.
-    Many pages declare their encoding in the markup instead:
+    Without one, UTF-8 would be assumed, but many pages declare their
+    encoding in the markup instead:
     <meta charset="..."> or <meta http-equiv="Content-Type" content="...">.
     """
     declared = EncodingDetector.find_declared_encoding(body, is_html=True)

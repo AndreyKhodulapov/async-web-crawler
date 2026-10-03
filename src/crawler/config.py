@@ -103,6 +103,7 @@ class CrawlOptions:
     connect_timeout: float = _option(10.0, above=0)
     read_timeout: float = _option(20.0, above=0)
     timeout_growth: float = _option(1.5, minimum=1)
+    max_page_size: int | None = _option(AsyncCrawler.DEFAULT_MAX_PAGE_SIZE, minimum=1)  # bytes; null lifts the limit
     keep_pages: bool = True  # false lets a page go once it is saved: the memory of a large crawl stays flat
 
 

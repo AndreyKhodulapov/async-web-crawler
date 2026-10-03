@@ -80,6 +80,7 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `connect_timeout` | number, > 0 | `10.0` | DNS, TCP and TLS |
 | `read_timeout` | number, > 0 | `20.0` | the longest pause between two chunks of the response |
 | `timeout_growth` | number, >= 1 | `1.5` | the timeouts grow by this factor on every retry |
+| `max_page_size` | whole number, >= 1, or `null` | `10485760` | bytes of a page body (10 MiB); a larger page fails unread; `null` lifts the limit |
 | `keep_pages` | true or false | `true` | `false` drops a page from memory once it is saved, for large crawls |
 
 ### `retry`

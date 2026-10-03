@@ -10,7 +10,7 @@ leaves a failing site alone.
 |------|----------|--------|
 | Transient | timeouts, HTTP 408, 429, 500, 502, 503, 504, Cloudflare's 520-524 | yes, with backoff |
 | Network | DNS failure, connection refused or reset | yes |
-| Permanent | HTTP 401, 403, 404, 410, 501, a redirect loop, a bad certificate, an invalid URL | no |
+| Permanent | HTTP 401, 403, 404, 410, 501, a redirect loop, a bad certificate, an invalid URL, a page over the size limit | no |
 | Parse | the body is not an HTML document | no: the same bytes come back |
 
 - Classify by **what a retry would do**, not by where the error comes from.

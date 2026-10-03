@@ -5,6 +5,7 @@ import logging
 import socket
 import ssl
 import time
+from collections.abc import AsyncIterator
 from unittest.mock import MagicMock
 
 import aiohttp
@@ -46,7 +47,6 @@ class FakeResponse:
     ) -> None:
         self.status = status
         self._body = body
-        self._encoding = encoding
         self.headers = {} if content_type is None else {"Content-Type": content_type}
         if retry_after is not None:
             self.headers["Retry-After"] = retry_after
@@ -54,6 +54,9 @@ class FakeResponse:
         # None means "not redirected": FakeSession fills in the requested URL.
         self.url = url
         self.history = () if url is None else (MagicMock(),)
+        self.charset = encoding
+        self.content_length: int | None = None
+        self.content = self  # a body read in chunks
         self.read_count = 0
 
     def raise_for_status(self) -> None:
@@ -70,8 +73,10 @@ class FakeResponse:
         self.read_count += 1
         return self._body
 
-    def get_encoding(self) -> str:
-        return self._encoding
+    async def iter_chunked(self, size: int) -> AsyncIterator[bytes]:
+        self.read_count += 1
+        for start in range(0, len(self._body), size):
+            yield self._body[start : start + size]
 
 
 class FakeRequest:

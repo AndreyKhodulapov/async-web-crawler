@@ -14,6 +14,7 @@ from crawler import (
     CircuitOpenError,
     RetryStrategy,
     RobotsDisallowedError,
+    RobotsParser,
     RobotsUnreachableError,
 )
 
@@ -163,6 +164,19 @@ class TestRobots:
             "/site/missing.html",
         }
         assert len(crawler.visited_urls) == 4
+
+    async def test_endless_robots_txt_is_cut_and_read(self, url, site, monkeypatch):
+        monkeypatch.setattr(RobotsParser, "MAX_SIZE", 1000)
+        site.robots, site.robots_endless = "User-agent: *\nDisallow: /site/b.html\n", True
+        async with polite(respect_robots=True, total_timeout=5) as crawler:
+            started = time.perf_counter()
+            html = await crawler.fetch_url(url("/site/a.html"))
+            with pytest.raises(RobotsDisallowedError):
+                await crawler.fetch_url(url("/site/b.html"))
+
+        assert "<title>A</title>" in html
+        # Read up to the limit, not until the total timeout.
+        assert time.perf_counter() - started < 3
 
     async def test_crawl_delay_spaces_out_requests(self, url, site):
         site.robots = "User-agent: *\nCrawl-delay: 0.1"

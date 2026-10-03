@@ -245,12 +245,19 @@ are not counted.
 | `read_timeout` | `20.0` | the longest pause between two chunks of the response |
 | `total_timeout` | `30.0` | the whole request, body included |
 | `timeout_growth` | `1.5` | each retry multiplies all three by this, up to 4 times the initial values; `1` keeps them fixed |
+| `max_page_size` | `10485760` | bytes of a page body; a larger one fails with `PageTooLargeError` (a permanent error) and the rest is not downloaded; `None` lifts the limit |
 
 With the defaults the read timeout is 20 s on the first attempt and 30, 45
 and 67.5 s on the three retries: a page that is only slow gets through, a
 server that does not answer at all is not waited for forever. A timeout
 fails with `FetchTimeoutError` that says which timeout fired, e.g.
 `read timeout (20.0s)`, and is retried like any other transient error.
+
+The body is read in chunks and given up once it is over its limit:
+`max_page_size` for a page, 50 MB for a sitemap. The limit is on the body
+unpacked from gzip or deflate, so a gzip bomb fails too, and a
+Content-Length over the limit fails the request before the body is read.
+robots.txt is cut at 500 KiB, the size RFC 9309 asks crawlers to read.
 
 ## Crawling
 
