@@ -71,6 +71,14 @@ class TestRateLimit:
         assert len(site.log) == len(starts) == len(paths)
         assert min(gaps(starts)) >= 0.1 - EPSILON
 
+    async def test_redirect_waits_for_its_turn(self, url, site):
+        async with polite(requests_per_second=10) as crawler:
+            await open_session(crawler, url, site)
+            starts = record_starts(crawler)
+            await crawler.fetch_url(url("/site/moved"))
+        assert [path for path, _ in site.log] == ["/site/moved", "/site/c.html"]
+        assert gaps(starts)[0] >= 0.1 - EPSILON
+
     async def test_waiting_host_does_not_hold_back_another(self, url, site):
         # Two slots, six pages of one host: the rest of them wait for their
         # turn without taking a slot, so the other host starts at once.
@@ -164,6 +172,29 @@ class TestRobots:
             "/site/missing.html",
         }
         assert len(crawler.visited_urls) == 4
+
+    async def test_redirect_to_a_disallowed_page_is_not_followed(self, url, site):
+        site.robots = "User-agent: *\nDisallow: /site/private/"
+        async with polite(respect_robots=True) as crawler:
+            pages = await crawler.crawl([url("/site/go")])
+            with pytest.raises(RobotsDisallowedError):
+                await crawler.fetch_url(url("/site/go"))
+
+        assert pages == {}
+        assert crawler.blocked_urls == {
+            url("/site/go"): f"redirects to {url('/site/private/secret')}, disallowed by robots.txt"
+        }
+        assert site.hits["/site/private/secret"] == 0
+
+    async def test_redirect_to_another_host_follows_its_robots_txt(self, url, site):
+        site.robots_by_host = {"localhost": "User-agent: *\nDisallow: /"}
+        async with polite(respect_robots=True) as crawler:
+            with pytest.raises(RobotsDisallowedError) as error:
+                await crawler.fetch_url(url("/site/to-other-host"))
+
+        assert error.value.url == url("/site/", "localhost")
+        assert site.hits["/site/"] == 0
+        assert site.hits["/robots.txt"] == 2  # of both hosts
 
     async def test_endless_robots_txt_is_cut_and_read(self, url, site, monkeypatch):
         monkeypatch.setattr(RobotsParser, "MAX_SIZE", 1000)

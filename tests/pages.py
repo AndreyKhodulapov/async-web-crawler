@@ -57,6 +57,8 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 # links redirect to another host (to-other-host) or to c.html (moved).
 # /site/names.html links to pages whose URLs need percent-encoding, one of
 # them twice: as raw text and already encoded.
+# Not linked either: /site/go redirects to private/secret, and
+# /site/cookie-check redirects to itself once to set a cookie.
 SITE_PAGES: dict[str, str] = {
     "/site/": """
         <title>Home</title>
@@ -71,6 +73,8 @@ SITE_PAGES: dict[str, str] = {
     "/site/a/deeper.html": '<title>Deeper</title><a href="deepest.html">Deepest</a> <a href="../c.html">C</a>',
     "/site/a/deepest.html": '<title>Deepest</title><a href="/site/">Home</a>',
     "/site/c.html": "<title>C</title>",
+    "/site/private/secret": "<title>Secret</title>",
+    "/site/cookie-check": "<title>Checked</title>",
     "/site/exits.html": '<title>Exits</title><a href="to-other-host">Sign in</a> <a href="moved">Moved</a>',
     "/site/names.html": """
         <title>Names</title>

@@ -69,6 +69,11 @@ class CrawlerQueue:
         if normalized is not None:
             self._seen.add(normalized)
 
+    def is_seen(self, url: str) -> bool:
+        """Whether a URL was accepted or remembered with `mark_seen`."""
+        normalized = normalize_url(url)
+        return normalized is not None and normalized in self._seen
+
     async def get_next(self) -> str | None:
         """Take the next URL, waiting while the queue is empty but work is in progress.
 

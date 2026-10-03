@@ -20,7 +20,8 @@ class SiteState:
     sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404.
     With `robots_endless`, comment lines follow the body for as long as
-    the client reads them.
+    the client reads them. `robots_by_host` gives other hosts of the server
+    a robots.txt of their own.
     `sitemaps` maps the names of the files under /sitemaps/ to their
     bodies; the first `sitemap_failures` requests for them answer 503.
     `sitemap_headers` are added to the responses with them.
@@ -35,6 +36,7 @@ class SiteState:
         self.robots: str | None = None
         self.robots_status = 200
         self.robots_endless = False
+        self.robots_by_host: dict[str, str] = {}
         self.sitemaps: dict[str, bytes] = {}
         self.sitemap_failures = 0
         self.sitemap_headers: dict[str, str] = {}
@@ -85,6 +87,8 @@ async def encoding_page(request: web.Request) -> web.Response:
 async def robots_txt(request: web.Request) -> web.StreamResponse:
     state = request.app[SITE_STATE]
     state.record(request)
+    if request.url.host in state.robots_by_host:
+        return web.Response(text=state.robots_by_host[request.url.host])
     if state.robots is None:
         raise web.HTTPNotFound()
     if not state.robots_endless:
@@ -156,6 +160,13 @@ async def site_page(request: web.Request) -> web.Response:
         raise web.HTTPFound("/site/c.html")
     if request.path == "/site/to-other-host":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/")
+    if request.path == "/site/go":
+        raise web.HTTPFound("/site/private/secret")
+    if request.path == "/site/cookie-check" and "checked" not in request.cookies:
+        # Sends the client back to the same page with a cookie.
+        response = web.HTTPFound("/site/cookie-check")
+        response.set_cookie("checked", "1")
+        raise response
     if request.path not in SITE_PAGES:
         raise web.HTTPNotFound()
     html = SITE_PAGES[request.path].replace("{other_host}", f"http://localhost:{request.url.port}")

@@ -44,16 +44,18 @@ class FakeResponse:
         content_type: str | None = "text/html",
         url: str | None = None,
         retry_after: str | None = None,
+        location: str | None = None,
     ) -> None:
         self.status = status
         self._body = body
         self.headers = {} if content_type is None else {"Content-Type": content_type}
         if retry_after is not None:
             self.headers["Retry-After"] = retry_after
+        if location is not None:
+            self.headers["Location"] = location
         self.content_type = content_type or "application/octet-stream"
-        # None means "not redirected": FakeSession fills in the requested URL.
+        # None means the requested URL, which FakeSession fills in.
         self.url = url
-        self.history = () if url is None else (MagicMock(),)
         self.charset = encoding
         self.content_length: int | None = None
         self.content = self  # a body read in chunks
@@ -110,8 +112,13 @@ class FakeSession:
         self.timeouts: list[aiohttp.ClientTimeout | None] = []  # per-request timeouts
 
     def get(
-        self, url: str, headers: dict[str, str] | None = None, timeout: aiohttp.ClientTimeout | None = None
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+        allow_redirects: bool = True,
     ) -> FakeRequest:
+        assert not allow_redirects  # the crawler follows redirects itself
         self.user_agents.append(None if headers is None else headers.get("User-Agent"))
         self.timeouts.append(timeout)
         return FakeRequest(self, url)
@@ -355,11 +362,14 @@ class TestFetchMany:
         assert result.redirected is False
 
     async def test_redirect_and_missing_content_type(self, crawler, fake_session):
-        fake_session.routes["http://a"] = FakeResponse(content_type=None, url="https://a/home")
+        fake_session.routes["http://a"] = FakeResponse(status=302, location="https://a/home")
+        fake_session.routes["https://a/home"] = FakeResponse(content_type=None)
         [result] = await crawler.fetch_many(["http://a"])
+        assert result.url == "http://a"
         assert result.final_url == "https://a/home"
         assert result.content_type is None
         assert result.redirected is True
+        assert fake_session.requested == ["http://a", "https://a/home"]
 
     async def test_unexpected_error_does_not_cancel_batch(self, crawler, fake_session):
         fake_session.latency = 0.01

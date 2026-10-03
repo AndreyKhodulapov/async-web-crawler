@@ -99,9 +99,11 @@ host and port) and cached for the crawler's lifetime. A missing robots.txt
 errors, after the retries) disallows the whole site for 60 seconds, then it
 is fetched again. Such pages are counted as unreachable, not as blocked:
 the site did not forbid them. A crawl does not queue them again, so only
-the pages found after the 60 seconds are fetched. Only the requested URL is checked: the
-HTTP client follows redirects on its own, so a redirect can still lead to a
-disallowed page, and the rate limit of the host it leads to does not apply. Crawl-delay is capped at 30 seconds. While
+the pages found after the 60 seconds are fetched. Redirects are followed by
+the crawler, one request at a time: the target of each is checked against
+robots.txt of its own site and waits for the rate limit of its own host, as
+a link to it would. A disallowed target fails the request with
+`RobotsDisallowedError` before it is sent. Crawl-delay is capped at 30 seconds. While
 a retry waits, the whole host waits with it, since a timeout or a 429 usually
 means the site is overloaded. A Retry-After header holds back the host even
 when the request is not retried, for at most `max_delay` seconds of the
@@ -177,9 +179,9 @@ counted in `error_stats()`. After that one request goes through as a probe
 Failures are timeouts, network errors, HTTP 408, 429 and any 5xx, even
 one that is not retried, such as 501; any other response, a 404 too, is a
 success, so broken links do not block a site. Every attempt counts,
-retries and robots.txt downloads included. An outcome counts for the host
-of the requested URL: the HTTP client follows redirects on its own, so a
-link that redirects to a failing host counts against the host of the link.
+retries and robots.txt downloads included. Each request of a redirect
+chain counts for its own host: a link that redirects to a failing host
+counts against that host, not the host of the link.
 The circuit is checked before a request waits for the rate limit, where a
 half-open one gives its probe to one request and refuses the rest, once
 more when its turn comes, and a last time once it holds a concurrency slot:
@@ -268,9 +270,12 @@ requested, failed ones included; pages that robots.txt disallows are not
 requested and do not count, and neither do pages the circuit breaker
 refuses: they wait for their host, see [Circuit breaker](#circuit-breaker). URLs are normalized (including their
 percent-encoding, so `/café` and `/caf%C3%A9` are one page), and each one is
-fetched at most once. The target of a redirect is remembered too, but only
-once the response arrives: if a direct link to it was queued or fetched before
-that, the page is downloaded twice and appears in the results under both URLs.
+fetched at most once. The target of a redirect is remembered before it is
+requested: a later link to it is not fetched, and a redirect to a page
+already seen is not followed (the page is listed in `skipped_urls` as
+`redirected to a page already seen`), so a page is never saved under two
+URLs. A page whose redirect leads to a URL robots.txt disallows is listed in
+`blocked_urls`; it counts toward `max_pages`, as its own request was sent.
 
 | Option | Effect |
 |--------|--------|
@@ -285,8 +290,9 @@ that, the page is downloaded twice and appears in the results under both URLs.
 Filters apply to discovered links, not to the start URLs. Patterns match the
 normalized URL both percent-encoded and decoded, so `r"/café"` works. A link
 that passes the filters but redirects to a URL that does not, such as a
-sign-in page on another domain, is skipped: it is left out of the results
-and listed in `skipped_urls` as `redirected out of scope`.
+sign-in page on another domain, is skipped without requesting the target:
+it is left out of the results and listed in `skipped_urls` as
+`redirected out of scope`.
 Invalid start URLs, sitemap URLs or patterns raise `ValueError` before anything is fetched.
 
 ```python
@@ -327,7 +333,7 @@ After a crawl, and during one, the crawler exposes its state:
 |-----------|---------|
 | `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()`; empty with `keep_pages=False` |
 | `failed_urls` | `{url: "ErrorType: message"}` |
-| `skipped_urls` | `{url: reason}` for pages fetched but left out, e.g. redirected out of scope |
+| `skipped_urls` | `{url: reason}` for pages fetched but left out, e.g. redirected out of scope or to a page already seen |
 | `blocked_urls` | `{url: reason}` for pages robots.txt did not allow to fetch |
 | `unreachable_urls` | `{url: reason}` for pages not fetched because robots.txt of their site was unreachable |
 | `failed_sitemaps` | `{sitemap url: "ErrorType: message"}` for sitemaps that could not be read |
@@ -361,7 +367,7 @@ print(f"{stats['successful']} of {stats['total_pages']} pages in {stats['elapsed
 | `total_pages` | pages the crawl is done with: `successful + failed + skipped` |
 | `successful` | pages fetched and parsed, the ones `crawl()` returns |
 | `failed` | pages in `failed_urls` |
-| `skipped` | pages in `skipped_urls`: fetched, but redirected out of scope |
+| `skipped` | pages in `skipped_urls`: fetched, but redirected out of scope or to a page already seen |
 | `elapsed_seconds` | running time of the crawl, up to now while it runs |
 | `pages_per_second` | `total_pages / elapsed_seconds` |
 | `avg_response_time` | average time of a page request (of its last attempt, if retried) |

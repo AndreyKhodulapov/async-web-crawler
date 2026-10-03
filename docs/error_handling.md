@@ -16,8 +16,7 @@ leaves a failing site alone.
 - Classify by **what a retry would do**, not by where the error comes from.
   A certificate that fails verification is raised by the network layer, but
   every attempt fails the same way. Retrying a redirect loop is costly too:
-  each attempt follows the whole chain (10 requests in aiohttp) outside the
-  rate limiter.
+  each attempt follows the whole chain (up to 10 requests).
 - Translate transport exceptions (aiohttp, asyncio) into one hierarchy of
   your own, in one place. Callers then depend on `TransientError` and
   `PermanentError`, not on the HTTP library, and the retry decision is an

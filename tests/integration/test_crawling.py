@@ -53,11 +53,8 @@ async def test_every_page_is_fetched_once(url, site):
     site.latency = 0.01
     crawler = await crawl(url("/site/"), max_concurrent=10, max_depth=5)
 
-    # The redirect target is the one exception: when a direct link to c.html
-    # is queued or in flight before "moved" is answered, nothing tells the
-    # crawler they are the same page until the response arrives.
-    fetched_twice = {path for path, hits in site.hits.items() if hits > 1}
-    assert fetched_twice <= {"/site/c.html"}
+    # The redirect target too: "moved" leads to c.html, which is also linked directly.
+    assert {path for path, hits in site.hits.items() if hits > 1} == set()
     assert site.hits["/site/"] == 1
     assert crawler.url_depths[url("/site/a/deepest.html")] == 3
 
@@ -70,6 +67,25 @@ async def test_redirect_target_is_not_fetched_again(url, site):
     assert site.hits["/site/moved"] == 1
     assert site.hits["/site/c.html"] == 1
     assert url("/site/c.html") not in crawler.visited_urls
+
+
+async def test_redirect_to_a_page_already_seen_is_not_followed(url, site):
+    # One worker makes the order fixed: c.html is crawled, then "moved" redirects to it.
+    async with AsyncCrawler(max_concurrent=1, max_depth=0, **UNTHROTTLED) as crawler:
+        await crawler.crawl([url("/site/c.html"), url("/site/moved")])
+
+    assert set(crawler.processed_urls) == {url("/site/c.html")}
+    assert crawler.skipped_urls == {url("/site/moved"): f"redirected to a page already seen: {url('/site/c.html')}"}
+    assert site.hits["/site/c.html"] == 1
+
+
+async def test_page_that_redirects_to_itself_is_crawled(url, site):
+    # The first answer sets a cookie and sends the client back to the same URL.
+    # (Cookies are not kept for an IP address, hence localhost.)
+    crawler = await crawl(url("/site/cookie-check", "localhost"), max_depth=0)
+
+    assert set(crawler.processed_urls) == {url("/site/cookie-check", "localhost")}
+    assert site.hits["/site/cookie-check"] == 2
 
 
 async def test_max_pages_counts_failed_pages_too(url, site):
@@ -98,7 +114,7 @@ async def test_start_url_redirect_to_other_host_keeps_that_host(server, url):
     assert f"http://localhost:{server.port}/site/a.html" in crawler.processed_urls
 
 
-async def test_redirect_out_of_the_start_hosts_is_skipped(url, server):
+async def test_redirect_out_of_the_start_hosts_is_skipped(url, server, site):
     crawler = await crawl(url("/site/exits.html"), max_depth=1, same_domain_only=True)
 
     assert set(crawler.processed_urls) == {url("/site/exits.html"), url("/site/moved")}
@@ -107,6 +123,8 @@ async def test_redirect_out_of_the_start_hosts_is_skipped(url, server):
         url("/site/to-other-host"): f"redirected out of scope: http://localhost:{server.port}/site/"
     }
     assert crawler.crawl_stats().skipped == 1
+    # The target out of scope is not requested at all.
+    assert site.hits["/site/"] == 0
 
 
 async def test_redirect_to_an_excluded_url_is_skipped(url):
@@ -198,9 +216,9 @@ async def test_page_stats_count_skipped_pages(url):
     crawler = await crawl(url("/site/exits.html"), max_depth=1, same_domain_only=True)
     stats = crawler.stats.get_stats()
 
-    # to-other-host was answered, but its redirect left the crawl scope.
+    # to-other-host was answered, but its redirect left the crawl scope and was not followed.
     assert (stats["total_pages"], stats["successful"], stats["failed"], stats["skipped"]) == (3, 2, 0, 1)
-    assert stats["status_codes"] == {200: 3}
+    assert stats["status_codes"] == {200: 2, 302: 1}
 
 
 async def test_state_is_reset_between_crawls(url):
