@@ -1,0 +1,73 @@
+# Example configuration of the crawler. Every key is optional: the values
+# here are the defaults, except for `urls`. Copy the file to config.yaml and
+# keep what you change. Times are in seconds; paths are relative to the
+# working directory.
+
+# Start URLs of the crawl.
+urls:
+  - https://example.com/
+
+# Sitemaps whose pages are crawled along with the start URLs.
+sitemaps:
+  urls: []              # e.g. [https://example.com/sitemap.xml]
+  from_robots: false    # also the sitemaps named in robots.txt of the start URLs' sites
+  max_urls: 50000       # pages taken from one sitemap, its index included
+
+crawler:
+  max_pages: 100        # pages requested, failed ones included
+  max_depth: 2          # links followed from a start URL; 0 crawls only the start URLs
+  max_concurrent: 10    # requests in flight
+  max_per_domain: null  # requests in flight to one host; null for no limit of its own
+  rate_limit: 1.0       # requests per second; null lifts the limit
+  per_domain_rate: true # the rate limit is for each host, not for all of them together
+  min_delay: 0.0        # pause between two requests to a host
+  jitter: 0.0           # random addition to the pause, up to this much
+  respect_robots: true
+  user_agent: "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
+  user_agents: []       # variants to rotate; each starts with the same name as user_agent
+  total_timeout: 30.0
+  connect_timeout: 10.0
+  read_timeout: 20.0
+  timeout_growth: 1.5   # the timeouts grow by this factor on every retry
+  keep_pages: true      # false: a page is dropped from memory once it is saved, for large crawls
+
+# Repeated attempts of a request that failed for a while.
+retry:
+  max_retries: 3
+  backoff_factor: 2.0   # the delay grows by this factor on every attempt
+  base_delay: 1.0
+  max_delay: 30.0
+
+# Stops asking a host that keeps failing.
+circuit_breaker:
+  failure_threshold: 0.5  # share of failed requests that opens the circuit; null turns it off
+  min_requests: 5         # requests in the window before the share counts
+  window: 60.0
+  cooldown: 30.0          # how long the host is left alone
+
+# Which links to follow. The patterns are regular expressions searched
+# anywhere in the URL; quote them with single quotes.
+filters:
+  same_domain_only: false
+  include: []           # e.g. ['^https://example\.com/blog/']
+  exclude: []           # e.g. ['\.pdf$', '/login']
+
+# Where the crawled pages are saved: files, by extension (.jsonl, .json,
+# .csv, .db), or database URLs (sqlite:///pages.db, postgresql://...).
+storage:
+  outputs: []           # e.g. [pages.jsonl, pages.csv]
+  batch_size: 100       # pages written at once
+  csv_encoding: utf-8   # utf-8-sig for Excel
+
+logging:
+  level: INFO           # DEBUG, INFO, WARNING, ERROR or CRITICAL
+  file: null            # e.g. crawler.log; the log goes to the console either way
+  max_bytes: 10485760   # the file is rotated at this size; 0 never rotates it
+  backup_count: 5       # rotated files that are kept; 0 never rotates the file
+
+# Files the statistics are written to after the crawl.
+report:
+  stats_json: null      # e.g. stats.json
+  html: null            # e.g. report.html
+  title: Crawl report
+  top_domains: 10       # hosts listed in the statistics

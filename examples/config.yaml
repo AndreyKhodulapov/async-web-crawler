@@ -1,0 +1,28 @@
+# Configuration of examples/advanced_usage.py: a short crawl of a sandbox
+# made for crawling practice. Every key and its default is listed in
+# config.example.yaml. Paths are relative to the working directory.
+
+urls:
+  - https://books.toscrape.com/index.html
+
+crawler:
+  max_pages: 20
+  max_depth: 1
+  max_concurrent: 5
+  rate_limit: 2.0       # requests per second to the site
+
+filters:
+  same_domain_only: true
+  exclude: ['/category/']   # the books of the first page, not the category pages
+
+storage:
+  outputs: [out/pages.jsonl, out/pages.csv]
+  batch_size: 10
+
+logging:
+  level: INFO
+  file: out/crawler.log     # JSON Lines, a record per line
+
+report:
+  stats_json: out/stats.json
+  title: Books to Scrape

@@ -1,6 +1,6 @@
 # HTML parsing: key concepts
 
-Short, interview-ready notes on how the crawler turns pages into data.
+Short notes on how the crawler turns pages into data.
 
 ## Parsers behind BeautifulSoup
 

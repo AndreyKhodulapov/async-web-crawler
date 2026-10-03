@@ -224,3 +224,6 @@ error_report.json
 pages.jsonl
 pages.csv
 crawler.db
+
+# Output of examples/advanced_usage.py
+out/

@@ -1,4 +1,4 @@
-"""Unit tests for the choice of a database storage by a URL."""
+"""Unit tests for the choice of a storage by a database URL or by the name of a file."""
 
 from pathlib import Path
 
@@ -7,12 +7,15 @@ from helpers import make_record
 from test_database_storage import RecordingDriver
 
 from crawler import (
+    CSVStorage,
     DatabaseStorage,
+    JSONStorage,
     PostgresStorage,
     RetryStrategy,
     SQLiteStorage,
     register_database,
     storage_from_env,
+    storage_from_output,
     storage_from_url,
 )
 from crawler.storage import DATABASE_URL_VARIABLE, DEFAULT_DATABASE_URL, factory
@@ -170,3 +173,58 @@ class TestRegisterDatabase:
     def test_registration_does_not_outlive_a_test(self):
         with pytest.raises(ValueError, match="unknown scheme"):
             storage_from_url("recording://host/pages")
+
+
+class TestStorageFromOutput:
+    @pytest.mark.parametrize(
+        ("name", "kind", "indent"),
+        [("pages.jsonl", JSONStorage, None), ("pages.NDJSON", JSONStorage, None), ("pages.json", JSONStorage, 2)],
+    )
+    def test_json_file_by_extension(self, name, kind, indent):
+        storage = storage_from_output(name)
+
+        assert type(storage) is kind
+        assert (storage.path, storage.indent) == (Path(name), indent)
+
+    def test_csv_file_takes_the_encoding(self):
+        storage = storage_from_output(Path("out/pages.csv"), csv_encoding="utf-8-sig", batch_size=3)
+
+        assert isinstance(storage, CSVStorage)
+        assert (storage.path, storage.encoding, storage.batch_size) == (Path("out/pages.csv"), "utf-8-sig", 3)
+
+    @pytest.mark.parametrize("name", ["pages.db", "pages.sqlite", "pages.sqlite3"])
+    def test_sqlite_file_by_extension(self, name):
+        storage = storage_from_output(name, batch_size=4)
+
+        assert isinstance(storage, SQLiteStorage)
+        assert (storage.path, storage.batch_size) == (Path(name), 4)
+
+    def test_database_url_goes_to_storage_from_url(self):
+        assert isinstance(storage_from_output("postgresql://crawler@localhost/crawler"), PostgresStorage)
+        assert storage_from_output("sqlite:///data/crawler.db").path == Path("data/crawler.db")
+
+    def test_home_directory_is_expanded(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HOME", str(tmp_path))
+
+        assert storage_from_output("~/pages.jsonl").path == tmp_path / "pages.jsonl"
+
+    @pytest.mark.parametrize(
+        ("name", "problem"),
+        [("pages.xml", 'unknown extension ".xml"'), ("pages", "it has no extension"), ("", "it has no extension")],
+    )
+    def test_unknown_extension_names_the_known_ones(self, name, problem):
+        with pytest.raises(ValueError, match=problem) as error:
+            storage_from_output(name)
+
+        assert ".jsonl, .ndjson, .json, .csv, .db, .sqlite, .sqlite3, or a database URL" in str(error.value)
+
+    def test_unknown_csv_encoding_is_rejected(self):
+        with pytest.raises(LookupError):
+            storage_from_output("pages.csv", csv_encoding="utf-99")
+
+    async def test_storage_saves_and_reads(self, tmp_path):
+        async with storage_from_output(tmp_path / "pages.json") as storage:
+            await storage.save(make_record("https://site/a"))
+
+        async with storage_from_output(tmp_path / "pages.json") as storage:
+            assert [record["url"] async for record in storage.read()] == ["https://site/a"]

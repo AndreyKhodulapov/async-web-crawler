@@ -140,3 +140,37 @@ def test_is_same_host(url, other, same):
 )
 def test_get_host(url, host):
     assert get_host(url) == host
+
+
+def test_repeated_url_is_worked_out_once():
+    normalize_url.cache_clear()
+    get_host.cache_clear()
+
+    for _ in range(3):
+        assert normalize_url("https://Example.com/a/../b") == "https://example.com/b"
+        assert get_host("https://Example.com/a/../b") == "example.com"
+
+    assert normalize_url.cache_info().misses == 1
+    assert get_host.cache_info().misses == 1
+
+
+def test_remembered_urls_are_limited():
+    # A crawl of any size keeps the answers for a fixed number of URLs.
+    limit = normalize_url.cache_info().maxsize
+    assert limit is not None and limit == get_host.cache_info().maxsize
+
+    normalize_url.cache_clear()
+    for number in range(limit + 10):
+        normalize_url(f"https://example.com/{number}")
+
+    assert normalize_url.cache_info().currsize == limit
+
+
+def test_inline_data_is_not_remembered():
+    # An inline image is tens of kilobytes that would stay in the cache as its key.
+    normalize_url.cache_clear()
+
+    assert resolve_url("data:image/png;base64," + "A" * 50_000, "https://example.com/") is None
+    assert resolve_url("mailto:someone@example.com", "https://example.com/") is None
+
+    assert normalize_url.cache_info().currsize == 0

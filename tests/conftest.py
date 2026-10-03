@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from collections import Counter
 
@@ -6,15 +7,19 @@ import pytest
 from aiohttp import web
 from pages import ENCODING_PAGES, SITE_PAGES, fixture_html
 
+from crawler.logging_setup import reset_logging
 from demo_site import free_port
 
 
 class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
-    `log` lists (path, time) of every request to /site/ pages, /flaky/ and
-    robots.txt, in the order they arrived. `robots` is the body of
-    /robots.txt, served with `robots_status`; None means 404.
+    `log` lists (path, time) of every request to /site/ pages, /flaky/,
+    sitemaps and robots.txt, in the order they arrived. `robots` is the
+    body of /robots.txt, served with `robots_status`; None means 404.
+    `sitemaps` maps the names of the files under /sitemaps/ to their
+    bodies; the first `sitemap_failures` requests for them answer 503.
+    `sitemap_headers` are added to the responses with them.
     """
 
     def __init__(self) -> None:
@@ -25,6 +30,9 @@ class SiteState:
         self.peak_in_flight = 0
         self.robots: str | None = None
         self.robots_status = 200
+        self.sitemaps: dict[str, bytes] = {}
+        self.sitemap_failures = 0
+        self.sitemap_headers: dict[str, str] = {}
 
     def record(self, request: web.Request) -> None:
         self.hits[request.path] += 1
@@ -77,6 +85,20 @@ async def robots_txt(request: web.Request) -> web.Response:
     return web.Response(text=state.robots, status=state.robots_status)
 
 
+async def sitemap(request: web.Request) -> web.Response:
+    state = request.app[SITE_STATE]
+    state.record(request)
+    if state.sitemap_failures > 0:
+        state.sitemap_failures -= 1
+        raise web.HTTPServiceUnavailable(headers={"Retry-After": "0"})
+    name = request.match_info["name"]
+    if name not in state.sitemaps:
+        raise web.HTTPNotFound()
+    # Gzipped files are sent as they are, not as a Content-Encoding the client would undo.
+    content_type = "application/gzip" if name.endswith(".gz") else "application/xml"
+    return web.Response(body=state.sitemaps[name], content_type=content_type, headers=state.sitemap_headers)
+
+
 async def flaky(request: web.Request) -> web.Response:
     """Answers 503 with Retry-After: 0 the first `fails` times, then a page."""
     state = request.app[SITE_STATE]
@@ -106,6 +128,15 @@ async def site_page(request: web.Request) -> web.Response:
 
 
 @pytest.fixture
+def restore_logging():
+    """Undoes `configure_logging` after the test: its handlers are removed and closed, the level is put back."""
+    level = logging.getLogger().level
+    yield
+    reset_logging()
+    logging.getLogger().setLevel(level)
+
+
+@pytest.fixture
 async def server(aiohttp_server):
     """Local HTTP server with predictable endpoints; no internet required."""
     app = web.Application()
@@ -120,6 +151,7 @@ async def server(aiohttp_server):
     app.router.add_get("/encoding/{name}", encoding_page)
     app.router.add_get("/site/{path:.*}", site_page)
     app.router.add_get("/robots.txt", robots_txt)
+    app.router.add_get("/sitemaps/{name}", sitemap)
     app.router.add_get("/flaky/{fails}", flaky)
     return await aiohttp_server(app)
 

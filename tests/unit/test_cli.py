@@ -1,247 +1,201 @@
-"""Unit tests for command-line parsing and reports of the demo script."""
+"""Unit tests for the command line of the crawler: options, their priority over the configuration file, exit codes."""
 
-from pathlib import Path
+import json
 
 import pytest
-from helpers import FakeClock
+import yaml
 
-from crawler import CircuitBreaker, CSVStorage, FetchTimeoutError, JSONStorage, PostgresStorage, SQLiteStorage
-from main import format_size, hide_password, make_crawler, open_storages, parse_args, print_error_report
-
-
-@pytest.mark.parametrize(
-    ("command", "retries", "log_level"),
-    [
-        ("benchmark", 0, "INFO"),
-        ("parse", 2, "INFO"),
-        ("crawl", 2, "WARNING"),
-        ("errors", 3, "INFO"),
-        ("save", 3, "INFO"),
-    ],
-)
-def test_defaults_differ_by_command(command, retries, log_level):
-    args = parse_args([command])
-    assert (args.retries, args.log_level) == (retries, log_level)
+import main
+from crawler import ConfigError, CrawlerConfig
+from main import build_config, config_overrides, parse_args
 
 
-@pytest.mark.parametrize(
-    "option",
-    [
-        "--rps",
-        "--min-delay",
-        "--jitter",
-        "--connect-timeout",
-        "--read-timeout",
-        "--timeout-growth",
-        "--breaker-cooldown",
-        "--retry-delay",
-    ],
-)
-@pytest.mark.parametrize("value", ["inf", "nan"])
-def test_rejects_non_finite_numbers(option, value):
-    with pytest.raises(SystemExit):
-        parse_args(["crawl", option, value])
+def write_config(tmp_path, data, name="config.yaml"):
+    path = tmp_path / name
+    path.write_text(json.dumps(data) if name.endswith(".json") else yaml.safe_dump(data), encoding="utf-8")
+    return str(path)
 
 
-def test_options_override_command_defaults():
-    args = parse_args(["benchmark", "--retries", "3", "--log-level", "debug"])
-    assert (args.retries, args.log_level) == (3, "DEBUG")
+def test_no_options_override_nothing():
+    assert config_overrides(parse_args([])) == {}
 
 
-def test_timeout_options_configure_the_crawler():
+def test_options_are_shaped_like_the_configuration():
     args = parse_args(
-        ["crawl", "--connect-timeout", "1", "--read-timeout", "2", "--total-timeout", "3", "--timeout-growth", "2"]
-    )
-    crawler = make_crawler(args)
-    timeout = crawler._timeout_for(retries=1)
-    assert (timeout.connect, timeout.sock_read, timeout.total) == (2, 4, 6)
+        [
+            "--urls", "https://one.example/", "https://two.example/",
+            "--max-pages", "7",
+            "--max-depth", "0",
+            "--output", "pages.jsonl",
+            "--output", "sqlite:///pages.db",
+            "--no-respect-robots",
+            "--rate-limit", "2.5",
+            "--stats-json", "stats.json",
+            "--report", "report.html",
+            "--log-level", "debug",
+            "--log-file", "crawler.log",
+        ]
+    )  # fmt: skip
+
+    assert config_overrides(args) == {
+        "urls": ["https://one.example/", "https://two.example/"],
+        "crawler": {"max_pages": 7, "max_depth": 0, "respect_robots": False, "rate_limit": 2.5},
+        "storage": {"outputs": ["pages.jsonl", "sqlite:///pages.db"]},
+        "report": {"stats_json": "stats.json", "html": "report.html"},
+        "logging": {"level": "DEBUG", "file": "crawler.log"},
+    }
 
 
-@pytest.mark.parametrize("value", ["0.5", "0", "x"])
-def test_rejects_timeout_growth_below_one(value):
-    with pytest.raises(SystemExit):
-        parse_args(["crawl", "--timeout-growth", value])
+def test_pages_are_not_kept_in_memory_whatever_the_file_says(tmp_path):
+    path = write_config(tmp_path, {"urls": ["https://example.com/"], "crawler": {"keep_pages": True}})
+
+    assert build_config(parse_args(["--config", path])).crawler.keep_pages is False
+    assert build_config(parse_args(["--urls", "https://example.com/"])).crawler.keep_pages is False
 
 
-def test_breaker_options_configure_the_crawler():
-    args = parse_args(["crawl", "--breaker-threshold", "0.8", "--breaker-cooldown", "5"])
-    breaker = make_crawler(args).circuit_breaker
-    assert (breaker.failure_threshold, breaker.cooldown) == (0.8, 5)
-    assert not make_crawler(parse_args(["crawl", "--no-breaker"])).circuit_breaker.enabled
+def test_rate_limit_of_zero_lifts_the_limit():
+    args = parse_args(["--urls", "https://example.com/", "--rate-limit", "0"])
+
+    assert config_overrides(args)["crawler"] == {"rate_limit": None}
+    assert build_config(args).crawler.rate_limit is None
 
 
-@pytest.mark.parametrize("value", ["0", "1.5", "nan", "x"])
-def test_rejects_breaker_threshold_outside_zero_to_one(value):
-    with pytest.raises(SystemExit):
-        parse_args(["crawl", "--breaker-threshold", value])
+@pytest.mark.parametrize(("option", "expected"), [("--respect-robots", True), ("--no-respect-robots", False)])
+def test_respect_robots_wins_over_the_file(option, expected, tmp_path):
+    config = write_config(tmp_path, {"urls": ["https://example.com/"], "crawler": {"respect_robots": not expected}})
 
-
-def test_errors_defaults_keep_the_local_demo_fast():
-    args = parse_args(["errors"])
-    assert (args.retry_delay, args.read_timeout, args.rps, args.no_robots) == (0.2, 1.0, 0.0, True)
-    assert args.breaker_cooldown == 1.0
-    assert parse_args(["crawl"]).breaker_cooldown == 30.0
-    assert args.json == Path("error_report.json")
-
-
-def test_retry_delay_configures_the_retry_strategy():
-    crawler = make_crawler(parse_args(["crawl", "--retry-delay", "0.5"]))
-    assert crawler.retry_strategy.base_delay == 0.5
-    assert make_crawler(parse_args(["crawl"])).retry_strategy.base_delay == 1.0
-
-
-def test_rejects_zero_retry_delay():
-    with pytest.raises(SystemExit):
-        parse_args(["crawl", "--retry-delay", "0"])
-
-
-def test_help_shows_the_defaults_of_the_command(capsys):
-    with pytest.raises(SystemExit):
-        parse_args(["errors", "--help"])
-    help_text = " ".join(capsys.readouterr().out.split())
-    assert "each chunk of the response, s (default: 1)" in help_text
-    assert "0 = no limit (default: 0)" in help_text
-    assert "up to 30 (default: 0.2)" in help_text
-
-
-def test_errors_checks_robots_only_when_asked():
-    assert parse_args(["errors", "--robots"]).no_robots is False
-    with pytest.raises(SystemExit):
-        parse_args(["errors", "--no-robots"])
-    with pytest.raises(SystemExit):
-        parse_args(["crawl", "--robots"])
-
-
-def test_rejects_retry_delay_longer_than_the_longest_pause():
-    assert parse_args(["crawl", "--retry-delay", "30"]).retry_delay == 30
-    with pytest.raises(SystemExit):
-        parse_args(["crawl", "--retry-delay", "31"])
-
-
-def test_error_report_tells_open_and_half_open_circuits_apart(capsys):
-    clock = FakeClock()
-    breaker = CircuitBreaker(0.5, min_requests=1, cooldown=30.0, clock=clock)
-    crawler = make_crawler(parse_args(["crawl"]))
-    crawler.circuit_breaker = breaker
-
-    def request(url, error=None):
-        with breaker.call(url) as call:
-            call.record(error)
-
-    request("http://a.test/", FetchTimeoutError("http://a.test/", "timed out"))
-    clock.now += breaker.cooldown  # a.test is half-open now
-    request("http://b.test/", FetchTimeoutError("http://b.test/", "timed out"))
-    request("http://c.test/")
-
-    print_error_report(crawler)
-    output = capsys.readouterr().out
-    assert "=== Circuit breaker (3 hosts: 1 open, 1 half-open) ===" in output
-
-
-def test_save_defaults(monkeypatch):
-    monkeypatch.delenv("CRAWLER_DATABASE_URL", raising=False)
-
-    args = parse_args(["save"])
-
-    assert (args.json, args.csv, args.database_url) == (Path("pages.jsonl"), Path("pages.csv"), "sqlite:///crawler.db")
-    assert (args.indent, args.csv_encoding, args.batch_size, args.append, args.preview) == (None, "utf-8", 10, False, 3)
-    # The site is local, as in `errors`.
-    assert (args.retry_delay, args.read_timeout, args.rps, args.no_robots) == (0.2, 1.0, 0.0, True)
-
-
-def test_save_takes_the_database_from_the_environment(monkeypatch):
-    monkeypatch.setenv("CRAWLER_DATABASE_URL", "postgresql://crawler:secret@db.example/pages")
-    assert parse_args(["save"]).database_url == "postgresql://crawler:secret@db.example/pages"
-    # The option wins over the variable.
-    assert parse_args(["save", "--database-url", "sqlite:///other.db"]).database_url == "sqlite:///other.db"
-
-    monkeypatch.setenv("CRAWLER_DATABASE_URL", "")
-    assert parse_args(["save"]).database_url == "sqlite:///crawler.db"
-
-
-@pytest.mark.parametrize("url", ["mysql://localhost/crawler", "crawler.db", "sqlite://crawler.db"])
-def test_save_rejects_a_database_url_it_cannot_use(url, monkeypatch, capsys):
-    with pytest.raises(SystemExit):
-        parse_args(["save", "--database-url", url])
-    assert "argument --database-url: " in capsys.readouterr().err
-
-    monkeypatch.setenv("CRAWLER_DATABASE_URL", url)
-    with pytest.raises(SystemExit):
-        parse_args(["save"])
-    # The variable is read by `save` alone.
-    assert parse_args(["crawl"]).command == "crawl"
-
-
-def test_save_help_does_not_show_the_database_password(monkeypatch, capsys):
-    monkeypatch.setenv("CRAWLER_DATABASE_URL", "postgresql://crawler:secret@db.example/pages")
-    with pytest.raises(SystemExit):
-        parse_args(["save", "--help"])
-    help_text = " ".join(capsys.readouterr().out.split())
-    assert "(default: $CRAWLER_DATABASE_URL, or sqlite:///crawler.db)" in help_text
-    assert "secret" not in help_text
+    assert build_config(parse_args(["--config", config, option])).crawler.respect_robots is expected
+    assert build_config(parse_args(["--config", config])).crawler.respect_robots is not expected
 
 
 @pytest.mark.parametrize(
-    "options", [["--csv-encoding", "no-such-encoding"], ["--batch-size", "0"], ["--indent", "-1"], ["--preview", "0"]]
+    "argv",
+    [
+        ["--urls", "example.com"],
+        ["--urls"],
+        ["--max-pages", "0"],
+        ["--max-pages", "1.5"],
+        ["--max-depth", "-1"],
+        ["--rate-limit", "-1"],
+        ["--rate-limit", "nan"],
+        ["--log-level", "LOUD"],
+        ["https://example.com/"],
+    ],
 )
-def test_save_rejects_bad_storage_options(options):
-    with pytest.raises(SystemExit):
-        parse_args(["save", *options])
+def test_invalid_options_are_usage_errors(argv, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(argv)
+
+    assert exit_info.value.code == 2
+    assert "usage:" in capsys.readouterr().err
 
 
-def test_save_rejects_one_file_for_json_and_csv(tmp_path, capsys):
-    with pytest.raises(SystemExit):
-        parse_args(["save", "--json", str(tmp_path / "pages"), "--csv", str(tmp_path / "pages")])
+def test_options_alone_make_a_configuration():
+    config = build_config(parse_args(["--urls", "https://example.com/", "--max-pages", "5"]))
 
-    assert "--json and --csv must be different files" in capsys.readouterr().err
+    defaults = CrawlerConfig()
+    assert config.urls == ("https://example.com/",)
+    assert config.crawler.max_pages == 5
+    assert (config.crawler.max_depth, config.storage, config.logging) == (
+        defaults.crawler.max_depth,
+        defaults.storage,
+        defaults.logging,
+    )
 
 
-def test_save_options_configure_the_storages(tmp_path):
-    database = tmp_path / "pages.db"
-    options = ["--json", str(tmp_path / "p.json"), "--indent", "2", "--csv", str(tmp_path / "p.csv")]
-    options += ["--csv-encoding", "cp1252", "--database-url", f"sqlite:///{database}", "--batch-size", "5"]
+@pytest.mark.parametrize("name", ["config.yaml", "config.json"])
+def test_options_win_over_the_file_and_the_rest_of_it_stays(name, tmp_path):
+    path = write_config(
+        tmp_path,
+        {
+            "urls": ["https://file.example/"],
+            "crawler": {"max_pages": 50, "max_depth": 3, "max_concurrent": 4},
+            "storage": {"outputs": ["file.jsonl", "file.csv"], "batch_size": 7},
+            "filters": {"exclude": ["/login"]},
+        },
+        name,
+    )
 
-    storages = open_storages(parse_args(["save", *options]))
+    config = build_config(parse_args(["--config", path, "--max-pages", "5", "--output", "flag.json"]))
 
-    assert list(storages) == [str(tmp_path / "p.json"), str(tmp_path / "p.csv"), f"sqlite:///{database}"]
-    json_storage, csv_storage, database_storage = storages.values()
-    assert type(json_storage) is JSONStorage
-    assert (json_storage.path, json_storage.indent) == (tmp_path / "p.json", 2)
-    assert type(csv_storage) is CSVStorage
-    assert (csv_storage.path, csv_storage.encoding) == (tmp_path / "p.csv", "cp1252")
-    assert type(database_storage) is SQLiteStorage
-    assert database_storage.path == database
-    assert {storage.batch_size for storage in storages.values()} == {5}
-    # Nothing is opened until the first page is saved.
+    assert config.crawler.max_pages == 5
+    assert config.storage.outputs == ("flag.json",)  # the list is replaced, not extended
+    assert (config.urls, config.crawler.max_depth, config.crawler.max_concurrent) == (("https://file.example/",), 3, 4)
+    assert (config.storage.batch_size, config.filters.exclude) == (7, ("/login",))
+
+
+def test_urls_option_replaces_the_urls_of_the_file(tmp_path):
+    path = write_config(tmp_path, {"urls": ["https://file.example/"]})
+
+    config = build_config(parse_args(["--config", path, "--urls", "https://flag.example/"]))
+
+    assert config.urls == ("https://flag.example/",)
+
+
+def test_sitemaps_of_the_file_are_enough_to_crawl(tmp_path):
+    path = write_config(tmp_path, {"sitemaps": {"urls": ["https://example.com/sitemap.xml"]}})
+
+    assert build_config(parse_args(["--config", path])).urls == ()
+
+
+@pytest.mark.parametrize("with_file", [False, True])
+def test_nothing_to_crawl_is_an_error(with_file, tmp_path):
+    argv = ["--config", write_config(tmp_path, {"crawler": {"max_pages": 5}})] if with_file else []
+
+    with pytest.raises(ConfigError, match="nothing to crawl: give --urls"):
+        build_config(parse_args(argv))
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        ([], "nothing to crawl"),
+        (["--config", "missing.yaml"], "missing.yaml: cannot read the file"),
+        (
+            ["--urls", "https://example.com/", "--output", "pages.txt"],
+            'storage.outputs[0]: Cannot choose a storage for "pages.txt"',
+        ),
+        (["--urls", "https://example.com/", "--log-file", " "], "logging.file: must not be empty"),
+    ],
+)
+def test_invalid_configuration_exits_with_2_before_anything_runs(argv, message, tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main, "run", None)  # would fail if called
+
+    assert main.main(argv) == 2
+
+    error = capsys.readouterr().err
+    assert error.startswith("error: Invalid configuration: ")
+    assert message in error
     assert list(tmp_path.iterdir()) == []
 
 
-def test_save_shows_the_database_without_its_password():
-    args = parse_args(["save", "--database-url", "postgresql://crawler:secret@db.example:5433/pages"])
+def test_problems_of_the_file_are_all_reported(tmp_path, capsys):
+    path = write_config(tmp_path, {"urls": ["example.com"], "crawler": {"max_pagse": 5}})
 
-    location, storage = list(open_storages(args).items())[2]
+    assert main.main(["--config", path]) == 2
 
-    assert location == "postgresql://crawler:***@db.example:5433/pages"
-    assert type(storage) is PostgresStorage
-
-
-@pytest.mark.parametrize(
-    ("url", "shown"),
-    [
-        ("postgresql://crawler:secret@host/db", "postgresql://crawler:***@host/db"),
-        ("postgresql://crawler@host/db", "postgresql://crawler@host/db"),
-        ("sqlite:///crawler.db", "sqlite:///crawler.db"),
-        ("postgresql://host/db?user=crawler&password=secret", "postgresql://host/db?user=crawler&password=***"),
-        ("postgresql://host/db?password=secret&sslmode=require", "postgresql://host/db?password=***&sslmode=require"),
-    ],
-)
-def test_hide_password(url, shown):
-    assert hide_password(url) == shown
+    error = capsys.readouterr().err
+    assert "2 problems" in error
+    assert 'crawler.max_pagse: unknown key; did you mean "max_pages"?' in error
+    assert "urls[0]: expected an http:// or https:// URL" in error
 
 
 @pytest.mark.parametrize(
-    ("size", "shown"),
-    [(0, "0 B"), (1023, "1023 B"), (1536, "1.5 KB"), (5 * 1024**2, "5.0 MB"), (3 * 1024**3, "3072.0 MB")],
+    ("outcome", "code"),
+    [(0, 0), (1, 1), (OSError("cannot open the log"), 1), (KeyboardInterrupt(), 130)],
 )
-def test_format_size(size, shown):
-    assert format_size(size) == shown
+def test_exit_code_follows_the_run(outcome, code, monkeypatch, capsys):
+    seen = {}
+
+    async def run(config, *, progress):
+        seen.update(urls=config.urls, progress=progress)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(main, "run", run)
+
+    assert main.main(["--urls", "https://example.com/", "--no-progress"]) == code
+    assert seen == {"urls": ("https://example.com/",), "progress": False}
+    assert capsys.readouterr().err == ("error: cannot open the log\n" if isinstance(outcome, OSError) else "")

@@ -1,5 +1,6 @@
 """URL helpers: validation, normalization and resolution of relative links."""
 
+import functools
 import re
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
@@ -11,6 +12,11 @@ def is_valid_http_url(url: str) -> bool:
     return normalize_url(url) is not None
 
 
+# A crawl asks about the same URL many times over: a link when it is found,
+# filtered and queued, a page at every step of its request, a link to the
+# site's menu on every page. The answers for the latest URLs are remembered,
+# here and in `get_host`.
+@functools.lru_cache(maxsize=4096)
 def normalize_url(url: str) -> str | None:
     """Return a canonical form of an absolute http(s) URL, or None if invalid.
 
@@ -62,11 +68,17 @@ def resolve_url(href: str, base_url: str) -> str | None:
         return None
     try:
         absolute = urljoin(base_url, href)
+        scheme = urlsplit(absolute).scheme
     except ValueError:
+        return None
+    # Turned away before `normalize_url`, which would remember the whole of
+    # an inline image ("data:" with tens of kilobytes) as a key of its cache.
+    if scheme not in ("http", "https"):
         return None
     return normalize_url(absolute)
 
 
+@functools.lru_cache(maxsize=4096)
 def get_host(url: str) -> str | None:
     """Return the normalized host of an http(s) URL, or None if the URL is invalid.
 

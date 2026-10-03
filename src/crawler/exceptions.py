@@ -10,7 +10,7 @@ Most errors fall into one of four kinds that decide whether a retry can help:
 - `NetworkError`: the request did not reach the server (DNS, a refused or
   reset connection); worth retrying too.
 - `PermanentError`: the request is wrong or forbidden (HTTP 404, 403, a bad
-  certificate); every attempt would fail the same way.
+  certificate, a sitemap that is not one); every attempt would fail the same way.
 - `ParseError`: the page was downloaded but is not an HTML document.
 
 `CrawlerClosedError`, `RobotsUnreachableError`, `CircuitOpenError` and
@@ -21,6 +21,7 @@ itself, and none is retried.
 pages already crawled.
 """
 
+from collections.abc import Sequence
 from typing import ClassVar, Self
 
 
@@ -117,12 +118,34 @@ class CircuitOpenError(FetchError):
     """The circuit breaker of the host is open: the request was not sent."""
 
 
+class SitemapError(PermanentError):
+    """The sitemap was downloaded but cannot be read: it is not XML, not a sitemap, or too large."""
+
+
 class UnexpectedError(FetchError):
     """An unforeseen exception (most likely a bug); the traceback is logged."""
 
 
 class StorageError(Exception):
     """Crawled pages could not be written to a storage, or the storage is closed."""
+
+
+class ConfigError(ValueError):
+    """A configuration cannot be read, or has unknown keys or invalid values.
+
+    `problems` lists them all, each starting with the path of its key, such
+    as "crawler.max_pages"; the message is the same list.
+    """
+
+    def __init__(self, problems: Sequence[str], source: str | None = None) -> None:
+        self.problems = list(problems)
+        self.source = source
+        prefix = f"{source}: " if source else ""
+        if len(self.problems) == 1:
+            super().__init__(f"Invalid configuration: {prefix}{self.problems[0]}")
+        else:
+            lines = "".join(f"\n  - {problem}" for problem in self.problems)
+            super().__init__(f"Invalid configuration: {prefix}{len(self.problems)} problems{lines}")
 
 
 ERROR_KINDS = (TransientError, PermanentError, NetworkError, ParseError)

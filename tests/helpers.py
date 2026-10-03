@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from crawler import CircuitBreaker, DataStorage, PageRecord, RetryStrategy
 
 BOT = "TestBot/1.0 (+https://example.com/bot)"
+SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
 
 # Crawler options for tests that check something other than politeness:
 # without the rate limit, robots.txt, retries and the circuit breaker they
@@ -17,6 +18,26 @@ UNTHROTTLED = {
     "retry_strategy": RetryStrategy(max_retries=0),
     "circuit_breaker": CircuitBreaker(failure_threshold=None),
 }
+# The same as sections of a configuration file.
+FAST_CONFIG = {
+    "crawler": {"rate_limit": None, "respect_robots": False, "user_agent": BOT, "max_depth": 1},
+    "retry": {"max_retries": 0},
+    "circuit_breaker": {"failure_threshold": None},
+}
+
+
+def urlset(*locations: str) -> bytes:
+    """A sitemap that lists pages."""
+    entries = "".join(f"<url><loc>{location}</loc><lastmod>2026-01-01</lastmod></url>" for location in locations)
+    return f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="{SITEMAP_NAMESPACE}">{entries}</urlset>'.encode()
+
+
+def index(*locations: str) -> bytes:
+    """A sitemap index that lists other sitemaps."""
+    entries = "".join(f"<sitemap><loc>{location}</loc></sitemap>" for location in locations)
+    return (
+        f'<?xml version="1.0" encoding="UTF-8"?><sitemapindex xmlns="{SITEMAP_NAMESPACE}">{entries}</sitemapindex>'
+    ).encode()
 
 
 class FakeClock:

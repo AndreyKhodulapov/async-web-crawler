@@ -17,6 +17,10 @@ class FetchResult:
     any: comparing the two URLs is not enough, as the HTTP client spells
     ``final_url`` in its own way. ``content_type`` is the media type without
     parameters, or None if the server did not send a Content-Type header.
+
+    ``body`` is set only for a download that asked for the bytes as they
+    were sent, such as a sitemap, which may be gzipped; ``content`` is
+    empty then.
     """
 
     url: str
@@ -28,6 +32,7 @@ class FetchResult:
     final_url: str | None = None
     content_type: str | None = None
     redirected: bool = False
+    body: bytes | None = None
 
     @property
     def ok(self) -> bool:
@@ -43,6 +48,8 @@ class FetchResult:
 @dataclass(frozen=True, slots=True)
 class CrawlStats:
     """Progress of a crawl at one moment.
+
+    For the pages of a crawl by status code and domain see `CrawlerStats`.
 
     `skipped` counts pages fetched but left out because they redirected
     outside the crawl scope; `blocked` counts pages robots.txt did not allow

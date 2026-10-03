@@ -1,6 +1,6 @@
 # Politeness: rate limits, robots.txt and backoff
 
-Short, interview-ready notes on how a crawler keeps from overloading the
+Short notes on how a crawler keeps from overloading the
 sites it visits and follows their rules.
 
 ## Concurrency is not rate

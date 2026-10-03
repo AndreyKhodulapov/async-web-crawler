@@ -18,7 +18,6 @@ from crawler.retry import RetryStrategy
 from crawler.storage.base import DataStorage
 
 # What stands between two records in either layout.
-_BETWEEN_RECORDS = re.compile(r"[\s,\[\]]*")
 
 
 class JSONStorage(DataStorage):
@@ -104,6 +103,7 @@ class JSONStorage(DataStorage):
         if not await aiofiles.os.path.exists(self.path):
             return
         decoder = json.JSONDecoder()
+        between_records = re.compile(r"[\s,\[\]]*")
         unread = ""
         try:
             async with aiofiles.open(self.path, encoding="utf-8") as file:
@@ -111,7 +111,7 @@ class JSONStorage(DataStorage):
                     unread += chunk
                     position = 0
                     while True:
-                        start = _BETWEEN_RECORDS.match(unread, position).end()
+                        start = between_records.match(unread, position).end()
                         try:
                             record, position = decoder.raw_decode(unread, start)
                         except json.JSONDecodeError:
@@ -127,7 +127,7 @@ class JSONStorage(DataStorage):
                     unread = unread[position:]
         except UnicodeError as error:
             raise StorageError(f"{self.path} is not UTF-8: {error}") from error
-        if not _BETWEEN_RECORDS.fullmatch(unread):
+        if not between_records.fullmatch(unread):
             raise StorageError(f"{self.path} ends with a broken record: {unread[:80]!r}")
 
     async def _close(self) -> None:

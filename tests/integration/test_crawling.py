@@ -169,6 +169,40 @@ async def test_stats_after_crawl(url):
     assert crawler.crawl_stats().elapsed == stats.elapsed  # the clock stops with the crawl
 
 
+async def test_page_stats_after_crawl(url, closed_port_url):
+    # Depth 1 from /site/: a.html, b.html, two 404s and the home page on another host.
+    start_urls = [url("/site/"), url("/status/503"), url("/data.json"), closed_port_url]
+    async with AsyncCrawler(max_depth=1, **UNTHROTTLED) as crawler:
+        assert crawler.stats.get_stats()["total_pages"] == 0
+        await crawler.crawl(start_urls)
+        stats = crawler.stats.get_stats()
+        progress = crawler.crawl_stats()
+        await crawler.crawl([url("/site/c.html")])
+
+    assert (stats["total_pages"], stats["successful"], stats["failed"], stats["skipped"]) == (9, 4, 5, 0)
+    assert (stats["successful"], stats["failed"]) == (progress.processed, progress.failed)
+    # JSON instead of HTML is a response too; the refused connection is not.
+    assert stats["status_codes"] == {200: 5, 404: 2, 503: 1}
+    assert stats["errors"] == {"PermanentHTTPError": 2, "NetworkError": 1, "ParseError": 1, "TransientHTTPError": 1}
+    assert list(stats["top_domains"].items()) == [("127.0.0.1", 8), ("localhost", 1)]
+    assert stats["elapsed_seconds"] == pytest.approx(progress.elapsed, abs=0.05)
+    assert stats["pages_per_second"] > 0
+    assert stats["avg_response_time"] > 0
+    assert stats["started_at"] < stats["finished_at"]
+    # Reset by the second crawl.
+    assert crawler.stats.get_stats()["total_pages"] == 1
+    assert crawler.stats.get_stats()["status_codes"] == {200: 1}
+
+
+async def test_page_stats_count_skipped_pages(url):
+    crawler = await crawl(url("/site/exits.html"), max_depth=1, same_domain_only=True)
+    stats = crawler.stats.get_stats()
+
+    # to-other-host was answered, but its redirect left the crawl scope.
+    assert (stats["total_pages"], stats["successful"], stats["failed"], stats["skipped"]) == (3, 2, 0, 1)
+    assert stats["status_codes"] == {200: 3}
+
+
 async def test_state_is_reset_between_crawls(url):
     async with AsyncCrawler(max_depth=1, **UNTHROTTLED) as crawler:
         first = await crawler.crawl([url("/site/")], same_domain_only=True)
