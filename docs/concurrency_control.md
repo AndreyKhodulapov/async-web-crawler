@@ -11,6 +11,12 @@ load under control.
   `take URL -> fetch -> parse -> queue new links`. Memory stays bounded (the
   queue holds strings, not thousands of pending tasks), and N is the natural
   concurrency knob.
+- The **frontier** (the queue of URLs found and not yet fetched) grows much
+  faster than the crawl: a page links to tens of new pages. With a page
+  limit, bound it too: here new links are dropped once queued, in progress
+  and requested reach 3x `max_pages`. Dropped links are not marked seen, so
+  they can come back later; the spare 2x covers pages that do not count
+  toward the limit, such as those robots.txt disallows.
 - Workers run in an `asyncio.TaskGroup`: the crawl returns only when all of
   them have finished, and no worker outlives it.
 
@@ -71,7 +77,9 @@ load under control.
   ones countable.
 - **Head-of-line blocking**: when every worker holds a URL for the same busy
   host, URLs for other hosts wait in the queue. Fixes include more workers than
-  slots, or one queue per host (as in large crawlers).
+  slots, putting off the URLs of a host that cannot be asked now (here: an
+  open circuit breaker, a Retry-After), or one queue per host (as in large
+  crawlers).
 
 ## Traversal order and depth
 
@@ -89,12 +97,24 @@ load under control.
   for the same page.
 - Deduplication is only as good as normalization: `HTTP://Site:80/a#top`
   and `http://site/a` are one page.
-- Redirects: the target is added to the seen set only after the response. If
-  a direct link to the target was queued or fetched before that, the page is
-  downloaded twice and shows up under both URLs. Nothing reveals the duplicate
-  before the response arrives.
-- Some duplicates cannot be detected by URL at all (`/` and `/index.html`).
-  `<link rel="canonical">` or content hashing handles those.
+- Redirects: follow them by hand (`allow_redirects=False`), so that the
+  target is checked before it is requested. A target already seen is not
+  followed, a new one joins the seen set at once: a page is downloaded and
+  saved under one URL only. Leave out of that check the page itself and the
+  earlier targets of its own chain: a cookie check redirects a page to
+  itself, and a real loop ends at the redirect limit. Forget the targets of
+  a page that fails: they were not crawled, and a direct link to one of
+  them must still be followed.
+- Tracking parameters (`utm_source`, `fbclid`) do not change the page: drop
+  them before the check. Do not sort or drop the other parameters: for some
+  sites their order or presence matters.
+- Some duplicates cannot be detected by URL at all (`/` and `/index.html`,
+  `/list?sort=price` and `/list`). `<link rel="canonical">` or content
+  hashing handles those. Trust a canonical URL only as far as it is cheap to
+  be wrong: here only one that differs in the query, so a site that points
+  every page to its home page does not lose them all.
+- Crawler traps (calendars, endless filters) need limits that do not depend
+  on URLs at all: depth, URL length, pages per host.
 
 ## URL filters
 
@@ -103,13 +123,12 @@ load under control.
 - Include/exclude regular expressions, compiled once up front so that a
   bad pattern fails fast. Exclude wins over include.
 - Filters apply to discovered links only: the start URLs are an explicit choice.
-- The HTTP client follows redirects by itself, so a link inside the scope can
-  land outside it (a sign-in page on another domain). The final URL is checked
-  again, and such a page is skipped. Detect the redirect from the response
-  history, not by comparing URL strings: the client spells the final URL in
-  its own way (percent-encoding, dot segments), so equal addresses can differ
-  as strings. Not requesting the other host at all
-  would need `allow_redirects=False` and manual redirect handling.
+- A link inside the scope can redirect outside it (a sign-in page on another
+  domain). An HTTP client that follows redirects by itself has already made
+  the request to the other host, past its robots.txt, rate limit and circuit
+  breaker, by the time the final URL can be checked. Following redirects by
+  hand checks every target before it is requested: the filters, robots.txt
+  of its site, the limits of its host.
 
 ## Measuring progress
 

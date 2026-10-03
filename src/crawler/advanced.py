@@ -6,11 +6,11 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
+from crawler import logging_setup
 from crawler.circuit_breaker import CircuitBreaker
 from crawler.client import AsyncCrawler
 from crawler.config import CrawlerConfig, load_config
 from crawler.exceptions import ConfigError
-from crawler.logging_setup import configure_logging, reset_logging
 from crawler.models import ParsedPage
 from crawler.retry import RetryStrategy
 from crawler.stats import CrawlerStats
@@ -41,10 +41,12 @@ class AdvancedCrawler:
     Directories of the log, the reports and the files of the storage are
     created if they are missing. Logging is set up when the crawler is
     made and reset by `close()`; it belongs to the whole process, so with
-    two crawlers at once the log is written as the later one says.
+    two crawlers at once the log is written as the later one says. With
+    `configure_logging=False` the crawler leaves logging alone and the
+    `logging` section is ignored: for a program that sets up logging itself.
     """
 
-    def __init__(self, config: CrawlerConfig | None = None) -> None:
+    def __init__(self, config: CrawlerConfig | None = None, *, configure_logging: bool = True) -> None:
         """
         Raises:
             OSError: a directory cannot be created, or the log file cannot be opened.
@@ -77,6 +79,7 @@ class AdvancedCrawler:
             connect_timeout=options.connect_timeout,
             read_timeout=options.read_timeout,
             timeout_growth=options.timeout_growth,
+            max_page_size=options.max_page_size,
             user_agent=options.user_agent,
             user_agents=options.user_agents,
             storage=self.storage,
@@ -86,13 +89,16 @@ class AdvancedCrawler:
         self.crawler.stats.top_domains = config.report.top_domains
         self.reports: list[Path] = []
         self._closed = False
+        self._configures_logging = configure_logging
 
         for path in _storage_files(self.storage):
             _make_directory(path)
+        if not configure_logging:
+            return
         if config.logging.file is not None:
             _make_directory(config.logging.file)
         # The last step: nothing after it can fail and leave the log file open.
-        configure_logging(
+        logging_setup.configure_logging(
             config.logging.level,
             config.logging.file,
             max_bytes=config.logging.max_bytes,
@@ -100,14 +106,18 @@ class AdvancedCrawler:
         )
 
     @classmethod
-    def from_config(cls, path: str | Path, overrides: Mapping[str, Any] | None = None) -> Self:
+    def from_config(
+        cls, path: str | Path, overrides: Mapping[str, Any] | None = None, *, configure_logging: bool = True
+    ) -> Self:
         """The crawler for a YAML or a JSON configuration file; `overrides` win over the file, see `load_config`.
+
+        `configure_logging` is that of the constructor.
 
         Raises:
             ConfigError: the file cannot be read, or holds an unknown key or an invalid value.
             OSError: as the constructor.
         """
-        return cls(load_config(path, overrides))
+        return cls(load_config(path, overrides), configure_logging=configure_logging)
 
     async def __aenter__(self) -> Self:
         return self
@@ -151,9 +161,11 @@ class AdvancedCrawler:
         pages = await self.crawler.crawl(
             config.urls,
             max_pages=config.crawler.max_pages,
+            max_pages_per_host=config.crawler.max_pages_per_host,
             same_domain_only=config.filters.same_domain_only,
             include_patterns=config.filters.include,
             exclude_patterns=config.filters.exclude,
+            exclude_extensions=config.filters.exclude_extensions,
             sitemap_urls=config.sitemaps.urls,
             robots_sitemaps=config.sitemaps.from_robots,
         )
@@ -214,7 +226,8 @@ class AdvancedCrawler:
         try:
             await self.crawler.close()
         finally:
-            reset_logging()
+            if self._configures_logging:
+                logging_setup.reset_logging()
 
 
 def _storage_files(storage: DataStorage | None) -> list[Path]:

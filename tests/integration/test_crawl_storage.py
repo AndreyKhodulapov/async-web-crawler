@@ -76,7 +76,9 @@ class TestSavedPages:
         assert record["content_type"] == "text/html"
         assert timedelta(0) <= record["crawled_at"] - started < timedelta(seconds=10)
         assert record["crawled_at"].utcoffset() == timedelta(0)
-        assert set(record["metadata"]) == {"description", "keywords", "language", "canonical", "final_url", "depth"}
+        assert set(record["metadata"]) == {
+            "description", "keywords", "language", "canonical", "robots", "final_url", "depth"
+        }  # fmt: skip
         assert record["metadata"]["final_url"] == url("/catalog/tools/")
         assert record["metadata"]["depth"] == 0
 

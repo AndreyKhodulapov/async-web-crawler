@@ -85,7 +85,7 @@ circuit breaker fails with `CircuitOpenError` without being sent.
 | `per_domain_rate` | `True` | `False` applies the rate to all hosts together; Crawl-delay and retry pauses stay per host |
 | `min_delay` | `0.0` | min seconds between two requests to one host |
 | `jitter` | `0.0` | random extra delay of up to this many seconds after each request |
-| `respect_robots` | `True` | check robots.txt before every request |
+| `respect_robots` | `True` | check robots.txt before every request; in a crawl, also follow `nofollow` and `noindex` (see [Crawling](#crawling)) |
 | `retry_strategy` | `RetryStrategy()` | which failures to retry, how many times and how long to wait, see below |
 | `circuit_breaker` | `CircuitBreaker()` | when to stop sending requests to a failing host, see below |
 | `user_agent` | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name |
@@ -99,13 +99,19 @@ host and port) and cached for the crawler's lifetime. A missing robots.txt
 errors, after the retries) disallows the whole site for 60 seconds, then it
 is fetched again. Such pages are counted as unreachable, not as blocked:
 the site did not forbid them. A crawl does not queue them again, so only
-the pages found after the 60 seconds are fetched. Only the requested URL is checked: the
-HTTP client follows redirects on its own, so a redirect can still lead to a
-disallowed page, and the rate limit of the host it leads to does not apply. Crawl-delay is capped at 30 seconds. While
+the pages found after the 60 seconds are fetched. Redirects are followed by
+the crawler, one request at a time: the target of each is checked against
+robots.txt of its own site and waits for the rate limit of its own host, as
+a link to it would. Up to `AsyncCrawler.MAX_REDIRECTS` (10) redirects in a
+row are followed; one more fails with `TooManyRedirectsError`, its target
+not requested. A disallowed target fails the request with
+`RobotsDisallowedError` before it is sent. Crawl-delay is capped at 30 seconds. While
 a retry waits, the whole host waits with it, since a timeout or a 429 usually
-means the site is overloaded. A Retry-After header holds back the host even
-when the request is not retried, for at most `max_delay` seconds of the
-retry strategy; a request whose Retry-After is longer than that is not retried.
+means the site is overloaded. A Retry-After header holds back the host for
+as long as it asks, up to `AsyncCrawler.MAX_RETRY_AFTER` (10 minutes), even
+when the request is not retried; a request whose Retry-After is longer than
+`max_delay` of the retry strategy is not retried. Later `fetch_url()` calls
+to the host wait for that time too.
 
 ## Retries
 
@@ -177,9 +183,9 @@ counted in `error_stats()`. After that one request goes through as a probe
 Failures are timeouts, network errors, HTTP 408, 429 and any 5xx, even
 one that is not retried, such as 501; any other response, a 404 too, is a
 success, so broken links do not block a site. Every attempt counts,
-retries and robots.txt downloads included. An outcome counts for the host
-of the requested URL: the HTTP client follows redirects on its own, so a
-link that redirects to a failing host counts against the host of the link.
+retries and robots.txt downloads included. Each request of a redirect
+chain counts for its own host: a link that redirects to a failing host
+counts against that host, not the host of the link.
 The circuit is checked before a request waits for the rate limit, where a
 half-open one gives its probe to one request and refuses the rest, once
 more when its turn comes, and a last time once it holds a concurrency slot:
@@ -191,14 +197,23 @@ error of its last attempt, not with `CircuitOpenError`. When the breaker
 refuses the download of robots.txt, the page fails with `CircuitOpenError`
 under its own URL, and robots.txt is not cached as unreachable.
 
-In a crawl, a page the breaker refuses does not count toward `max_pages`
-and is not failed: it is put off until the circuit may let a probe through,
-or for a second while the probe is in flight, and the workers go on with
-other pages meanwhile. So the pages of a host that went down for a moment
-are fetched once it is back. After the circuit of a host has opened
+In a crawl, a page the breaker refuses is not failed: it is put off until
+the circuit may let a probe through, or for a second while the probe is in
+flight, and the workers go on with other pages meanwhile. So the pages of
+a host that went down for a moment are fetched once it is back, even when
+the page refused was the last one `max_pages` allowed. A page refused
+before its request does not count toward `max_pages`; one whose redirect
+target is refused has sent its request, so it counts, and counts again
+when it is taken again. After the circuit of a host has opened
 `AsyncCrawler.MAX_CIRCUIT_OPENINGS` (3) times in the crawl, no more probes
 are sent: its remaining pages go to `failed_urls` with `CircuitOpenError`,
 and a host that stays down holds the crawl for about two cooldowns.
+
+The same goes for a host held back longer than
+`AsyncCrawler.MIN_PENALTY_TO_DEFER` (1 second), by a Retry-After or the
+pause before a retry: its pages are put off until the host may be asked
+again, instead of holding workers in the rate limiter, and count toward
+`max_pages` only when they are taken again.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
@@ -245,6 +260,7 @@ are not counted.
 | `read_timeout` | `20.0` | the longest pause between two chunks of the response |
 | `total_timeout` | `30.0` | the whole request, body included |
 | `timeout_growth` | `1.5` | each retry multiplies all three by this, up to 4 times the initial values; `1` keeps them fixed |
+| `max_page_size` | `10485760` | bytes of a page body; a larger one fails with `PageTooLargeError` (a permanent error) and the rest is not downloaded; `None` lifts the limit |
 
 With the defaults the read timeout is 20 s on the first attempt and 30, 45
 and 67.5 s on the three retries: a page that is only slow gets through, a
@@ -252,34 +268,85 @@ server that does not answer at all is not waited for forever. A timeout
 fails with `FetchTimeoutError` that says which timeout fired, e.g.
 `read timeout (20.0s)`, and is retried like any other transient error.
 
+The body is read in chunks and given up once it is over its limit:
+`max_page_size` for a page, 50 MB for a sitemap. The limit is on the body
+unpacked from gzip or deflate, so a gzip bomb fails too, and a
+Content-Length over the limit fails the request before the body is read.
+robots.txt is cut at 500 KiB, the size RFC 9309 asks crawlers to read.
+
 ## Crawling
 
 `crawl()` runs `max_concurrent` workers over a priority queue of URLs. A link
 found on a page at depth `d` gets depth `d + 1` and is followed only up to
 `max_depth`, so the site is walked breadth-first. `max_pages` caps the pages
-requested, failed ones included; pages that robots.txt disallows are not
+requested, failed and skipped ones included; pages that robots.txt disallows are not
 requested and do not count, and neither do pages the circuit breaker
 refuses: they wait for their host, see [Circuit breaker](#circuit-breaker). URLs are normalized (including their
 percent-encoding, so `/café` and `/caf%C3%A9` are one page), and each one is
-fetched at most once. The target of a redirect is remembered too, but only
-once the response arrives: if a direct link to it was queued or fetched before
-that, the page is downloaded twice and appears in the results under both URLs.
+fetched at most once. The target of a redirect is remembered before it is
+requested: a later link to it is not fetched, and a redirect to a page
+already seen is not followed (the page is listed in `skipped_urls` as
+`redirected to a page already seen`), so a page is never saved under two
+URLs. If the page fails on the way (the target answers an error, the chain
+is too long), its targets are forgotten: a later link to one of them is
+fetched as any other. A page whose redirect leads to a URL robots.txt disallows is listed in
+`blocked_urls`; it counts toward `max_pages`, as its own request was sent.
+
+Some sites have endless URL spaces: a listing under every sort order and
+filter, a calendar, a session ID in every link. Against them a crawl:
+
+- drops tracking parameters (`utm_*`, `fbclid`, `gclid`, `dclid`,
+  `msclkid`, `yclid`) from every URL it queues, so `/a?utm_source=x` is
+  requested as `/a` and is the same page; the other parameters are kept as
+  they are (`strip_tracking_params`);
+- does not follow a link longer than `MAX_URL_LENGTH` (2048 characters);
+- skips a page whose `<link rel="canonical">` is the same URL with another
+  query and is processed or still to be crawled, such as
+  `/list?page=2&sort=price` with the canonical `/list?page=2`: it is listed
+  in `skipped_urls` as `duplicate of <canonical>`, not returned or saved,
+  and its links, being variants too, are not followed. A canonical URL with
+  another path is not trusted: a site that points every page to its home
+  page would lose them all. Nor is one that failed or was left out: the
+  variant is kept then. A page that names itself, also under the URL it
+  was redirected to, is not a duplicate;
+- with `max_pages_per_host`, requests at most that many pages of one host:
+  the other pages of the host are listed in `skipped_urls` without a
+  request and do not count toward `max_pages`, nor toward the progress and
+  the speed of the crawl (`crawl_stats().over_host_limit` counts them).
+
+The first two happen before a request, the canonical URL is known only
+after it: a variant of a page still counts toward `max_pages`.
+
+With `respect_robots`, a crawl also does what pages ask of crawlers, see
+[politeness.md](politeness.md#robots-directives-of-pages-and-links): links
+marked `rel="nofollow"` are not followed, nor are the links of a page whose
+robots meta tag or `X-Robots-Tag` header says `nofollow`; a page
+that says `noindex` is not returned or saved, and is listed in
+`skipped_urls` as `noindex in X-Robots-Tag` or
+`noindex in a robots meta tag`, but its links are followed. `none` means
+both. A robots meta tag is `<meta name="robots">` or a `<meta>` named
+after the crawler: the robots.txt name of its `user_agent`,
+`<meta name="asyncwebcrawler">` by default. A meta tag or an
+`X-Robots-Tag` header that names another crawler is ignored.
 
 | Option | Effect |
 |--------|--------|
 | `AsyncCrawler(max_depth=2)` | how far from the start pages to go; 0 fetches the start pages only |
 | `AsyncCrawler(max_per_domain=None)` | parallel requests to one host; `None` means only `max_concurrent` applies |
-| `same_domain_only=False` | follow links on the start hosts only (and on the hosts they redirect to) |
+| `max_pages_per_host=None` | pages requested from one host; `None` means only `max_pages` applies |
+| `same_domain_only=False` | follow links on the start hosts only (and on the hosts their redirects end on, not those they pass through); the configuration turns it on by default |
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
+| `exclude_extensions=()` | file extensions such as `"pdf"`; a link to such a file is skipped. Only the last extension of the URL path counts, in any case, the query does not. The configuration sets a list of documents, images, archives and media by default |
 | `sitemap_urls=()` | sitemaps whose pages are crawled too |
 | `robots_sitemaps=False` | also read the sitemaps that robots.txt of the start URLs' sites names; needs `respect_robots` |
 
 Filters apply to discovered links, not to the start URLs. Patterns match the
 normalized URL both percent-encoded and decoded, so `r"/café"` works. A link
 that passes the filters but redirects to a URL that does not, such as a
-sign-in page on another domain, is skipped: it is left out of the results
-and listed in `skipped_urls` as `redirected out of scope`.
+sign-in page on another domain, is skipped without requesting the target:
+it is left out of the results and listed in `skipped_urls` as
+`redirected out of scope`.
 Invalid start URLs, sitemap URLs or patterns raise `ValueError` before anything is fetched.
 
 ```python
@@ -314,19 +381,32 @@ is saved and its links are queued. `crawl()` then returns an empty dict,
 the pages are in the storage and the counts in `stats` and `crawl_stats()`;
 memory stays nearly flat (see [performance.md](performance.md)).
 
+The queue is bounded by `max_pages` as well: a large site can have far more
+links than a crawl will ever request, and each one queued costs memory and
+work. Once the pages queued, in progress and requested reach
+`FRONTIER_FACTOR` (3) times `max_pages`, new links and sitemap pages are not
+queued, nor remembered, so a page found again later is queued if there is
+room by then. The spare room is for pages that do not count toward
+`max_pages` (disallowed by robots.txt, over `max_pages_per_host`); a crawl
+whose queue is mostly such pages may end before `max_pages`. With
+`max_pages_per_host`, a host gets at most `FRONTIER_FACTOR` times that many
+pages queued in the whole crawl, so a large site cannot fill the queue
+with pages it would skip and crowd out the other hosts. How many links
+were left out, and why, is logged at the end of the crawl.
+
 After a crawl, and during one, the crawler exposes its state:
 
 | Attribute | Content |
 |-----------|---------|
 | `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()`; empty with `keep_pages=False` |
 | `failed_urls` | `{url: "ErrorType: message"}` |
-| `skipped_urls` | `{url: reason}` for pages fetched but left out, e.g. redirected out of scope |
+| `skipped_urls` | `{url: reason}` for pages fetched but left out: not HTML, redirected out of scope or to a page already seen, `noindex`, or a duplicate by the canonical URL; also pages not requested over `max_pages_per_host` |
 | `blocked_urls` | `{url: reason}` for pages robots.txt did not allow to fetch |
 | `unreachable_urls` | `{url: reason}` for pages not fetched because robots.txt of their site was unreachable |
 | `failed_sitemaps` | `{sitemap url: "ErrorType: message"}` for sitemaps that could not be read |
 | `visited_urls` | every URL taken for fetching, successful or not |
 | `url_depths` | depth of every URL accepted into the queue; 0 for start URLs and pages listed in sitemaps |
-| `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit; pages saved and not saved, see [Saving pages](#saving-pages) |
+| `crawl_stats()` | `CrawlStats`: processed, failed, skipped (`over_host_limit` of them not requested over `max_pages_per_host`), blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit; pages saved and not saved, see [Saving pages](#saving-pages) |
 | `stats.get_stats()` | the pages by outcome, status code and domain, see [Page statistics](#page-statistics) |
 | `error_stats()` | `ErrorStats`, see [Error statistics](#error-statistics) |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
@@ -354,7 +434,7 @@ print(f"{stats['successful']} of {stats['total_pages']} pages in {stats['elapsed
 | `total_pages` | pages the crawl is done with: `successful + failed + skipped` |
 | `successful` | pages fetched and parsed, the ones `crawl()` returns |
 | `failed` | pages in `failed_urls` |
-| `skipped` | pages in `skipped_urls`: fetched, but redirected out of scope |
+| `skipped` | pages in `skipped_urls`: fetched, but not HTML, redirected out of scope or to a page already seen, `noindex`, or a duplicate by the canonical URL; or not requested over `max_pages_per_host` |
 | `elapsed_seconds` | running time of the crawl, up to now while it runs |
 | `pages_per_second` | `total_pages / elapsed_seconds` |
 | `avg_response_time` | average time of a page request (of its last attempt, if retried) |
@@ -415,8 +495,8 @@ asyncio.run(main())
 
 | Member | What it does |
 |--------|--------------|
-| `AdvancedCrawler(config)` | takes a `CrawlerConfig`; the defaults without one |
-| `AdvancedCrawler.from_config(path, overrides)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
+| `AdvancedCrawler(config, configure_logging=True)` | takes a `CrawlerConfig`; the defaults without one |
+| `AdvancedCrawler.from_config(path, overrides, configure_logging=True)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
 | `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section; returns the pages by URL |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
 | `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics) |
@@ -430,7 +510,9 @@ if they are missing. A configuration with neither `urls` nor `sitemaps.urls`
 makes `crawl()` raise `ConfigError`. A report that cannot be written is
 logged and does not fail the crawl. Logging is set up when the crawler is
 made (see [Logging](#logging)) and belongs to the whole process: with two
-crawlers at once the log is written as the later one says.
+crawlers at once the log is written as the later one says. A program that
+sets up logging itself passes `configure_logging=False`: the crawler then
+leaves logging alone, `close()` too, and the `logging` section is ignored.
 
 To show the progress of the crawl, run it as a task and pass the inner
 crawler to `show_progress`:
@@ -458,17 +540,17 @@ async with AsyncCrawler() as crawler:
 ```
 
 ```
-[######--------------]  30% | 30/100 pages, 1 failed | 1.6 pages/s | ETA 44s | active 6 (2 in flight) | queued 88 | 19s
+[######--------------]  30% | 30/100 pages, 1 failed | 1.6 pages/s | ETA 44s | active 6 (2 in flight) | queued 64 | 19s
 ```
 
 | Part | Meaning |
 |------|---------|
 | bar, percent | pages done of `max_pages`, rounded down |
-| `30/100 pages, 1 failed` | pages requested and finished (processed, failed, skipped), and the failed among them |
+| `30/100 pages, 1 failed` | pages requested and finished (processed, failed, skipped; not the pages over `max_pages_per_host`, which are skipped without a request), and the failed among them |
 | `pages/s` | the speed over the last 10 seconds |
 | `ETA` | the time the remaining pages take at that speed; `--` while the speed is 0, `done` once the crawl has ended |
 | `active`, `in flight` | pages taken by workers, and the HTTP requests being made |
-| `queued` | pages waiting in the queue |
+| `queued` | pages waiting in the queue, but no more than `max_pages` leaves to request: the rest will not be fetched |
 | the last value | the time since the crawl started |
 
 The percent and the time left are measured against `max_pages`: a site with
@@ -562,15 +644,15 @@ the same types:
 | `title` | the page title; an empty string if it has none |
 | `text` | visible text of the page |
 | `links` | absolute links found on the page |
-| `metadata` | `description`, `keywords`, `language`, `canonical`, plus `final_url` (the URL after redirects) and `depth` in the crawl |
+| `metadata` | `description`, `keywords`, `language`, `canonical`, `robots`, plus `final_url` (the URL after redirects) and `depth` in the crawl |
 | `crawled_at` | when the page was processed: a `datetime` in UTC |
 | `status_code` | HTTP status of the response |
 | `content_type` | media type of the response; an empty string if the server sent none |
 
 | Storage | Keeps the pages in | Notes |
 |---------|--------------------|-------|
-| `JSONStorage(path, indent=None)` | a JSON Lines file, or one indented array with `indent` | records are added without reading the file, and read back in pieces; the array is valid JSON after every write |
-| `CSVStorage(path, encoding="utf-8")` | a CSV file with a header row | the header comes from the first record, or from the file if it exists; `links` and `metadata` are JSON in a cell; quoting per RFC 4180; a character the encoding lacks is written as `?` |
+| `JSONStorage(path, indent=None, overwrite=False)` | a JSON Lines file, or one indented array with `indent` | records are added without reading the file, and read back in pieces; the array is valid JSON after every write |
+| `CSVStorage(path, encoding="utf-8", overwrite=False)` | a CSV file with a header row | the header comes from the first record, or from the file if it exists; `links` and `metadata` are JSON in a cell; quoting per RFC 4180; a character the encoding lacks is written as `?` |
 | `SQLiteStorage(path)` | the `pages` table of an SQLite file | `links` and `metadata` as JSON text, `crawled_at` as ISO 8601 in UTC |
 | `PostgresStorage(dsn)` | the `pages` table of a PostgreSQL database | `links` and `metadata` as `JSONB`, `crawled_at` as `TIMESTAMPTZ`; a connection pool |
 | `CompositeStorage(*storages)` | each of the storages | a page counts as written once all of them have it; one failing does not stop the others |
@@ -599,6 +681,14 @@ A database storage creates its table on the first use (`init_db()`), with
 transaction: all of its pages are saved or none. Saving a URL again replaces
 its row. `count()`, `status_counts()` and `get(url)` query the table.
 
+A file storage adds to the file if it exists, so a second crawl with the
+same file keeps the pages of the first one, and a page fetched by both is
+in the file twice; adding to a file that is not empty is logged as a
+warning. With `overwrite=True` the file is started anew: what it held is
+dropped on the first write (a crawl that saves nothing leaves it as it
+was), and a file that could not be added to, such as one of the other JSON
+layout, is replaced too.
+
 In a crawl, a failed save never stops the crawler: it is logged, the page
 stays in the results, and `crawl_stats()` counts `saved` and `save_failed`.
 `saved` counts the pages actually written out, so pages still in the buffer
@@ -612,7 +702,8 @@ are written at the end of the crawl, or counted as `save_failed`.
 `storage_from_output(output)` chooses the storage by the name of a file:
 `.jsonl` (or `.ndjson`) is JSON Lines, `.json` an indented array, `.csv` CSV,
 `.db` (or `.sqlite`, `.sqlite3`) SQLite; a string with `://` is a database
-URL. This is what the `storage.outputs` of a configuration file go through.
+URL. `overwrite=True` reaches the file storages only. This is what the
+`storage.outputs` of a configuration file go through.
 
 The database is chosen by a URL: `storage_from_url(url)` takes it as an
 argument, `storage_from_env()` reads it from `CRAWLER_DATABASE_URL` and
@@ -659,8 +750,8 @@ storage = storage_from_url("mysql://user:password@host/database")
 | `url`, `final_url` | requested URL and the URL after redirects |
 | `title` | `<title>`, or `og:title` if it is missing |
 | `text` | visible text of `<main>` (or a single `<article>`, or `<body>`) |
-| `links` | absolute, normalized, unique `http(s)` links in page order |
-| `metadata` | `title`, `description`, `keywords`, `language`, `canonical` |
+| `links` | absolute, normalized, unique `http(s)` links in page order; without those marked `rel="nofollow"` when the crawler follows robots.txt |
+| `metadata` | `title`, `description`, `keywords`, `language`, `canonical`, `robots` (directives of `<meta name="robots">` and, in a crawl, of the `<meta>` named after the crawler; lower case) |
 | `headings` | `h1`-`h3` as `{"level", "text"}` |
 | `images` | `{"src", "alt"}`; `data-src` is used for lazy-loaded images |
 | `tables` | `{"caption", "headers", "rows"}` |
@@ -669,8 +760,17 @@ storage = storage_from_url("mysql://user:password@host/database")
 
 Responses whose `Content-Type` is not HTML are not parsed, and their body is
 not even downloaded: `fetch_and_parse` fails with `ParseError`, and so does
-an empty document; a crawl lists such pages as failed. This keeps a crawl
-from pulling in archives or videos it finds links to. The parser can be used on its own:
+an empty document. A crawl lists a page that is not HTML as skipped
+(`not HTML: application/pdf`), not as failed: nothing went wrong with it, and
+it is not counted in `error_stats()`; its request counts toward `max_pages`.
+An empty document is a failed page. This keeps a crawl from pulling in
+archives or videos it finds links to; `exclude_extensions` keeps it from even
+asking for those whose URL tells what they are. The parser can be used on its own:
 `HTMLParser().parse(html, url)`, or `await HTMLParser().parse_html(html, url)`
 in async code. Pass `AsyncCrawler(parser=HTMLParser(same_host_only=True))` to
-keep only links to the page's own host.
+keep only links to the page's own host. `HTMLParser(skip_nofollow=True)`
+leaves out links marked `rel="nofollow"`; the crawler's own parser does so
+when `respect_robots` is on, a parser passed in decides for itself.
+`HTMLParser(robots_name="mybot")` adds the directives of
+`<meta name="mybot">` to those of `<meta name="robots">`; the crawler's own
+parser takes the robots.txt name of its `user_agent`.

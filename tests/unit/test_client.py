@@ -5,11 +5,13 @@ import logging
 import socket
 import ssl
 import time
+from collections.abc import AsyncIterator
 from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
 from helpers import UNTHROTTLED, FakeClock
+from multidict import CIMultiDict
 
 from crawler import (
     AsyncCrawler,
@@ -26,6 +28,7 @@ from crawler import (
     NetworkError,
     ParseError,
     PermanentError,
+    ProgressTracker,
     RetryStrategy,
     RobotsDisallowedError,
     RobotsUnreachableError,
@@ -43,17 +46,26 @@ class FakeResponse:
         content_type: str | None = "text/html",
         url: str | None = None,
         retry_after: str | None = None,
+        location: str | None = None,
+        robots_tag: tuple[str, ...] = (),
     ) -> None:
         self.status = status
         self._body = body
-        self._encoding = encoding
-        self.headers = {} if content_type is None else {"Content-Type": content_type}
+        self.headers: CIMultiDict[str] = CIMultiDict()
+        if content_type is not None:
+            self.headers["Content-Type"] = content_type
+        for value in robots_tag:
+            self.headers.add("X-Robots-Tag", value)
         if retry_after is not None:
             self.headers["Retry-After"] = retry_after
+        if location is not None:
+            self.headers["Location"] = location
         self.content_type = content_type or "application/octet-stream"
-        # None means "not redirected": FakeSession fills in the requested URL.
+        # None means the requested URL, which FakeSession fills in.
         self.url = url
-        self.history = () if url is None else (MagicMock(),)
+        self.charset = encoding
+        self.content_length: int | None = None
+        self.content = self  # a body read in chunks
         self.read_count = 0
 
     def raise_for_status(self) -> None:
@@ -70,8 +82,10 @@ class FakeResponse:
         self.read_count += 1
         return self._body
 
-    def get_encoding(self) -> str:
-        return self._encoding
+    async def iter_chunked(self, size: int) -> AsyncIterator[bytes]:
+        self.read_count += 1
+        for start in range(0, len(self._body), size):
+            yield self._body[start : start + size]
 
 
 class FakeRequest:
@@ -105,8 +119,13 @@ class FakeSession:
         self.timeouts: list[aiohttp.ClientTimeout | None] = []  # per-request timeouts
 
     def get(
-        self, url: str, headers: dict[str, str] | None = None, timeout: aiohttp.ClientTimeout | None = None
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        timeout: aiohttp.ClientTimeout | None = None,
+        allow_redirects: bool = True,
     ) -> FakeRequest:
+        assert not allow_redirects  # the crawler follows redirects itself
         self.user_agents.append(None if headers is None else headers.get("User-Agent"))
         self.timeouts.append(timeout)
         return FakeRequest(self, url)
@@ -348,13 +367,23 @@ class TestFetchMany:
         assert result.final_url == "http://a"
         assert result.content_type == "text/html"
         assert result.redirected is False
+        assert result.robots_tag == ()
+
+    async def test_robots_tag_for_this_crawler(self, crawler, fake_session):
+        headers = ("noindex", "otherbot: nofollow", "AsyncWebCrawler: noarchive")
+        fake_session.routes["http://a"] = FakeResponse(robots_tag=headers)
+        [result] = await crawler.fetch_many(["http://a"])
+        assert result.robots_tag == ("noindex", "noarchive")
 
     async def test_redirect_and_missing_content_type(self, crawler, fake_session):
-        fake_session.routes["http://a"] = FakeResponse(content_type=None, url="https://a/home")
+        fake_session.routes["http://a"] = FakeResponse(status=302, location="https://a/home")
+        fake_session.routes["https://a/home"] = FakeResponse(content_type=None)
         [result] = await crawler.fetch_many(["http://a"])
+        assert result.url == "http://a"
         assert result.final_url == "https://a/home"
         assert result.content_type is None
         assert result.redirected is True
+        assert fake_session.requested == ["http://a", "https://a/home"]
 
     async def test_unexpected_error_does_not_cancel_batch(self, crawler, fake_session):
         fake_session.latency = 0.01
@@ -448,8 +477,17 @@ class TestRetries:
             await crawler.fetch_url("http://a")
 
         assert fake_session.requested == ["http://a"]
-        # The host waits as long as a retry could, not the two minutes asked for.
-        assert crawler.rate_limiter.reserve("a") == pytest.approx(5.0, abs=0.1)
+        # The host waits the two minutes asked for, though a retry could not.
+        assert crawler.rate_limiter.reserve("a") == pytest.approx(120.0, abs=0.1)
+
+    async def test_retry_after_is_capped(self, make_crawler, fake_session, caplog):
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=0))
+        fake_session.routes["http://a"] = FakeResponse(status=429, retry_after="86400")
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_url("http://a")
+
+        assert crawler.rate_limiter.reserve("a") == pytest.approx(AsyncCrawler.MAX_RETRY_AFTER, abs=0.1)
+        assert "a asked to wait 86400s (Retry-After), waiting 600s" in caplog.text
 
     async def test_timeouts_grow_with_every_retry(self, make_crawler, fake_session):
         crawler = make_crawler(
@@ -767,6 +805,128 @@ class TestCrawlBlockedHost:
         assert crawler.failed_urls.keys() == {"http://a/1"}
         assert crawler.processed_urls.keys() == {"http://a/2", "http://a/3"}
         assert crawler.crawl_stats().queued == 0
+
+    async def test_last_page_of_max_pages_refused_after_its_wait_is_crawled_later(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            max_concurrent=2,
+            max_depth=0,
+            requests_per_second=20,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.1),
+        )
+        fake_session.routes["http://a/1"] = aiohttp.ClientConnectionError("refused")
+
+        # a/2 reaches max_pages and closes the queue, then waits for its turn
+        # while a/1 opens the circuit: it is refused, deferred and probes the host later.
+        await crawler.crawl(["http://a/1", "http://a/2"], max_pages=2)
+
+        assert fake_session.requested == ["http://a/1", "http://a/2"]
+        assert crawler.failed_urls.keys() == {"http://a/1"}
+        assert crawler.processed_urls.keys() == {"http://a/2"}
+        assert crawler.crawl_stats().queued == 0
+
+
+class TestRedirectLimit:
+    @staticmethod
+    def chain(fake_session: FakeSession, redirects: int) -> None:
+        for hop in range(redirects):
+            fake_session.routes[f"http://a/{hop}"] = FakeResponse(status=302, location=f"http://a/{hop + 1}")
+
+    async def test_max_redirects_are_followed(self, crawler, fake_session):
+        self.chain(fake_session, AsyncCrawler.MAX_REDIRECTS)
+
+        result = await crawler.fetch_result("http://a/0")
+
+        assert result.ok
+        assert result.final_url == "http://a/10"
+        assert len(fake_session.requested) == 11
+
+    async def test_one_more_fails_without_asking_for_its_target(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=1, max_depth=1)
+        self.chain(fake_session, AsyncCrawler.MAX_REDIRECTS + 1)
+        fake_session.routes["http://b/"] = FakeResponse(b'<a href="http://a/11">11</a>')
+
+        await crawler.crawl(["http://a/0", "http://b/"])
+
+        assert crawler.failed_urls == {"http://a/0": "TooManyRedirectsError: too many redirects (more than 10)"}
+        # The target the chain did not reach is not taken for a page already seen.
+        assert crawler.processed_urls.keys() == {"http://b/", "http://a/11"}
+        assert fake_session.requested.count("http://a/11") == 1
+
+
+class TestHostQueueLimit:
+    async def test_host_over_its_limit_leaves_room_for_the_others(self, make_crawler, fake_session, caplog):
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(max_concurrent=1, max_depth=1)
+        links = [f"http://a/{n}" for n in range(1, 101)] + ["http://b/", "http://c/", "http://d/"]
+        fake_session.routes["http://a/0"] = FakeResponse("".join(f'<a href="{link}">x</a>' for link in links).encode())
+
+        # The queue holds 3 x 12 pages; a host with a limit of 3 pages gets 3 x 3 of them.
+        await crawler.crawl(["http://a/0"], max_pages=12, max_pages_per_host=3, same_domain_only=False)
+
+        assert crawler.processed_urls.keys() == {
+            "http://a/0",
+            "http://a/1",
+            "http://a/2",
+            "http://b/",
+            "http://c/",
+            "http://d/",
+        }
+        assert len(crawler.skipped_urls) == 6  # a/3 to a/8, over max_pages_per_host
+        stats = crawler.crawl_stats()
+        assert (stats.skipped, stats.over_host_limit) == (6, 6)
+        # Not requested: the crawl ended with half of max_pages done, not all of it.
+        assert ProgressTracker(max_pages=12).update(stats, finished=True).done == 6
+        messages = [record.getMessage() for record in caplog.records]
+        assert "Host a has 9 pages queued (3 x max_pages_per_host): its new links are not queued" in messages
+        assert "92 links were not queued: their host had 3 x max_pages_per_host pages queued" in messages
+
+    async def test_no_limit_by_host_without_max_pages_per_host(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=1, max_depth=1)
+        fake_session.routes["http://a/0"] = FakeResponse(
+            "".join(f'<a href="http://a/{n}">x</a>' for n in range(1, 11)).encode()
+        )
+
+        await crawler.crawl(["http://a/0"], max_pages=20)
+
+        assert len(crawler.processed_urls) == 11
+
+
+class TestCrawlDuplicates:
+    async def test_variant_of_a_page_that_failed_is_kept(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=0))
+        fake_session.routes["http://a/list"] = FakeResponse(status=404)
+        fake_session.routes["http://a/list?page=2"] = FakeResponse(b'<link rel="canonical" href="http://a/list">')
+
+        await crawler.crawl(["http://a/list", "http://a/list?page=2"])
+
+        assert crawler.failed_urls.keys() == {"http://a/list"}
+        assert crawler.processed_urls.keys() == {"http://a/list?page=2"}
+
+    async def test_variant_of_a_page_still_queued_is_skipped(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=1, max_depth=0)
+        fake_session.routes["http://a/list?page=2"] = FakeResponse(b'<link rel="canonical" href="http://a/list">')
+
+        await crawler.crawl(["http://a/list?page=2", "http://a/list"])
+
+        assert crawler.skipped_urls == {"http://a/list?page=2": "duplicate of http://a/list"}
+        assert crawler.processed_urls.keys() == {"http://a/list"}
+
+    async def test_page_refused_at_its_redirect_target_counts_toward_max_pages(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            max_concurrent=1,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+        fake_session.routes["http://b/down"] = aiohttp.ClientConnectionError("refused")
+        fake_session.routes["http://a/1"] = FakeResponse(status=302, location="http://b/1")
+        await crawler.fetch_result("http://b/down")
+
+        # a/1 is requested, its redirect to b is refused: the request to a was sent all the same.
+        await crawler.crawl(["http://a/1", "http://a/2"], max_pages=2)
+
+        assert fake_session.requested == ["http://b/down", "http://a/1", "http://a/2"]
+        assert crawler.processed_urls.keys() == {"http://a/2"}
+        assert crawler.crawl_stats().queued == 1
 
 
 class TestCrawlPageStats:

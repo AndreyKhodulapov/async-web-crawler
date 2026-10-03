@@ -1,11 +1,13 @@
 import asyncio
+import contextlib
+import gzip
 import logging
 import time
 from collections import Counter
 
 import pytest
 from aiohttp import web
-from pages import ENCODING_PAGES, SITE_PAGES, fixture_html
+from pages import ENCODING_PAGES, SITE_HEADERS, SITE_PAGES, fixture_html
 
 from crawler.logging_setup import reset_logging
 from demo_site import free_port
@@ -15,8 +17,11 @@ class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
-    sitemaps and robots.txt, in the order they arrived. `robots` is the
+    /busy/, /shop/, sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404.
+    With `robots_endless`, comment lines follow the body for as long as
+    the client reads them. `robots_by_host` gives other hosts of the server
+    a robots.txt of their own.
     `sitemaps` maps the names of the files under /sitemaps/ to their
     bodies; the first `sitemap_failures` requests for them answer 503.
     `sitemap_headers` are added to the responses with them.
@@ -30,6 +35,8 @@ class SiteState:
         self.peak_in_flight = 0
         self.robots: str | None = None
         self.robots_status = 200
+        self.robots_endless = False
+        self.robots_by_host: dict[str, str] = {}
         self.sitemaps: dict[str, bytes] = {}
         self.sitemap_failures = 0
         self.sitemap_headers: dict[str, str] = {}
@@ -77,12 +84,44 @@ async def encoding_page(request: web.Request) -> web.Response:
     return web.Response(body=body, headers={"Content-Type": content_type})
 
 
-async def robots_txt(request: web.Request) -> web.Response:
+async def robots_txt(request: web.Request) -> web.StreamResponse:
     state = request.app[SITE_STATE]
     state.record(request)
+    if request.url.host in state.robots_by_host:
+        return web.Response(text=state.robots_by_host[request.url.host])
     if state.robots is None:
         raise web.HTTPNotFound()
-    return web.Response(text=state.robots, status=state.robots_status)
+    if not state.robots_endless:
+        return web.Response(text=state.robots, status=state.robots_status)
+    response = web.StreamResponse(status=state.robots_status, headers={"Content-Type": "text/plain"})
+    await response.prepare(request)
+    await response.write(state.robots.encode())
+    with contextlib.suppress(ConnectionResetError):  # the client stops reading
+        while True:
+            await response.write(b"# padding\n" * 1000)
+    return response
+
+
+async def endless_page(request: web.Request) -> web.StreamResponse:
+    """An HTML page that never ends, sent without Content-Length."""
+    response = web.StreamResponse(headers={"Content-Type": "text/html"})
+    await response.prepare(request)
+    await response.write(b"<title>Endless</title>")
+    with contextlib.suppress(ConnectionResetError):  # the client stops reading
+        while True:
+            await response.write(b"<p>" + b"x" * 65536 + b"</p>")
+    return response
+
+
+async def large_page(request: web.Request) -> web.Response:
+    """A 2 MB page; its Content-Length tells the size before the body."""
+    return web.Response(body=b"<title>Large</title>" + b"x" * 2_000_000, content_type="text/html")
+
+
+async def gzip_bomb(request: web.Request) -> web.Response:
+    """A few kilobytes on the wire that the client unpacks into 20 MB of HTML."""
+    body = gzip.compress(b"<title>Bomb</title>" + b" " * 20_000_000)
+    return web.Response(body=body, headers={"Content-Type": "text/html", "Content-Encoding": "gzip"})
 
 
 async def sitemap(request: web.Request) -> web.Response:
@@ -108,6 +147,52 @@ async def flaky(request: web.Request) -> web.Response:
     return web.Response(text="<title>Recovered</title>", content_type="text/html")
 
 
+async def busy(request: web.Request) -> web.Response:
+    """Answers 429 with Retry-After of `seconds`."""
+    request.app[SITE_STATE].record(request)
+    raise web.HTTPTooManyRequests(headers={"Retry-After": request.match_info["seconds"]})
+
+
+SHOP_PAGES = 20
+SHOP_SORTS = ("price", "name", "date")
+
+
+async def shop_list(request: web.Request) -> web.Response:
+    """Page N of a listing, under every sort order: an endless-looking URL space.
+
+    /shop/list?page=N, with or without &sort=S, links to every sort order of
+    the page, to the next page in the same order, to item N and, as a share
+    button, to itself with utm_source. Its canonical URL is /shop/list?page=N.
+    """
+    request.app[SITE_STATE].record(request)
+    page = int(request.query.get("page", "1"))
+    sort = request.query.get("sort")
+    order = "" if sort is None else f"&sort={sort}"
+    links = [f"list?page={page}&sort={each}" for each in SHOP_SORTS]
+    links += [f"item/{page}", f"list?page={page}{order}&utm_source=share"]
+    if page < SHOP_PAGES:
+        links.append(f"list?page={page + 1}{order}")
+    html = f'<link rel="canonical" href="/shop/list?page={page}"><title>Page {page}</title>'
+    html += " ".join(f'<a href="{link}">{link}</a>' for link in links)
+    return web.Response(text=html, content_type="text/html")
+
+
+async def shop_item(request: web.Request) -> web.Response:
+    request.app[SITE_STATE].record(request)
+    return web.Response(text=f"<title>Item {request.match_info['n']}</title>", content_type="text/html")
+
+
+WIDE_LINKS = 50
+
+
+async def wide_page(request: web.Request) -> web.Response:
+    """Page N links to WIDE_LINKS pages of its own: a site far larger than any crawl of it."""
+    request.app[SITE_STATE].record(request)
+    first = int(request.match_info["n"]) * WIDE_LINKS + 1
+    html = " ".join(f'<a href="{n}">{n}</a>' for n in range(first, first + WIDE_LINKS))
+    return web.Response(text=f"<title>Wide</title>{html}", content_type="text/html")
+
+
 async def site_page(request: web.Request) -> web.Response:
     state = request.app[SITE_STATE]
     state.record(request)
@@ -119,12 +204,28 @@ async def site_page(request: web.Request) -> web.Response:
         state.in_flight -= 1
     if request.path == "/site/moved":
         raise web.HTTPFound("/site/c.html")
+    if request.path == "/site/to-missing":
+        raise web.HTTPFound("/site/missing.html")
     if request.path == "/site/to-other-host":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/")
+    if request.path == "/site/bounce":
+        # Through a page of another host, like a consent page, and back.
+        raise web.HTTPFound(f"http://localhost:{request.url.port}/site/bounce-back")
+    if request.path == "/site/bounce-back":
+        raise web.HTTPFound(f"http://127.0.0.1:{request.url.port}/site/")
+    if request.path == "/site/go":
+        raise web.HTTPFound("/site/private/secret")
+    if request.path == "/site/lang" and "hl" not in request.query:
+        raise web.HTTPFound("/site/lang?hl=en")
+    if request.path == "/site/cookie-check" and "checked" not in request.cookies:
+        # Sends the client back to the same page with a cookie.
+        response = web.HTTPFound("/site/cookie-check")
+        response.set_cookie("checked", "1")
+        raise response
     if request.path not in SITE_PAGES:
         raise web.HTTPNotFound()
     html = SITE_PAGES[request.path].replace("{other_host}", f"http://localhost:{request.url.port}")
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(text=html, content_type="text/html", headers=SITE_HEADERS.get(request.path))
 
 
 @pytest.fixture
@@ -148,11 +249,18 @@ async def server(aiohttp_server):
     app.router.add_get("/catalog/tools/", catalog)
     app.router.add_get("/moved", moved)
     app.router.add_get("/data.json", json_data)
+    app.router.add_get("/huge/endless", endless_page)
+    app.router.add_get("/huge/large", large_page)
+    app.router.add_get("/huge/gzip", gzip_bomb)
     app.router.add_get("/encoding/{name}", encoding_page)
     app.router.add_get("/site/{path:.*}", site_page)
     app.router.add_get("/robots.txt", robots_txt)
     app.router.add_get("/sitemaps/{name}", sitemap)
     app.router.add_get("/flaky/{fails}", flaky)
+    app.router.add_get("/busy/{seconds}", busy)
+    app.router.add_get("/shop/list", shop_list)
+    app.router.add_get("/shop/item/{n}", shop_item)
+    app.router.add_get("/wide/{n}", wide_page)
     return await aiohttp_server(app)
 
 

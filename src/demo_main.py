@@ -714,6 +714,7 @@ def save_error_report(path: Path, crawler: AsyncCrawler) -> None:
     report = {
         **error_report(crawler),
         "failed": [{"url": url, "error": error} for url, error in crawler.failed_urls.items()],
+        "skipped": [{"url": url, "reason": reason} for url, reason in crawler.skipped_urls.items()],
         "fetched": list(crawler.processed_urls),
     }
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -723,7 +724,7 @@ def save_error_report(path: Path, crawler: AsyncCrawler) -> None:
 async def run_errors(args: argparse.Namespace) -> None:
     async with DemoSite(extra_links=args.urls) as site:
         print(f"Crawling {site.url}: ordinary pages, HTTP 503, 429, 500, 404 and 403, a slow page,", file=sys.stderr)
-        print("a JSON file, a server that is down and a domain that does not exist\n", file=sys.stderr)
+        print("an empty page, a JSON file, a server that is down and a domain that does not exist\n", file=sys.stderr)
         # Depth 1: the start page and its links, none of theirs. Two requests
         # to a host at a time keep the pages in the order of the links.
         async with make_crawler(args, max_depth=1, max_per_domain=2) as crawler:

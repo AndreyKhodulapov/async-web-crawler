@@ -115,7 +115,8 @@ sites it visits and follows their rules.
   still ends empty. Count such pages apart from the disallowed ones, so the
   report does not blame robots.txt for a network failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
-  origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB.
+  origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB,
+  and stop downloading there: a huge or endless file must not fill the memory.
 - **Single flight**: when many workers reach a new site at once, they must
   share one robots.txt download. Cache the `Task` rather than its result, and
   `await asyncio.shield(task)` so that one cancelled caller does not cancel
@@ -126,6 +127,25 @@ sites it visits and follows their rules.
 - robots.txt is a convention, not access control: it tells polite crawlers
   what to skip, and it does not protect anything.
 
+## Robots directives of pages and links
+
+- robots.txt speaks for a whole site before a request; a page can speak
+  for itself after it: `<meta name="robots" content="noindex, nofollow">`
+  in its HTML, or an `X-Robots-Tag` response header, which works for any
+  file type. Either may speak to one crawler: `<meta name="mybot"
+  content="noindex">`, `X-Robots-Tag: mybot: noindex`. The name is the one
+  robots.txt knows the crawler by; directives for all crawlers and for
+  this one add up.
+- `nofollow` on a page: do not follow its links. `rel="nofollow"` on a
+  link: do not follow that one. `noindex`: do not keep the page; its links
+  may still be followed (`noindex, follow` is common on listing pages).
+  `none` is `noindex, nofollow`.
+- Here they are honored together with robots.txt (`respect_robots`): a
+  `noindex` page is listed as skipped (`noindex in X-Robots-Tag`) and not
+  saved, `nofollow` links are dropped by the parser. Not part of RFC 9309,
+  but search engines follow them, and site owners expect a polite crawler
+  to do the same.
+
 ## Backing off a struggling site
 
 - Which errors to retry and how long to wait between retries is in
@@ -134,7 +154,14 @@ sites it visits and follows their rules.
 - A 429 or a timeout usually means the **whole site** is struggling:
   penalize the host in the rate limiter, so that every worker slows down,
   not only the one that failed. A Retry-After is a request to the whole
-  crawler: it holds back the host even when the failed URL is not retried.
+  crawler: it holds back the host for as long as it asks, even when the
+  failed URL is not retried and the wait is longer than any retry pause.
+  Coming back after 30 seconds when asked for 2 minutes is what gets a bot
+  blocked. Cap it all the same (here 10 minutes): a misconfigured server
+  must not stop the crawl for a day.
+- While a host is held back for long, put its pages aside rather than let
+  workers wait for it: otherwise one host blocks the crawl of all the
+  others (head-of-line blocking).
   Scrapy's AutoThrottle adapts the delay to latency the same way.
 
 ## User-Agent

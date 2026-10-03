@@ -1,6 +1,7 @@
-"""Unit tests for JSONStorage: both file layouts, appending, reading back."""
+"""Unit tests for JSONStorage: both file layouts, appending, overwriting, reading back."""
 
 import json
+import logging
 
 import pytest
 from helpers import make_record
@@ -220,3 +221,57 @@ class TestBothLayouts:
 
         with pytest.raises(TypeError, match="set is not JSON serializable"):
             await storage.save(make_record(metadata={"tags": {"a"}}))
+
+
+@LAYOUTS
+class TestOverwrite:
+    async def test_file_of_an_earlier_run_is_replaced(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        first, second = make_records(4)[:2], make_records(4)[2:]
+        async with JSONStorage(path, indent=indent) as storage:
+            for record in first:
+                await storage.save(record)
+
+        async with JSONStorage(path, indent=indent, overwrite=True, batch_size=1) as storage:
+            for record in second:
+                await storage.save(record)
+
+            assert await read_all(storage) == second
+        if indent is not None:
+            assert len(json.loads(path.read_text(encoding="utf-8"))) == 2
+
+    async def test_file_that_cannot_be_added_to_is_replaced(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        path.write_text("not this storage's file")
+        record = make_record()
+
+        async with JSONStorage(path, indent=indent, overwrite=True) as storage:
+            await storage.save(record)
+
+            assert await read_all(storage) == [record]
+
+    async def test_file_is_kept_until_the_first_write(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        path.write_text("kept")
+
+        async with JSONStorage(path, indent=indent, overwrite=True) as storage:
+            await storage.flush()
+
+        assert path.read_text() == "kept"
+
+    async def test_adding_to_a_file_is_logged(self, tmp_path, indent, caplog):
+        caplog.set_level(logging.WARNING, logger="crawler.storage")
+        path = tmp_path / "pages"
+        async with JSONStorage(path, indent=indent) as storage:
+            await storage.save(make_record("https://site/a"))
+        async with JSONStorage(path, indent=indent, overwrite=True) as storage:
+            await storage.save(make_record("https://site/b"))
+        assert caplog.records == []
+        size = path.stat().st_size
+
+        async with JSONStorage(path, indent=indent) as storage:
+            await storage.save(make_record("https://site/c"))
+
+        [warning] = caplog.records
+        assert warning.levelno == logging.WARNING
+        assert warning.getMessage().startswith(f"{path} already has {size} bytes: adding the pages to it;")

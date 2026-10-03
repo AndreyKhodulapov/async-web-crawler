@@ -12,8 +12,7 @@ crawler:
   max_pages: 500
   rate_limit: 2.0           # requests per second
 filters:
-  same_domain_only: true
-  exclude: ['\.pdf$']
+  exclude: ['/login']
 storage:
   outputs: [pages.jsonl]    # files by extension, or database URLs
 ```
@@ -66,6 +65,7 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `max_pages` | whole number, >= 1 | `100` | pages requested, failed ones included |
+| `max_pages_per_host` | whole number, >= 1, or `null` | `null` | pages requested from one host; the others of that host are skipped without a request, and no more than 3 times as many are queued; `null` for no limit of its own |
 | `max_depth` | whole number, >= 0 | `2` | links followed from a start URL; 0 crawls the start URLs only |
 | `max_concurrent` | whole number, >= 1 | `10` | requests in flight |
 | `max_per_domain` | whole number, >= 1, or `null` | `null` | requests in flight to one host; `null` for no limit of its own |
@@ -73,13 +73,14 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `per_domain_rate` | true or false | `true` | the rate limit is for each host, not for all of them together |
 | `min_delay` | number, >= 0 | `0.0` | pause between two requests to a host |
 | `jitter` | number, >= 0 | `0.0` | random addition to the pause, up to this much |
-| `respect_robots` | true or false | `true` | check robots.txt before every request |
+| `respect_robots` | true or false | `true` | check robots.txt before every request, and follow `nofollow` and `noindex` of pages and links |
 | `user_agent` | string, one line | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name; spaces and line breaks around it are dropped |
 | `user_agents` | list of strings | `[]` | variants to rotate; each must have the same name as `user_agent` |
 | `total_timeout` | number, > 0 | `30.0` | the whole request, body included |
 | `connect_timeout` | number, > 0 | `10.0` | DNS, TCP and TLS |
 | `read_timeout` | number, > 0 | `20.0` | the longest pause between two chunks of the response |
 | `timeout_growth` | number, >= 1 | `1.5` | the timeouts grow by this factor on every retry |
+| `max_page_size` | whole number, >= 1, or `null` | `10485760` | bytes of a page body (10 MiB); a larger page fails unread; `null` lifts the limit |
 | `keep_pages` | true or false | `true` | `false` drops a page from memory once it is saved, for large crawls |
 
 ### `retry`
@@ -113,12 +114,25 @@ not to the start URLs.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `same_domain_only` | true or false | `false` | follow links on the hosts of the start URLs and of `sitemaps.urls` only |
+| `same_domain_only` | true or false | `true` | follow links on the hosts of the start URLs and of `sitemaps.urls` only; `false` follows links to any host |
 | `include` | list of regular expressions | `[]` | a link must match at least one; empty means any link |
 | `exclude` | list of regular expressions | `[]` | a matching link is skipped, even if included |
+| `exclude_extensions` | list of file extensions | documents, images, archives, media, programs, `css`, `js` (see `config.example.yaml`) | a link to a file with one of them is not followed; `[]` follows every link |
 
 A pattern is searched anywhere in the URL. In YAML write patterns in single
 quotes, where a backslash is a backslash: `'\.pdf$'`.
+
+An extension is compared with the last one of the file the URL path names,
+in any case and with or without the dot: `pdf` rejects `/files/Manual.PDF`
+and `/report.pdf?v=2`, but not `/view?file=report.pdf`. Write `gz`, not
+`tar.gz`. A page that turns out not to be HTML anyway, such as a PDF behind
+a link without an extension, is requested but not downloaded: it is listed
+as skipped and counts toward `max_pages`.
+
+The library itself, `AsyncCrawler.crawl()`, follows links to any host and
+to files unless given `same_domain_only=True` and `exclude_extensions`; the
+configuration turns both on, so that a crawl stays on the site it was
+started on.
 
 ### `storage`
 
@@ -129,6 +143,7 @@ Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
 | `outputs` | list of strings | `[]` | files or database URLs; the pages go to each of them; empty saves nothing |
 | `batch_size` | whole number, >= 1 | `100` | pages written at once |
 | `csv_encoding` | string | `utf-8` | encoding of CSV files, e.g. `utf-8-sig` for Excel |
+| `overwrite` | true or false | `false` | true starts the files anew on the first write; false adds to them and logs a warning if a file is not empty. A database keeps a row per URL either way |
 
 | Output | Storage |
 |--------|---------|
@@ -232,8 +247,7 @@ crawler:
   rate_limit: 2.0
   keep_pages: false         # memory does not grow with the crawl
 filters:
-  same_domain_only: true
-  exclude: ['\.(pdf|zip|jpg|png)$', '/login']
+  exclude: ['/login']
 storage:
   outputs: ['sqlite:///site.db']
 logging:

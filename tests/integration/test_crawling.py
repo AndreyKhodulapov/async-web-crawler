@@ -1,6 +1,8 @@
 """Integration tests: crawl a small site served by a local aiohttp server."""
 
 import asyncio
+import logging
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from helpers import UNTHROTTLED
@@ -42,10 +44,32 @@ async def test_max_depth_zero_fetches_start_urls_only(url, site):
     assert site.hits.total() == 1
 
 
-async def test_non_html_page_fails_with_parse_error(url):
+async def test_non_html_page_is_skipped(url):
     crawler = await crawl(url("/data.json"), max_depth=0)
+
     assert crawler.processed_urls == {}
-    assert crawler.failed_urls == {url("/data.json"): "ParseError: unsupported content type: application/json"}
+    assert crawler.failed_urls == {}
+    assert crawler.skipped_urls == {url("/data.json"): "not HTML: application/json"}
+    # The page is fine, it is just not one to parse: not an error.
+    assert crawler.error_stats().total == 0
+    assert crawler.stats.get_stats()["skipped"] == 1
+
+
+async def test_non_html_page_counts_toward_max_pages(url, site):
+    async with AsyncCrawler(max_concurrent=1, **UNTHROTTLED) as crawler:
+        await crawler.crawl([url("/data.json"), url("/site/")], max_pages=1)
+
+    # Its request was sent; a site of links to files must not make the crawl endless.
+    assert set(crawler.skipped_urls) == {url("/data.json")}
+    assert site.hits["/site/"] == 0
+
+
+async def test_links_to_files_with_excluded_extensions_are_not_requested(url, site):
+    crawler = await crawl(url("/site/"), max_depth=1, exclude_extensions=["pdf"])
+
+    assert site.hits["/site/files/manual.pdf"] == 0
+    assert url("/site/files/manual.pdf") not in crawler.url_depths
+    assert set(crawler.failed_urls) == {url("/site/missing.html")}
 
 
 async def test_every_page_is_fetched_once(url, site):
@@ -53,11 +77,8 @@ async def test_every_page_is_fetched_once(url, site):
     site.latency = 0.01
     crawler = await crawl(url("/site/"), max_concurrent=10, max_depth=5)
 
-    # The redirect target is the one exception: when a direct link to c.html
-    # is queued or in flight before "moved" is answered, nothing tells the
-    # crawler they are the same page until the response arrives.
-    fetched_twice = {path for path, hits in site.hits.items() if hits > 1}
-    assert fetched_twice <= {"/site/c.html"}
+    # The redirect target too: "moved" leads to c.html, which is also linked directly.
+    assert {path for path, hits in site.hits.items() if hits > 1} == set()
     assert site.hits["/site/"] == 1
     assert crawler.url_depths[url("/site/a/deepest.html")] == 3
 
@@ -72,6 +93,35 @@ async def test_redirect_target_is_not_fetched_again(url, site):
     assert url("/site/c.html") not in crawler.visited_urls
 
 
+async def test_redirect_to_a_page_already_seen_is_not_followed(url, site):
+    # One worker makes the order fixed: c.html is crawled, then "moved" redirects to it.
+    async with AsyncCrawler(max_concurrent=1, max_depth=0, **UNTHROTTLED) as crawler:
+        await crawler.crawl([url("/site/c.html"), url("/site/moved")])
+
+    assert set(crawler.processed_urls) == {url("/site/c.html")}
+    assert crawler.skipped_urls == {url("/site/moved"): f"redirected to a page already seen: {url('/site/c.html')}"}
+    assert site.hits["/site/c.html"] == 1
+
+
+async def test_target_of_a_redirect_that_failed_is_crawled_when_linked(url, site):
+    # One worker: "to-missing" fails at missing.html, then the home page links to missing.html itself.
+    async with AsyncCrawler(max_concurrent=1, max_depth=1, **UNTHROTTLED) as crawler:
+        await crawler.crawl([url("/site/to-missing"), url("/site/")], same_domain_only=True)
+
+    # The target is requested under its own URL, not taken for a page already seen.
+    assert {url("/site/to-missing"), url("/site/missing.html")} <= set(crawler.failed_urls)
+    assert site.hits["/site/missing.html"] == 2
+
+
+async def test_page_that_redirects_to_itself_is_crawled(url, site):
+    # The first answer sets a cookie and sends the client back to the same URL.
+    # (Cookies are not kept for an IP address, hence localhost.)
+    crawler = await crawl(url("/site/cookie-check", "localhost"), max_depth=0)
+
+    assert set(crawler.processed_urls) == {url("/site/cookie-check", "localhost")}
+    assert site.hits["/site/cookie-check"] == 2
+
+
 async def test_max_pages_counts_failed_pages_too(url, site):
     # Breadth-first order: the start page, then a.html, b.html and missing.html.
     crawler = await crawl(url("/site/"), max_pages=4)
@@ -80,6 +130,110 @@ async def test_max_pages_counts_failed_pages_too(url, site):
     assert len(crawler.visited_urls) == 4
     assert site.hits.total() == 4
     assert crawler.crawl_stats().queued > 0
+
+
+class TestBoundedQueue:
+    @pytest.mark.parametrize("max_concurrent", [1, 5])
+    async def test_queue_of_a_wide_site_stays_bounded(self, url, max_concurrent, caplog):
+        # Every page links to 50 new ones. Without the bound all of the 1001
+        # links found were queued, though 20 pages were to be requested.
+        caplog.set_level(logging.INFO, logger="crawler.client")
+        crawler = await crawl(url("/wide/0"), max_concurrent=max_concurrent, max_depth=10, max_pages=20)
+
+        assert len(crawler.processed_urls) == 20
+        assert len(crawler.url_depths) <= AsyncCrawler.FRONTIER_FACTOR * 20
+        assert crawler.crawl_stats().queued <= (AsyncCrawler.FRONTIER_FACTOR - 1) * 20
+        assert "links were not queued: the queue was full" in caplog.text
+
+    async def test_queue_is_breadth_first_within_the_bound(self, url, site):
+        crawler = await crawl(url("/wide/0"), max_concurrent=1, max_depth=10, max_pages=3)
+
+        # Room for 3 * 3 pages; the start page counts twice, in progress and
+        # requested, so it queues 7 of its links, and the first two are crawled.
+        assert list(crawler.processed_urls) == [url("/wide/0"), url("/wide/1"), url("/wide/2")]
+        assert sorted(crawler.url_depths.values()) == [0] + [1] * 7
+
+
+class TestUrlTraps:
+    async def test_variants_of_a_listing_do_not_take_over_the_crawl(self, url):
+        # Every page of the listing links to its three sort orders and a
+        # share link with utm_source; every variant links on in its order.
+        # Without the guards, 46 of the 60 pages saved were variants and 7 were items.
+        crawler = await crawl(url("/shop/list?page=1"), max_concurrent=1, max_depth=100, max_pages=60)
+
+        # A sort order is requested to learn its canonical URL, then skipped
+        # with its links: each page of the listing costs five requests.
+        pages = range(1, 13)
+        assert set(crawler.processed_urls) == {url(f"/shop/list?page={n}") for n in pages} | {
+            url(f"/shop/item/{n}") for n in pages
+        }
+        assert len(crawler.skipped_urls) == 36
+        for variant, reason in crawler.skipped_urls.items():
+            page = parse_qs(urlsplit(variant).query)["page"][0]
+            assert reason == f"duplicate of {url(f'/shop/list?page={page}')}"
+        assert not [url for url in crawler.visited_urls if "utm_source" in url]
+
+    async def test_tracking_parameters_are_dropped(self, url, site):
+        crawler = await crawl(url("/site/c.html?utm_source=mail&utm_medium=x&fbclid=1"), max_depth=0)
+
+        assert set(crawler.processed_urls) == {url("/site/c.html")}
+        assert site.hits["/site/c.html"] == 1
+
+    async def test_variant_by_canonical_url_is_skipped(self, url):
+        start = [url("/site/variant.html"), url("/site/variant.html?ref=nav")]
+        async with AsyncCrawler(max_concurrent=1, max_depth=1, **UNTHROTTLED) as crawler:
+            await crawler.crawl(start)
+
+        assert set(crawler.processed_urls) == {url("/site/variant.html"), url("/site/c.html")}
+        assert crawler.skipped_urls == {start[1]: f"duplicate of {start[0]}"}
+        assert crawler.stats.get_stats()["skipped"] == 1
+
+    async def test_canonical_url_is_not_trusted_on_another_path_or_unseen(self, url):
+        # The home page is seen, but on another path; variant.html is not seen at all.
+        start = [url("/site/"), url("/site/points-home.html"), url("/site/variant.html?ref=nav")]
+        async with AsyncCrawler(max_concurrent=1, max_depth=0, **UNTHROTTLED) as crawler:
+            await crawler.crawl(start)
+
+        assert set(crawler.processed_urls) == set(start)
+        assert crawler.skipped_urls == {}
+
+    async def test_page_redirected_to_a_variant_of_itself_is_not_its_own_duplicate(self, url):
+        crawler = await crawl(url("/site/lang"), max_depth=1)
+
+        assert set(crawler.processed_urls) == {url("/site/lang"), url("/site/c.html")}
+        assert crawler.skipped_urls == {}
+
+    async def test_canonical_url_spelled_otherwise_is_the_page_itself(self, url):
+        # The client decodes "%2F" in the query of the URL it was sent to; the canonical URL keeps it.
+        crawler = await crawl(url("/site/search?path=%2Fdocs"), max_depth=1)
+
+        assert set(crawler.processed_urls) == {url("/site/search?path=%2Fdocs"), url("/site/c.html")}
+        assert crawler.skipped_urls == {}
+
+    async def test_long_links_are_not_followed(self, url, site):
+        crawler = await crawl(url("/site/long.html"), max_depth=1)
+
+        assert set(crawler.processed_urls) == {url("/site/long.html"), url("/site/b.html")}
+        assert site.hits["/site/c.html"] == 0
+
+    async def test_max_pages_per_host(self, url, site):
+        # Breadth-first: the start page, a.html and b.html, then missing.html and
+        # manual.pdf are over the limit of the host; the same site on localhost is not.
+        crawler = await crawl(
+            url("/site/"), max_concurrent=1, max_pages=4, max_pages_per_host=3, same_domain_only=False
+        )
+
+        assert site.hits.total() == 4
+        assert site.hits["/site/"] == 2
+        reason = "max_pages_per_host reached: 3 pages of 127.0.0.1"
+        assert crawler.skipped_urls == {url("/site/missing.html"): reason, url("/site/files/manual.pdf"): reason}
+        assert crawler.crawl_stats().over_host_limit == 2
+        assert set(crawler.processed_urls) == {
+            url("/site/"),
+            url("/site/a.html"),
+            url("/site/b.html"),
+            url("/site/", "localhost"),
+        }
 
 
 async def test_same_domain_only(url, server):
@@ -98,7 +252,15 @@ async def test_start_url_redirect_to_other_host_keeps_that_host(server, url):
     assert f"http://localhost:{server.port}/site/a.html" in crawler.processed_urls
 
 
-async def test_redirect_out_of_the_start_hosts_is_skipped(url, server):
+async def test_start_url_redirect_keeps_the_host_it_ends_on_only(server, url):
+    crawler = await crawl(url("/site/bounce"), max_depth=1, same_domain_only=True)
+
+    assert url("/site/a.html") in crawler.processed_urls
+    # The home page links to the same site on localhost, which the redirect only passed through.
+    assert not [page for page in crawler.visited_urls if page.startswith("http://localhost")]
+
+
+async def test_redirect_out_of_the_start_hosts_is_skipped(url, server, site):
     crawler = await crawl(url("/site/exits.html"), max_depth=1, same_domain_only=True)
 
     assert set(crawler.processed_urls) == {url("/site/exits.html"), url("/site/moved")}
@@ -107,6 +269,8 @@ async def test_redirect_out_of_the_start_hosts_is_skipped(url, server):
         url("/site/to-other-host"): f"redirected out of scope: http://localhost:{server.port}/site/"
     }
     assert crawler.crawl_stats().skipped == 1
+    # The target out of scope is not requested at all.
+    assert site.hits["/site/"] == 0
 
 
 async def test_redirect_to_an_excluded_url_is_skipped(url):
@@ -179,11 +343,12 @@ async def test_page_stats_after_crawl(url, closed_port_url):
         progress = crawler.crawl_stats()
         await crawler.crawl([url("/site/c.html")])
 
-    assert (stats["total_pages"], stats["successful"], stats["failed"], stats["skipped"]) == (9, 4, 5, 0)
+    assert (stats["total_pages"], stats["successful"], stats["failed"], stats["skipped"]) == (9, 4, 4, 1)
     assert (stats["successful"], stats["failed"]) == (progress.processed, progress.failed)
     # JSON instead of HTML is a response too; the refused connection is not.
     assert stats["status_codes"] == {200: 5, 404: 2, 503: 1}
-    assert stats["errors"] == {"PermanentHTTPError": 2, "NetworkError": 1, "ParseError": 1, "TransientHTTPError": 1}
+    # JSON instead of HTML is skipped, not failed.
+    assert stats["errors"] == {"PermanentHTTPError": 2, "NetworkError": 1, "TransientHTTPError": 1}
     assert list(stats["top_domains"].items()) == [("127.0.0.1", 8), ("localhost", 1)]
     assert stats["elapsed_seconds"] == pytest.approx(progress.elapsed, abs=0.05)
     assert stats["pages_per_second"] > 0
@@ -198,9 +363,9 @@ async def test_page_stats_count_skipped_pages(url):
     crawler = await crawl(url("/site/exits.html"), max_depth=1, same_domain_only=True)
     stats = crawler.stats.get_stats()
 
-    # to-other-host was answered, but its redirect left the crawl scope.
+    # to-other-host was answered, but its redirect left the crawl scope and was not followed.
     assert (stats["total_pages"], stats["successful"], stats["failed"], stats["skipped"]) == (3, 2, 0, 1)
-    assert stats["status_codes"] == {200: 3}
+    assert stats["status_codes"] == {200: 2, 302: 1}
 
 
 async def test_state_is_reset_between_crawls(url):
@@ -222,8 +387,8 @@ async def test_error_stats_after_crawl(url, closed_port_url):
         stats = crawler.error_stats()
         await crawler.crawl([url("/site/b.html")])
 
-    # 503 twice, then the page; 404; JSON instead of HTML; three refused connections.
-    assert stats.by_kind == {"TransientError": 2, "PermanentError": 1, "NetworkError": 3, "ParseError": 1, "other": 0}
+    # 503 twice, then the page; 404; three refused connections. JSON instead of HTML is not an error.
+    assert stats.by_kind == {"TransientError": 2, "PermanentError": 1, "NetworkError": 3, "ParseError": 0, "other": 0}
     assert (stats.retries, stats.successful_retries) == (4, 1)
     assert stats.avg_retry_time > 0
     assert list(stats.permanent_errors) == [url("/status/404")]
@@ -236,6 +401,8 @@ async def test_invalid_start_urls_are_rejected():
             await crawler.crawl(["https://example.com", "ftp://site/"])
         with pytest.raises(ValueError, match="max_pages"):
             await crawler.crawl(["https://example.com"], max_pages=0)
+        with pytest.raises(ValueError, match="max_pages_per_host"):
+            await crawler.crawl(["https://example.com"], max_pages_per_host=0)
         with pytest.raises(TypeError, match="got a string"):
             await crawler.crawl("https://example.com")
 

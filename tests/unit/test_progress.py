@@ -24,6 +24,13 @@ class TestProgressTracker:
         assert (progress.active, progress.in_flight, progress.queued) == (6, 2, 7)
         assert not progress.finished
 
+    def test_queued_shows_no_more_than_the_limit_leaves_to_request(self):
+        tracker = ProgressTracker(max_pages=40)
+
+        assert tracker.update(snapshot(1.0, 30, queued=100, in_progress=6)).queued == 4
+        assert tracker.update(snapshot(2.0, 40, queued=100)).queued == 0
+        assert tracker.update(snapshot(3.0, 10, queued=3)).queued == 3
+
     def test_first_snapshot_uses_the_average_speed(self):
         progress = ProgressTracker(max_pages=100).update(snapshot(5.0, 10))
 
@@ -82,6 +89,14 @@ class TestProgressTracker:
         assert (progress.done, progress.total, progress.failed, progress.percent) == (100, 100, 35, 100.0)
         assert progress.pages_per_second == 40.0
         assert "| 100/100 pages, 35 failed |" in format_progress(progress)
+
+    def test_pages_over_max_pages_per_host_are_not_done(self):
+        # They are skipped without a request and leave max_pages to other pages.
+        stats = CrawlStats(processed=6, skipped=8, over_host_limit=6, elapsed=4.0)
+        progress = ProgressTracker(max_pages=12).update(stats)
+
+        assert (progress.done, progress.percent) == (8, 200 / 3)
+        assert progress.pages_per_second == stats.pages_per_second == 2.0
 
     def test_next_crawl_starts_the_speed_anew(self):
         tracker = ProgressTracker(max_pages=100)

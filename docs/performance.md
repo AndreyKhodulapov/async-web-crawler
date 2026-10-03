@@ -91,7 +91,10 @@ string. The extractors take the other 20, links and text the most.
    its pages to a storage does not need them in memory. Fix: the option
    `keep_pages=False` (`crawler.keep_pages` in the configuration; the
    command line always sets it). Memory then stays nearly flat: what is
-   left is the set of seen URLs, about 1 KB a page.
+   left is the set of seen URLs, about 1 KB a page. The queue is bounded
+   too, to three times `max_pages`: before that, a crawl of 1000 pages with
+   300 new links each kept 123 thousand URLs, about 33 MB, though it would
+   request 1000 of them.
 3. **A filter object built for every tag.** The extractors asked
    `tag.find_parent(names)` for every tag to skip hidden content; each call
    builds a matcher. A plain walk up `tag.parents` does the same check:

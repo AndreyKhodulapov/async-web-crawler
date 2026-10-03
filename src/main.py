@@ -48,9 +48,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "repeat for several, in place of those of the configuration",
     )
     parser.add_argument(
+        "--overwrite",
+        action=argparse.BooleanOptionalAction,
+        help="start output files anew, or add to them; databases keep a row per URL either way",
+    )
+    parser.add_argument(
         "--respect-robots",
         action=argparse.BooleanOptionalAction,
-        help="follow robots.txt, or do not",
+        help="follow robots.txt, nofollow and noindex, or do not",
+    )
+    parser.add_argument(
+        "--same-domain-only",
+        action=argparse.BooleanOptionalAction,
+        help="follow links on the hosts of the start URLs only, or on any host",
     )
     parser.add_argument(
         "--rate-limit",
@@ -75,7 +85,9 @@ def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         ("crawler", "max_pages", args.max_pages),
         ("crawler", "max_depth", args.max_depth),
         ("crawler", "respect_robots", args.respect_robots),
+        ("filters", "same_domain_only", args.same_domain_only),
         ("storage", "outputs", args.output),
+        ("storage", "overwrite", args.overwrite),
         ("report", "stats_json", args.stats_json),
         ("report", "html", args.report),
         ("logging", "level", args.log_level),

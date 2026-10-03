@@ -8,7 +8,7 @@ import pytest
 import yaml
 from helpers import BOT, FAST_CONFIG, urlset
 
-from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, CSVStorage, JSONStorage
+from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, CSVStorage, JSONStorage, configure_logging
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
 
@@ -129,6 +129,32 @@ async def test_sitemaps_alone_are_enough(url, site):
         assert set(await crawler.crawl()) == {url("/site/c.html")}
 
 
+async def test_links_to_files_are_not_followed_by_default(url, site):
+    async with AdvancedCrawler(make_config(urls=[url("/site/")])) as crawler:
+        await crawler.crawl()
+
+    assert site.hits["/site/files/manual.pdf"] == 0
+    assert set(crawler.crawler.failed_urls) == {url("/site/missing.html")}
+
+
+@pytest.mark.parametrize(("filters", "leaves"), [({}, False), ({"same_domain_only": False}, True)])
+async def test_links_to_other_hosts_are_not_followed_by_default(url, server, filters, leaves):
+    other_host = f"http://localhost:{server.port}/site/"  # the start page, linked by another name of the server
+    async with AdvancedCrawler(make_config(urls=[url("/site/")], filters=filters)) as crawler:
+        await crawler.crawl()
+
+    assert (other_host in crawler.crawler.processed_urls) is leaves
+
+
+async def test_max_pages_per_host_reaches_the_crawl(url, site):
+    config = make_config(urls=[url("/site/")], crawler={"max_pages_per_host": 2})
+    async with AdvancedCrawler(config) as crawler:
+        await crawler.crawl()
+
+    assert site.hits.total() == 2
+    assert crawler.crawler.skipped_urls
+
+
 async def test_close_stops_logging_to_the_file_and_closes_the_crawler(url, tmp_path):
     crawler = AdvancedCrawler(make_config(urls=[url("/site/c.html")], logging={"file": str(tmp_path / "crawler.log")}))
     assert len(file_handlers()) == 1
@@ -143,6 +169,37 @@ async def test_close_stops_logging_to_the_file_and_closes_the_crawler(url, tmp_p
     # As AsyncCrawler: a closed crawler fetches nothing.
     assert await crawler.crawl() == {}
     assert crawler.get_stats()["errors"] == {"CrawlerClosedError": 1}
+
+
+async def test_logging_is_left_alone_when_asked(url, tmp_path):
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml.safe_dump(FAST_CONFIG | {"urls": [url("/site/c.html")]}), encoding="utf-8")
+    log_file = tmp_path / "logs" / "crawler.log"
+    config = make_config(urls=[url("/site/c.html")], logging={"level": "DEBUG", "file": str(log_file)})
+
+    for crawler in (
+        AdvancedCrawler(config, configure_logging=False),
+        AdvancedCrawler.from_config(config_file, {"logging": {"level": "DEBUG"}}, configure_logging=False),
+    ):
+        assert (root.handlers, root.level) == (handlers, level)
+        await crawler.crawl()
+        await crawler.close()
+        assert (root.handlers, root.level) == (handlers, level)
+
+    assert not log_file.parent.exists()
+
+
+async def test_close_leaves_logging_set_up_by_others_alone(url):
+    configure_logging("WARNING")
+    handlers = list(logging.getLogger().handlers)
+
+    crawler = AdvancedCrawler(make_config(urls=[url("/site/c.html")]), configure_logging=False)
+    await crawler.close()
+
+    assert logging.getLogger().handlers == handlers
+    assert logging.getLogger().level == logging.WARNING
 
 
 async def test_report_that_cannot_be_written_does_not_fail_the_crawl(url, tmp_path, caplog):

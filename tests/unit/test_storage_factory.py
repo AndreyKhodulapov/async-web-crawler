@@ -192,6 +192,17 @@ class TestStorageFromOutput:
         assert isinstance(storage, CSVStorage)
         assert (storage.path, storage.encoding, storage.batch_size) == (Path("out/pages.csv"), "utf-8-sig", 3)
 
+    @pytest.mark.parametrize("name", ["pages.jsonl", "pages.json", "pages.csv"])
+    def test_file_takes_overwrite(self, name):
+        assert storage_from_output(name).overwrite is False
+        assert storage_from_output(name, overwrite=True).overwrite is True
+
+    def test_database_ignores_overwrite(self):
+        assert isinstance(storage_from_output("pages.db", overwrite=True), SQLiteStorage)
+        assert isinstance(
+            storage_from_output("postgresql://crawler@localhost/crawler", overwrite=True), PostgresStorage
+        )
+
     @pytest.mark.parametrize("name", ["pages.db", "pages.sqlite", "pages.sqlite3"])
     def test_sqlite_file_by_extension(self, name):
         storage = storage_from_output(name, batch_size=4)

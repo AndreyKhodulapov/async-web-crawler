@@ -15,13 +15,16 @@ from aiofiles.threadpool.binary import AsyncBufferedReader
 from crawler.exceptions import StorageError
 from crawler.models import PageRecord
 from crawler.retry import RetryStrategy
-from crawler.storage.base import DataStorage
-
-# What stands between two records in either layout.
+from crawler.storage.base import DataStorage, warn_adding_to_file
 
 
 class JSONStorage(DataStorage):
     """Keeps pages in a JSON file, adding to the file if it exists.
+
+    With `overwrite` the file is started anew instead: what it held is
+    dropped on the first write. Adding to a file that is not empty is
+    logged as a warning, since a second run with the same file keeps the
+    pages of the first one too.
 
     By default the file is JSON Lines: a record per line, which other tools
     can read line by line. With `indent` it is one indented JSON array, easier
@@ -32,7 +35,7 @@ class JSONStorage(DataStorage):
     through it in pieces, so the file may be larger than the memory. The
     file is UTF-8, `crawled_at` is written in ISO 8601.
 
-    Raises (on the first write):
+    Raises (on the first write, unless `overwrite`):
         StorageError: the file exists in the other layout, is an array
             that some other program wrote, or is JSON Lines whose last
             line is not complete.
@@ -48,6 +51,7 @@ class JSONStorage(DataStorage):
         path: str | Path,
         *,
         indent: int | None = None,
+        overwrite: bool = False,
         batch_size: int = 100,
         retry_strategy: RetryStrategy | None = None,
         cooldown: float = 5.0,
@@ -55,6 +59,7 @@ class JSONStorage(DataStorage):
         super().__init__(batch_size, retry_strategy=retry_strategy, cooldown=cooldown)
         self.path = Path(path)
         self.indent = indent
+        self.overwrite = overwrite
         # Closes the array; written after the records and overwritten by the next ones.
         self._tail = b"" if indent is None else b"\n]\n"
         self._file: AsyncBufferedReader | None = None
@@ -76,7 +81,7 @@ class JSONStorage(DataStorage):
 
     async def _open(self) -> AsyncBufferedReader:
         exists = await aiofiles.os.path.exists(self.path)
-        file = await aiofiles.open(self.path, "r+b" if exists else "w+b")
+        file = await aiofiles.open(self.path, "r+b" if exists and not self.overwrite else "w+b")
         size = await file.seek(0, os.SEEK_END)
         if size:
             self._end = max(size - len(self._tail), 0)
@@ -93,6 +98,7 @@ class JSONStorage(DataStorage):
                 # A write that was cut short: the next record would be glued to its last line.
                 await file.close()
                 raise StorageError(f"{self.path} does not end with a line break: its last record may be broken")
+            warn_adding_to_file(self.path, size)
         self._file = file
         return file
 

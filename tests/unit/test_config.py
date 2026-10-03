@@ -19,6 +19,7 @@ from crawler import (
     load_config,
 )
 from crawler.config import (
+    EXCLUDED_EXTENSIONS,
     CircuitBreakerOptions,
     CrawlOptions,
     FilterOptions,
@@ -36,6 +37,7 @@ FULL = {
     "sitemaps": {"urls": ["https://example.com/sitemap.xml"], "from_robots": True, "max_urls": 200},
     "crawler": {
         "max_pages": 500,
+        "max_pages_per_host": 50,
         "max_depth": 3,
         "max_concurrent": 20,
         "max_per_domain": 4,
@@ -50,12 +52,23 @@ FULL = {
         "connect_timeout": 5.0,
         "read_timeout": 15.0,
         "timeout_growth": 2.0,
+        "max_page_size": 1_000_000,
         "keep_pages": False,
     },
     "retry": {"max_retries": 5, "backoff_factor": 3.0, "base_delay": 0.5, "max_delay": 10.0},
     "circuit_breaker": {"failure_threshold": 0.8, "min_requests": 10, "window": 120.0, "cooldown": 15.0},
-    "filters": {"same_domain_only": True, "include": ["^https://example\\.com/blog/"], "exclude": ["\\.pdf$"]},
-    "storage": {"outputs": ["pages.jsonl", "pages.csv"], "batch_size": 50, "csv_encoding": "utf-8-sig"},
+    "filters": {
+        "same_domain_only": True,
+        "include": ["^https://example\\.com/blog/"],
+        "exclude": ["\\.pdf$"],
+        "exclude_extensions": ["zip", "mp4"],
+    },
+    "storage": {
+        "outputs": ["pages.jsonl", "pages.csv"],
+        "batch_size": 50,
+        "csv_encoding": "utf-8-sig",
+        "overwrite": True,
+    },
     "logging": {"level": "DEBUG", "file": "crawler.log", "max_bytes": 1000, "backup_count": 2},
     "report": {"stats_json": "stats.json", "html": "report.html", "title": "Blog crawl", "top_domains": 5},
 }
@@ -80,7 +93,13 @@ class TestDefaults:
         assert config == CrawlerConfig()
         assert config.urls == ()
         assert config.crawler == CrawlOptions(
-            max_pages=100, max_depth=2, max_concurrent=10, max_per_domain=None, rate_limit=1.0, respect_robots=True
+            max_pages=100,
+            max_pages_per_host=None,
+            max_depth=2,
+            max_concurrent=10,
+            max_per_domain=None,
+            rate_limit=1.0,
+            respect_robots=True,
         )
         assert config.crawler.user_agent == AsyncCrawler.DEFAULT_USER_AGENT
         assert config.sitemaps == SitemapOptions(urls=(), from_robots=False, max_urls=50_000)
@@ -88,8 +107,11 @@ class TestDefaults:
         assert config.circuit_breaker == CircuitBreakerOptions(
             failure_threshold=0.5, min_requests=5, window=60.0, cooldown=30.0
         )
-        assert config.filters == FilterOptions(same_domain_only=False, include=(), exclude=())
-        assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8")
+        assert config.filters == FilterOptions(
+            same_domain_only=True, include=(), exclude=(), exclude_extensions=EXCLUDED_EXTENSIONS
+        )
+        assert {"pdf", "jpg", "zip", "mp4"} <= set(EXCLUDED_EXTENSIONS)
+        assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8", overwrite=False)
         assert config.logging == LoggingOptions(level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5)
         assert config.report == ReportOptions(stats_json=None, html=None, title="Crawl report", top_domains=10)
 
@@ -102,6 +124,7 @@ class TestDefaults:
         crawler, crawl = defaults(AsyncCrawler.__init__), defaults(AsyncCrawler.crawl)
         options = CrawlOptions()
         assert options.max_pages == crawl["max_pages"]
+        assert options.max_pages_per_host == crawl["max_pages_per_host"]
         assert options.rate_limit == crawler["requests_per_second"]
         for name in ("max_depth", "max_concurrent", "max_per_domain", "per_domain_rate", "min_delay", "jitter"):
             assert getattr(options, name) == crawler[name], name
@@ -111,6 +134,7 @@ class TestDefaults:
             "connect_timeout",
             "read_timeout",
             "timeout_growth",
+            "max_page_size",
             "keep_pages",
         ):
             assert getattr(options, name) == crawler[name], name
@@ -119,7 +143,10 @@ class TestDefaults:
         assert CircuitBreakerOptions() == CircuitBreakerOptions(
             **{name: breaker[name] for name in CircuitBreakerOptions.__dataclass_fields__}
         )
-        assert FilterOptions().same_domain_only == crawl["same_domain_only"]
+        # Differ on purpose: a crawl by the configuration stays on the start hosts and leaves files alone,
+        # the library follows every link.
+        assert crawl["same_domain_only"] is False
+        assert crawl["exclude_extensions"] == ()
         assert SitemapOptions().from_robots == crawl["robots_sitemaps"]
 
     def test_configuration_cannot_be_changed(self):
@@ -149,6 +176,7 @@ class TestValues:
         assert config.urls == ("https://example.com/", "https://example.org/docs")
         assert config.crawler.max_per_domain == 4
         assert config.filters.exclude == ("\\.pdf$",)
+        assert config.filters.exclude_extensions == ("zip", "mp4")
 
     def test_to_dict_can_be_read_back_and_written_as_json(self):
         config = CrawlerConfig.from_dict(FULL)
@@ -163,10 +191,14 @@ class TestValues:
 
     def test_null_turns_a_limit_off(self):
         config = CrawlerConfig.from_dict(
-            {"crawler": {"rate_limit": None, "max_per_domain": None}, "circuit_breaker": {"failure_threshold": None}}
+            {
+                "crawler": {"rate_limit": None, "max_per_domain": None, "max_page_size": None},
+                "circuit_breaker": {"failure_threshold": None},
+            }
         )
 
         assert config.crawler.rate_limit is None
+        assert config.crawler.max_page_size is None
         assert config.circuit_breaker.failure_threshold is None
 
     def test_section_without_keys_keeps_its_defaults(self):
@@ -206,6 +238,12 @@ class TestStorage:
         assert isinstance(first, JSONStorage) and isinstance(second, CSVStorage)
         assert (second.encoding, first.batch_size, second.batch_size) == ("utf-8-sig", 7, 7)
 
+    def test_overwrite_reaches_the_files(self):
+        storage = StorageOptions(outputs=("pages.jsonl", "pages.csv", "pages.db"), overwrite=True).build()
+
+        first, second, _ = storage.storages
+        assert first.overwrite is True and second.overwrite is True
+
     def test_validation_opens_nothing(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)
         CrawlerConfig.from_dict({"storage": {"outputs": ["pages.jsonl", "pages.db", "sqlite:///other.db"]}})
@@ -219,7 +257,7 @@ class TestInvalid:
 
     def test_unknown_key_without_a_close_one_lists_the_keys(self):
         assert problems({"filters": {"zzz": 1}}) == [
-            "filters.zzz: unknown key; expected one of same_domain_only, include, exclude"
+            "filters.zzz: unknown key; expected one of same_domain_only, include, exclude, exclude_extensions"
         ]
 
     def test_unknown_section(self):
@@ -251,6 +289,7 @@ class TestInvalid:
         ("data", "problem"),
         [
             ({"crawler": {"max_pages": 0}}, "crawler.max_pages: must be >= 1, got 0"),
+            ({"crawler": {"max_pages_per_host": 0}}, "crawler.max_pages_per_host: must be >= 1, got 0"),
             ({"crawler": {"max_depth": -1}}, "crawler.max_depth: must be >= 0, got -1"),
             ({"crawler": {"max_concurrent": 0}}, "crawler.max_concurrent: must be >= 1, got 0"),
             ({"crawler": {"max_per_domain": 0}}, "crawler.max_per_domain: must be >= 1, got 0"),
@@ -294,6 +333,19 @@ class TestInvalid:
 
         assert problem.startswith("filters.exclude[1]: not a regular expression: ")
         assert problem.endswith(', got "("')
+
+    def test_file_extensions_are_normalized(self):
+        config = CrawlerConfig.from_dict({"filters": {"exclude_extensions": [".PDF", " Zip "]}})
+
+        assert config.filters.exclude_extensions == ("pdf", "zip")
+        assert CrawlerConfig.from_dict({"filters": {"exclude_extensions": []}}).filters.exclude_extensions == ()
+
+    def test_invalid_file_extension(self):
+        assert problems({"filters": {"exclude_extensions": ["pdf", "tar.gz", "", "a/b"]}}) == [
+            "filters.exclude_extensions[1]: expected one extension without dots, such as 'pdf' or 'gz', got \"tar.gz\"",
+            "filters.exclude_extensions[2]: expected one extension without dots, such as 'pdf' or 'gz', got \"\"",
+            "filters.exclude_extensions[3]: expected one extension without dots, such as 'pdf' or 'gz', got \"a/b\"",
+        ]
 
     def test_unknown_output_extension(self):
         (problem,) = problems({"storage": {"outputs": ["pages.jsonl", "pages.xml"]}})

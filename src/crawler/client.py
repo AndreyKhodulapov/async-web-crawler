@@ -1,16 +1,20 @@
 """Asynchronous HTTP client that downloads many pages concurrently."""
 
 import asyncio
+import codecs
 import contextlib
+import dataclasses
 import itertools
 import logging
 import math
 import ssl
 import time
-from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
+from collections import Counter
+from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import NamedTuple, Self
+from urllib.parse import urlsplit
 
 import aiohttp
 import certifi
@@ -27,6 +31,7 @@ from crawler.exceptions import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    PageTooLargeError,
     ParseError,
     RobotsDisallowedError,
     RobotsUnreachableError,
@@ -38,15 +43,15 @@ from crawler.exceptions import (
 from crawler.filters import UrlFilter
 from crawler.models import CrawlStats, ErrorStats, FetchResult, PageRecord, ParsedPage
 from crawler.parser import HTMLParser, is_html_content_type
-from crawler.queue import CrawlerQueue
+from crawler.queue import CrawlerQueue, queue_form
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryStrategy, parse_retry_after
-from crawler.robots import RobotsParser, product_token
+from crawler.robots import RobotsParser, product_token, robots_tag_directives
 from crawler.semaphores import SemaphoreManager
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
 from crawler.storage.base import DataStorage
-from crawler.urls import get_host, is_valid_http_url, normalize_url
+from crawler.urls import get_host, is_valid_http_url, normalize_url, resolve_url, strip_tracking_params
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +62,9 @@ class _Response(NamedTuple):
     size: int
     final_url: str
     content_type: str | None
-    redirected: bool
+    redirected: bool = False  # a redirect, not followed; `final_url` is its Location header
     body: bytes | None = None  # the bytes as sent, when asked for instead of the text
+    robots_tag: tuple[str, ...] = ()  # the X-Robots-Tag headers as sent
 
 
 class AsyncCrawler:
@@ -81,16 +87,20 @@ class AsyncCrawler:
       a random `jitter` (see `RateLimiter`). `per_domain_rate=False` applies
       the rate to all hosts together; `requests_per_second=None` removes it.
     - With `respect_robots`, every URL is checked against robots.txt of its
-      site first. A disallowed URL is not requested and fails with
+      site first; `crawl()` also honors `noindex` and `nofollow` of pages
+      and links. A disallowed URL is not requested and fails with
       `RobotsDisallowedError`. While robots.txt of a site cannot be read,
       its URLs are not requested either and fail with
       `RobotsUnreachableError` (see `RobotsParser`).
+    - Redirects are followed one request at a time, up to
+      `MAX_REDIRECTS`: the target of each goes through robots.txt, the
+      rate limit, the retries and the circuit breaker of its own host.
     - Failed requests are retried as `retry_strategy` says: by default
       transient and network errors, such as a timeout or HTTP 503, up to 3
       times with exponential backoff (see `RetryStrategy`). The pause before
       a retry is spent in the rate limiter: the whole host waits with it; so
-      it does after a Retry-After header, even when the request is not
-      retried.
+      it does for as long as a Retry-After header asks, up to
+      `MAX_RETRY_AFTER` seconds, even when the request is not retried.
     - A host whose requests keep failing is left alone for a while, as
       `circuit_breaker` says: by default once half of at least 5 requests
       in a minute have failed with a transient or network error, its
@@ -106,6 +116,11 @@ class AsyncCrawler:
     multiplies all three by `timeout_growth**n`, at most by
     `MAX_TIMEOUT_GROWTH`: a server that is merely slow gets a chance to
     answer, and a dead one is not waited for forever.
+
+    A page body over `max_page_size` bytes (None for no limit) fails with
+    `PageTooLargeError`; the rest of it is not downloaded. The limit is on
+    the unpacked body, so a small gzipped response that unpacks into
+    gigabytes fails too.
 
     `user_agent` identifies the crawler, and robots.txt rules are looked up
     by its name ("MyBot/1.0 (+url)" is "mybot"). `user_agents` rotates
@@ -135,6 +150,7 @@ class AsyncCrawler:
     lets a page go once it is saved and its links are queued:
     `processed_urls` stays empty, the pages are in the storage, the counts
     in `stats` and `crawl_stats()`. That is the setting for a large crawl.
+    The queue of `crawl()` is bounded by `max_pages` too, see `crawl()`.
 
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
     the same way as any other per-URL failure. Closing does not interrupt
@@ -145,8 +161,21 @@ class AsyncCrawler:
     # Sites such as Wikipedia ask bots to identify themselves with a contact
     # URL and may block generic user agents.
     DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
+    DEFAULT_MAX_PAGE_SIZE = 10 * 1024 * 1024
     MAX_TIMEOUT_GROWTH = 4.0
+    MAX_REDIRECTS = 10
+    REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
     MAX_CIRCUIT_OPENINGS = 3
+    # The longest Retry-After a host is held back for, in seconds.
+    MAX_RETRY_AFTER = 600.0
+    # In crawl(), a page whose host is held back longer than this is put off.
+    MIN_PENALTY_TO_DEFER = 1.0
+    # In crawl(), longer links are not followed: they are mostly generated ones.
+    MAX_URL_LENGTH = 2048
+    # In crawl(), new links are not queued once the pages queued, in progress
+    # and requested reach this many times max_pages: most would never be fetched.
+    # Likewise a host has at most this many times max_pages_per_host queued.
+    FRONTIER_FACTOR = 3
 
     def __init__(
         self,
@@ -165,6 +194,7 @@ class AsyncCrawler:
         connect_timeout: float = 10.0,
         read_timeout: float = 20.0,
         timeout_growth: float = 1.5,
+        max_page_size: int | None = DEFAULT_MAX_PAGE_SIZE,
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
         parser: HTMLParser | None = None,
@@ -182,6 +212,8 @@ class AsyncCrawler:
                 raise ValueError(f"{name} must be positive, got {value}")
         if not (math.isfinite(timeout_growth) and timeout_growth >= 1):
             raise ValueError(f"timeout_growth must be a number >= 1, got {timeout_growth}")
+        if max_page_size is not None and max_page_size < 1:
+            raise ValueError(f"max_page_size must be >= 1 or None, got {max_page_size}")
         if isinstance(user_agents, str):
             raise TypeError(f"expected a list of user agents, got a string: {user_agents!r}")
         robots_name = product_token(user_agent)
@@ -208,9 +240,12 @@ class AsyncCrawler:
             sock_read=read_timeout,
         )
         self.timeout_growth = timeout_growth
+        self.max_page_size = max_page_size
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
-        self._parser = parser or HTMLParser()
+        # Links marked rel="nofollow" are left out of the pages, as robots.txt is followed;
+        # a robots meta tag may name the crawler ("asyncwebcrawler"), as X-Robots-Tag may.
+        self._parser = parser or HTMLParser(skip_nofollow=respect_robots, robots_name=robots_name)
         self.storage = storage
         self.keep_pages = keep_pages
         self._session: aiohttp.ClientSession | None = None
@@ -220,9 +255,17 @@ class AsyncCrawler:
         self.processed_urls: dict[str, ParsedPage] = {}
         self._start_urls: set[str] = set()
         self._sitemap_pages_out_of_scope: list[str] = []
+        self._redirect_sources: dict[str, str] = {}  # redirect target -> the page that led to it
         self._failed_sitemaps: dict[str, str] = {}
         self.stats = CrawlerStats()
         self._pages_requested = 0
+        self._host_pages: Counter[str] = Counter()  # pages requested by host
+        self._over_host_limit = 0  # pages skipped without a request over max_pages_per_host
+        self._max_frontier = 0  # pages queued, in progress and requested that crawl() allows
+        self._links_dropped = 0
+        self._host_queued: Counter[str] = Counter()  # pages ever queued by host
+        self._max_host_queued: int | None = None  # pages queued by host that crawl() allows
+        self._links_dropped_by_host = 0
         self._pages_to_save = 0
         self._written_before = 0
         self._pending_before = 0
@@ -258,7 +301,10 @@ class AsyncCrawler:
 
     @property
     def skipped_urls(self) -> dict[str, str]:
-        """URL -> reason for pages the latest crawl fetched but left out. Do not modify."""
+        """URL -> reason for pages the latest crawl left out, e.g. not HTML. Do not modify.
+
+        All of them were fetched, except those over `max_pages_per_host`.
+        """
         return self._queue.skipped
 
     @property
@@ -336,27 +382,99 @@ class AsyncCrawler:
         *,
         html_only: bool = False,
         raw: bool = False,
+        truncate_at: int | None = None,
         check_robots: bool = True,
+        check_redirect_robots: bool = True,
+        follow: Callable[[str], bool] | None = None,
         failure_level: int = logging.WARNING,
         track_errors: bool = True,
     ) -> FetchResult:
-        """Download a page, checking robots.txt first and retrying transient failures.
+        """Download a page, following its redirects one at a time.
+
+        Every request of the chain goes through robots.txt, the circuit
+        breaker, the rate limit and the retries of its own host, as a link
+        to the target would (see `_fetch_hop`). robots.txt is checked for
+        `url` with `check_robots`, for the targets of its redirects with
+        `check_redirect_robots`. `follow`, if given, is asked about every
+        target, normalized, before it is requested; when it says no, the
+        result is that of the redirect itself: no content, `redirected`
+        set and `final_url` the target. More than `MAX_REDIRECTS` redirects
+        in a row fail with `TooManyRedirectsError`.
 
         With `raw`, which is how a sitemap is downloaded, the result has the
         `body` as it was sent instead of the decoded `content`, and a body
         over the size limit of a sitemap fails with `SitemapError`. With
+        `truncate_at`, which is how robots.txt is downloaded, the body is
+        cut to that many bytes instead of failing over `max_page_size`. With
         `track_errors`, the attempts count in `error_stats()`.
+        """
+        target, elapsed, retried, attempts = url, 0.0, False, 0
+        for redirects in itertools.count():
+            result, attempts = await self._fetch_hop(
+                target,
+                html_only=html_only,
+                raw=raw,
+                truncate_at=truncate_at,
+                check_robots=check_robots if redirects == 0 else check_redirect_robots,
+                failure_level=failure_level,
+                track_errors=track_errors,
+            )
+            elapsed += result.elapsed
+            retried = retried or attempts > 1
+            if not result.redirected:
+                break
+            if redirects == self.MAX_REDIRECTS:
+                # Checked before the target is asked about: it is not reached.
+                error = TooManyRedirectsError(url, f"too many redirects (more than {self.MAX_REDIRECTS})")
+                result = FetchResult.failure(url, error, elapsed)
+                break
+            assert result.final_url is not None
+            location = resolve_url(result.final_url, target)
+            if location is None:
+                error = InvalidURLError(target, f"redirects to an invalid URL: {result.final_url!r}")
+                result = FetchResult.failure(url, error, elapsed)
+                break
+            if follow is not None and not follow(location):
+                result = dataclasses.replace(result, final_url=location)
+                break
+            logger.info("Redirect %s -> %s (%d)", target, location, result.status)
+            target = location
+        # A request refused before it was sent (robots.txt, the circuit
+        # breaker) has no outcome to count.
+        if track_errors and attempts:
+            self._errors.record_outcome(url, result.error, retried=retried)
+        if result.error is None and redirects:
+            result = dataclasses.replace(result, redirected=True)
+        return dataclasses.replace(result, url=url, elapsed=elapsed)
+
+    async def _fetch_hop(
+        self,
+        url: str,
+        *,
+        html_only: bool,
+        raw: bool,
+        truncate_at: int | None,
+        check_robots: bool,
+        failure_level: int,
+        track_errors: bool,
+    ) -> tuple[FetchResult, int]:
+        """Make the request for one URL, checking robots.txt first and retrying transient failures.
+
+        A redirect is not followed: it comes back as a result with
+        `redirected` set and `final_url` its Location header as sent. Also
+        returns the number of attempts made, 0 if the request was refused
+        before it was sent.
         """
         # Checked up front as well as in _request(): a closed crawler must
         # report itself even for a URL that robots.txt would block.
         if self._closed:
-            return FetchResult.failure(url, CrawlerClosedError(url, "crawler is closed"), 0.0)
+            return FetchResult.failure(url, CrawlerClosedError(url, "crawler is closed"), 0.0), 0
         if check_robots and (refusal := await self._check_robots(url)) is not None:
-            return FetchResult.failure(url, refusal, 0.0)
+            return FetchResult.failure(url, refusal, 0.0), 0
         # Refused at once, without waiting for the turn of the host.
         if (refusal := self._check_circuit(url)) is not None:
             logger.info("Refused %s: %s", url, refusal.message)
-            return FetchResult.failure(url, refusal, 0.0)
+            return FetchResult.failure(url, refusal, 0.0), 0
         # The strategy needs an attempt that raises; the result of the last
         # one is kept to report a failure with its timing.
         last: FetchResult | None = None
@@ -367,7 +485,7 @@ class AsyncCrawler:
             nonlocal last, attempts, failed_at
             timeout = self._timeout_for(retries=attempts)
             attempts += 1
-            result = await self._fetch_once(url, html_only=html_only, raw=raw, timeout=timeout)
+            result = await self._fetch_once(url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout)
             if isinstance(result.error, CircuitOpenError):
                 # Not sent. A retry fails as the attempt before it did: the
                 # strategy sees the circuit open and stops, and the failure
@@ -400,17 +518,17 @@ class AsyncCrawler:
             )
         except FetchError as error:
             assert last is not None and last.error is error
-            if track_errors:
-                self._errors.record_outcome(url, error, retried=attempts > 1)
             host = get_host(url)
             # The server asked to wait: the other requests to the host wait
-            # even when this one is not retried, up to the longest retry pause.
+            # as long as it asked, even when this one is not retried.
             if isinstance(error, HTTPStatusError) and error.retry_after and host is not None:
-                self.rate_limiter.penalize(host, min(error.retry_after, self.retry_strategy.max_delay))
-            return last
-        if track_errors:
-            self._errors.record_outcome(url, None, retried=attempts > 1)
-        return result
+                if error.retry_after > self.MAX_RETRY_AFTER:
+                    logger.warning(
+                        "%s asked to wait %gs (Retry-After), waiting %gs", host, error.retry_after, self.MAX_RETRY_AFTER
+                    )
+                self.rate_limiter.penalize(host, min(error.retry_after, self.MAX_RETRY_AFTER))
+            return last, attempts
+        return result, attempts
 
     async def _wait_before_retry(self, error: Exception, delay: float) -> None:
         """Hold back the host of the failed request instead of sleeping.
@@ -473,7 +591,15 @@ class AsyncCrawler:
     async def _download_robots(self, url: str) -> tuple[int, str]:
         """Fetcher for RobotsParser: robots.txt goes through the same limits and retries as a page."""
         # Many sites have no robots.txt; RobotsParser logs the outcomes that matter.
-        result = await self._fetch(url, check_robots=False, failure_level=logging.INFO, track_errors=False)
+        result = await self._fetch(
+            url,
+            truncate_at=RobotsParser.MAX_SIZE,
+            # Its redirects too: their robots.txt may be the one being downloaded.
+            check_robots=False,
+            check_redirect_robots=False,
+            failure_level=logging.INFO,
+            track_errors=False,
+        )
         if isinstance(result.error, HTTPStatusError):
             return result.error.status, ""
         if result.error is not None:
@@ -490,7 +616,9 @@ class AsyncCrawler:
         assert result.body is not None
         return result.body
 
-    async def _fetch_once(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
+    async def _fetch_once(
+        self, url: str, *, html_only: bool, raw: bool, truncate_at: int | None, timeout: aiohttp.ClientTimeout
+    ) -> FetchResult:
         """Make one request, unless the circuit breaker of the host refuses it."""
         host = get_host(url)
         call = self.circuit_breaker.call(url)
@@ -515,18 +643,22 @@ class AsyncCrawler:
                 # so a request waiting for its host does not hold a slot another
                 # host could use; inside the slot the interval is checked once more.
                 async with gate() if host is None else self.rate_limiter.slot(host, gate):
-                    result = await self._send(url, html_only=html_only, raw=raw, timeout=timeout)
+                    result = await self._send(
+                        url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout
+                    )
                     call.record(result.error)
                     return result
         except CircuitOpenError as error:
             return FetchResult.failure(url, error, 0.0)
 
-    async def _send(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> FetchResult:
+    async def _send(
+        self, url: str, *, html_only: bool, raw: bool, truncate_at: int | None, timeout: aiohttp.ClientTimeout
+    ) -> FetchResult:
         """Send the request and report its outcome, whatever it is, as a FetchResult."""
         logger.info("Fetching %s", url)
         started = time.perf_counter()
         try:
-            response = await self._request(url, html_only=html_only, raw=raw, timeout=timeout)
+            response = await self._request(url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout)
         except FetchError as error:
             elapsed = time.perf_counter() - started
             # RetryStrategy logs the failure along with what comes next.
@@ -560,6 +692,7 @@ class AsyncCrawler:
             content_type=response.content_type,
             redirected=response.redirected,
             body=response.body,
+            robots_tag=robots_tag_directives(response.robots_tag, self._user_agent),
         )
 
     async def _parse(self, result: FetchResult) -> ParsedPage:
@@ -581,9 +714,11 @@ class AsyncCrawler:
         start_urls: Iterable[str],
         max_pages: int = 100,
         *,
+        max_pages_per_host: int | None = None,
         same_domain_only: bool = False,
         include_patterns: Iterable[str] = (),
         exclude_patterns: Iterable[str] = (),
+        exclude_extensions: Iterable[str] = (),
         sitemap_urls: Iterable[str] = (),
         robots_sitemaps: bool = False,
     ) -> dict[str, ParsedPage]:
@@ -604,15 +739,51 @@ class AsyncCrawler:
         the circuit of a host has opened `MAX_CIRCUIT_OPENINGS` times in
         the crawl, its refused pages go to `failed_urls` with
         `CircuitOpenError`, so a host that stays down holds the crawl for
-        about two cooldowns of the breaker.
+        about two cooldowns of the breaker. A page whose host is held back
+        for longer than `MIN_PENALTY_TO_DEFER` seconds, by a Retry-After or
+        the pause before a retry, is put off until the host may be asked
+        again, without counting toward `max_pages` before then.
+
+        With `respect_robots`, the links of a page whose <meta name="robots">
+        (or <meta> with the robots.txt name of the crawler, "asyncwebcrawler")
+        or X-Robots-Tag says "nofollow" are not followed, and neither are
+        links marked rel="nofollow". A page that says "noindex" is not
+        returned or saved but listed in `skipped_urls`; its links are
+        followed. "none" means both.
 
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
         the pages they redirect to); `include_patterns` and `exclude_patterns`
-        are regular expressions, see `UrlFilter`. A link that passes the
-        filters but redirects to a URL that does not is skipped: the page is
-        not returned, its links are not followed, and it is listed in
-        `skipped_urls` with the reason.
+        are regular expressions and `exclude_extensions` file extensions
+        such as "pdf", see `UrlFilter`. A link that passes the
+        filters but redirects to a URL that does not is skipped, and so is a
+        page that redirects to a URL already seen: the target is not
+        requested, the page is not returned, and it is listed in
+        `skipped_urls` with the reason. A page that redirects to a URL
+        robots.txt disallows is listed in `blocked_urls`; having been
+        requested, it counts toward `max_pages`. A page whose Content-Type
+        is not HTML is skipped too, with its body left undownloaded; it counts
+        toward `max_pages` as well.
+
+        Against endless URL spaces (sort orders, filters, session IDs):
+        tracking parameters such as "utm_source" are dropped from every URL
+        queued (see `CrawlerQueue`); a link longer than `MAX_URL_LENGTH` is
+        not followed; a page whose canonical URL differs from its own in the
+        query alone and has been seen already is skipped as a duplicate, and
+        its links are not followed. `max_pages_per_host` caps the pages
+        requested from one host; the others are skipped without a request
+        and do not count toward `max_pages`.
+
+        The queue is bounded, so that the memory does not grow with every
+        link of a large site: once the pages queued, in progress and
+        requested reach `FRONTIER_FACTOR` times `max_pages`, new links and
+        sitemap pages are not queued (nor remembered: a page found again
+        later may be queued then). The spare room is for pages that do not
+        count toward `max_pages`, such as those robots.txt disallows; a
+        crawl whose queue is mostly such pages may end before `max_pages`.
+        With `max_pages_per_host`, a host has at most `FRONTIER_FACTOR`
+        times that many pages queued in the whole crawl, so that one large
+        site does not fill the queue with pages it will skip.
 
         The pages listed in the sitemaps `sitemap_urls` are crawled too, and
         with `robots_sitemaps` so are those of the sitemaps that robots.txt
@@ -637,15 +808,18 @@ class AsyncCrawler:
         cache and the states of the circuit breaker carry over.
 
         Raises:
-            TypeError: a single string is passed instead of a list of URLs or patterns.
-            ValueError: `max_pages` is not positive, a start URL, a sitemap URL or a pattern is invalid,
-                `robots_sitemaps` is asked of a crawler that does not read robots.txt.
+            TypeError: a single string is passed instead of a list of URLs, patterns or extensions.
+            ValueError: `max_pages` or `max_pages_per_host` is not positive, a start URL, a sitemap URL,
+                a pattern or an extension is invalid, `robots_sitemaps` is asked of a crawler that does not
+                read robots.txt.
             RuntimeError: another crawl is running on this crawler.
         """
         if isinstance(start_urls, str):
             raise TypeError(f"expected a list of start URLs, got a string: {start_urls!r}")
         if max_pages < 1:
             raise ValueError(f"max_pages must be >= 1, got {max_pages}")
+        if max_pages_per_host is not None and max_pages_per_host < 1:
+            raise ValueError(f"max_pages_per_host must be >= 1 or None, got {max_pages_per_host}")
         start_urls = list(start_urls)
         invalid = [url for url in start_urls if not is_valid_http_url(url)]
         if invalid:
@@ -665,12 +839,21 @@ class AsyncCrawler:
             allowed_hosts={get_host(url) for url in start_urls + sitemap_urls} if same_domain_only else None,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            exclude_extensions=exclude_extensions,
+            max_url_length=self.MAX_URL_LENGTH,
         )
         self._queue = CrawlerQueue()
         self.processed_urls = {}
         self._failed_sitemaps = {}
         self._sitemap_pages_out_of_scope = []
+        self._redirect_sources = {}
         self._pages_requested = 0
+        self._host_pages = Counter()
+        self._over_host_limit = 0
+        self._max_frontier = self.FRONTIER_FACTOR * max_pages
+        self._links_dropped = 0
+        self._max_host_queued = None if max_pages_per_host is None else self.FRONTIER_FACTOR * max_pages_per_host
+        self._links_dropped_by_host = 0
         self._pages_to_save = 0
         self._written_before = self.storage.written if self.storage is not None else 0
         self._pending_before = self.storage.pending if self.storage is not None else 0
@@ -681,6 +864,7 @@ class AsyncCrawler:
         for url in start_urls:
             self._queue.add_url(url, priority=0, depth=0)
         self._start_urls = set(self._queue.depths)
+        self._host_queued = Counter(get_host(url) for url in self._start_urls)
 
         logger.info(
             "Crawl started: %d start URLs, max_depth=%d, max_pages=%d", len(start_urls), self.max_depth, max_pages
@@ -692,7 +876,7 @@ class AsyncCrawler:
                 await self._queue_sitemap_pages(sitemap_urls, start_urls if robots_sitemaps else [], url_filter)
             async with asyncio.TaskGroup() as group:
                 for _ in range(self.max_concurrent):
-                    group.create_task(self._crawl_worker(self._queue, url_filter, max_pages))
+                    group.create_task(self._crawl_worker(self._queue, url_filter, max_pages, max_pages_per_host))
             await self._flush_storage()
         finally:
             self._crawl_finished = time.perf_counter()
@@ -708,6 +892,14 @@ class AsyncCrawler:
             stats.queued,
             stats.elapsed,
         )
+        if self._links_dropped:
+            logger.info("%d links were not queued: the queue was full", self._links_dropped)
+        if self._links_dropped_by_host:
+            logger.info(
+                "%d links were not queued: their host had %d x max_pages_per_host pages queued",
+                self._links_dropped_by_host,
+                self.FRONTIER_FACTOR,
+            )
         if self.storage is not None:
             logger.info(
                 "Saved %d pages to %s, %d not saved", stats.saved, type(self.storage).__name__, stats.save_failed
@@ -732,7 +924,7 @@ class AsyncCrawler:
                     # Hosts join the scope only under `same_domain_only`.
                     if url_filter.allowed_hosts is not None:
                         self._sitemap_pages_out_of_scope.append(page)
-                elif self._queue.add_url(page, priority=0, depth=0):
+                elif self._queue_found(self._queue, page, depth=0):
                     queued += 1
         logger.info(
             "Sitemaps: %d read, %d failed, %d pages listed, %d new queued",
@@ -752,10 +944,43 @@ class AsyncCrawler:
         out_of_scope = []
         for page in self._sitemap_pages_out_of_scope:
             if url_filter.allows(page):
-                queue.add_url(page, priority=0, depth=0)
+                self._queue_found(queue, page, depth=0)
             else:
                 out_of_scope.append(page)
         self._sitemap_pages_out_of_scope = out_of_scope
+
+    def _queue_found(self, queue: CrawlerQueue, url: str, *, depth: int) -> bool:
+        """Queue a link or a sitemap page unless the queue, or the share of its host, is full; True if it was queued.
+
+        Its priority is its depth: breadth-first.
+        """
+        host = get_host(url)
+        if self._max_host_queued is not None and self._host_queued[host] >= self._max_host_queued:
+            if not queue.closed and not queue.is_seen(url):
+                self._links_dropped_by_host += 1
+            return False
+        if not queue.closed and queue.unfinished + self._pages_requested >= self._max_frontier:
+            if not queue.is_seen(url):
+                if not self._links_dropped:
+                    logger.info(
+                        "Queue is full: pages queued, in progress and requested reached %d (%d x max_pages); "
+                        "new links are not queued until it has room",
+                        self._max_frontier,
+                        self.FRONTIER_FACTOR,
+                    )
+                self._links_dropped += 1
+            return False
+        if not queue.add_url(url, priority=depth, depth=depth):
+            return False
+        self._host_queued[host] += 1
+        if self._host_queued[host] == self._max_host_queued:
+            logger.info(
+                "Host %s has %d pages queued (%d x max_pages_per_host): its new links are not queued",
+                host,
+                self._max_host_queued,
+                self.FRONTIER_FACTOR,
+            )
+        return True
 
     async def _sitemaps_in_robots(self, url: str) -> list[str]:
         """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read."""
@@ -796,6 +1021,7 @@ class AsyncCrawler:
             processed=stats["processed"],
             failed=stats["failed"],
             skipped=stats["skipped"],
+            over_host_limit=self._over_host_limit,
             blocked=stats["blocked"],
             unreachable=stats["unreachable"],
             queued=stats["queued"],
@@ -815,9 +1041,18 @@ class AsyncCrawler:
         """Errors of page requests since the latest crawl() started, or since the crawler was created."""
         return self._errors.get_stats()
 
-    async def _crawl_worker(self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int) -> None:
+    async def _crawl_worker(
+        self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int, max_pages_per_host: int | None
+    ) -> None:
         while (url := await queue.get_next()) is not None:
             try:
+                # A host that asked to wait (Retry-After) or waits out the
+                # pause before a retry: the worker takes pages of other hosts
+                # meanwhile instead of waiting in the rate limiter.
+                if (penalty := self._penalty_left(url)) > self.MIN_PENALTY_TO_DEFER:
+                    logger.info("Deferred %s for %.1fs: its host is held back", url, penalty)
+                    queue.defer(url, penalty, priority=queue.depth(url))
+                    continue
                 # robots.txt and the circuit breaker are checked before the
                 # page counts toward max_pages: a refused page costs no request.
                 refusal = await self._check_robots(url) or self._check_circuit(url) or self._check_probes_left(url)
@@ -836,7 +1071,15 @@ class AsyncCrawler:
                     # that reached the limit: it goes back to the queue.
                     queue.requeue(url, priority=queue.depth(url))
                     continue
+                host = get_host(url)
+                assert host is not None  # the queue holds valid URLs only
+                if max_pages_per_host is not None and self._host_pages[host] >= max_pages_per_host:
+                    # Not requested, so not counted toward max_pages.
+                    self._over_host_limit += 1
+                    self._skip_page(url, queue, f"max_pages_per_host reached: {max_pages_per_host} pages of {host}")
+                    continue
                 self._pages_requested += 1
+                self._host_pages[host] += 1
                 if self._pages_requested >= max_pages:
                     # This URL is the last one allowed: the others stop taking new ones.
                     queue.close()
@@ -850,35 +1093,63 @@ class AsyncCrawler:
 
     async def _crawl_page(self, url: str, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
         depth = queue.depth(url)
-        result = await self._fetch(url, html_only=True, check_robots=False)
+        skip_reason: str | None = None
+        sent = False  # a request of the page got an answer: a redirect
+        targets: list[str] = []  # the redirects followed, remembered as seen for this page
+
+        def follow(target: str) -> bool:
+            nonlocal skip_reason, sent
+            sent = True
+            skip_reason = self._redirect_refusal(url, target, queue, url_filter)
+            if skip_reason is None:
+                targets.append(target)
+            return skip_reason is None
+
+        result = await self._fetch(url, html_only=True, check_robots=False, follow=follow)
         if isinstance(result.error, CircuitOpenError):
-            # Not sent: the circuit opened while the page waited for its turn.
-            self._pages_requested -= 1
-            self._defer_or_fail(url, queue, result.error)
+            # The circuit of the host, or of the host a redirect leads to,
+            # opened while the request waited for its turn.
+            if not sent:
+                # Nothing was sent: the page costs nothing of the limits.
+                self._pages_requested -= 1
+                self._host_pages[get_host(url)] -= 1
+                if queue.closed:
+                    # The page reached max_pages and closed the queue; now it is
+                    # back under the limit, and this worker goes on to crawl it,
+                    # or the page that takes its place, even if the others have stopped.
+                    queue.reopen()
+            if not self._defer_or_fail(url, queue, result.error):
+                self._forget_redirects(url, targets, queue)
+            return
+        if result.error is not None:
+            # The page is not crawled: its redirect targets are no longer
+            # seen, so that a direct link to one of them is still followed.
+            self._forget_redirects(url, targets, queue)
+        # The worker has checked robots.txt for the page; these are about the target of its redirect.
+        if isinstance(result.error, RobotsDisallowedError):
+            queue.mark_blocked(url, f"redirects to {result.error.url}, {result.error.message}")
+            return
+        if isinstance(result.error, RobotsUnreachableError):
+            queue.mark_unreachable(url, f"redirects to {result.error.url}, {result.error.message}")
             return
         if result.error is not None:
             self._fail_page(url, queue, result.error, result)
             return
-        if result.redirected:
-            # Normalized like the links, so that patterns see the same form.
-            final_url = normalize_url(result.final_url or url)
-            assert final_url is not None  # aiohttp has just fetched it
-            # A later link to the redirect target must not fetch the page again.
-            queue.mark_seen(final_url)
-            if url in self._start_urls:
-                # A start URL that redirects ("example.com" -> "www.example.com")
-                # defines the site as much as the URL itself. A page from a
-                # sitemap has depth 0 too, but is filtered like a link.
-                url_filter.allow_host_of(final_url)
-                self._queue_sitemap_pages_in_scope(queue, url_filter)
-            elif not url_filter.allows(final_url):
-                # aiohttp follows redirects on its own, so a link inside the
-                # crawl scope can lead out of it, e.g. to a sign-in page on
-                # another domain. Such a page is not part of the site.
-                logger.info("Skipped %s: redirected out of scope to %s", url, final_url)
-                queue.mark_skipped(url, f"redirected out of scope: {final_url}")
-                self.stats.record_page(url, status=result.status, elapsed=result.elapsed, skipped=True)
-                return
+        if url in self._start_urls and result.redirected and skip_reason is None:
+            # A start URL that redirects ("example.com" -> "www.example.com")
+            # defines the site as much as the URL itself; the hosts the chain
+            # only passed through (a consent page) do not. A page from a
+            # sitemap has depth 0 too, but is filtered like a link.
+            assert result.final_url is not None
+            url_filter.allow_host_of(result.final_url)
+            self._queue_sitemap_pages_in_scope(queue, url_filter)
+        if skip_reason is None and not is_html_content_type(result.content_type):
+            # A link without a file extension may still lead to a PDF or an
+            # image. Not a failure: the page is fine, just not one to parse.
+            skip_reason = f"not HTML: {result.content_type}"
+        if skip_reason is not None:
+            self._skip_page(url, queue, skip_reason, result)
+            return
 
         try:
             page = await self._parse(result)
@@ -886,11 +1157,22 @@ class AsyncCrawler:
             logger.warning("Failed to parse %s: %s", url, error.message)
             self._fail_page(url, queue, error, result)
             return
+        duplicate = self._duplicate_of(url, result.final_url, page, queue)
+        if duplicate is not None:
+            # A variant of a page already seen ("?sort=price" of "/list"):
+            # its links are variants too, so they are not followed.
+            self._skip_page(url, queue, f"duplicate of {duplicate}", result)
+            return
+        noindex, nofollow = self._robots_directives(result, page)
         queued = 0
-        if depth < self.max_depth:
+        if depth < self.max_depth and not nofollow:
             for link in page["links"]:
-                if url_filter.allows(link) and queue.add_url(link, priority=depth + 1, depth=depth + 1):
+                if url_filter.allows(link) and self._queue_found(queue, link, depth=depth + 1):
                     queued += 1
+        if noindex is not None:
+            # The site asks not to keep the page; its links may still be followed.
+            self._skip_page(url, queue, noindex, result, links_queued=queued)
+            return
         if self.keep_pages:
             self.processed_urls[url] = page
         queue.mark_processed(url)
@@ -898,6 +1180,76 @@ class AsyncCrawler:
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
         if self.storage is not None:
             await self._save_page(_page_record(result, page, depth))
+
+    @staticmethod
+    def _duplicate_of(url: str, final_url: str | None, page: ParsedPage, queue: CrawlerQueue) -> str | None:
+        """The canonical URL of the page `url` if it is another page of the crawl it is a variant of; else None.
+
+        `final_url` is where the page was served from after its redirects.
+        Only a canonical URL that differs from it in the query alone counts:
+        a page with "?sort=price" or "?sessionid=1" whose canonical URL is
+        the plain one. A canonical URL elsewhere is not trusted, as a site
+        that gets it wrong (every page pointing to the home page) would lose
+        all its pages. The canonical page must be processed or still to be
+        crawled: if it failed or was left out, the variant is all there is.
+        URLs are compared in the form the queue keeps them in.
+        """
+        canonical = page["metadata"]["canonical"]
+        target = None if canonical is None else queue_form(canonical)
+        served = queue_form(final_url or url)
+        if target is None or served is None or target in (url, served):
+            # The page names itself, under its own URL or the one it was redirected to.
+            return None
+        target_parts, served_parts = urlsplit(target), urlsplit(served)
+        if (target_parts.netloc, target_parts.path) != (served_parts.netloc, served_parts.path):
+            return None
+        return canonical if queue.is_pending_or_processed(target) else None
+
+    def _robots_directives(self, result: FetchResult, page: ParsedPage) -> tuple[str | None, bool]:
+        """Whether the page asks not to be kept, and why (None if it does not); whether not to follow its links.
+
+        Read from X-Robots-Tag and the robots meta tags (<meta name="robots">
+        and the one with the crawler's name), only while robots.txt is followed.
+        """
+        if self.robots is None:
+            return None, False
+        sources = (("X-Robots-Tag", result.robots_tag), ("a robots meta tag", page["metadata"]["robots"]))
+        noindex = next((f"noindex in {name}" for name, found in sources if {"noindex", "none"} & set(found)), None)
+        nofollow = any({"nofollow", "none"} & set(found) for _, found in sources)
+        return noindex, nofollow
+
+    def _redirect_refusal(self, url: str, target: str, queue: CrawlerQueue, url_filter: UrlFilter) -> str | None:
+        """Why the page `url` of the crawl must not follow its redirect to `target`; None if it may.
+
+        Asked before the target is requested, so a redirect out of the crawl
+        scope costs no request to another site.
+        """
+        # A link inside the crawl scope can lead out of it, e.g. to a sign-in
+        # page on another domain. Such a page is not part of the site. A start
+        # URL may lead anywhere: the host it ends on joins the crawl scope
+        # once the chain is over (see _crawl_page).
+        if url not in self._start_urls and not url_filter.allows(target):
+            return f"redirected out of scope: {target}"
+        # A page is crawled under one URL: a later link to the target is not
+        # fetched, and a redirect to a page already seen is not followed.
+        # The redirects of one page may lead back to it (a cookie check) or
+        # loop; they are followed up to MAX_REDIRECTS.
+        # Compared without tracking parameters, as the queue keeps URLs.
+        page = strip_tracking_params(target)
+        if page != url and self._redirect_sources.get(page) != url:
+            if queue.is_seen(page):
+                return f"redirected to a page already seen: {target}"
+            queue.mark_seen(page)
+            self._redirect_sources[page] = url
+        return None
+
+    def _forget_redirects(self, url: str, targets: Iterable[str], queue: CrawlerQueue) -> None:
+        """Let the redirect targets of the page `url` be queued again: the page failed, so they were not crawled."""
+        for target in targets:
+            page = strip_tracking_params(target)
+            if self._redirect_sources.get(page) == url:
+                del self._redirect_sources[page]
+                queue.forget(page)
 
     def _fail_page(self, url: str, queue: CrawlerQueue, error: FetchError, result: FetchResult | None = None) -> None:
         """Finish a page of the crawl as failed; `result` is that of its request, None if none was sent."""
@@ -907,6 +1259,31 @@ class AsyncCrawler:
             status=None if result is None else result.status,
             elapsed=None if result is None else result.elapsed,
             error=type(error).__name__,
+        )
+
+    def _skip_page(
+        self,
+        url: str,
+        queue: CrawlerQueue,
+        reason: str,
+        result: FetchResult | None = None,
+        *,
+        links_queued: int | None = None,
+    ) -> None:
+        """Finish a page of the crawl as skipped; `result` is that of its request, None if none was sent.
+
+        `links_queued` is how many new links of the page were queued, for the log; None if they were not followed.
+        """
+        if links_queued is None:
+            logger.info("Skipped %s: %s", url, reason)
+        else:
+            logger.info("Skipped %s: %s; %d new links queued", url, reason, links_queued)
+        queue.mark_skipped(url, reason)
+        self.stats.record_page(
+            url,
+            status=None if result is None else result.status,
+            elapsed=None if result is None else result.elapsed,
+            skipped=True,
         )
 
     async def _save_page(self, record: PageRecord) -> None:
@@ -943,20 +1320,30 @@ class AsyncCrawler:
             return None
         return CircuitOpenError(url, f"circuit breaker of {host} opened {opened} times, no more probes in this crawl")
 
-    def _defer_or_fail(self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError) -> None:
-        """Put off a page the circuit breaker refused until its host may be probed, or give up on it."""
+    def _penalty_left(self, url: str) -> float:
+        """Seconds the host of `url` is still held back for, after Retry-After or before a retry."""
         host = get_host(url)
+        return 0.0 if host is None else self.rate_limiter.penalty_left(host)
+
+    def _defer_or_fail(self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError) -> bool:
+        """Put off a page the circuit breaker refused until its host may be probed, or give up on it.
+
+        The host is that of the refusal: the page may redirect to another one.
+        Returns whether the page was put off rather than failed.
+        """
+        host = get_host(refusal.url)
         assert host is not None  # a URL without a host has no circuit
         opened = self.circuit_breaker.times_opened(host)
         if opened >= self.MAX_CIRCUIT_OPENINGS:
             logger.info("Gave up on %s: circuit breaker of %s opened %d times", url, host, opened)
             self._fail_page(url, queue, refusal)
-            return
+            return False
         # Back when the probe may go; a page refused while the probe is in
         # flight comes back a second later.
-        delay = self.circuit_breaker.probe_in(url) or 1.0
+        delay = self.circuit_breaker.probe_in(refusal.url) or 1.0
         logger.info("Deferred %s for %.1fs: %s", url, delay, refusal.message)
         queue.defer(url, delay, priority=queue.depth(url))
+        return True
 
     async def close(self) -> None:
         """Close the underlying session and the storage. Safe to call more than once.
@@ -995,16 +1382,19 @@ class AsyncCrawler:
             connector=connector,
             timeout=self._timeout,
             headers={"User-Agent": self._user_agent},
-            fallback_charset_resolver=_sniff_charset,
         )
 
-    async def _request(self, url: str, *, html_only: bool, raw: bool, timeout: aiohttp.ClientTimeout) -> _Response:
-        """Perform the GET request and read the whole body.
+    async def _request(
+        self, url: str, *, html_only: bool, raw: bool, truncate_at: int | None, timeout: aiohttp.ClientTimeout
+    ) -> _Response:
+        """Perform the GET request and read the body up to its size limit.
 
         With `html_only`, the body of a response whose Content-Type is not
         HTML is not read: the content is empty and the size is 0. With
-        `raw`, the body is returned as bytes and the content is empty; it is
-        read up to the size limit of a sitemap (see `_read_sitemap`).
+        `raw`, the body is returned as bytes and the content is empty; over
+        the size limit of a sitemap it fails with `SitemapError`. With
+        `truncate_at`, the body is cut to that many bytes. Otherwise a body
+        over `max_page_size` fails with `PageTooLargeError`.
         The size is measured after content decoding (gzip, deflate, ...),
         so it may be larger than the number of bytes sent over the network.
         """
@@ -1017,11 +1407,25 @@ class AsyncCrawler:
         session = self._get_session()
         headers = None if self._rotated_agents is None else {"User-Agent": next(self._rotated_agents)}
         try:
-            async with session.get(url, headers=headers, timeout=timeout) as response:
+            # Redirects are followed by _fetch(), one request at a time, so
+            # that each one is checked as a link to its target would be.
+            async with session.get(url, headers=headers, timeout=timeout, allow_redirects=False) as response:
                 response.raise_for_status()
                 # aiohttp reports "application/octet-stream" when the header
                 # is missing; None lets callers tell the two cases apart.
                 content_type = response.content_type if aiohttp.hdrs.CONTENT_TYPE in response.headers else None
+                location = response.headers.get(aiohttp.hdrs.LOCATION)
+                robots_tag = tuple(response.headers.getall("X-Robots-Tag", ()))
+                if response.status in self.REDIRECT_STATUSES and location is not None:
+                    # The body of a redirect is not wanted.
+                    return _Response(
+                        status=response.status,
+                        content="",
+                        size=0,
+                        final_url=location,
+                        content_type=content_type,
+                        redirected=True,
+                    )
                 if html_only and not is_html_content_type(content_type):
                     # A link to an archive or a video must not be downloaded
                     # just to be rejected by the parser. Leaving the block
@@ -1033,23 +1437,20 @@ class AsyncCrawler:
                         size=0,
                         final_url=str(response.url),
                         content_type=content_type,
-                        redirected=bool(response.history),
+                        robots_tag=robots_tag,
                     )
-                body = await self._read_sitemap(response, url) if raw else await response.read()
+                body = await self._read_body(response, url, raw=raw, truncate_at=truncate_at)
                 return _Response(
                     status=response.status,
-                    content="" if raw else _decode(body, response.get_encoding()),
+                    content="" if raw else _decode(body, _encoding(response, body)),
                     size=len(body),
                     final_url=str(response.url),
                     content_type=content_type,
-                    redirected=bool(response.history),
                     body=body if raw else None,
+                    robots_tag=robots_tag,
                 )
-        # Order matters: TooManyRedirects is a ClientResponseError, which is a
-        # ClientError; aiohttp's ServerTimeoutError is both a ClientError and
+        # Order matters: aiohttp's ServerTimeoutError is both a ClientError and
         # a TimeoutError; InvalidURL and the certificate error are ClientErrors too.
-        except aiohttp.TooManyRedirects as exc:
-            raise TooManyRedirectsError(url, f"too many redirects ({len(exc.history)})") from exc
         except aiohttp.ClientResponseError as exc:
             retry_after = parse_retry_after(exc.headers.get(aiohttp.hdrs.RETRY_AFTER) if exc.headers else None)
             raise HTTPStatusError(url, exc.status, exc.message, retry_after=retry_after) from exc
@@ -1064,20 +1465,32 @@ class AsyncCrawler:
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
 
-    async def _read_sitemap(self, response: aiohttp.ClientResponse, url: str) -> bytes:
-        """Read the body of a sitemap, giving up once it is over the size limit of a sitemap.
+    async def _read_body(
+        self, response: aiohttp.ClientResponse, url: str, *, raw: bool, truncate_at: int | None
+    ) -> bytes:
+        """Read the body, giving up once it is over its size limit; the rest is not downloaded.
 
         A response sent with Content-Encoding: gzip is unpacked as it is
-        read, so a few hundred kilobytes may turn into hundreds of
-        megabytes; the rest of such a body is not downloaded.
+        read, so a few hundred kilobytes may turn into gigabytes: the limit
+        is on the unpacked body.
         """
-        limit = self.sitemaps.MAX_SIZE
+        limit = truncate_at or (self.sitemaps.MAX_SIZE if raw else self.max_page_size)
+        if limit is None:
+            return await response.read()
+        too_large = SitemapError if raw else PageTooLargeError
+        # Content-Length counts the packed bytes, never more than the unpacked ones.
+        if truncate_at is None and response.content_length is not None and response.content_length > limit:
+            raise too_large(url, f"larger than {limit} bytes")
         chunks, size = [], 0
         async for chunk in response.content.iter_chunked(64 * 1024):
-            size += len(chunk)
-            if size > limit:
-                raise SitemapError(url, f"larger than {limit} bytes")
+            if size + len(chunk) > limit:
+                if truncate_at is None:
+                    raise too_large(url, f"larger than {limit} bytes")
+                chunks.append(chunk[: limit - size])
+                logger.info("Cut the body of %s to %d bytes", url, limit)
+                break
             chunks.append(chunk)
+            size += len(chunk)
         return b"".join(chunks)
 
 
@@ -1108,11 +1521,23 @@ def _describe_timeout(exc: TimeoutError, timeout: aiohttp.ClientTimeout) -> str:
     return f"total timeout ({timeout.total:.1f}s)"
 
 
+def _encoding(response: aiohttp.ClientResponse, body: bytes) -> str:
+    """The charset of the Content-Type header if Python knows it, else the one the markup declares.
+
+    `response.get_encoding()` does the same with a resolver, but only for a
+    body read whole with `read()`, not in chunks.
+    """
+    if response.charset:
+        with contextlib.suppress(LookupError, ValueError):
+            return codecs.lookup(response.charset).name
+    return _sniff_charset(response, body)
+
+
 def _sniff_charset(response: aiohttp.ClientResponse, body: bytes) -> str:
     """Pick an encoding when the Content-Type header has no charset.
 
-    aiohttp calls this only in that case and would otherwise assume UTF-8.
-    Many pages declare their encoding in the markup instead:
+    Without one, UTF-8 would be assumed, but many pages declare their
+    encoding in the markup instead:
     <meta charset="..."> or <meta http-equiv="Content-Type" content="...">.
     """
     declared = EncodingDetector.find_declared_encoding(body, is_html=True)

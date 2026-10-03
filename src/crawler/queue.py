@@ -6,22 +6,23 @@ import itertools
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from crawler.urls import normalize_url
+from crawler.urls import normalize_url, strip_tracking_params
 
 
 class CrawlerQueue:
     """URLs waiting to be crawled, ordered by priority, plus their outcomes.
 
     A lower `priority` value is served first; URLs with equal priority come
-    out in the order they were added. Every URL is normalized and accepted
-    at most once, so a page is never queued twice, whether it is still
-    waiting, being fetched or already done.
+    out in the order they were added. Every URL is normalized, stripped of
+    tracking parameters such as "utm_source" (see `strip_tracking_params`)
+    and accepted at most once, so a page is never queued twice, whether it
+    is still waiting, being fetched or already done.
 
     Lifecycle of a URL: `add_url` -> `get_next` (in progress) ->
     `mark_processed`, `mark_failed`, `mark_skipped`, `mark_blocked` or
     `mark_unreachable`; `requeue` and `defer` put it back unfetched.
     Workers loop until `get_next` returns None, which happens when there is
-    nothing left to do (see `get_next`) or after `close`.
+    nothing left to do (see `get_next`) or after `close`, until `reopen`.
     """
 
     def __init__(self) -> None:
@@ -48,13 +49,18 @@ class CrawlerQueue:
         return self._closed
 
     @property
+    def unfinished(self) -> int:
+        """URLs queued, deferred or in progress: accepted and not finished yet."""
+        return len(self._heap) + len(self._deferred) + len(self._in_progress)
+
+    @property
     def depths(self) -> Mapping[str, int]:
         """Read-only view: accepted URL -> depth it was found at."""
         return MappingProxyType(self._depths)
 
     def add_url(self, url: str, priority: int = 0, *, depth: int = 0) -> bool:
         """Queue a URL; return False if it is invalid, already seen, or the queue is closed."""
-        normalized = normalize_url(url)
+        normalized = queue_form(url)
         if normalized is None or normalized in self._seen or self._closed:
             return False
         self._seen.add(normalized)
@@ -63,11 +69,34 @@ class CrawlerQueue:
         self._wakeup.set()
         return True
 
+    def is_pending_or_processed(self, url: str) -> bool:
+        """Whether a URL was accepted and is still queued, deferred, in progress or processed.
+
+        False for a URL never accepted (one only remembered with `mark_seen`
+        too) and for one failed, skipped, blocked or unreachable.
+        """
+        normalized = queue_form(url)
+        if normalized is None or normalized not in self._depths:
+            return False
+        finished = (self.failed, self.skipped, self.blocked, self.unreachable)
+        return not any(normalized in outcomes for outcomes in finished)
+
     def mark_seen(self, url: str) -> None:
         """Remember a URL without queuing it, e.g. the target of a redirect."""
-        normalized = normalize_url(url)
+        normalized = queue_form(url)
         if normalized is not None:
             self._seen.add(normalized)
+
+    def is_seen(self, url: str) -> bool:
+        """Whether a URL was accepted or remembered with `mark_seen`."""
+        normalized = queue_form(url)
+        return normalized is not None and normalized in self._seen
+
+    def forget(self, url: str) -> None:
+        """Undo `mark_seen`: the URL may be queued again. An accepted URL stays seen."""
+        normalized = queue_form(url)
+        if normalized is not None and normalized not in self._depths:
+            self._seen.discard(normalized)
 
     async def get_next(self) -> str | None:
         """Take the next URL, waiting while the queue is empty but work is in progress.
@@ -75,7 +104,7 @@ class CrawlerQueue:
         An empty queue does not mean the crawl is over: a page that is still
         being fetched may add new links, and a deferred URL comes back. None
         is returned only when the queue is empty and no URL is in progress
-        or deferred, or after `close`.
+        or deferred, or while the queue is closed.
         """
         while not self._closed:
             if self._heap:
@@ -156,6 +185,15 @@ class CrawlerQueue:
             self._undefer(url)
         self._wakeup.set()
 
+    def reopen(self) -> None:
+        """Undo `close`: URLs are handed out and accepted again.
+
+        Workers that `get_next` has already given None to have stopped;
+        the queue does not bring them back.
+        """
+        self._closed = False
+        self._wakeup.set()
+
     def get_stats(self) -> dict[str, int]:
         return {
             "queued": len(self._heap) + len(self._deferred),
@@ -179,3 +217,9 @@ class CrawlerQueue:
         self._in_progress.remove(url)
         # The last finished URL may mean the crawl is over: waiters must re-check.
         self._wakeup.set()
+
+
+def queue_form(url: str) -> str | None:
+    """The form in which the queue keeps a URL: normalized, without tracking parameters; None if the URL is invalid."""
+    normalized = normalize_url(url)
+    return None if normalized is None else strip_tracking_params(normalized)

@@ -6,7 +6,7 @@ import itertools
 import time
 
 import pytest
-from helpers import BOT, UNTHROTTLED, FakeClock
+from helpers import BOT, UNTHROTTLED, FakeClock, MemoryStorage
 
 from crawler import (
     AsyncCrawler,
@@ -14,6 +14,7 @@ from crawler import (
     CircuitOpenError,
     RetryStrategy,
     RobotsDisallowedError,
+    RobotsParser,
     RobotsUnreachableError,
 )
 
@@ -70,6 +71,14 @@ class TestRateLimit:
         assert len(site.log) == len(starts) == len(paths)
         assert min(gaps(starts)) >= 0.1 - EPSILON
 
+    async def test_redirect_waits_for_its_turn(self, url, site):
+        async with polite(requests_per_second=10) as crawler:
+            await open_session(crawler, url, site)
+            starts = record_starts(crawler)
+            await crawler.fetch_url(url("/site/moved"))
+        assert [path for path, _ in site.log] == ["/site/moved", "/site/c.html"]
+        assert gaps(starts)[0] >= 0.1 - EPSILON
+
     async def test_waiting_host_does_not_hold_back_another(self, url, site):
         # Two slots, six pages of one host: the rest of them wait for their
         # turn without taking a slot, so the other host starts at once.
@@ -115,6 +124,47 @@ class TestRobots:
                 await crawler.fetch_url(url("/site/"))
         async with polite(respect_robots=True, user_agent="OtherBot/2.0") as crawler:
             assert await crawler.fetch_url(url("/site/"))
+
+    async def test_nofollow_and_noindex_are_respected(self, url, site):
+        storage = MemoryStorage()
+        async with polite(respect_robots=True, max_depth=2, storage=storage) as crawler:
+            pages = await crawler.crawl([url("/site/robots.html")])
+
+        # rel="nofollow" (a.html) and the links of pages that ask not to follow
+        # them (c.html, a/deeper.html) are not requested; those of a page
+        # that asks only not to be kept are (b.html).
+        assert set(site.hits) == {
+            "/robots.txt", "/site/robots.html", "/site/noindex.html", "/site/nofollow.html", "/site/tagged.html",
+            "/site/b.html",
+        }  # fmt: skip
+        assert crawler.skipped_urls == {
+            url("/site/noindex.html"): "noindex in a robots meta tag",
+            url("/site/tagged.html"): "noindex in X-Robots-Tag",
+        }
+        crawled = {url("/site/robots.html"), url("/site/nofollow.html"), url("/site/b.html")}
+        assert set(pages) == crawled
+        assert {record["url"] for batch in storage.batches for record in batch} == crawled
+        assert pages[url("/site/nofollow.html")]["metadata"]["robots"] == ["nofollow"]
+
+    async def test_robots_meta_tag_named_after_the_crawler_is_respected(self, url, site):
+        start = [url("/site/for-testbot.html"), url("/site/for-otherbot.html")]
+        async with polite(respect_robots=True, max_depth=1) as crawler:
+            pages = await crawler.crawl(start)
+
+        # "none" for TestBot: not kept, links not followed; for another crawler: ignored.
+        assert crawler.skipped_urls == {url("/site/for-testbot.html"): "noindex in a robots meta tag"}
+        assert set(pages) == {url("/site/for-otherbot.html"), url("/site/b.html")}
+        assert site.hits["/site/c.html"] == 0
+
+    async def test_nofollow_and_noindex_are_ignored_without_robots_txt(self, url, site):
+        async with polite(respect_robots=False, max_depth=2) as crawler:
+            pages = await crawler.crawl([url("/site/robots.html")])
+
+        assert not any(reason.startswith("noindex") for reason in crawler.skipped_urls.values())
+        assert {url("/site/a.html"), url("/site/noindex.html"), url("/site/tagged.html"), url("/site/c.html")} <= set(
+            pages
+        )
+        assert site.hits["/site/a/deeper.html"] == 1
 
     async def test_unreachable_robots_txt_keeps_the_site_unfetched(self, url, site):
         site.robots, site.robots_status = "", 503
@@ -164,6 +214,42 @@ class TestRobots:
         }
         assert len(crawler.visited_urls) == 4
 
+    async def test_redirect_to_a_disallowed_page_is_not_followed(self, url, site):
+        site.robots = "User-agent: *\nDisallow: /site/private/"
+        async with polite(respect_robots=True) as crawler:
+            pages = await crawler.crawl([url("/site/go")])
+            with pytest.raises(RobotsDisallowedError):
+                await crawler.fetch_url(url("/site/go"))
+
+        assert pages == {}
+        assert crawler.blocked_urls == {
+            url("/site/go"): f"redirects to {url('/site/private/secret')}, disallowed by robots.txt"
+        }
+        assert site.hits["/site/private/secret"] == 0
+
+    async def test_redirect_to_another_host_follows_its_robots_txt(self, url, site):
+        site.robots_by_host = {"localhost": "User-agent: *\nDisallow: /"}
+        async with polite(respect_robots=True) as crawler:
+            with pytest.raises(RobotsDisallowedError) as error:
+                await crawler.fetch_url(url("/site/to-other-host"))
+
+        assert error.value.url == url("/site/", "localhost")
+        assert site.hits["/site/"] == 0
+        assert site.hits["/robots.txt"] == 2  # of both hosts
+
+    async def test_endless_robots_txt_is_cut_and_read(self, url, site, monkeypatch):
+        monkeypatch.setattr(RobotsParser, "MAX_SIZE", 1000)
+        site.robots, site.robots_endless = "User-agent: *\nDisallow: /site/b.html\n", True
+        async with polite(respect_robots=True, total_timeout=5) as crawler:
+            started = time.perf_counter()
+            html = await crawler.fetch_url(url("/site/a.html"))
+            with pytest.raises(RobotsDisallowedError):
+                await crawler.fetch_url(url("/site/b.html"))
+
+        assert "<title>A</title>" in html
+        # Read up to the limit, not until the total timeout.
+        assert time.perf_counter() - started < 3
+
     async def test_crawl_delay_spaces_out_requests(self, url, site):
         site.robots = "User-agent: *\nCrawl-delay: 0.1"
         async with polite(respect_robots=True, max_depth=1) as crawler:
@@ -202,6 +288,24 @@ class TestRetries:
         assert len(starts) == 5
         assert all(start - starts[0] >= 0.2 - EPSILON for start in starts[1:])
         assert min(gaps(starts)) >= 0.1 - EPSILON
+
+
+class TestRetryAfter:
+    async def test_crawl_puts_off_the_pages_of_a_host_that_asked_to_wait(self, url, site):
+        # The host asks for 2 s, longer than a retry may wait: the request is
+        # not retried, yet the host is left alone for the whole 2 s, and the
+        # crawl goes on to another host meanwhile.
+        other_host = url("/site/b.html", "localhost")
+        options = {"max_concurrent": 1, "max_depth": 0, "retry_strategy": RetryStrategy(max_retries=1, max_delay=0.5)}
+        async with polite(**options) as crawler:
+            await crawler.crawl([url("/busy/2"), url("/site/a.html"), other_host])
+
+        (busy, asked), (other, _), (page, requested) = site.log
+        assert [busy, other, page] == ["/busy/2", "/site/b.html", "/site/a.html"]
+        assert requested - asked >= 2 - EPSILON
+        assert list(crawler.failed_urls) == [url("/busy/2")]
+        assert set(crawler.processed_urls) == {url("/site/a.html"), other_host}
+        assert crawler.crawl_stats().requests == 3
 
 
 class TestCircuitBreaker:

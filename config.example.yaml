@@ -15,6 +15,7 @@ sitemaps:
 
 crawler:
   max_pages: 100        # pages requested, failed ones included
+  max_pages_per_host: null  # pages requested from one host; null for no limit of its own
   max_depth: 2          # links followed from a start URL; 0 crawls only the start URLs
   max_concurrent: 10    # requests in flight
   max_per_domain: null  # requests in flight to one host; null for no limit of its own
@@ -22,13 +23,14 @@ crawler:
   per_domain_rate: true # the rate limit is for each host, not for all of them together
   min_delay: 0.0        # pause between two requests to a host
   jitter: 0.0           # random addition to the pause, up to this much
-  respect_robots: true
+  respect_robots: true  # robots.txt, and nofollow / noindex of pages and links
   user_agent: "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
   user_agents: []       # variants to rotate; each starts with the same name as user_agent
   total_timeout: 30.0
   connect_timeout: 10.0
   read_timeout: 20.0
   timeout_growth: 1.5   # the timeouts grow by this factor on every retry
+  max_page_size: 10485760  # bytes; a larger page fails unread; null lifts the limit
   keep_pages: true      # false: a page is dropped from memory once it is saved, for large crawls
 
 # Repeated attempts of a request that failed for a while.
@@ -48,9 +50,16 @@ circuit_breaker:
 # Which links to follow. The patterns are regular expressions searched
 # anywhere in the URL; quote them with single quotes.
 filters:
-  same_domain_only: false
+  same_domain_only: true  # links to other hosts are not followed
   include: []           # e.g. ['^https://example\.com/blog/']
   exclude: []           # e.g. ['\.pdf$', '/login']
+  # Links to files with these extensions are not followed; [] follows them all.
+  exclude_extensions: [pdf, doc, docx, xls, xlsx, ppt, pptx,
+                       jpg, jpeg, png, gif, webp, svg, ico,
+                       zip, gz, tar, rar, 7z,
+                       mp3, mp4, avi, mov, webm,
+                       exe, dmg, iso,
+                       css, js]
 
 # Where the crawled pages are saved: files, by extension (.jsonl, .json,
 # .csv, .db), or database URLs (sqlite:///pages.db, postgresql://...).
@@ -58,6 +67,7 @@ storage:
   outputs: []           # e.g. [pages.jsonl, pages.csv]
   batch_size: 100       # pages written at once
   csv_encoding: utf-8   # utf-8-sig for Excel
+  overwrite: false      # true starts the files anew; false adds to them (databases keep a row per URL)
 
 logging:
   level: INFO           # DEBUG, INFO, WARNING, ERROR or CRITICAL

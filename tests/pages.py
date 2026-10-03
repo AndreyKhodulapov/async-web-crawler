@@ -57,6 +57,20 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 # links redirect to another host (to-other-host) or to c.html (moved).
 # /site/names.html links to pages whose URLs need percent-encoding, one of
 # them twice: as raw text and already encoded.
+# Not linked either: /site/go redirects to private/secret, /site/to-missing
+# to missing.html (a 404), and /site/cookie-check redirects to itself once to
+# set a cookie.
+# /site/bounce redirects to the home page through bounce-back on the other host.
+# /site/robots.html links to pages that ask crawlers, by rel="nofollow",
+# <meta name="robots"> or X-Robots-Tag, not to follow links or keep pages.
+# /site/for-testbot.html and /site/for-otherbot.html ask the same by a
+# <meta> named after one crawler: the tests' own (BOT) or another.
+# /site/long.html links to a page with a query of LONG_QUERY characters.
+# /site/variant.html names itself as canonical, so with any query it is a
+# variant; /site/points-home.html names the home page, a canonical URL
+# with another path. /site/lang redirects to /site/lang?hl=en, which names
+# /site/lang as canonical; /site/search names itself with "%2F" in its query.
+LONG_QUERY = 3000
 SITE_PAGES: dict[str, str] = {
     "/site/": """
         <title>Home</title>
@@ -71,6 +85,8 @@ SITE_PAGES: dict[str, str] = {
     "/site/a/deeper.html": '<title>Deeper</title><a href="deepest.html">Deepest</a> <a href="../c.html">C</a>',
     "/site/a/deepest.html": '<title>Deepest</title><a href="/site/">Home</a>',
     "/site/c.html": "<title>C</title>",
+    "/site/private/secret": "<title>Secret</title>",
+    "/site/cookie-check": "<title>Checked</title>",
     "/site/exits.html": '<title>Exits</title><a href="to-other-host">Sign in</a> <a href="moved">Moved</a>',
     "/site/names.html": """
         <title>Names</title>
@@ -78,4 +94,20 @@ SITE_PAGES: dict[str, str] = {
     """,
     "/site/café.html": "<title>Café</title>",
     "/site/a b.html": "<title>Space</title>",
+    "/site/robots.html": """
+        <title>Robots</title><a href="a.html" rel="sponsored nofollow">Ad</a> <a href="noindex.html">Noindex</a>
+        <a href="nofollow.html">Nofollow</a> <a href="tagged.html">Tagged</a>
+    """,
+    "/site/noindex.html": '<meta name="robots" content="noindex"><title>Noindex</title><a href="b.html">B</a>',
+    "/site/nofollow.html": '<meta name="robots" content="nofollow"><title>Nofollow</title><a href="c.html">C</a>',
+    "/site/tagged.html": '<title>Tagged</title><a href="a/deeper.html">Deeper</a>',
+    "/site/for-testbot.html": '<meta name="TestBot" content="none"><title>For TestBot</title><a href="c.html">C</a>',
+    "/site/for-otherbot.html": '<meta name="otherbot" content="none"><title>For OtherBot</title><a href="b.html">B</a>',
+    "/site/variant.html": '<link rel="canonical" href="variant.html"><title>Variant</title><a href="c.html">C</a>',
+    "/site/points-home.html": '<link rel="canonical" href="/site/"><title>Points home</title>',
+    "/site/lang": '<link rel="canonical" href="lang"><title>Lang</title><a href="c.html">C</a>',
+    "/site/search": '<link rel="canonical" href="search?path=%2Fdocs"><title>Search</title><a href="c.html">C</a>',
+    "/site/long.html": f'<title>Long</title><a href="c.html?q={"x" * LONG_QUERY}">Long</a> <a href="b.html">B</a>',
 }
+# Response headers of some of SITE_PAGES.
+SITE_HEADERS: dict[str, dict[str, str]] = {"/site/tagged.html": {"X-Robots-Tag": "none"}}

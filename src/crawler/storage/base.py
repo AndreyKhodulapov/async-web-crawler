@@ -6,6 +6,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Sequence
+from pathlib import Path
 from types import TracebackType
 from typing import ClassVar, Self
 
@@ -178,3 +179,12 @@ class DataStorage(ABC):
     @abstractmethod
     async def _close(self) -> None:
         """Release the file or the connection."""
+
+
+def warn_adding_to_file(path: Path, size: int) -> None:
+    """Log that a file storage adds pages to a file that is not empty, such as one of an earlier run."""
+    logger.warning(
+        "%s already has %d bytes: adding the pages to it; overwrite (storage.overwrite, --overwrite) starts it anew",
+        path,
+        size,
+    )

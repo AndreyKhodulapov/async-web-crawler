@@ -11,6 +11,7 @@ from crawler import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    PageTooLargeError,
     RetryStrategy,
     TooManyRedirectsError,
 )
@@ -50,7 +51,10 @@ async def test_redirect_loop_is_not_retried(server):
     async with AsyncCrawler(**{**UNTHROTTLED, "retry_strategy": RetryStrategy(max_retries=2)}) as crawler:
         with pytest.raises(TooManyRedirectsError, match="too many redirects"):
             await crawler.fetch_url(str(server.make_url("/redirect-loop")))
-        assert crawler.rate_limiter.get_stats().requests == 1  # one attempt, no retries
+        # The page and the ten redirects followed, each waiting for its turn
+        # in the rate limiter; the eleventh is not. No retries.
+        assert crawler.rate_limiter.get_stats().requests == 11
+        assert crawler.error_stats().retries == 0
 
 
 @pytest.mark.parametrize("timeout", ["read_timeout", "total_timeout"])
@@ -145,3 +149,32 @@ async def test_fixed_timeout_keeps_failing_a_slow_page(server):
         with pytest.raises(FetchTimeoutError, match=r"read timeout \(0\.3s\)"):
             await crawler.fetch_url(str(server.make_url("/delay/0.5")))
         assert crawler.rate_limiter.get_stats().requests == 2
+
+
+class TestPageSizeLimit:
+    @pytest.mark.parametrize("path", ["/huge/endless", "/huge/large", "/huge/gzip"])
+    async def test_page_over_the_limit_fails_unread(self, url, path):
+        async with AsyncCrawler(max_page_size=1_000_000, **UNTHROTTLED) as crawler:
+            started = time.perf_counter()
+            with pytest.raises(PageTooLargeError, match="larger than 1000000 bytes"):
+                await crawler.fetch_url(url(path))
+        # Given up while reading, not at the total timeout of a page that never ends.
+        assert time.perf_counter() - started < 5
+
+    async def test_page_within_the_limit_is_read(self, url):
+        async with AsyncCrawler(max_page_size=3_000_000, **UNTHROTTLED) as crawler:
+            html = await crawler.fetch_url(url("/huge/large"))
+        assert html.startswith("<title>Large</title>")
+
+    async def test_no_limit(self, url):
+        async with AsyncCrawler(max_page_size=None, **UNTHROTTLED) as crawler:
+            html = await crawler.fetch_url(url("/huge/gzip"))
+        assert len(html) > 20_000_000
+
+    async def test_crawl_fails_the_page_and_goes_on(self, url):
+        async with AsyncCrawler(max_page_size=1_000_000, **UNTHROTTLED) as crawler:
+            pages = await crawler.crawl([url("/huge/gzip"), url("/ok")])
+
+        assert list(pages) == [url("/ok")]
+        assert crawler.failed_urls == {url("/huge/gzip"): "PageTooLargeError: larger than 1000000 bytes"}
+        assert crawler.error_stats().permanent_errors == crawler.failed_urls

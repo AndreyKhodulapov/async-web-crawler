@@ -15,11 +15,25 @@ import yaml
 
 from crawler.client import AsyncCrawler
 from crawler.exceptions import ConfigError
+from crawler.filters import extension_problem, normalize_extension
 from crawler.robots import product_token
 from crawler.storage import CompositeStorage, DataStorage, storage_from_output
 from crawler.urls import is_valid_http_url
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+# Links to files a crawl of web pages has no use for: documents, images,
+# archives, media, programs, styles and scripts.
+# fmt: off
+EXCLUDED_EXTENSIONS = (
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "jpg", "jpeg", "png", "gif", "webp", "svg", "ico",
+    "zip", "gz", "tar", "rar", "7z",
+    "mp3", "mp4", "avi", "mov", "webm",
+    "exe", "dmg", "iso",
+    "css", "js",
+)
+# fmt: on
 
 _INVALID = object()  # a value that was reported and is left at its default
 
@@ -87,6 +101,7 @@ class CrawlOptions:
     """Section `crawler`: how much to crawl and how fast. Times are in seconds."""
 
     max_pages: int = _option(100, minimum=1)
+    max_pages_per_host: int | None = _option(None, minimum=1)  # null: as many as max_pages
     max_depth: int = _option(2, minimum=0)
     max_concurrent: int = _option(10, minimum=1)
     max_per_domain: int | None = _option(None, minimum=1)
@@ -103,6 +118,7 @@ class CrawlOptions:
     connect_timeout: float = _option(10.0, above=0)
     read_timeout: float = _option(20.0, above=0)
     timeout_growth: float = _option(1.5, minimum=1)
+    max_page_size: int | None = _option(AsyncCrawler.DEFAULT_MAX_PAGE_SIZE, minimum=1)  # bytes; null lifts the limit
     keep_pages: bool = True  # false lets a page go once it is saved: the memory of a large crawl stays flat
 
 
@@ -139,9 +155,12 @@ class CircuitBreakerOptions:
 class FilterOptions:
     """Section `filters`: which links to follow, see `UrlFilter`."""
 
-    same_domain_only: bool = False
+    same_domain_only: bool = True  # links to other hosts are not followed
     include: tuple[str, ...] = _option((), check=_pattern)
     exclude: tuple[str, ...] = _option((), check=_pattern)
+    exclude_extensions: tuple[str, ...] = _option(
+        EXCLUDED_EXTENSIONS, check=extension_problem, normalize=normalize_extension
+    )  # links to files with these extensions are not followed; [] follows them all
 
 
 @dataclass(frozen=True)
@@ -151,6 +170,7 @@ class StorageOptions:
     outputs: tuple[str, ...] = _option((), check=_file_path)  # files by extension, or database URLs
     batch_size: int = _option(100, minimum=1)
     csv_encoding: str = "utf-8"
+    overwrite: bool = False  # files are started anew instead of added to; databases keep a row per URL anyway
 
     def build(self) -> DataStorage | None:
         """The storage of the pages; None if there are no outputs.
@@ -160,7 +180,9 @@ class StorageOptions:
             LookupError: `csv_encoding` is unknown.
         """
         storages = [
-            storage_from_output(output, csv_encoding=self.csv_encoding, batch_size=self.batch_size)
+            storage_from_output(
+                output, csv_encoding=self.csv_encoding, overwrite=self.overwrite, batch_size=self.batch_size
+            )
             for output in self.outputs
         ]
         if not storages:

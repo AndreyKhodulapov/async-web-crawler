@@ -28,7 +28,9 @@ def test_options_are_shaped_like_the_configuration():
             "--max-depth", "0",
             "--output", "pages.jsonl",
             "--output", "sqlite:///pages.db",
+            "--overwrite",
             "--no-respect-robots",
+            "--no-same-domain-only",
             "--rate-limit", "2.5",
             "--stats-json", "stats.json",
             "--report", "report.html",
@@ -40,7 +42,8 @@ def test_options_are_shaped_like_the_configuration():
     assert config_overrides(args) == {
         "urls": ["https://one.example/", "https://two.example/"],
         "crawler": {"max_pages": 7, "max_depth": 0, "respect_robots": False, "rate_limit": 2.5},
-        "storage": {"outputs": ["pages.jsonl", "sqlite:///pages.db"]},
+        "filters": {"same_domain_only": False},
+        "storage": {"outputs": ["pages.jsonl", "sqlite:///pages.db"], "overwrite": True},
         "report": {"stats_json": "stats.json", "html": "report.html"},
         "logging": {"level": "DEBUG", "file": "crawler.log"},
     }
@@ -51,6 +54,26 @@ def test_pages_are_not_kept_in_memory_whatever_the_file_says(tmp_path):
 
     assert build_config(parse_args(["--config", path])).crawler.keep_pages is False
     assert build_config(parse_args(["--urls", "https://example.com/"])).crawler.keep_pages is False
+
+
+@pytest.mark.parametrize(("option", "expected"), [("--same-domain-only", True), ("--no-same-domain-only", False)])
+def test_same_domain_only_wins_over_the_file(option, expected, tmp_path):
+    config = write_config(tmp_path, {"urls": ["https://example.com/"], "filters": {"same_domain_only": not expected}})
+
+    assert build_config(parse_args(["--config", config, option])).filters.same_domain_only is expected
+    assert build_config(parse_args(["--config", config])).filters.same_domain_only is not expected
+
+
+@pytest.mark.parametrize(("option", "expected"), [("--overwrite", True), ("--no-overwrite", False)])
+def test_overwrite_wins_over_the_file(option, expected, tmp_path):
+    config = write_config(tmp_path, {"urls": ["https://example.com/"], "storage": {"overwrite": not expected}})
+
+    assert build_config(parse_args(["--config", config, option])).storage.overwrite is expected
+    assert build_config(parse_args(["--config", config])).storage.overwrite is not expected
+
+
+def test_crawl_stays_on_the_start_hosts_by_default():
+    assert build_config(parse_args(["--urls", "https://example.com/"])).filters.same_domain_only is True
 
 
 def test_rate_limit_of_zero_lifts_the_limit():

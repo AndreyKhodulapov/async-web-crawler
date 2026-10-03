@@ -2,7 +2,7 @@
 
 import pytest
 
-from crawler.urls import get_host, is_same_host, is_valid_http_url, normalize_url, resolve_url
+from crawler.urls import get_host, is_same_host, is_valid_http_url, normalize_url, resolve_url, strip_tracking_params
 
 BASE = "https://example.com/docs/guide/intro.html?lang=en"
 
@@ -174,3 +174,20 @@ def test_inline_data_is_not_remembered():
     assert resolve_url("mailto:someone@example.com", "https://example.com/") is None
 
     assert normalize_url.cache_info().currsize == 0
+
+
+@pytest.mark.parametrize(
+    ("url", "stripped"),
+    [
+        ("https://site/a?utm_source=mail&utm_campaign=x", "https://site/a"),
+        ("https://site/a?id=1&utm_source=mail&page=2", "https://site/a?id=1&page=2"),
+        ("https://site/a?fbclid=1&gclid=2&msclkid=3&yclid=4&dclid=5", "https://site/a"),
+        # The other parameters keep their order and spelling.
+        ("https://site/a?b=2&a=1&a=0&flag", "https://site/a?b=2&a=1&a=0&flag"),
+        # Only the names count, in their case: "UTM_SOURCE" and "utm" are not tracking parameters.
+        ("https://site/a?ref=utm_source&UTM_SOURCE=x&utm=1", "https://site/a?ref=utm_source&UTM_SOURCE=x&utm=1"),
+        ("https://site/a", "https://site/a"),
+    ],
+)
+def test_strip_tracking_params(url, stripped):
+    assert strip_tracking_params(url) == stripped

@@ -46,6 +46,30 @@ def test_exclude_patterns():
     assert url_filter.allows("https://site/manual.pdf.html")
 
 
+def test_exclude_extensions():
+    url_filter = UrlFilter(exclude_extensions=["pdf", ".JPG"])
+    assert not url_filter.allows("https://site/files/manual.pdf")
+    assert not url_filter.allows("https://site/Photo.jpg?size=large")  # any case; the query does not matter
+    assert not url_filter.allows("https://site/caf%C3%A9.PDF")
+    assert url_filter.allows("https://site/view?file=manual.pdf")  # the query names no file of the path
+    assert url_filter.allows("https://site/manual.pdf.html")
+    assert url_filter.allows("https://site/v1.pdf/")  # a directory
+    assert url_filter.allows("https://site/pdf")
+
+
+def test_max_url_length():
+    url_filter = UrlFilter(max_url_length=30)
+    assert url_filter.allows("https://site/" + "a" * 17)  # 30 characters
+    assert not url_filter.allows("https://site/" + "a" * 18)
+    assert UrlFilter().allows("https://site/?q=" + "a" * 100_000)
+
+
+@pytest.mark.parametrize("length", [0, -1])
+def test_invalid_max_url_length_is_rejected(length):
+    with pytest.raises(ValueError, match="max_url_length must be >= 1"):
+        UrlFilter(max_url_length=length)
+
+
 def test_patterns_match_both_encoded_and_decoded_url():
     # Links are normalized to the percent-encoded form.
     url = "https://site/caf%C3%A9/a%20b"
@@ -67,7 +91,7 @@ def test_all_rules_combined():
     assert not url_filter.allows("https://site/blog/post?share=1")
 
 
-@pytest.mark.parametrize("field", ["include_patterns", "exclude_patterns"])
+@pytest.mark.parametrize("field", ["include_patterns", "exclude_patterns", "exclude_extensions"])
 def test_single_string_instead_of_a_list_is_rejected(field):
     with pytest.raises(TypeError, match="got a string"):
         UrlFilter(**{field: "pdf"})
@@ -77,3 +101,9 @@ def test_single_string_instead_of_a_list_is_rejected(field):
 def test_invalid_pattern_is_rejected_early(field):
     with pytest.raises(ValueError, match=r"invalid pattern '\(unclosed'"):
         UrlFilter(**{field: ["(unclosed"]})
+
+
+@pytest.mark.parametrize("extension", ["", ".", "tar.gz", "a/b"])
+def test_invalid_extension_is_rejected_early(extension):
+    with pytest.raises(ValueError, match="invalid file extension"):
+        UrlFilter(exclude_extensions=["pdf", extension])

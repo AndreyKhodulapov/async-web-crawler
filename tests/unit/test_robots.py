@@ -15,6 +15,7 @@ from crawler import (
     TooManyRedirectsError,
     product_token,
 )
+from crawler.robots import robots_tag_directives
 
 
 def allowed(robots_txt: str, path: str, user_agent: str = BOT) -> bool:
@@ -32,6 +33,23 @@ def allowed(robots_txt: str, path: str, user_agent: str = BOT) -> bool:
 )
 def test_product_token(user_agent, token):
     assert product_token(user_agent) == token
+
+
+@pytest.mark.parametrize(
+    ("headers", "directives"),
+    [
+        ([], ()),
+        (["NoIndex, nofollow"], ("noindex", "nofollow")),
+        (["noindex", "noindex, noarchive"], ("noindex", "noarchive")),
+        # For this crawler by name, and for another one.
+        (["TestBot: none", "googlebot: noindex"], ("none",)),
+        # A directive with a value is not a crawler name.
+        (["unavailable_after: 25 Jun 2010 15:00:00 PST"], ("unavailable_after: 25 jun 2010 15:00:00 pst",)),
+        (["max-snippet: 20, nofollow"], ("max-snippet: 20", "nofollow")),
+    ],
+)
+def test_robots_tag_directives(headers, directives):
+    assert robots_tag_directives(headers, BOT) == directives
 
 
 class TestGroups:

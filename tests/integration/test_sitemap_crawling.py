@@ -53,6 +53,16 @@ async def test_sitemap_pages_come_after_the_start_urls_and_their_links_are_follo
     assert site.hits["/site/c.html"] == 1
 
 
+async def test_large_sitemap_does_not_fill_the_queue(url, site):
+    site.sitemaps = {"sitemap.xml": urlset(*(url(f"/wide/{n}") for n in range(1, 101)))}
+    async with make_crawler(max_concurrent=1) as crawler:
+        pages = await crawler.crawl([url("/wide/0")], 5, sitemap_urls=[url(SITEMAP)])
+
+    assert list(pages) == [url(f"/wide/{n}") for n in range(5)]
+    # The start URL is queued before the sitemaps are read; 14 of their pages join it.
+    assert len(crawler.url_depths) == AsyncCrawler.FRONTIER_FACTOR * 5
+
+
 async def test_start_url_listed_in_the_sitemap_is_fetched_once(url, site):
     site.sitemaps = {"sitemap.xml": urlset(url("/site/c.html"), url("/site/c.html#top"))}
     async with make_crawler() as crawler:

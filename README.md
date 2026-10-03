@@ -12,28 +12,36 @@ configuration file, by command-line options, or from Python.
 ## Features
 
 - **Crawling**: a priority queue of URLs and a pool of workers, depth and
-  page limits, deduplication of normalized URLs, filters by domain and by
-  regular expressions
+  page limits, deduplication of normalized URLs, filters by domain, by
+  regular expressions and by file extension (by default the crawl stays on
+  the start hosts, and documents, images and archives are not followed);
+  guards against endless URL spaces: tracking parameters dropped, a URL
+  length limit, `<link rel="canonical">` for variants of a page, a page
+  limit per host; a queue bounded by the page limit, so memory does not
+  grow with the size of the site
 - **Sitemaps** as a source of pages: plain and index sitemaps, gzip, the
   sitemaps named in robots.txt
 - **Concurrency**: one connection pool, a global limit of requests in
   flight and an optional limit per host
 - **Politeness**: requests per second per host or overall, minimum delay
-  and jitter, robots.txt per RFC 9309 with Crawl-delay, a configurable
-  User-Agent with rotation
+  and jitter, robots.txt per RFC 9309 with Crawl-delay, `nofollow` and
+  `noindex` of links, robots meta tags and `X-Robots-Tag` (also those
+  that name the crawler), a
+  configurable User-Agent with rotation
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that
   grow with every retry
 - **Circuit breaker** per host: a host that keeps failing is left alone
   for a while, then tested with a single probe request
 - **Clear error types** grouped by whether a retry can help; one failing
-  URL never breaks a crawl
+  URL never breaks a crawl; a size limit on every body, gzip bombs included
 - **HTML parsing** into title, metadata, text, links, images, headings,
   tables and lists; broken HTML and any encoding are handled; runs in a
   worker thread
 - **Storage** behind one interface: JSON Lines or a JSON array, CSV,
   SQLite, PostgreSQL, or several at once; asynchronous writes in batches
-  with retries
+  with retries; a file is added to by the next run, or started anew with
+  `--overwrite`
 - **Configuration file** in YAML or JSON, checked on load with every
   problem reported by the path of its key
 - **Command line** with live progress, a summary, exit codes for scripts
@@ -76,8 +84,6 @@ urls:
 crawler:
   max_pages: 20
   rate_limit: 2.0           # requests per second
-filters:
-  same_domain_only: true
 storage:
   outputs: [pages.jsonl, pages.csv]
 report:
@@ -110,7 +116,9 @@ or the default without a file.
 | `--max-pages N` | `crawler.max_pages` | pages to request, failed ones included |
 | `--max-depth N` | `crawler.max_depth` | links followed from a start URL; 0 crawls the start URLs only |
 | `--output PATH` | `storage.outputs` | where to save the pages: a `.jsonl`, `.json`, `.csv` or `.db` file, or a database URL; repeat for several, in place of those of the file |
-| `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, or do not |
+| `--overwrite`, `--no-overwrite` | `storage.overwrite` | start output files anew, or add to them (the default; the log warns about a file that is not empty); a database keeps a row per URL either way |
+| `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, `nofollow` and `noindex`, or do not |
+| `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
 | `--stats-json PATH` | `report.stats_json` | write the statistics of the crawl to a JSON file |
 | `--report PATH` | `report.html` | write an HTML report with charts |
@@ -118,13 +126,13 @@ or the default without a file.
 | `--log-file PATH` | `logging.file` | also write the log to a file, as JSON Lines |
 | `--no-progress` | | do not show the progress line |
 
-Everything else (sitemaps, filters, retries, the circuit breaker, timeouts)
+Everything else (sitemaps, the other filters, retries, the circuit breaker, timeouts)
 is set in the file. The command line never keeps the pages in memory
 (`crawler.keep_pages` is off whatever the file says): they go to `--output`.
 The log and the progress line go to stderr, the summary to stdout:
 
 ```
-[####################] 100% | 8/8 pages, 0 failed | 1.1 pages/s | done | active 0 (0 in flight) | queued 66 | 8s
+[####################] 100% | 8/8 pages, 0 failed | 1.1 pages/s | done | active 0 (0 in flight) | queued 0 | 8s
 
 === Crawl finished (8.06s) ===
 Pages: 8 (8 successful, 0 failed, 0 skipped), 1.0 pages/s, average response time 2.37s
@@ -183,6 +191,7 @@ with live progress, ready to run:
 
 ```bash
 python examples/advanced_usage.py      # crawls by examples/config.yaml, writes to out/
+PYTHONPATH=src python examples/advanced_usage.py   # the same without `pip install -e .`
 ```
 
 `AsyncCrawler` is the crawler itself, without files or configuration:
@@ -286,7 +295,7 @@ src/
     ├── config.py           # CrawlerConfig, load_config: YAML or JSON file, defaults, validation
     ├── logging_setup.py    # configure_logging: text on the console, JSON Lines in a rotated file
     ├── progress.py         # ProgressTracker, show_progress: percent, speed, time left, active tasks
-    ├── filters.py          # UrlFilter: host and pattern rules
+    ├── filters.py          # UrlFilter: host, pattern and file extension rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
     ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats

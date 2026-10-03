@@ -10,14 +10,13 @@ leaves a failing site alone.
 |------|----------|--------|
 | Transient | timeouts, HTTP 408, 429, 500, 502, 503, 504, Cloudflare's 520-524 | yes, with backoff |
 | Network | DNS failure, connection refused or reset | yes |
-| Permanent | HTTP 401, 403, 404, 410, 501, a redirect loop, a bad certificate, an invalid URL | no |
+| Permanent | HTTP 401, 403, 404, 410, 501, a redirect loop, a bad certificate, an invalid URL, a page over the size limit | no |
 | Parse | the body is not an HTML document | no: the same bytes come back |
 
 - Classify by **what a retry would do**, not by where the error comes from.
   A certificate that fails verification is raised by the network layer, but
   every attempt fails the same way. Retrying a redirect loop is costly too:
-  each attempt follows the whole chain (10 requests in aiohttp) outside the
-  rate limiter.
+  each attempt follows the whole chain (up to 10 requests).
 - Translate transport exceptions (aiohttp, asyncio) into one hierarchy of
   your own, in one place. Callers then depend on `TransientError` and
   `PermanentError`, not on the HTTP library, and the retry decision is an
@@ -66,7 +65,8 @@ leaves a failing site alone.
 - **Retry-After** (seconds or an HTTP date, with 429 or 503) tells when to
   come back: wait `max(backoff, Retry-After)`. When it asks for longer than
   the cap, do not retry: coming back early earns another refusal. The rest of
-  the crawler honors it too, see [politeness.md](politeness.md#backing-off-a-struggling-site).
+  the crawler still honors it in full, up to a cap of its own (10 minutes),
+  see [politeness.md](politeness.md#backing-off-a-struggling-site).
 - **Make the wait injectable**. `RetryStrategy(wait=...)` sleeps by default;
   the crawler instead holds back the whole host in the rate limiter, and
   tests pass a wait that only records the delays.

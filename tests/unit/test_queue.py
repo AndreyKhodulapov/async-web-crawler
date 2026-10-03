@@ -64,10 +64,29 @@ class TestAddUrl:
         assert dict(queue.depths) == {"http://site/": 3}
         assert queue.depth("http://site/") == 3
 
+    async def test_tracking_parameters_are_dropped(self):
+        queue = CrawlerQueue()
+        assert queue.add_url("http://site/a?id=1&utm_source=mail") is True
+        assert queue.add_url("http://site/a?fbclid=x&id=1") is False
+        assert queue.is_seen("http://site/a?id=1&gclid=y")
+        assert await take(queue) == "http://site/a?id=1"
+
     def test_marked_seen_url_is_not_queued(self):
         queue = CrawlerQueue()
         queue.mark_seen("http://site/redirect-target")
         assert queue.add_url("http://site/redirect-target") is False
+
+    def test_forgotten_url_is_queued_again_unless_accepted(self):
+        queue = CrawlerQueue()
+        queue.mark_seen("http://site/redirect-target")
+        queue.add_url("http://site/page")
+
+        queue.forget("http://site/redirect-target?utm_source=x")
+        queue.forget("http://site/page")
+        queue.forget("not a url")
+
+        assert queue.add_url("http://site/redirect-target") is True
+        assert queue.add_url("http://site/page") is False
 
 
 class TestGetNext:
@@ -109,6 +128,22 @@ class TestGetNext:
         assert queue.add_url("http://site/c") is False
         queue.mark_processed(page)  # pages in progress can still finish
         assert queue.get_stats()["queued"] == 1
+
+    async def test_reopen_hands_out_and_accepts_urls_again(self):
+        queue = CrawlerQueue()
+        queue.add_url("http://site/a")
+        page = await take(queue)
+        queue.close()
+        waiter = asyncio.create_task(queue.get_next())
+        await asyncio.sleep(0)
+
+        queue.reopen()
+        queue.defer(page, 0.01)
+
+        assert waiter.done() and waiter.result() is None  # stopped before the reopen
+        assert queue.get_stats()["queued"] == 1  # deferred, not queued at once
+        assert await queue.get_next() == page
+        assert queue.add_url("http://site/b") is True
 
 
 class TestDefer:
@@ -165,6 +200,19 @@ class TestDefer:
 
 
 class TestStatus:
+    async def test_unfinished_counts_queued_deferred_and_in_progress_urls(self):
+        queue = CrawlerQueue()
+        for name in "abcd":
+            queue.add_url(f"http://site/{name}")
+        a, b, _ = [await take(queue) for _ in range(3)]
+        assert queue.unfinished == 4
+
+        queue.defer(a, 60)
+        queue.mark_processed(b)
+
+        assert queue.unfinished == 3
+        queue.close()
+
     async def test_stats_follow_the_lifecycle(self):
         queue = CrawlerQueue()
         for name in ("a", "b", "c", "d", "e", "f"):
@@ -202,6 +250,24 @@ class TestStatus:
         assert queue.skipped == {c: "redirected out of scope: http://other/"}
         assert queue.blocked == {d: "disallowed by robots.txt"}
         assert queue.unreachable == {e: "robots.txt is unreachable (HTTP 503)"}
+
+    async def test_pending_or_processed_urls(self):
+        queue = CrawlerQueue()
+        for name in "abcd":
+            queue.add_url(f"http://site/{name}")
+        queue.mark_seen("http://site/target")
+        a, b = await take(queue), await take(queue)
+        queue.mark_processed(a)
+        queue.mark_failed(b, "error")
+        c = await take(queue)
+
+        assert queue.is_pending_or_processed("http://site/a?utm_source=x")
+        assert queue.is_pending_or_processed(c)
+        assert queue.is_pending_or_processed("http://site/d")
+        assert not queue.is_pending_or_processed(b)
+        assert not queue.is_pending_or_processed("http://site/target")
+        assert not queue.is_pending_or_processed("http://site/never")
+        assert not queue.is_pending_or_processed("not a url")
 
     async def test_requeue_puts_a_url_back_even_after_close(self):
         queue = CrawlerQueue()
