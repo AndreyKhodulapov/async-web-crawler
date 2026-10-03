@@ -515,13 +515,30 @@ class TestRetries:
         crawler = make_crawler(timeout_growth=1e300, read_timeout=1)
         assert crawler._timeout_for(retries=5).sock_read == AsyncCrawler.MAX_TIMEOUT_GROWTH
 
-    async def test_backoff_holds_back_the_whole_host(self, make_crawler, fake_session):
-        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=1, base_delay=0.2))
-        fake_session.routes["http://a/slow"] = [FakeResponse(status=503), FakeResponse()]
+    @pytest.mark.parametrize(
+        ("failure", "held_back"),
+        [
+            (FakeResponse(status=429), True),
+            (FakeResponse(status=503, retry_after="1"), True),
+            (aiohttp.ServerTimeoutError(), True),
+            (FakeResponse(status=503), False),
+            (FakeResponse(status=500), False),
+            (aiohttp.ClientConnectionError(), False),
+        ],
+        ids=["429", "retry-after", "timeout", "503", "500", "connection"],
+    )
+    async def test_backoff_holds_back_the_whole_host_only_when_it_is_overloaded(
+        self, make_crawler, fake_session, failure, held_back
+    ):
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=1, base_delay=0.1))
+        fake_session.routes["http://a/slow"] = [failure, FakeResponse()]
         retrying = asyncio.create_task(crawler.fetch_url("http://a/slow"))
         await asyncio.sleep(0.01)  # the first attempt has failed, the retry waits
 
-        assert crawler.rate_limiter.reserve("a") > 0  # other pages of the host wait too
+        # Other pages of the host wait too after HTTP 429, a Retry-After or a
+        # timeout, signs that the whole site is overloaded; after a failure of
+        # one page they do not.
+        assert (crawler.rate_limiter.reserve("a") > 0) is held_back
         assert crawler.rate_limiter.reserve("b") == 0
         await retrying
 

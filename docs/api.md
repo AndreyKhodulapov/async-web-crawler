@@ -106,8 +106,11 @@ a link to it would. Up to `AsyncCrawler.MAX_REDIRECTS` (10) redirects in a
 row are followed; one more fails with `TooManyRedirectsError`, its target
 not requested. A disallowed target fails the request with
 `RobotsDisallowedError` before it is sent. Crawl-delay is capped at 30 seconds. While
-a retry waits, the whole host waits with it, since a timeout or a 429 usually
-means the site is overloaded. A Retry-After header holds back the host for
+a request that got HTTP 429, a Retry-After header or a timeout waits for
+its retry, the whole host waits with it: such a failure usually means the
+site is overloaded. After any other failure (HTTP 500, a reset connection)
+only that request waits, and the other pages of the host are fetched
+meanwhile. A Retry-After header holds back the host for
 as long as it asks, up to `AsyncCrawler.MAX_RETRY_AFTER` (10 minutes), even
 when the request is not retried; a request whose Retry-After is longer than
 `max_delay` of the retry strategy is not retried. Later `fetch_url()` calls
@@ -211,7 +214,8 @@ and a host that stays down holds the crawl for about two cooldowns.
 
 The same goes for a host held back longer than
 `AsyncCrawler.MIN_PENALTY_TO_DEFER` (1 second), by a Retry-After or the
-pause before a retry: its pages are put off until the host may be asked
+pause before the retry of a request that found it overloaded (HTTP 429, a
+timeout): its pages are put off until the host may be asked
 again, instead of holding workers in the rate limiter, and count toward
 `max_pages` only when they are taken again.
 

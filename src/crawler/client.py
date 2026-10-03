@@ -97,10 +97,14 @@ class AsyncCrawler:
       rate limit, the retries and the circuit breaker of its own host.
     - Failed requests are retried as `retry_strategy` says: by default
       transient and network errors, such as a timeout or HTTP 503, up to 3
-      times with exponential backoff (see `RetryStrategy`). The pause before
-      a retry is spent in the rate limiter: the whole host waits with it; so
-      it does for as long as a Retry-After header asks, up to
-      `MAX_RETRY_AFTER` seconds, even when the request is not retried.
+      times with exponential backoff (see `RetryStrategy`). After HTTP 429,
+      a Retry-After header or a timeout, which say the whole site is
+      overloaded, the pause before the retry is spent in the rate limiter:
+      the whole host waits with it; so it does for as long as a Retry-After
+      header asks, up to `MAX_RETRY_AFTER` seconds, even when the request
+      is not retried. After any other failure (HTTP 500, a reset
+      connection) only the failed request waits: the other pages of the
+      host are fetched meanwhile.
     - A host whose requests keep failing is left alone for a while, as
       `circuit_breaker` says: by default once half of at least 5 requests
       in a minute have failed with a transient or network error, its
@@ -531,13 +535,19 @@ class AsyncCrawler:
         return result, attempts
 
     async def _wait_before_retry(self, error: Exception, delay: float) -> None:
-        """Hold back the host of the failed request instead of sleeping.
+        """Wait `delay` seconds before the retry; a failure that speaks for the whole host holds the host back.
 
-        The retry then waits for its turn in the rate limiter, and so does
-        every other request to the host: a timeout or HTTP 429 usually means
-        the whole site is overloaded, not one page.
+        HTTP 429, a Retry-After header or a timeout usually means the whole
+        site is overloaded: the pause is spent in the rate limiter, so that
+        the retry and every other request to the host wait for it. Any
+        other failure (HTTP 500, a reset connection) is taken to be about
+        the one page: only this request sleeps, and the host is asked for
+        its other pages meanwhile.
         """
         assert isinstance(error, FetchError)  # _fetch_once() reports every failure as one
+        if not _signals_overload(error):
+            await asyncio.sleep(delay)
+            return
         host = get_host(error.url)
         assert host is not None  # an invalid URL fails with an error that is not retried
         self.rate_limiter.penalize(host, delay)
@@ -741,8 +751,9 @@ class AsyncCrawler:
         `CircuitOpenError`, so a host that stays down holds the crawl for
         about two cooldowns of the breaker. A page whose host is held back
         for longer than `MIN_PENALTY_TO_DEFER` seconds, by a Retry-After or
-        the pause before a retry, is put off until the host may be asked
-        again, without counting toward `max_pages` before then.
+        the pause before the retry of a request that found the host
+        overloaded (HTTP 429, a timeout), is put off until the host may be
+        asked again, without counting toward `max_pages` before then.
 
         With `respect_robots`, the links of a page whose <meta name="robots">
         (or <meta> with the robots.txt name of the crawler, "asyncwebcrawler")
@@ -1509,6 +1520,13 @@ def _page_record(result: FetchResult, page: ParsedPage, depth: int) -> PageRecor
         status_code=result.status,
         content_type=result.content_type or "",
     )
+
+
+def _signals_overload(error: FetchError) -> bool:
+    """Whether the failure says the whole host is overloaded, not one page: HTTP 429, a Retry-After header or a timeout."""
+    if isinstance(error, HTTPStatusError):
+        return error.status == 429 or bool(error.retry_after)
+    return isinstance(error, FetchTimeoutError)
 
 
 def _describe_timeout(exc: TimeoutError, timeout: aiohttp.ClientTimeout) -> str:

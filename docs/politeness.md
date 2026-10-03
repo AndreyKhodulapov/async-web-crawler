@@ -159,6 +159,12 @@ sites it visits and follows their rules.
   Coming back after 30 seconds when asked for 2 minutes is what gets a bot
   blocked. Cap it all the same (here 10 minutes): a misconfigured server
   must not stop the crawl for a day.
+- A 500 or 502 on one URL, or a reset connection, more often means **one
+  page** or one backend is broken. Let only that request wait for its
+  retry: holding the host for every retry lets a few broken pages stall
+  the whole site for minutes (two pages answering 503 among 40 took a
+  crawl from 0.2 s to 10 s). A host that fails everywhere is caught by the
+  circuit breaker instead.
 - While a host is held back for long, put its pages aside rather than let
   workers wait for it: otherwise one host blocks the crawl of all the
   others (head-of-line blocking).

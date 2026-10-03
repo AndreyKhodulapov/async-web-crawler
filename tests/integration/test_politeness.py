@@ -273,9 +273,27 @@ class TestRetries:
         assert stats.retries == 1
         assert stats.requests == 2
 
-    async def test_backoff_holds_back_requests_already_waiting(self, url, site):
-        # The retry of /flaky/1 waits 0.2..0.4 s; the pages had booked their
-        # turns before the failure, and they wait for the retry too.
+    async def test_backoff_after_429_holds_back_requests_already_waiting(self, url, site):
+        # HTTP 429 says the whole site is overloaded. The retry of /busy/0
+        # waits 0.2..0.4 s; the pages had booked their turns before the
+        # failure, and they wait for the retry too.
+        async with polite(
+            requests_per_second=10, retry_strategy=RetryStrategy(max_retries=1, base_delay=0.4, max_delay=0.4)
+        ) as crawler:
+            await open_session(crawler, url, site)
+            starts = record_starts(crawler)
+            await crawler.fetch_many([url("/busy/0"), url("/site/"), url("/site/a.html"), url("/site/b.html")])
+
+        # The first attempt fails at once; its retry and the pages wait out the 0.2..0.4 s pause.
+        assert site.log[0][0] == "/busy/0"
+        assert len(starts) == 5
+        assert all(start - starts[0] >= 0.2 - EPSILON for start in starts[1:])
+        assert min(gaps(starts)) >= 0.1 - EPSILON
+
+    async def test_backoff_after_a_server_error_holds_back_the_page_only(self, url, site):
+        # HTTP 503 without a wait asked for (/flaky/1 sends Retry-After: 0) is
+        # taken to be about the one page: its retry waits 0.2..0.4 s on its
+        # own, and the pages take the next turns of the host meanwhile.
         async with polite(
             requests_per_second=10, retry_strategy=RetryStrategy(max_retries=1, base_delay=0.4, max_delay=0.4)
         ) as crawler:
@@ -283,11 +301,30 @@ class TestRetries:
             starts = record_starts(crawler)
             await crawler.fetch_many([url("/flaky/1"), url("/site/"), url("/site/a.html"), url("/site/b.html")])
 
-        # The first attempt fails at once; its retry and the pages wait out the 0.2..0.4 s pause.
-        assert site.log[0][0] == "/flaky/1"
+        assert [path for path, _ in site.log] == ["/flaky/1", "/site/", "/site/a.html", "/site/b.html", "/flaky/1"]
         assert len(starts) == 5
-        assert all(start - starts[0] >= 0.2 - EPSILON for start in starts[1:])
+        assert starts[1] - starts[0] < 0.2 - EPSILON  # the first page did not wait for the pause
+        assert starts[4] - starts[0] >= 0.2 - EPSILON  # the retry did
         assert min(gaps(starts)) >= 0.1 - EPSILON
+
+    async def test_failing_pages_do_not_hold_back_the_crawl_of_their_host(self, url, site):
+        # Two pages of the host answer HTTP 503 every time, and their retries
+        # wait 0.2..0.4 s each. The other pages are crawled meanwhile by the
+        # free workers, not after the pauses.
+        broken = [url("/flaky/9?page=1"), url("/flaky/9?page=2")]
+        pages = [url(f"/site/{name}") for name in ("", "a.html", "b.html", "c.html", "a/deeper.html", "a/deepest.html")]
+        options = {"max_concurrent": 5, "max_depth": 0, "retry_strategy": RetryStrategy(max_retries=1, base_delay=0.4)}
+        async with polite(**options) as crawler:
+            await crawler.crawl([*broken, *pages])
+
+        paths = [path for path, _ in site.log]
+        assert paths.count("/flaky/9") == 4
+        assert paths[-2:] == ["/flaky/9", "/flaky/9"]  # the retries come after every other page
+        first = site.log[0][1]
+        assert all(requested - first < 0.2 - EPSILON for path, requested in site.log if path != "/flaky/9")
+        assert set(crawler.failed_urls) == set(broken)
+        assert set(crawler.processed_urls) == set(pages)
+        assert crawler.crawl_stats().retries == 2
 
 
 class TestRetryAfter:

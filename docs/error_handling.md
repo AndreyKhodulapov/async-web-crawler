@@ -68,8 +68,10 @@ leaves a failing site alone.
   the crawler still honors it in full, up to a cap of its own (10 minutes),
   see [politeness.md](politeness.md#backing-off-a-struggling-site).
 - **Make the wait injectable**. `RetryStrategy(wait=...)` sleeps by default;
-  the crawler instead holds back the whole host in the rate limiter, and
-  tests pass a wait that only records the delays.
+  the crawler instead holds back the whole host in the rate limiter after a
+  429, a Retry-After or a timeout (see
+  [politeness.md](politeness.md#backing-off-a-struggling-site)), and tests
+  pass a wait that only records the delays.
 
 ## Timeouts
 
