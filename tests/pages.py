@@ -59,6 +59,8 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 # them twice: as raw text and already encoded.
 # Not linked either: /site/go redirects to private/secret, and
 # /site/cookie-check redirects to itself once to set a cookie.
+# /site/robots.html links to pages that ask crawlers, by rel="nofollow",
+# <meta name="robots"> or X-Robots-Tag, not to follow links or keep pages.
 SITE_PAGES: dict[str, str] = {
     "/site/": """
         <title>Home</title>
@@ -82,4 +84,13 @@ SITE_PAGES: dict[str, str] = {
     """,
     "/site/café.html": "<title>Café</title>",
     "/site/a b.html": "<title>Space</title>",
+    "/site/robots.html": """
+        <title>Robots</title><a href="a.html" rel="sponsored nofollow">Ad</a> <a href="noindex.html">Noindex</a>
+        <a href="nofollow.html">Nofollow</a> <a href="tagged.html">Tagged</a>
+    """,
+    "/site/noindex.html": '<meta name="robots" content="noindex"><title>Noindex</title><a href="b.html">B</a>',
+    "/site/nofollow.html": '<meta name="robots" content="nofollow"><title>Nofollow</title><a href="c.html">C</a>',
+    "/site/tagged.html": '<title>Tagged</title><a href="a/deeper.html">Deeper</a>',
 }
+# Response headers of some of SITE_PAGES.
+SITE_HEADERS: dict[str, dict[str, str]] = {"/site/tagged.html": {"X-Robots-Tag": "none"}}

@@ -46,6 +46,7 @@ class TestValidPage:
             "keywords": ["garden", "tools", "shovels"],
             "language": "en",
             "canonical": "https://shop.example.com/catalog/",
+            "robots": [],
         }
 
     def test_text_is_main_content_only(self, valid_page):
@@ -134,6 +135,12 @@ class TestLinks:
         page = parser.parse('<a href="next">n</a>', "http://example.com/old", final_url="https://example.com/new/")
         assert page["url"] == "http://example.com/old"
         assert page["links"] == ["https://example.com/new/next"]
+
+    @pytest.mark.parametrize(("skip_nofollow", "expected"), [(False, ["/a", "/b", "/c"]), (True, ["/a"])])
+    def test_skip_nofollow(self, skip_nofollow, expected):
+        html = '<a href="/a" rel="noopener">a</a><a href="/b" rel="NoFollow">b</a><a href="/c" rel="ugc nofollow">c</a>'
+        page = HTMLParser(skip_nofollow=skip_nofollow).parse(html, "https://example.com/")
+        assert page["links"] == [f"https://example.com{path}" for path in expected]
 
     def test_extract_links_directly(self, parser):
         html = '<a href="/a">1</a><a href="/a#x">2</a><a href="A">3</a>'
@@ -243,7 +250,15 @@ class TestMetadata:
             "keywords": [],
             "language": None,
             "canonical": None,
+            "robots": [],
         }
+
+    def test_robots_directives(self, parser):
+        html = (
+            '<meta name="Robots" content="NoIndex, follow"><meta name="robots" content="noindex,nofollow">'
+            '<meta name="googlebot" content="noarchive"><noscript><meta name="robots" content="none"></noscript>'
+        )
+        assert parser.extract_metadata(soup(html))["robots"] == ["noindex", "follow", "nofollow"]
 
     def test_svg_title_in_body_is_not_page_title(self, parser):
         assert parser.extract_metadata(soup("<body><svg><title>icon</title></svg></body>"))["title"] is None

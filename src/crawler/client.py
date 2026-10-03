@@ -44,7 +44,7 @@ from crawler.parser import HTMLParser, is_html_content_type
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryStrategy, parse_retry_after
-from crawler.robots import RobotsParser, product_token
+from crawler.robots import RobotsParser, product_token, robots_tag_directives
 from crawler.semaphores import SemaphoreManager
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
@@ -62,6 +62,7 @@ class _Response(NamedTuple):
     content_type: str | None
     redirected: bool = False  # a redirect, not followed; `final_url` is its Location header
     body: bytes | None = None  # the bytes as sent, when asked for instead of the text
+    robots_tag: tuple[str, ...] = ()  # the X-Robots-Tag headers as sent
 
 
 class AsyncCrawler:
@@ -84,7 +85,8 @@ class AsyncCrawler:
       a random `jitter` (see `RateLimiter`). `per_domain_rate=False` applies
       the rate to all hosts together; `requests_per_second=None` removes it.
     - With `respect_robots`, every URL is checked against robots.txt of its
-      site first. A disallowed URL is not requested and fails with
+      site first; `crawl()` also honors `noindex` and `nofollow` of pages
+      and links. A disallowed URL is not requested and fails with
       `RobotsDisallowedError`. While robots.txt of a site cannot be read,
       its URLs are not requested either and fail with
       `RobotsUnreachableError` (see `RobotsParser`).
@@ -232,7 +234,8 @@ class AsyncCrawler:
         self.max_page_size = max_page_size
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
-        self._parser = parser or HTMLParser()
+        # Links marked rel="nofollow" are left out of the pages, as robots.txt is followed.
+        self._parser = parser or HTMLParser(skip_nofollow=respect_robots)
         self.storage = storage
         self.keep_pages = keep_pages
         self._session: aiohttp.ClientSession | None = None
@@ -669,6 +672,7 @@ class AsyncCrawler:
             content_type=response.content_type,
             redirected=response.redirected,
             body=response.body,
+            robots_tag=robots_tag_directives(response.robots_tag, self._user_agent),
         )
 
     async def _parse(self, result: FetchResult) -> ParsedPage:
@@ -718,6 +722,12 @@ class AsyncCrawler:
         for longer than `MIN_PENALTY_TO_DEFER` seconds, by a Retry-After or
         the pause before a retry, is put off until the host may be asked
         again, without counting toward `max_pages` before then.
+
+        With `respect_robots`, the links of a page whose <meta name="robots">
+        or X-Robots-Tag says "nofollow" are not followed, and neither are
+        links marked rel="nofollow". A page that says "noindex" is not
+        returned or saved but listed in `skipped_urls`; its links are
+        followed. "none" means both.
 
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
@@ -1018,11 +1028,18 @@ class AsyncCrawler:
             logger.warning("Failed to parse %s: %s", url, error.message)
             self._fail_page(url, queue, error, result)
             return
+        noindex, nofollow = self._robots_directives(result, page)
         queued = 0
-        if depth < self.max_depth:
+        if depth < self.max_depth and not nofollow:
             for link in page["links"]:
                 if url_filter.allows(link) and queue.add_url(link, priority=depth + 1, depth=depth + 1):
                     queued += 1
+        if noindex is not None:
+            # The site asks not to keep the page; its links may still be followed.
+            logger.info("Skipped %s: %s; %d new links queued", url, noindex, queued)
+            queue.mark_skipped(url, noindex)
+            self.stats.record_page(url, status=result.status, elapsed=result.elapsed, skipped=True)
+            return
         if self.keep_pages:
             self.processed_urls[url] = page
         queue.mark_processed(url)
@@ -1030,6 +1047,18 @@ class AsyncCrawler:
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
         if self.storage is not None:
             await self._save_page(_page_record(result, page, depth))
+
+    def _robots_directives(self, result: FetchResult, page: ParsedPage) -> tuple[str | None, bool]:
+        """Whether the page asks not to be kept, and why (None if it does not); whether not to follow its links.
+
+        Read from <meta name="robots"> and X-Robots-Tag, only while robots.txt is followed.
+        """
+        if self.robots is None:
+            return None, False
+        sources = (("X-Robots-Tag", result.robots_tag), ('<meta name="robots">', page["metadata"]["robots"]))
+        noindex = next((f"noindex in {name}" for name, found in sources if {"noindex", "none"} & set(found)), None)
+        nofollow = any({"nofollow", "none"} & set(found) for _, found in sources)
+        return noindex, nofollow
 
     def _redirect_refusal(self, url: str, target: str, queue: CrawlerQueue, url_filter: UrlFilter) -> str | None:
         """Why the page `url` of the crawl must not follow its redirect to `target`; None if it may.
@@ -1195,6 +1224,7 @@ class AsyncCrawler:
                 # is missing; None lets callers tell the two cases apart.
                 content_type = response.content_type if aiohttp.hdrs.CONTENT_TYPE in response.headers else None
                 location = response.headers.get(aiohttp.hdrs.LOCATION)
+                robots_tag = tuple(response.headers.getall("X-Robots-Tag", ()))
                 if response.status in self.REDIRECT_STATUSES and location is not None:
                     # The body of a redirect is not wanted.
                     return _Response(
@@ -1216,6 +1246,7 @@ class AsyncCrawler:
                         size=0,
                         final_url=str(response.url),
                         content_type=content_type,
+                        robots_tag=robots_tag,
                     )
                 body = await self._read_body(response, url, raw=raw, truncate_at=truncate_at)
                 return _Response(
@@ -1225,6 +1256,7 @@ class AsyncCrawler:
                     final_url=str(response.url),
                     content_type=content_type,
                     body=body if raw else None,
+                    robots_tag=robots_tag,
                 )
         # Order matters: aiohttp's ServerTimeoutError is both a ClientError and
         # a TimeoutError; InvalidURL and the certificate error are ClientErrors too.

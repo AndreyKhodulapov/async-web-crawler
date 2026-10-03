@@ -20,7 +20,8 @@ class FetchResult:
 
     ``body`` is set only for a download that asked for the bytes as they
     were sent, such as a sitemap, which may be gzipped; ``content`` is
-    empty then.
+    empty then. ``robots_tag`` holds the directives of the X-Robots-Tag
+    headers meant for this crawler, such as "noindex", in lower case.
     """
 
     url: str
@@ -33,6 +34,7 @@ class FetchResult:
     content_type: str | None = None
     redirected: bool = False
     body: bytes | None = None
+    robots_tag: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -176,6 +178,7 @@ class Metadata(TypedDict):
     keywords: list[str]
     language: str | None
     canonical: str | None
+    robots: list[str]  # directives of <meta name="robots">, such as "noindex", in lower case
 
 
 class Image(TypedDict):

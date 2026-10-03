@@ -127,6 +127,22 @@ sites it visits and follows their rules.
 - robots.txt is a convention, not access control: it tells polite crawlers
   what to skip, and it does not protect anything.
 
+## Robots directives of pages and links
+
+- robots.txt speaks for a whole site before a request; a page can speak
+  for itself after it: `<meta name="robots" content="noindex, nofollow">`
+  in its HTML, or an `X-Robots-Tag` response header, which works for any
+  file type. A header may name one crawler: `X-Robots-Tag: mybot: noindex`.
+- `nofollow` on a page: do not follow its links. `rel="nofollow"` on a
+  link: do not follow that one. `noindex`: do not keep the page; its links
+  may still be followed (`noindex, follow` is common on listing pages).
+  `none` is `noindex, nofollow`.
+- Here they are honored together with robots.txt (`respect_robots`): a
+  `noindex` page is listed as skipped (`noindex in X-Robots-Tag`) and not
+  saved, `nofollow` links are dropped by the parser. Not part of RFC 9309,
+  but search engines follow them, and site owners expect a polite crawler
+  to do the same.
+
 ## Backing off a struggling site
 
 - Which errors to retry and how long to wait between retries is in

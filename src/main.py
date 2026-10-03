@@ -50,7 +50,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--respect-robots",
         action=argparse.BooleanOptionalAction,
-        help="follow robots.txt, or do not",
+        help="follow robots.txt, nofollow and noindex, or do not",
     )
     parser.add_argument(
         "--same-domain-only",

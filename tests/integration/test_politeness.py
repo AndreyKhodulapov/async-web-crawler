@@ -6,7 +6,7 @@ import itertools
 import time
 
 import pytest
-from helpers import BOT, UNTHROTTLED, FakeClock
+from helpers import BOT, UNTHROTTLED, FakeClock, MemoryStorage
 
 from crawler import (
     AsyncCrawler,
@@ -124,6 +124,37 @@ class TestRobots:
                 await crawler.fetch_url(url("/site/"))
         async with polite(respect_robots=True, user_agent="OtherBot/2.0") as crawler:
             assert await crawler.fetch_url(url("/site/"))
+
+    async def test_nofollow_and_noindex_are_respected(self, url, site):
+        storage = MemoryStorage()
+        async with polite(respect_robots=True, max_depth=2, storage=storage) as crawler:
+            pages = await crawler.crawl([url("/site/robots.html")])
+
+        # rel="nofollow" (a.html) and the links of pages that ask not to follow
+        # them (c.html, a/deeper.html) are not requested; those of a page
+        # that asks only not to be kept are (b.html).
+        assert set(site.hits) == {
+            "/robots.txt", "/site/robots.html", "/site/noindex.html", "/site/nofollow.html", "/site/tagged.html",
+            "/site/b.html",
+        }  # fmt: skip
+        assert crawler.skipped_urls == {
+            url("/site/noindex.html"): 'noindex in <meta name="robots">',
+            url("/site/tagged.html"): "noindex in X-Robots-Tag",
+        }
+        crawled = {url("/site/robots.html"), url("/site/nofollow.html"), url("/site/b.html")}
+        assert set(pages) == crawled
+        assert {record["url"] for batch in storage.batches for record in batch} == crawled
+        assert pages[url("/site/nofollow.html")]["metadata"]["robots"] == ["nofollow"]
+
+    async def test_nofollow_and_noindex_are_ignored_without_robots_txt(self, url, site):
+        async with polite(respect_robots=False, max_depth=2) as crawler:
+            pages = await crawler.crawl([url("/site/robots.html")])
+
+        assert not any(reason.startswith("noindex") for reason in crawler.skipped_urls.values())
+        assert {url("/site/a.html"), url("/site/noindex.html"), url("/site/tagged.html"), url("/site/c.html")} <= set(
+            pages
+        )
+        assert site.hits["/site/a/deeper.html"] == 1
 
     async def test_unreachable_robots_txt_keeps_the_site_unfetched(self, url, site):
         site.robots, site.robots_status = "", 503

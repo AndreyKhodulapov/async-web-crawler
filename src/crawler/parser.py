@@ -14,6 +14,7 @@ from bs4.element import Comment, Declaration, Doctype, NavigableString, PageElem
 
 from crawler.exceptions import ParseError
 from crawler.models import Heading, Image, ItemList, Metadata, ParsedPage, Table
+from crawler.robots import robots_directives
 from crawler.urls import is_same_host, resolve_url
 
 logger = logging.getLogger(__name__)
@@ -61,11 +62,14 @@ class HTMLParser:
     Content inside <noscript>, <template>, <script> and <style> is ignored
     by every extractor.
 
-    With `same_host_only=True`, links to other hosts are dropped.
+    With `same_host_only=True`, links to other hosts are dropped. With
+    `skip_nofollow=True`, so are links marked rel="nofollow": the site asks
+    crawlers not to follow them.
     """
 
-    def __init__(self, *, same_host_only: bool = False) -> None:
+    def __init__(self, *, same_host_only: bool = False, skip_nofollow: bool = False) -> None:
         self.same_host_only = same_host_only
+        self.skip_nofollow = skip_nofollow
 
     async def parse_html(
         self,
@@ -151,13 +155,18 @@ class HTMLParser:
         Relative links are resolved against `base_url`. With `same_host_only`,
         links are kept only if they share the host of `page_url`: a <base href>
         may point to another host, such as a CDN, which is not the site itself.
-        `page_url` defaults to `base_url`.
+        `page_url` defaults to `base_url`. With `skip_nofollow`, links with
+        "nofollow" among their rel values are left out.
         """
         own_url = page_url or base_url
         links: dict[str, None] = {}  # an ordered set
         skipped = 0
+        nofollow = _exactly("nofollow")
         for anchor in _content_tags(soup, "a"):
             if not anchor.has_attr("href"):
+                continue
+            if self.skip_nofollow and _attr_matches(anchor, "rel", nofollow):
+                skipped += 1
                 continue
             link = resolve_url(_attr(anchor, "href"), base_url)
             if link is None or (self.same_host_only and not is_same_host(link, own_url)):
@@ -195,10 +204,12 @@ class HTMLParser:
         return " ".join(filter(None, (_visible_text(root) for root in roots)))
 
     def extract_metadata(self, soup: BeautifulSoup, base_url: str | None = None) -> Metadata:
-        """Return the title, description, keywords, language and canonical URL.
+        """Return the title, description, keywords, language, canonical URL and robots directives.
 
         Open Graph tags are used when the standard ones are missing. The
-        canonical URL is resolved against `base_url` when it is given.
+        canonical URL is resolved against `base_url` when it is given. The
+        robots directives are those of every <meta name="robots">, in
+        lower case and without repeats.
         """
         # An inline <svg> may have its own <title> (a tooltip); it is not the
         # page title. Documents without <head> put the real one in <body>.
@@ -217,6 +228,10 @@ class HTMLParser:
             href = _attr(canonical_tag, "href").strip()
             canonical = resolve_url(href, base_url) if base_url else (href or None)
 
+        robots = _exactly("robots")
+        directives = (robots_directives(_attr(tag, "content")) for tag in metas if _attr_matches(tag, "name", robots))
+        robots_meta = list(dict.fromkeys(directive for found in directives for directive in found))
+
         language = None
         if soup.html is not None and isinstance(lang := soup.html.get("lang"), str):
             language = lang.strip() or None
@@ -229,6 +244,7 @@ class HTMLParser:
             keywords=[word for word in map(str.strip, keywords.split(",")) if word],
             language=language,
             canonical=canonical,
+            robots=robots_meta,
         )
 
     def extract_images(self, soup: BeautifulSoup, base_url: str) -> list[Image]:
@@ -356,7 +372,7 @@ def _empty_page(url: str, final_url: str) -> ParsedPage:
         title=None,
         text="",
         links=[],
-        metadata=Metadata(title=None, description=None, keywords=[], language=None, canonical=None),
+        metadata=Metadata(title=None, description=None, keywords=[], language=None, canonical=None, robots=[]),
         headings=[],
         images=[],
         tables=[],

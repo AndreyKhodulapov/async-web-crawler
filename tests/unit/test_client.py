@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import aiohttp
 import pytest
 from helpers import UNTHROTTLED, FakeClock
+from multidict import CIMultiDict
 
 from crawler import (
     AsyncCrawler,
@@ -45,10 +46,15 @@ class FakeResponse:
         url: str | None = None,
         retry_after: str | None = None,
         location: str | None = None,
+        robots_tag: tuple[str, ...] = (),
     ) -> None:
         self.status = status
         self._body = body
-        self.headers = {} if content_type is None else {"Content-Type": content_type}
+        self.headers: CIMultiDict[str] = CIMultiDict()
+        if content_type is not None:
+            self.headers["Content-Type"] = content_type
+        for value in robots_tag:
+            self.headers.add("X-Robots-Tag", value)
         if retry_after is not None:
             self.headers["Retry-After"] = retry_after
         if location is not None:
@@ -360,6 +366,13 @@ class TestFetchMany:
         assert result.final_url == "http://a"
         assert result.content_type == "text/html"
         assert result.redirected is False
+        assert result.robots_tag == ()
+
+    async def test_robots_tag_for_this_crawler(self, crawler, fake_session):
+        headers = ("noindex", "otherbot: nofollow", "AsyncWebCrawler: noarchive")
+        fake_session.routes["http://a"] = FakeResponse(robots_tag=headers)
+        [result] = await crawler.fetch_many(["http://a"])
+        assert result.robots_tag == ("noindex", "noarchive")
 
     async def test_redirect_and_missing_content_type(self, crawler, fake_session):
         fake_session.routes["http://a"] = FakeResponse(status=302, location="https://a/home")

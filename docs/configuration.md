@@ -72,7 +72,7 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `per_domain_rate` | true or false | `true` | the rate limit is for each host, not for all of them together |
 | `min_delay` | number, >= 0 | `0.0` | pause between two requests to a host |
 | `jitter` | number, >= 0 | `0.0` | random addition to the pause, up to this much |
-| `respect_robots` | true or false | `true` | check robots.txt before every request |
+| `respect_robots` | true or false | `true` | check robots.txt before every request, and follow `nofollow` and `noindex` of pages and links |
 | `user_agent` | string, one line | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name; spaces and line breaks around it are dropped |
 | `user_agents` | list of strings | `[]` | variants to rotate; each must have the same name as `user_agent` |
 | `total_timeout` | number, > 0 | `30.0` | the whole request, body included |

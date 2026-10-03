@@ -85,7 +85,7 @@ circuit breaker fails with `CircuitOpenError` without being sent.
 | `per_domain_rate` | `True` | `False` applies the rate to all hosts together; Crawl-delay and retry pauses stay per host |
 | `min_delay` | `0.0` | min seconds between two requests to one host |
 | `jitter` | `0.0` | random extra delay of up to this many seconds after each request |
-| `respect_robots` | `True` | check robots.txt before every request |
+| `respect_robots` | `True` | check robots.txt before every request; in a crawl, also follow `nofollow` and `noindex` (see [Crawling](#crawling)) |
 | `retry_strategy` | `RetryStrategy()` | which failures to retry, how many times and how long to wait, see below |
 | `circuit_breaker` | `CircuitBreaker()` | when to stop sending requests to a failing host, see below |
 | `user_agent` | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name |
@@ -285,6 +285,15 @@ already seen is not followed (the page is listed in `skipped_urls` as
 URLs. A page whose redirect leads to a URL robots.txt disallows is listed in
 `blocked_urls`; it counts toward `max_pages`, as its own request was sent.
 
+With `respect_robots`, a crawl also does what pages ask of crawlers, see
+[politeness.md](politeness.md#robots-directives-of-pages-and-links): links
+marked `rel="nofollow"` are not followed, nor are the links of a page whose
+`<meta name="robots">` or `X-Robots-Tag` header says `nofollow`; a page
+that says `noindex` is not returned or saved, and is listed in
+`skipped_urls` as `noindex in X-Robots-Tag` or
+`noindex in <meta name="robots">`, but its links are followed. `none` means
+both. An `X-Robots-Tag` header that names another crawler is ignored.
+
 | Option | Effect |
 |--------|--------|
 | `AsyncCrawler(max_depth=2)` | how far from the start pages to go; 0 fetches the start pages only |
@@ -342,7 +351,7 @@ After a crawl, and during one, the crawler exposes its state:
 |-----------|---------|
 | `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()`; empty with `keep_pages=False` |
 | `failed_urls` | `{url: "ErrorType: message"}` |
-| `skipped_urls` | `{url: reason}` for pages fetched but left out: not HTML, redirected out of scope or to a page already seen |
+| `skipped_urls` | `{url: reason}` for pages fetched but left out: not HTML, redirected out of scope or to a page already seen, or `noindex` |
 | `blocked_urls` | `{url: reason}` for pages robots.txt did not allow to fetch |
 | `unreachable_urls` | `{url: reason}` for pages not fetched because robots.txt of their site was unreachable |
 | `failed_sitemaps` | `{sitemap url: "ErrorType: message"}` for sitemaps that could not be read |
@@ -376,7 +385,7 @@ print(f"{stats['successful']} of {stats['total_pages']} pages in {stats['elapsed
 | `total_pages` | pages the crawl is done with: `successful + failed + skipped` |
 | `successful` | pages fetched and parsed, the ones `crawl()` returns |
 | `failed` | pages in `failed_urls` |
-| `skipped` | pages in `skipped_urls`: fetched, but not HTML, or redirected out of scope or to a page already seen |
+| `skipped` | pages in `skipped_urls`: fetched, but not HTML, redirected out of scope or to a page already seen, or `noindex` |
 | `elapsed_seconds` | running time of the crawl, up to now while it runs |
 | `pages_per_second` | `total_pages / elapsed_seconds` |
 | `avg_response_time` | average time of a page request (of its last attempt, if retried) |
@@ -584,7 +593,7 @@ the same types:
 | `title` | the page title; an empty string if it has none |
 | `text` | visible text of the page |
 | `links` | absolute links found on the page |
-| `metadata` | `description`, `keywords`, `language`, `canonical`, plus `final_url` (the URL after redirects) and `depth` in the crawl |
+| `metadata` | `description`, `keywords`, `language`, `canonical`, `robots`, plus `final_url` (the URL after redirects) and `depth` in the crawl |
 | `crawled_at` | when the page was processed: a `datetime` in UTC |
 | `status_code` | HTTP status of the response |
 | `content_type` | media type of the response; an empty string if the server sent none |
@@ -681,8 +690,8 @@ storage = storage_from_url("mysql://user:password@host/database")
 | `url`, `final_url` | requested URL and the URL after redirects |
 | `title` | `<title>`, or `og:title` if it is missing |
 | `text` | visible text of `<main>` (or a single `<article>`, or `<body>`) |
-| `links` | absolute, normalized, unique `http(s)` links in page order |
-| `metadata` | `title`, `description`, `keywords`, `language`, `canonical` |
+| `links` | absolute, normalized, unique `http(s)` links in page order; without those marked `rel="nofollow"` when the crawler follows robots.txt |
+| `metadata` | `title`, `description`, `keywords`, `language`, `canonical`, `robots` (directives of `<meta name="robots">`, lower case) |
 | `headings` | `h1`-`h3` as `{"level", "text"}` |
 | `images` | `{"src", "alt"}`; `data-src` is used for lazy-loaded images |
 | `tables` | `{"caption", "headers", "rows"}` |
@@ -699,4 +708,6 @@ archives or videos it finds links to; `exclude_extensions` keeps it from even
 asking for those whose URL tells what they are. The parser can be used on its own:
 `HTMLParser().parse(html, url)`, or `await HTMLParser().parse_html(html, url)`
 in async code. Pass `AsyncCrawler(parser=HTMLParser(same_host_only=True))` to
-keep only links to the page's own host.
+keep only links to the page's own host. `HTMLParser(skip_nofollow=True)`
+leaves out links marked `rel="nofollow"`; the crawler's own parser does so
+when `respect_robots` is on, a parser passed in decides for itself.

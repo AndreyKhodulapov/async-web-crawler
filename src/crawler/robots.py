@@ -1,4 +1,4 @@
-"""robots.txt: downloading, parsing (RFC 9309) and caching per site."""
+"""robots.txt: downloading, parsing (RFC 9309) and caching per site; robots directives of pages."""
 
 import asyncio
 import functools
@@ -6,7 +6,7 @@ import logging
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -21,6 +21,35 @@ def product_token(user_agent: str) -> str:
     """The name robots.txt knows a crawler by: "MyBot/1.0 (+https://...)" gives "mybot"."""
     match = re.match(r"[A-Za-z_-]+", user_agent.strip())
     return match.group().lower() if match else ""
+
+
+# X-Robots-Tag directives that carry a value after a colon. Any other word
+# before a colon names the crawler the rest of the header is for.
+_VALUED_DIRECTIVES = frozenset({"unavailable_after", "max-snippet", "max-image-preview", "max-video-preview"})
+
+
+def robots_directives(value: str) -> list[str]:
+    """The directives of a robots meta tag or X-Robots-Tag value: "NoIndex, follow" gives ["noindex", "follow"]."""
+    return [directive for part in value.split(",") if (directive := part.strip().lower())]
+
+
+def robots_tag_directives(values: Iterable[str], user_agent: str) -> tuple[str, ...]:
+    """The directives of X-Robots-Tag headers that apply to the crawler named by `user_agent`.
+
+    A header is for every crawler ("noindex, nofollow") or for the one it
+    names ("mybot: noindex"); the headers for other crawlers are left out.
+    """
+    token = product_token(user_agent)
+    directives: dict[str, None] = {}  # an ordered set
+    for value in values:
+        name, colon, rest = value.partition(":")
+        name = name.strip().lower()
+        if colon and re.fullmatch(r"[a-z0-9_-]+", name) and name not in _VALUED_DIRECTIVES:
+            if name != token:
+                continue
+            value = rest
+        directives.update(dict.fromkeys(robots_directives(value)))
+    return tuple(directives)
 
 
 @dataclass(frozen=True, slots=True)

@@ -22,7 +22,7 @@ crawler:
   per_domain_rate: true # the rate limit is for each host, not for all of them together
   min_delay: 0.0        # pause between two requests to a host
   jitter: 0.0           # random addition to the pause, up to this much
-  respect_robots: true
+  respect_robots: true  # robots.txt, and nofollow / noindex of pages and links
   user_agent: "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
   user_agents: []       # variants to rotate; each starts with the same name as user_agent
   total_timeout: 30.0

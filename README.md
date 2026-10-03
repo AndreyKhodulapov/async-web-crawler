@@ -20,8 +20,9 @@ configuration file, by command-line options, or from Python.
 - **Concurrency**: one connection pool, a global limit of requests in
   flight and an optional limit per host
 - **Politeness**: requests per second per host or overall, minimum delay
-  and jitter, robots.txt per RFC 9309 with Crawl-delay, a configurable
-  User-Agent with rotation
+  and jitter, robots.txt per RFC 9309 with Crawl-delay, `nofollow` and
+  `noindex` of links, `<meta name="robots">` and `X-Robots-Tag`, a
+  configurable User-Agent with rotation
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that
   grow with every retry
@@ -109,7 +110,7 @@ or the default without a file.
 | `--max-pages N` | `crawler.max_pages` | pages to request, failed ones included |
 | `--max-depth N` | `crawler.max_depth` | links followed from a start URL; 0 crawls the start URLs only |
 | `--output PATH` | `storage.outputs` | where to save the pages: a `.jsonl`, `.json`, `.csv` or `.db` file, or a database URL; repeat for several, in place of those of the file |
-| `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, or do not |
+| `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, `nofollow` and `noindex`, or do not |
 | `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
 | `--stats-json PATH` | `report.stats_json` | write the statistics of the crawl to a JSON file |

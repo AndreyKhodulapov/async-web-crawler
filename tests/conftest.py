@@ -7,7 +7,7 @@ from collections import Counter
 
 import pytest
 from aiohttp import web
-from pages import ENCODING_PAGES, SITE_PAGES, fixture_html
+from pages import ENCODING_PAGES, SITE_HEADERS, SITE_PAGES, fixture_html
 
 from crawler.logging_setup import reset_logging
 from demo_site import free_port
@@ -176,7 +176,7 @@ async def site_page(request: web.Request) -> web.Response:
     if request.path not in SITE_PAGES:
         raise web.HTTPNotFound()
     html = SITE_PAGES[request.path].replace("{other_host}", f"http://localhost:{request.url.port}")
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(text=html, content_type="text/html", headers=SITE_HEADERS.get(request.path))
 
 
 @pytest.fixture
