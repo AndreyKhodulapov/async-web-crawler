@@ -197,12 +197,14 @@ error of its last attempt, not with `CircuitOpenError`. When the breaker
 refuses the download of robots.txt, the page fails with `CircuitOpenError`
 under its own URL, and robots.txt is not cached as unreachable.
 
-In a crawl, a page the breaker refuses does not count toward `max_pages`
-and is not failed: it is put off until the circuit may let a probe through,
-or for a second while the probe is in flight, and the workers go on with
-other pages meanwhile. So the pages of a host that went down for a moment
-are fetched once it is back, even when the page refused was the last one
-`max_pages` allowed. After the circuit of a host has opened
+In a crawl, a page the breaker refuses is not failed: it is put off until
+the circuit may let a probe through, or for a second while the probe is in
+flight, and the workers go on with other pages meanwhile. So the pages of
+a host that went down for a moment are fetched once it is back, even when
+the page refused was the last one `max_pages` allowed. A page refused
+before its request does not count toward `max_pages`; one whose redirect
+target is refused has sent its request, so it counts, and counts again
+when it is taken again. After the circuit of a host has opened
 `AsyncCrawler.MAX_CIRCUIT_OPENINGS` (3) times in the crawl, no more probes
 are sent: its remaining pages go to `failed_urls` with `CircuitOpenError`,
 and a host that stays down holds the crawl for about two cooldowns.

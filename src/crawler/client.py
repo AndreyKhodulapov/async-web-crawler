@@ -1060,23 +1060,27 @@ class AsyncCrawler:
     async def _crawl_page(self, url: str, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
         depth = queue.depth(url)
         skip_reason: str | None = None
+        sent = False  # a request of the page got an answer: a redirect
 
         def follow(target: str) -> bool:
-            nonlocal skip_reason
+            nonlocal skip_reason, sent
+            sent = True
             skip_reason = self._redirect_refusal(url, target, queue, url_filter)
             return skip_reason is None
 
         result = await self._fetch(url, html_only=True, check_robots=False, follow=follow)
         if isinstance(result.error, CircuitOpenError):
-            # Not sent: the circuit of the host, or of the host a redirect
-            # leads to, opened while the page waited for its turn.
-            self._pages_requested -= 1
-            self._host_pages[get_host(url)] -= 1
-            if queue.closed:
-                # The page reached max_pages and closed the queue; now it is
-                # back under the limit, and this worker goes on to crawl it,
-                # or the page that takes its place, even if the others have stopped.
-                queue.reopen()
+            # The circuit of the host, or of the host a redirect leads to,
+            # opened while the request waited for its turn.
+            if not sent:
+                # Nothing was sent: the page costs nothing of the limits.
+                self._pages_requested -= 1
+                self._host_pages[get_host(url)] -= 1
+                if queue.closed:
+                    # The page reached max_pages and closed the queue; now it is
+                    # back under the limit, and this worker goes on to crawl it,
+                    # or the page that takes its place, even if the others have stopped.
+                    queue.reopen()
             self._defer_or_fail(url, queue, result.error)
             return
         # The worker has checked robots.txt for the page; these are about the target of its redirect.

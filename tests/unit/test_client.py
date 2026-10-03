@@ -872,6 +872,23 @@ class TestCrawlDuplicates:
         assert crawler.skipped_urls == {"http://a/list?page=2": "duplicate of http://a/list"}
         assert crawler.processed_urls.keys() == {"http://a/list"}
 
+    async def test_page_refused_at_its_redirect_target_counts_toward_max_pages(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            max_concurrent=1,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+        fake_session.routes["http://b/down"] = aiohttp.ClientConnectionError("refused")
+        fake_session.routes["http://a/1"] = FakeResponse(status=302, location="http://b/1")
+        await crawler.fetch_result("http://b/down")
+
+        # a/1 is requested, its redirect to b is refused: the request to a was sent all the same.
+        await crawler.crawl(["http://a/1", "http://a/2"], max_pages=2)
+
+        assert fake_session.requested == ["http://b/down", "http://a/1", "http://a/2"]
+        assert crawler.processed_urls.keys() == {"http://a/2"}
+        assert crawler.crawl_stats().queued == 1
+
 
 class TestCrawlPageStats:
     async def test_bug_while_crawling_a_page_fails_that_page_only(self, make_crawler, fake_session, monkeypatch):
