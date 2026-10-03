@@ -243,8 +243,9 @@ class AsyncCrawler:
         self.max_page_size = max_page_size
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
-        # Links marked rel="nofollow" are left out of the pages, as robots.txt is followed.
-        self._parser = parser or HTMLParser(skip_nofollow=respect_robots)
+        # Links marked rel="nofollow" are left out of the pages, as robots.txt is followed;
+        # a robots meta tag may name the crawler ("asyncwebcrawler"), as X-Robots-Tag may.
+        self._parser = parser or HTMLParser(skip_nofollow=respect_robots, robots_name=robots_name)
         self.storage = storage
         self.keep_pages = keep_pages
         self._session: aiohttp.ClientSession | None = None
@@ -259,6 +260,7 @@ class AsyncCrawler:
         self.stats = CrawlerStats()
         self._pages_requested = 0
         self._host_pages: Counter[str] = Counter()  # pages requested by host
+        self._over_host_limit = 0  # pages skipped without a request over max_pages_per_host
         self._max_frontier = 0  # pages queued, in progress and requested that crawl() allows
         self._links_dropped = 0
         self._host_queued: Counter[str] = Counter()  # pages ever queued by host
@@ -743,6 +745,7 @@ class AsyncCrawler:
         again, without counting toward `max_pages` before then.
 
         With `respect_robots`, the links of a page whose <meta name="robots">
+        (or <meta> with the robots.txt name of the crawler, "asyncwebcrawler")
         or X-Robots-Tag says "nofollow" are not followed, and neither are
         links marked rel="nofollow". A page that says "noindex" is not
         returned or saved but listed in `skipped_urls`; its links are
@@ -846,6 +849,7 @@ class AsyncCrawler:
         self._redirect_sources = {}
         self._pages_requested = 0
         self._host_pages = Counter()
+        self._over_host_limit = 0
         self._max_frontier = self.FRONTIER_FACTOR * max_pages
         self._links_dropped = 0
         self._max_host_queued = None if max_pages_per_host is None else self.FRONTIER_FACTOR * max_pages_per_host
@@ -1017,6 +1021,7 @@ class AsyncCrawler:
             processed=stats["processed"],
             failed=stats["failed"],
             skipped=stats["skipped"],
+            over_host_limit=self._over_host_limit,
             blocked=stats["blocked"],
             unreachable=stats["unreachable"],
             queued=stats["queued"],
@@ -1070,10 +1075,8 @@ class AsyncCrawler:
                 assert host is not None  # the queue holds valid URLs only
                 if max_pages_per_host is not None and self._host_pages[host] >= max_pages_per_host:
                     # Not requested, so not counted toward max_pages.
-                    reason = f"max_pages_per_host reached: {max_pages_per_host} pages of {host}"
-                    logger.info("Skipped %s: %s", url, reason)
-                    queue.mark_skipped(url, reason)
-                    self.stats.record_page(url, skipped=True)
+                    self._over_host_limit += 1
+                    self._skip_page(url, queue, f"max_pages_per_host reached: {max_pages_per_host} pages of {host}")
                     continue
                 self._pages_requested += 1
                 self._host_pages[host] += 1
@@ -1137,9 +1140,7 @@ class AsyncCrawler:
             # image. Not a failure: the page is fine, just not one to parse.
             skip_reason = f"not HTML: {result.content_type}"
         if skip_reason is not None:
-            logger.info("Skipped %s: %s", url, skip_reason)
-            queue.mark_skipped(url, skip_reason)
-            self.stats.record_page(url, status=result.status, elapsed=result.elapsed, skipped=True)
+            self._skip_page(url, queue, skip_reason, result)
             return
 
         try:
@@ -1152,10 +1153,7 @@ class AsyncCrawler:
         if duplicate is not None:
             # A variant of a page already seen ("?sort=price" of "/list"):
             # its links are variants too, so they are not followed.
-            reason = f"duplicate of {duplicate}"
-            logger.info("Skipped %s: %s", url, reason)
-            queue.mark_skipped(url, reason)
-            self.stats.record_page(url, status=result.status, elapsed=result.elapsed, skipped=True)
+            self._skip_page(url, queue, f"duplicate of {duplicate}", result)
             return
         noindex, nofollow = self._robots_directives(result, page)
         queued = 0
@@ -1165,9 +1163,7 @@ class AsyncCrawler:
                     queued += 1
         if noindex is not None:
             # The site asks not to keep the page; its links may still be followed.
-            logger.info("Skipped %s: %s; %d new links queued", url, noindex, queued)
-            queue.mark_skipped(url, noindex)
-            self.stats.record_page(url, status=result.status, elapsed=result.elapsed, skipped=True)
+            self._skip_page(url, queue, noindex, result, links_queued=queued)
             return
         if self.keep_pages:
             self.processed_urls[url] = page
@@ -1204,11 +1200,12 @@ class AsyncCrawler:
     def _robots_directives(self, result: FetchResult, page: ParsedPage) -> tuple[str | None, bool]:
         """Whether the page asks not to be kept, and why (None if it does not); whether not to follow its links.
 
-        Read from <meta name="robots"> and X-Robots-Tag, only while robots.txt is followed.
+        Read from X-Robots-Tag and the robots meta tags (<meta name="robots">
+        and the one with the crawler's name), only while robots.txt is followed.
         """
         if self.robots is None:
             return None, False
-        sources = (("X-Robots-Tag", result.robots_tag), ('<meta name="robots">', page["metadata"]["robots"]))
+        sources = (("X-Robots-Tag", result.robots_tag), ("a robots meta tag", page["metadata"]["robots"]))
         noindex = next((f"noindex in {name}" for name, found in sources if {"noindex", "none"} & set(found)), None)
         nofollow = any({"nofollow", "none"} & set(found) for _, found in sources)
         return noindex, nofollow
@@ -1246,6 +1243,31 @@ class AsyncCrawler:
             status=None if result is None else result.status,
             elapsed=None if result is None else result.elapsed,
             error=type(error).__name__,
+        )
+
+    def _skip_page(
+        self,
+        url: str,
+        queue: CrawlerQueue,
+        reason: str,
+        result: FetchResult | None = None,
+        *,
+        links_queued: int | None = None,
+    ) -> None:
+        """Finish a page of the crawl as skipped; `result` is that of its request, None if none was sent.
+
+        `links_queued` is how many new links of the page were queued, for the log; None if they were not followed.
+        """
+        if links_queued is None:
+            logger.info("Skipped %s: %s", url, reason)
+        else:
+            logger.info("Skipped %s: %s; %d new links queued", url, reason, links_queued)
+        queue.mark_skipped(url, reason)
+        self.stats.record_page(
+            url,
+            status=None if result is None else result.status,
+            elapsed=None if result is None else result.elapsed,
+            skipped=True,
         )
 
     async def _save_page(self, record: PageRecord) -> None:

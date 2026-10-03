@@ -56,7 +56,8 @@ class CrawlStats:
     `skipped` counts pages fetched but left out because they were not HTML,
     redirected outside the crawl scope or to a page already seen, asked not
     to be indexed or were variants of a page already seen (by their
-    canonical URL), and pages not requested over `max_pages_per_host`; `blocked` counts
+    canonical URL), and pages not requested over `max_pages_per_host`;
+    `over_host_limit` counts the last of them alone. `blocked` counts
     pages robots.txt did not allow to fetch, `unreachable` pages left unfetched because robots.txt of their
     site could not be read. `in_progress` counts pages taken by workers:
     waiting for a free slot, being fetched or parsed. `active_requests` counts only HTTP requests
@@ -79,6 +80,7 @@ class CrawlStats:
     processed: int = 0
     failed: int = 0
     skipped: int = 0
+    over_host_limit: int = 0
     blocked: int = 0
     unreachable: int = 0
     queued: int = 0
@@ -95,8 +97,8 @@ class CrawlStats:
 
     @property
     def pages_per_second(self) -> float:
-        """Fetched pages per second: processed, failed and skipped."""
-        finished = self.processed + self.failed + self.skipped
+        """Fetched pages per second: processed, failed and skipped, not those over `max_pages_per_host`."""
+        finished = self.processed + self.failed + self.skipped - self.over_host_limit
         return finished / self.elapsed if self.elapsed > 0 else 0.0
 
     @property
@@ -180,7 +182,7 @@ class Metadata(TypedDict):
     keywords: list[str]
     language: str | None
     canonical: str | None
-    robots: list[str]  # directives of <meta name="robots">, such as "noindex", in lower case
+    robots: list[str]  # directives of <meta name="robots"> and of the crawler's name, such as "noindex", in lower case
 
 
 class Image(TypedDict):

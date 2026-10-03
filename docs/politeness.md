@@ -132,7 +132,10 @@ sites it visits and follows their rules.
 - robots.txt speaks for a whole site before a request; a page can speak
   for itself after it: `<meta name="robots" content="noindex, nofollow">`
   in its HTML, or an `X-Robots-Tag` response header, which works for any
-  file type. A header may name one crawler: `X-Robots-Tag: mybot: noindex`.
+  file type. Either may speak to one crawler: `<meta name="mybot"
+  content="noindex">`, `X-Robots-Tag: mybot: noindex`. The name is the one
+  robots.txt knows the crawler by; directives for all crawlers and for
+  this one add up.
 - `nofollow` on a page: do not follow its links. `rel="nofollow"` on a
   link: do not follow that one. `noindex`: do not keep the page; its links
   may still be followed (`noindex, follow` is common on listing pages).

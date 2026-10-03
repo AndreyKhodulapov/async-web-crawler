@@ -309,7 +309,8 @@ filter, a calendar, a session ID in every link. Against them a crawl:
   was redirected to, is not a duplicate;
 - with `max_pages_per_host`, requests at most that many pages of one host:
   the other pages of the host are listed in `skipped_urls` without a
-  request and do not count toward `max_pages`.
+  request and do not count toward `max_pages`, nor toward the progress and
+  the speed of the crawl (`crawl_stats().over_host_limit` counts them).
 
 The first two happen before a request, the canonical URL is known only
 after it: a variant of a page still counts toward `max_pages`.
@@ -317,11 +318,14 @@ after it: a variant of a page still counts toward `max_pages`.
 With `respect_robots`, a crawl also does what pages ask of crawlers, see
 [politeness.md](politeness.md#robots-directives-of-pages-and-links): links
 marked `rel="nofollow"` are not followed, nor are the links of a page whose
-`<meta name="robots">` or `X-Robots-Tag` header says `nofollow`; a page
+robots meta tag or `X-Robots-Tag` header says `nofollow`; a page
 that says `noindex` is not returned or saved, and is listed in
 `skipped_urls` as `noindex in X-Robots-Tag` or
-`noindex in <meta name="robots">`, but its links are followed. `none` means
-both. An `X-Robots-Tag` header that names another crawler is ignored.
+`noindex in a robots meta tag`, but its links are followed. `none` means
+both. A robots meta tag is `<meta name="robots">` or a `<meta>` named
+after the crawler: the robots.txt name of its `user_agent`,
+`<meta name="asyncwebcrawler">` by default. A meta tag or an
+`X-Robots-Tag` header that names another crawler is ignored.
 
 | Option | Effect |
 |--------|--------|
@@ -400,7 +404,7 @@ After a crawl, and during one, the crawler exposes its state:
 | `failed_sitemaps` | `{sitemap url: "ErrorType: message"}` for sitemaps that could not be read |
 | `visited_urls` | every URL taken for fetching, successful or not |
 | `url_depths` | depth of every URL accepted into the queue; 0 for start URLs and pages listed in sitemaps |
-| `crawl_stats()` | `CrawlStats`: processed, failed, skipped, blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit; pages saved and not saved, see [Saving pages](#saving-pages) |
+| `crawl_stats()` | `CrawlStats`: processed, failed, skipped (`over_host_limit` of them not requested over `max_pages_per_host`), blocked, unreachable, queued, in progress, active requests, elapsed, pages per second; requests, retries, current and average requests per second, average gap between requests to a host, average wait for the rate limit; pages saved and not saved, see [Saving pages](#saving-pages) |
 | `stats.get_stats()` | the pages by outcome, status code and domain, see [Page statistics](#page-statistics) |
 | `error_stats()` | `ErrorStats`, see [Error statistics](#error-statistics) |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
@@ -540,7 +544,7 @@ async with AsyncCrawler() as crawler:
 | Part | Meaning |
 |------|---------|
 | bar, percent | pages done of `max_pages`, rounded down |
-| `30/100 pages, 1 failed` | pages requested and finished (processed, failed, skipped), and the failed among them |
+| `30/100 pages, 1 failed` | pages requested and finished (processed, failed, skipped; not the pages over `max_pages_per_host`, which are skipped without a request), and the failed among them |
 | `pages/s` | the speed over the last 10 seconds |
 | `ETA` | the time the remaining pages take at that speed; `--` while the speed is 0, `done` once the crawl has ended |
 | `active`, `in flight` | pages taken by workers, and the HTTP requests being made |
@@ -745,7 +749,7 @@ storage = storage_from_url("mysql://user:password@host/database")
 | `title` | `<title>`, or `og:title` if it is missing |
 | `text` | visible text of `<main>` (or a single `<article>`, or `<body>`) |
 | `links` | absolute, normalized, unique `http(s)` links in page order; without those marked `rel="nofollow"` when the crawler follows robots.txt |
-| `metadata` | `title`, `description`, `keywords`, `language`, `canonical`, `robots` (directives of `<meta name="robots">`, lower case) |
+| `metadata` | `title`, `description`, `keywords`, `language`, `canonical`, `robots` (directives of `<meta name="robots">` and, in a crawl, of the `<meta>` named after the crawler; lower case) |
 | `headings` | `h1`-`h3` as `{"level", "text"}` |
 | `images` | `{"src", "alt"}`; `data-src` is used for lazy-loaded images |
 | `tables` | `{"caption", "headers", "rows"}` |
@@ -765,3 +769,6 @@ in async code. Pass `AsyncCrawler(parser=HTMLParser(same_host_only=True))` to
 keep only links to the page's own host. `HTMLParser(skip_nofollow=True)`
 leaves out links marked `rel="nofollow"`; the crawler's own parser does so
 when `respect_robots` is on, a parser passed in decides for itself.
+`HTMLParser(robots_name="mybot")` adds the directives of
+`<meta name="mybot">` to those of `<meta name="robots">`; the crawler's own
+parser takes the robots.txt name of its `user_agent`.

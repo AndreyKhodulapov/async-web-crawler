@@ -28,6 +28,7 @@ from crawler import (
     NetworkError,
     ParseError,
     PermanentError,
+    ProgressTracker,
     RetryStrategy,
     RobotsDisallowedError,
     RobotsUnreachableError,
@@ -871,6 +872,10 @@ class TestHostQueueLimit:
             "http://d/",
         }
         assert len(crawler.skipped_urls) == 6  # a/3 to a/8, over max_pages_per_host
+        stats = crawler.crawl_stats()
+        assert (stats.skipped, stats.over_host_limit) == (6, 6)
+        # Not requested: the crawl ended with half of max_pages done, not all of it.
+        assert ProgressTracker(max_pages=12).update(stats, finished=True).done == 6
         messages = [record.getMessage() for record in caplog.records]
         assert "Host a has 9 pages queued (3 x max_pages_per_host): its new links are not queued" in messages
         assert "92 links were not queued: their host had 3 x max_pages_per_host pages queued" in messages

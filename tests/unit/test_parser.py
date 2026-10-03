@@ -260,6 +260,14 @@ class TestMetadata:
         )
         assert parser.extract_metadata(soup(html))["robots"] == ["noindex", "follow", "nofollow"]
 
+    def test_robots_directives_for_the_crawler(self):
+        html = (
+            '<meta name="robots" content="nofollow"><meta name="MyBot" content="NoIndex">'
+            '<meta name="otherbot" content="noarchive">'
+        )
+        assert HTMLParser(robots_name="mybot").extract_metadata(soup(html))["robots"] == ["nofollow", "noindex"]
+        assert HTMLParser().extract_metadata(soup(html))["robots"] == ["nofollow"]
+
     def test_svg_title_in_body_is_not_page_title(self, parser):
         assert parser.extract_metadata(soup("<body><svg><title>icon</title></svg></body>"))["title"] is None
 

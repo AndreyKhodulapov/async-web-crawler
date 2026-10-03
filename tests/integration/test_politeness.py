@@ -138,13 +138,23 @@ class TestRobots:
             "/site/b.html",
         }  # fmt: skip
         assert crawler.skipped_urls == {
-            url("/site/noindex.html"): 'noindex in <meta name="robots">',
+            url("/site/noindex.html"): "noindex in a robots meta tag",
             url("/site/tagged.html"): "noindex in X-Robots-Tag",
         }
         crawled = {url("/site/robots.html"), url("/site/nofollow.html"), url("/site/b.html")}
         assert set(pages) == crawled
         assert {record["url"] for batch in storage.batches for record in batch} == crawled
         assert pages[url("/site/nofollow.html")]["metadata"]["robots"] == ["nofollow"]
+
+    async def test_robots_meta_tag_named_after_the_crawler_is_respected(self, url, site):
+        start = [url("/site/for-testbot.html"), url("/site/for-otherbot.html")]
+        async with polite(respect_robots=True, max_depth=1) as crawler:
+            pages = await crawler.crawl(start)
+
+        # "none" for TestBot: not kept, links not followed; for another crawler: ignored.
+        assert crawler.skipped_urls == {url("/site/for-testbot.html"): "noindex in a robots meta tag"}
+        assert set(pages) == {url("/site/for-otherbot.html"), url("/site/b.html")}
+        assert site.hits["/site/c.html"] == 0
 
     async def test_nofollow_and_noindex_are_ignored_without_robots_txt(self, url, site):
         async with polite(respect_robots=False, max_depth=2) as crawler:

@@ -217,6 +217,7 @@ class TestUrlTraps:
         assert site.hits["/site/"] == 2
         reason = "max_pages_per_host reached: 3 pages of 127.0.0.1"
         assert crawler.skipped_urls == {url("/site/missing.html"): reason, url("/site/files/manual.pdf"): reason}
+        assert crawler.crawl_stats().over_host_limit == 2
         assert set(crawler.processed_urls) == {
             url("/site/"),
             url("/site/a.html"),

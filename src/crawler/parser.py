@@ -64,12 +64,17 @@ class HTMLParser:
 
     With `same_host_only=True`, links to other hosts are dropped. With
     `skip_nofollow=True`, so are links marked rel="nofollow": the site asks
-    crawlers not to follow them.
+    crawlers not to follow them. `robots_name` is the name robots.txt knows
+    the crawler by ("mybot"): the robots directives of a page then include
+    those of <meta name="mybot">, besides <meta name="robots">.
     """
 
-    def __init__(self, *, same_host_only: bool = False, skip_nofollow: bool = False) -> None:
+    def __init__(
+        self, *, same_host_only: bool = False, skip_nofollow: bool = False, robots_name: str | None = None
+    ) -> None:
         self.same_host_only = same_host_only
         self.skip_nofollow = skip_nofollow
+        self.robots_name = robots_name or None
 
     async def parse_html(
         self,
@@ -208,8 +213,9 @@ class HTMLParser:
 
         Open Graph tags are used when the standard ones are missing. The
         canonical URL is resolved against `base_url` when it is given. The
-        robots directives are those of every <meta name="robots">, in
-        lower case and without repeats.
+        robots directives are those of every <meta name="robots">, and of
+        <meta name="`robots_name`"> if the parser has one, in lower case
+        and without repeats.
         """
         # An inline <svg> may have its own <title> (a tooltip); it is not the
         # page title. Documents without <head> put the real one in <body>.
@@ -228,8 +234,12 @@ class HTMLParser:
             href = _attr(canonical_tag, "href").strip()
             canonical = resolve_url(href, base_url) if base_url else (href or None)
 
-        robots = _exactly("robots")
-        directives = (robots_directives(_attr(tag, "content")) for tag in metas if _attr_matches(tag, "name", robots))
+        names = [_exactly(name) for name in ("robots", self.robots_name) if name is not None]
+        directives = (
+            robots_directives(_attr(tag, "content"))
+            for tag in metas
+            if any(_attr_matches(tag, "name", name) for name in names)
+        )
         robots_meta = list(dict.fromkeys(directive for found in directives for directive in found))
 
         language = None

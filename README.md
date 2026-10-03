@@ -25,7 +25,8 @@ configuration file, by command-line options, or from Python.
   flight and an optional limit per host
 - **Politeness**: requests per second per host or overall, minimum delay
   and jitter, robots.txt per RFC 9309 with Crawl-delay, `nofollow` and
-  `noindex` of links, `<meta name="robots">` and `X-Robots-Tag`, a
+  `noindex` of links, robots meta tags and `X-Robots-Tag` (also those
+  that name the crawler), a
   configurable User-Agent with rotation
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that

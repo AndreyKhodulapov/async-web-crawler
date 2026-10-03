@@ -90,6 +90,14 @@ class TestProgressTracker:
         assert progress.pages_per_second == 40.0
         assert "| 100/100 pages, 35 failed |" in format_progress(progress)
 
+    def test_pages_over_max_pages_per_host_are_not_done(self):
+        # They are skipped without a request and leave max_pages to other pages.
+        stats = CrawlStats(processed=6, skipped=8, over_host_limit=6, elapsed=4.0)
+        progress = ProgressTracker(max_pages=12).update(stats)
+
+        assert (progress.done, progress.percent) == (8, 200 / 3)
+        assert progress.pages_per_second == stats.pages_per_second == 2.0
+
     def test_next_crawl_starts_the_speed_anew(self):
         tracker = ProgressTracker(max_pages=100)
         tracker.update(snapshot(9.0, 90))

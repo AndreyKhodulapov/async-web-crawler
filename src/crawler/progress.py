@@ -17,7 +17,8 @@ class Progress:
     """How far a crawl has got at one moment.
 
     `done` counts the pages requested and finished: processed, failed
-    (`failed` of them) and skipped; `total` is the page limit of the crawl.
+    (`failed` of them) and skipped, but not the pages skipped without a
+    request over `max_pages_per_host`; `total` is the page limit of the crawl.
     Pages that failed without a request, refused by an open circuit breaker,
     are not held against the limit by the crawl, so `done` stops at `total`
     while `failed` and the speed count them all. `percent` is `done` of `total`. `pages_per_second` is the speed over the
@@ -68,7 +69,8 @@ class ProgressTracker:
 
     def update(self, stats: CrawlStats, *, finished: bool = False) -> Progress:
         """Progress as of `stats`, the latest snapshot of the crawl; `finished` marks the last one."""
-        finished_pages = stats.processed + stats.failed + stats.skipped
+        # Pages over max_pages_per_host are not requested and leave max_pages to the others.
+        finished_pages = stats.processed + stats.failed + stats.skipped - stats.over_host_limit
         done = min(finished_pages, self.max_pages)
         if self._samples and stats.elapsed < self._samples[-1][0]:
             self._samples.clear()  # another crawl has started

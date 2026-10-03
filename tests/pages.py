@@ -62,6 +62,8 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 # /site/bounce redirects to the home page through bounce-back on the other host.
 # /site/robots.html links to pages that ask crawlers, by rel="nofollow",
 # <meta name="robots"> or X-Robots-Tag, not to follow links or keep pages.
+# /site/for-testbot.html and /site/for-otherbot.html ask the same by a
+# <meta> named after one crawler: the tests' own (BOT) or another.
 # /site/long.html links to a page with a query of LONG_QUERY characters.
 # /site/variant.html names itself as canonical, so with any query it is a
 # variant; /site/points-home.html names the home page, a canonical URL
@@ -98,6 +100,8 @@ SITE_PAGES: dict[str, str] = {
     "/site/noindex.html": '<meta name="robots" content="noindex"><title>Noindex</title><a href="b.html">B</a>',
     "/site/nofollow.html": '<meta name="robots" content="nofollow"><title>Nofollow</title><a href="c.html">C</a>',
     "/site/tagged.html": '<title>Tagged</title><a href="a/deeper.html">Deeper</a>',
+    "/site/for-testbot.html": '<meta name="TestBot" content="none"><title>For TestBot</title><a href="c.html">C</a>',
+    "/site/for-otherbot.html": '<meta name="otherbot" content="none"><title>For OtherBot</title><a href="b.html">B</a>',
     "/site/variant.html": '<link rel="canonical" href="variant.html"><title>Variant</title><a href="c.html">C</a>',
     "/site/points-home.html": '<link rel="canonical" href="/site/"><title>Points home</title>',
     "/site/lang": '<link rel="canonical" href="lang"><title>Lang</title><a href="c.html">C</a>',
