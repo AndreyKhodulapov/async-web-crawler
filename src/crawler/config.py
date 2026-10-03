@@ -154,7 +154,7 @@ class CircuitBreakerOptions:
 class FilterOptions:
     """Section `filters`: which links to follow, see `UrlFilter`."""
 
-    same_domain_only: bool = False
+    same_domain_only: bool = True  # links to other hosts are not followed
     include: tuple[str, ...] = _option((), check=_pattern)
     exclude: tuple[str, ...] = _option((), check=_pattern)
     exclude_extensions: tuple[str, ...] = _option(

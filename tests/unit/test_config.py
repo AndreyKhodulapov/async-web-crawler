@@ -96,7 +96,7 @@ class TestDefaults:
             failure_threshold=0.5, min_requests=5, window=60.0, cooldown=30.0
         )
         assert config.filters == FilterOptions(
-            same_domain_only=False, include=(), exclude=(), exclude_extensions=EXCLUDED_EXTENSIONS
+            same_domain_only=True, include=(), exclude=(), exclude_extensions=EXCLUDED_EXTENSIONS
         )
         assert {"pdf", "jpg", "zip", "mp4"} <= set(EXCLUDED_EXTENSIONS)
         assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8")
@@ -130,8 +130,9 @@ class TestDefaults:
         assert CircuitBreakerOptions() == CircuitBreakerOptions(
             **{name: breaker[name] for name in CircuitBreakerOptions.__dataclass_fields__}
         )
-        assert FilterOptions().same_domain_only == crawl["same_domain_only"]
-        # Differs on purpose: a crawl by the configuration leaves files alone, the library follows every link.
+        # Differ on purpose: a crawl by the configuration stays on the start hosts and leaves files alone,
+        # the library follows every link.
+        assert crawl["same_domain_only"] is False
         assert crawl["exclude_extensions"] == ()
         assert SitemapOptions().from_robots == crawl["robots_sitemaps"]
 

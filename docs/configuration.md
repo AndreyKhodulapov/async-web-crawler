@@ -12,8 +12,7 @@ crawler:
   max_pages: 500
   rate_limit: 2.0           # requests per second
 filters:
-  same_domain_only: true
-  exclude: ['\.pdf$']
+  exclude: ['/login']
 storage:
   outputs: [pages.jsonl]    # files by extension, or database URLs
 ```
@@ -114,7 +113,7 @@ not to the start URLs.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `same_domain_only` | true or false | `false` | follow links on the hosts of the start URLs and of `sitemaps.urls` only |
+| `same_domain_only` | true or false | `true` | follow links on the hosts of the start URLs and of `sitemaps.urls` only; `false` follows links to any host |
 | `include` | list of regular expressions | `[]` | a link must match at least one; empty means any link |
 | `exclude` | list of regular expressions | `[]` | a matching link is skipped, even if included |
 | `exclude_extensions` | list of file extensions | documents, images, archives, media, programs, `css`, `js` (see `config.example.yaml`) | a link to a file with one of them is not followed; `[]` follows every link |
@@ -127,8 +126,12 @@ in any case and with or without the dot: `pdf` rejects `/files/Manual.PDF`
 and `/report.pdf?v=2`, but not `/view?file=report.pdf`. Write `gz`, not
 `tar.gz`. A page that turns out not to be HTML anyway, such as a PDF behind
 a link without an extension, is requested but not downloaded: it is listed
-as skipped and counts toward `max_pages`. The library itself, `AsyncCrawler.crawl()`,
-follows links to files unless given `exclude_extensions`.
+as skipped and counts toward `max_pages`.
+
+The library itself, `AsyncCrawler.crawl()`, follows links to any host and
+to files unless given `same_domain_only=True` and `exclude_extensions`; the
+configuration turns both on, so that a crawl stays on the site it was
+started on.
 
 ### `storage`
 
@@ -242,8 +245,7 @@ crawler:
   rate_limit: 2.0
   keep_pages: false         # memory does not grow with the crawl
 filters:
-  same_domain_only: true
-  exclude: ['\.(pdf|zip|jpg|png)$', '/login']
+  exclude: ['/login']
 storage:
   outputs: ['sqlite:///site.db']
 logging:

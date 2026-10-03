@@ -13,8 +13,8 @@ configuration file, by command-line options, or from Python.
 
 - **Crawling**: a priority queue of URLs and a pool of workers, depth and
   page limits, deduplication of normalized URLs, filters by domain, by
-  regular expressions and by file extension (documents, images and archives
-  are not followed by default)
+  regular expressions and by file extension (by default the crawl stays on
+  the start hosts, and documents, images and archives are not followed)
 - **Sitemaps** as a source of pages: plain and index sitemaps, gzip, the
   sitemaps named in robots.txt
 - **Concurrency**: one connection pool, a global limit of requests in
@@ -77,8 +77,6 @@ urls:
 crawler:
   max_pages: 20
   rate_limit: 2.0           # requests per second
-filters:
-  same_domain_only: true
 storage:
   outputs: [pages.jsonl, pages.csv]
 report:
@@ -112,6 +110,7 @@ or the default without a file.
 | `--max-depth N` | `crawler.max_depth` | links followed from a start URL; 0 crawls the start URLs only |
 | `--output PATH` | `storage.outputs` | where to save the pages: a `.jsonl`, `.json`, `.csv` or `.db` file, or a database URL; repeat for several, in place of those of the file |
 | `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, or do not |
+| `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
 | `--stats-json PATH` | `report.stats_json` | write the statistics of the crawl to a JSON file |
 | `--report PATH` | `report.html` | write an HTML report with charts |
@@ -119,7 +118,7 @@ or the default without a file.
 | `--log-file PATH` | `logging.file` | also write the log to a file, as JSON Lines |
 | `--no-progress` | | do not show the progress line |
 
-Everything else (sitemaps, filters, retries, the circuit breaker, timeouts)
+Everything else (sitemaps, the other filters, retries, the circuit breaker, timeouts)
 is set in the file. The command line never keeps the pages in memory
 (`crawler.keep_pages` is off whatever the file says): they go to `--output`.
 The log and the progress line go to stderr, the summary to stdout:

@@ -137,6 +137,15 @@ async def test_links_to_files_are_not_followed_by_default(url, site):
     assert set(crawler.crawler.failed_urls) == {url("/site/missing.html")}
 
 
+@pytest.mark.parametrize(("filters", "leaves"), [({}, False), ({"same_domain_only": False}, True)])
+async def test_links_to_other_hosts_are_not_followed_by_default(url, server, filters, leaves):
+    other_host = f"http://localhost:{server.port}/site/"  # the start page, linked by another name of the server
+    async with AdvancedCrawler(make_config(urls=[url("/site/")], filters=filters)) as crawler:
+        await crawler.crawl()
+
+    assert (other_host in crawler.crawler.processed_urls) is leaves
+
+
 async def test_close_stops_logging_to_the_file_and_closes_the_crawler(url, tmp_path):
     crawler = AdvancedCrawler(make_config(urls=[url("/site/c.html")], logging={"file": str(tmp_path / "crawler.log")}))
     assert len(file_handlers()) == 1

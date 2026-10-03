@@ -49,7 +49,7 @@ circuit_breaker:
 # Which links to follow. The patterns are regular expressions searched
 # anywhere in the URL; quote them with single quotes.
 filters:
-  same_domain_only: false
+  same_domain_only: true  # links to other hosts are not followed
   include: []           # e.g. ['^https://example\.com/blog/']
   exclude: []           # e.g. ['\.pdf$', '/login']
   # Links to files with these extensions are not followed; [] follows them all.
