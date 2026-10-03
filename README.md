@@ -12,8 +12,9 @@ configuration file, by command-line options, or from Python.
 ## Features
 
 - **Crawling**: a priority queue of URLs and a pool of workers, depth and
-  page limits, deduplication of normalized URLs, filters by domain and by
-  regular expressions
+  page limits, deduplication of normalized URLs, filters by domain, by
+  regular expressions and by file extension (documents, images and archives
+  are not followed by default)
 - **Sitemaps** as a source of pages: plain and index sitemaps, gzip, the
   sitemaps named in robots.txt
 - **Concurrency**: one connection pool, a global limit of requests in
@@ -286,7 +287,7 @@ src/
     ├── config.py           # CrawlerConfig, load_config: YAML or JSON file, defaults, validation
     ├── logging_setup.py    # configure_logging: text on the console, JSON Lines in a rotated file
     ├── progress.py         # ProgressTracker, show_progress: percent, speed, time left, active tasks
-    ├── filters.py          # UrlFilter: host and pattern rules
+    ├── filters.py          # UrlFilter: host, pattern and file extension rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
     ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats

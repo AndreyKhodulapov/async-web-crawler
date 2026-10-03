@@ -42,10 +42,32 @@ async def test_max_depth_zero_fetches_start_urls_only(url, site):
     assert site.hits.total() == 1
 
 
-async def test_non_html_page_fails_with_parse_error(url):
+async def test_non_html_page_is_skipped(url):
     crawler = await crawl(url("/data.json"), max_depth=0)
+
     assert crawler.processed_urls == {}
-    assert crawler.failed_urls == {url("/data.json"): "ParseError: unsupported content type: application/json"}
+    assert crawler.failed_urls == {}
+    assert crawler.skipped_urls == {url("/data.json"): "not HTML: application/json"}
+    # The page is fine, it is just not one to parse: not an error.
+    assert crawler.error_stats().total == 0
+    assert crawler.stats.get_stats()["skipped"] == 1
+
+
+async def test_non_html_page_counts_toward_max_pages(url, site):
+    async with AsyncCrawler(max_concurrent=1, **UNTHROTTLED) as crawler:
+        await crawler.crawl([url("/data.json"), url("/site/")], max_pages=1)
+
+    # Its request was sent; a site of links to files must not make the crawl endless.
+    assert set(crawler.skipped_urls) == {url("/data.json")}
+    assert site.hits["/site/"] == 0
+
+
+async def test_links_to_files_with_excluded_extensions_are_not_requested(url, site):
+    crawler = await crawl(url("/site/"), max_depth=1, exclude_extensions=["pdf"])
+
+    assert site.hits["/site/files/manual.pdf"] == 0
+    assert url("/site/files/manual.pdf") not in crawler.url_depths
+    assert set(crawler.failed_urls) == {url("/site/missing.html")}
 
 
 async def test_every_page_is_fetched_once(url, site):
@@ -197,11 +219,12 @@ async def test_page_stats_after_crawl(url, closed_port_url):
         progress = crawler.crawl_stats()
         await crawler.crawl([url("/site/c.html")])
 
-    assert (stats["total_pages"], stats["successful"], stats["failed"], stats["skipped"]) == (9, 4, 5, 0)
+    assert (stats["total_pages"], stats["successful"], stats["failed"], stats["skipped"]) == (9, 4, 4, 1)
     assert (stats["successful"], stats["failed"]) == (progress.processed, progress.failed)
     # JSON instead of HTML is a response too; the refused connection is not.
     assert stats["status_codes"] == {200: 5, 404: 2, 503: 1}
-    assert stats["errors"] == {"PermanentHTTPError": 2, "NetworkError": 1, "ParseError": 1, "TransientHTTPError": 1}
+    # JSON instead of HTML is skipped, not failed.
+    assert stats["errors"] == {"PermanentHTTPError": 2, "NetworkError": 1, "TransientHTTPError": 1}
     assert list(stats["top_domains"].items()) == [("127.0.0.1", 8), ("localhost", 1)]
     assert stats["elapsed_seconds"] == pytest.approx(progress.elapsed, abs=0.05)
     assert stats["pages_per_second"] > 0
@@ -240,8 +263,8 @@ async def test_error_stats_after_crawl(url, closed_port_url):
         stats = crawler.error_stats()
         await crawler.crawl([url("/site/b.html")])
 
-    # 503 twice, then the page; 404; JSON instead of HTML; three refused connections.
-    assert stats.by_kind == {"TransientError": 2, "PermanentError": 1, "NetworkError": 3, "ParseError": 1, "other": 0}
+    # 503 twice, then the page; 404; three refused connections. JSON instead of HTML is not an error.
+    assert stats.by_kind == {"TransientError": 2, "PermanentError": 1, "NetworkError": 3, "ParseError": 0, "other": 0}
     assert (stats.retries, stats.successful_retries) == (4, 1)
     assert stats.avg_retry_time > 0
     assert list(stats.permanent_errors) == [url("/status/404")]

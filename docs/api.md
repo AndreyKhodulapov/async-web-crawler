@@ -266,7 +266,7 @@ robots.txt is cut at 500 KiB, the size RFC 9309 asks crawlers to read.
 `crawl()` runs `max_concurrent` workers over a priority queue of URLs. A link
 found on a page at depth `d` gets depth `d + 1` and is followed only up to
 `max_depth`, so the site is walked breadth-first. `max_pages` caps the pages
-requested, failed ones included; pages that robots.txt disallows are not
+requested, failed and skipped ones included; pages that robots.txt disallows are not
 requested and do not count, and neither do pages the circuit breaker
 refuses: they wait for their host, see [Circuit breaker](#circuit-breaker). URLs are normalized (including their
 percent-encoding, so `/café` and `/caf%C3%A9` are one page), and each one is
@@ -284,6 +284,7 @@ URLs. A page whose redirect leads to a URL robots.txt disallows is listed in
 | `same_domain_only=False` | follow links on the start hosts only (and on the hosts they redirect to) |
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
+| `exclude_extensions=()` | file extensions such as `"pdf"`; a link to such a file is skipped. Only the last extension of the URL path counts, in any case, the query does not. The configuration sets a list of documents, images, archives and media by default |
 | `sitemap_urls=()` | sitemaps whose pages are crawled too |
 | `robots_sitemaps=False` | also read the sitemaps that robots.txt of the start URLs' sites names; needs `respect_robots` |
 
@@ -333,7 +334,7 @@ After a crawl, and during one, the crawler exposes its state:
 |-----------|---------|
 | `processed_urls` | `{url: ParsedPage}`, the pages returned by `crawl()`; empty with `keep_pages=False` |
 | `failed_urls` | `{url: "ErrorType: message"}` |
-| `skipped_urls` | `{url: reason}` for pages fetched but left out, e.g. redirected out of scope or to a page already seen |
+| `skipped_urls` | `{url: reason}` for pages fetched but left out: not HTML, redirected out of scope or to a page already seen |
 | `blocked_urls` | `{url: reason}` for pages robots.txt did not allow to fetch |
 | `unreachable_urls` | `{url: reason}` for pages not fetched because robots.txt of their site was unreachable |
 | `failed_sitemaps` | `{sitemap url: "ErrorType: message"}` for sitemaps that could not be read |
@@ -367,7 +368,7 @@ print(f"{stats['successful']} of {stats['total_pages']} pages in {stats['elapsed
 | `total_pages` | pages the crawl is done with: `successful + failed + skipped` |
 | `successful` | pages fetched and parsed, the ones `crawl()` returns |
 | `failed` | pages in `failed_urls` |
-| `skipped` | pages in `skipped_urls`: fetched, but redirected out of scope or to a page already seen |
+| `skipped` | pages in `skipped_urls`: fetched, but not HTML, or redirected out of scope or to a page already seen |
 | `elapsed_seconds` | running time of the crawl, up to now while it runs |
 | `pages_per_second` | `total_pages / elapsed_seconds` |
 | `avg_response_time` | average time of a page request (of its last attempt, if retried) |
@@ -682,8 +683,12 @@ storage = storage_from_url("mysql://user:password@host/database")
 
 Responses whose `Content-Type` is not HTML are not parsed, and their body is
 not even downloaded: `fetch_and_parse` fails with `ParseError`, and so does
-an empty document; a crawl lists such pages as failed. This keeps a crawl
-from pulling in archives or videos it finds links to. The parser can be used on its own:
+an empty document. A crawl lists a page that is not HTML as skipped
+(`not HTML: application/pdf`), not as failed: nothing went wrong with it, and
+it is not counted in `error_stats()`; its request counts toward `max_pages`.
+An empty document is a failed page. This keeps a crawl from pulling in
+archives or videos it finds links to; `exclude_extensions` keeps it from even
+asking for those whose URL tells what they are. The parser can be used on its own:
 `HTMLParser().parse(html, url)`, or `await HTMLParser().parse_html(html, url)`
 in async code. Pass `AsyncCrawler(parser=HTMLParser(same_host_only=True))` to
 keep only links to the page's own host.

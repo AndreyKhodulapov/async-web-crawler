@@ -55,10 +55,11 @@ async def test_example_crawls_saves_and_reports(example, url, tmp_path, monkeypa
     await example.main(config_file)
 
     output = capsys.readouterr().out
-    assert "Processed: 5 pages in " in output
+    # The link to files/manual.pdf is not followed: the configuration leaves files alone.
+    assert "Processed: 4 pages in " in output
     assert "Successful: 3\n" in output
-    assert "Failed: 2\n" in output
-    assert "Status codes: {200: 3, 404: 2}" in output
+    assert "Failed: 1\n" in output
+    assert "Status codes: {200: 3, 404: 1}" in output
     assert f"links: {url('/site/')}\n" in output
     assert "Report: out/report.html\n" in output
     assert "Pages: out/pages.jsonl\n" in output

@@ -139,7 +139,8 @@ errors a crawler meets:
 | `/server-error` | always HTTP 500 | retries once, as the rule for 500 says, and gives up |
 | `/slow` | the page after 1.2 s | times out at the 1 s read timeout, retries with 1.5 s and gets the page |
 | `/missing`, `/private` | HTTP 404, 403 | no retry; listed as permanent errors |
-| `/data.json` | JSON | `ParseError`, no retry |
+| `/empty` | an HTML page with nothing in it | `ParseError`, no retry |
+| `/data.json` | JSON | skipped as not HTML, its body not downloaded; not an error |
 | `localhost:<closed port>/page/1` ... `8` | connection refused | retries until 5 failures open the circuit breaker of `localhost`; the pages not sent yet wait for its probes and are given up once it has opened 3 times |
 | `unreachable.invalid` | DNS error | 3 retries, then gives up |
 
@@ -175,9 +176,9 @@ INFO    | crawler.client | Gave up on http://localhost:50865/page/8: circuit bre
 Then come the pages, the error statistics and the circuit breakers:
 
 ```
-=== Crawl (25 pages, 3.39s) ===
+=== Crawl (26 pages, 3.39s) ===
 DEPTH  RESULT                                LINKS  URL
-    0  ok                                       24  http://127.0.0.1:50864/
+    0  ok                                       25  http://127.0.0.1:50864/
     1  ok                                        0  http://127.0.0.1:50864/articles/1
     ...
     1  ok                                        0  http://127.0.0.1:50864/flaky
@@ -186,13 +187,14 @@ DEPTH  RESULT                                LINKS  URL
     1  ok                                        0  http://127.0.0.1:50864/slow
     1  PermanentHTTPError: HTTP 404 Not...          http://127.0.0.1:50864/missing
     1  PermanentHTTPError: HTTP 403...              http://127.0.0.1:50864/private
-    1  ParseError: unsupported content...           http://127.0.0.1:50864/data.json
+    1  ParseError: empty document                   http://127.0.0.1:50864/empty
+    1  skipped, not HTML: application/json          http://127.0.0.1:50864/data.json
     1  NetworkError:...                             http://localhost:50865/page/1
     ...
     1  NetworkError:...                             http://localhost:50865/page/7
     1  CircuitOpenError: circuit breaker...         http://localhost:50865/page/8
     1  NetworkError:...                             http://unreachable.invalid/
-Crawled: 12 pages, failed: 13, skipped: 0, blocked: 0, unreachable: 0, left in queue: 0, speed: 7.4 pages/s
+Crawled: 12 pages, failed: 13, skipped: 1, blocked: 0, unreachable: 0, left in queue: 0, speed: 7.4 pages/s
 
 === Errors (24 failed attempts) ===
 By kind:  TransientError 6, PermanentError 2, NetworkError 15, ParseError 1, other 0

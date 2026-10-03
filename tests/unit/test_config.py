@@ -19,6 +19,7 @@ from crawler import (
     load_config,
 )
 from crawler.config import (
+    EXCLUDED_EXTENSIONS,
     CircuitBreakerOptions,
     CrawlOptions,
     FilterOptions,
@@ -55,7 +56,12 @@ FULL = {
     },
     "retry": {"max_retries": 5, "backoff_factor": 3.0, "base_delay": 0.5, "max_delay": 10.0},
     "circuit_breaker": {"failure_threshold": 0.8, "min_requests": 10, "window": 120.0, "cooldown": 15.0},
-    "filters": {"same_domain_only": True, "include": ["^https://example\\.com/blog/"], "exclude": ["\\.pdf$"]},
+    "filters": {
+        "same_domain_only": True,
+        "include": ["^https://example\\.com/blog/"],
+        "exclude": ["\\.pdf$"],
+        "exclude_extensions": ["zip", "mp4"],
+    },
     "storage": {"outputs": ["pages.jsonl", "pages.csv"], "batch_size": 50, "csv_encoding": "utf-8-sig"},
     "logging": {"level": "DEBUG", "file": "crawler.log", "max_bytes": 1000, "backup_count": 2},
     "report": {"stats_json": "stats.json", "html": "report.html", "title": "Blog crawl", "top_domains": 5},
@@ -89,7 +95,10 @@ class TestDefaults:
         assert config.circuit_breaker == CircuitBreakerOptions(
             failure_threshold=0.5, min_requests=5, window=60.0, cooldown=30.0
         )
-        assert config.filters == FilterOptions(same_domain_only=False, include=(), exclude=())
+        assert config.filters == FilterOptions(
+            same_domain_only=False, include=(), exclude=(), exclude_extensions=EXCLUDED_EXTENSIONS
+        )
+        assert {"pdf", "jpg", "zip", "mp4"} <= set(EXCLUDED_EXTENSIONS)
         assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8")
         assert config.logging == LoggingOptions(level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5)
         assert config.report == ReportOptions(stats_json=None, html=None, title="Crawl report", top_domains=10)
@@ -122,6 +131,8 @@ class TestDefaults:
             **{name: breaker[name] for name in CircuitBreakerOptions.__dataclass_fields__}
         )
         assert FilterOptions().same_domain_only == crawl["same_domain_only"]
+        # Differs on purpose: a crawl by the configuration leaves files alone, the library follows every link.
+        assert crawl["exclude_extensions"] == ()
         assert SitemapOptions().from_robots == crawl["robots_sitemaps"]
 
     def test_configuration_cannot_be_changed(self):
@@ -151,6 +162,7 @@ class TestValues:
         assert config.urls == ("https://example.com/", "https://example.org/docs")
         assert config.crawler.max_per_domain == 4
         assert config.filters.exclude == ("\\.pdf$",)
+        assert config.filters.exclude_extensions == ("zip", "mp4")
 
     def test_to_dict_can_be_read_back_and_written_as_json(self):
         config = CrawlerConfig.from_dict(FULL)
@@ -225,7 +237,7 @@ class TestInvalid:
 
     def test_unknown_key_without_a_close_one_lists_the_keys(self):
         assert problems({"filters": {"zzz": 1}}) == [
-            "filters.zzz: unknown key; expected one of same_domain_only, include, exclude"
+            "filters.zzz: unknown key; expected one of same_domain_only, include, exclude, exclude_extensions"
         ]
 
     def test_unknown_section(self):
@@ -300,6 +312,19 @@ class TestInvalid:
 
         assert problem.startswith("filters.exclude[1]: not a regular expression: ")
         assert problem.endswith(', got "("')
+
+    def test_file_extensions_are_normalized(self):
+        config = CrawlerConfig.from_dict({"filters": {"exclude_extensions": [".PDF", " Zip "]}})
+
+        assert config.filters.exclude_extensions == ("pdf", "zip")
+        assert CrawlerConfig.from_dict({"filters": {"exclude_extensions": []}}).filters.exclude_extensions == ()
+
+    def test_invalid_file_extension(self):
+        assert problems({"filters": {"exclude_extensions": ["pdf", "tar.gz", "", "a/b"]}}) == [
+            "filters.exclude_extensions[1]: expected one extension without dots, such as 'pdf' or 'gz', got \"tar.gz\"",
+            "filters.exclude_extensions[2]: expected one extension without dots, such as 'pdf' or 'gz', got \"\"",
+            "filters.exclude_extensions[3]: expected one extension without dots, such as 'pdf' or 'gz', got \"a/b\"",
+        ]
 
     def test_unknown_output_extension(self):
         (problem,) = problems({"storage": {"outputs": ["pages.jsonl", "pages.xml"]}})

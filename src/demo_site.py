@@ -9,6 +9,7 @@ The start page links to pages that answer normally and to pages that fail:
     /slow           answers after 1.2 s, longer than a 1 s read timeout
     /missing        HTTP 404
     /private        HTTP 403
+    /empty          an HTML page with nothing in it
     /data.json      JSON instead of HTML
 
 It also links to a server that is down: pages on `localhost` at a port
@@ -72,6 +73,7 @@ class DemoSite:
         app.router.add_get("/server-error", self._server_error)
         app.router.add_get("/slow", self._slow)
         app.router.add_get("/private", self._private)
+        app.router.add_get("/empty", self._empty)
         app.router.add_get("/data.json", self._data)
         # /missing is not routed: aiohttp answers 404.
         runner = web.AppRunner(app, access_log=None)
@@ -95,7 +97,7 @@ class DemoSite:
     def links(self) -> list[str]:
         """Every link of the start page, in order."""
         own = [f"articles/{number}" for number in range(1, self.ARTICLES + 1)]
-        own += ["flaky", "rate-limited", "server-error", "slow", "missing", "private", "data.json"]
+        own += ["flaky", "rate-limited", "server-error", "slow", "missing", "private", "empty", "data.json"]
         down = [f"http://localhost:{self._down_port}/page/{number}" for number in range(1, 8 + 1)]
         return [self.url + path for path in own] + down + ["http://unreachable.invalid/", *self.extra_links]
 
@@ -129,6 +131,9 @@ class DemoSite:
 
     async def _private(self, request: web.Request) -> web.Response:
         raise web.HTTPForbidden()
+
+    async def _empty(self, request: web.Request) -> web.Response:
+        return web.Response(text="", content_type="text/html")
 
     async def _data(self, request: web.Request) -> web.Response:
         return web.json_response({"pages": self.ARTICLES})

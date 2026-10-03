@@ -72,8 +72,12 @@ async def test_errors_demo_meets_every_kind_of_error(url, tmp_path, capsys):
         "/server-error": "TransientHTTPError: HTTP 500 Internal Server Error",
         "/missing": "PermanentHTTPError: HTTP 404 Not Found",
         "/private": "PermanentHTTPError: HTTP 403 Forbidden",
-        "/data.json": "ParseError: unsupported content type: application/json",
+        "/empty": "ParseError: empty document",
     }
+    # JSON instead of HTML is not an error: the page is left out.
+    assert [(urlsplit(page["url"]).path, page["reason"]) for page in saved["skipped"]] == [
+        ("/data.json", "not HTML: application/json")
+    ]
 
     errors = saved["errors"]
     # HTTP 500 is retried once by the default rules.
@@ -125,7 +129,7 @@ async def test_save_demo_writes_three_storages_and_reads_them_back(tmp_path, cap
     assert from_database == in_json
     start = from_json[0]
     assert (start["title"], start["status_code"], start["content_type"]) == ("Unreliable site", 200, "text/html")
-    assert (start["metadata"]["depth"], len(start["links"])) == (0, 24)
+    assert (start["metadata"]["depth"], len(start["links"])) == (0, 25)
 
     output = capsys.readouterr().out
     assert "=== Saved pages (this crawl: 12 saved, 0 not saved) ===" in output

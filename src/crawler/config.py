@@ -15,11 +15,25 @@ import yaml
 
 from crawler.client import AsyncCrawler
 from crawler.exceptions import ConfigError
+from crawler.filters import extension_problem, normalize_extension
 from crawler.robots import product_token
 from crawler.storage import CompositeStorage, DataStorage, storage_from_output
 from crawler.urls import is_valid_http_url
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+
+# Links to files a crawl of web pages has no use for: documents, images,
+# archives, media, programs, styles and scripts.
+# fmt: off
+EXCLUDED_EXTENSIONS = (
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    "jpg", "jpeg", "png", "gif", "webp", "svg", "ico",
+    "zip", "gz", "tar", "rar", "7z",
+    "mp3", "mp4", "avi", "mov", "webm",
+    "exe", "dmg", "iso",
+    "css", "js",
+)
+# fmt: on
 
 _INVALID = object()  # a value that was reported and is left at its default
 
@@ -143,6 +157,9 @@ class FilterOptions:
     same_domain_only: bool = False
     include: tuple[str, ...] = _option((), check=_pattern)
     exclude: tuple[str, ...] = _option((), check=_pattern)
+    exclude_extensions: tuple[str, ...] = _option(
+        EXCLUDED_EXTENSIONS, check=extension_problem, normalize=normalize_extension
+    )  # links to files with these extensions are not followed; [] follows them all
 
 
 @dataclass(frozen=True)

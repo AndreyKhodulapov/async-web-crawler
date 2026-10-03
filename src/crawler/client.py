@@ -277,7 +277,7 @@ class AsyncCrawler:
 
     @property
     def skipped_urls(self) -> dict[str, str]:
-        """URL -> reason for pages the latest crawl fetched but left out. Do not modify."""
+        """URL -> reason for pages the latest crawl fetched but left out, e.g. not HTML. Do not modify."""
         return self._queue.skipped
 
     @property
@@ -685,6 +685,7 @@ class AsyncCrawler:
         same_domain_only: bool = False,
         include_patterns: Iterable[str] = (),
         exclude_patterns: Iterable[str] = (),
+        exclude_extensions: Iterable[str] = (),
         sitemap_urls: Iterable[str] = (),
         robots_sitemaps: bool = False,
     ) -> dict[str, ParsedPage]:
@@ -710,13 +711,16 @@ class AsyncCrawler:
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
         the pages they redirect to); `include_patterns` and `exclude_patterns`
-        are regular expressions, see `UrlFilter`. A link that passes the
+        are regular expressions and `exclude_extensions` file extensions
+        such as "pdf", see `UrlFilter`. A link that passes the
         filters but redirects to a URL that does not is skipped, and so is a
         page that redirects to a URL already seen: the target is not
         requested, the page is not returned, and it is listed in
         `skipped_urls` with the reason. A page that redirects to a URL
         robots.txt disallows is listed in `blocked_urls`; having been
-        requested, it counts toward `max_pages`.
+        requested, it counts toward `max_pages`. A page whose Content-Type
+        is not HTML is skipped too, with its body left undownloaded; it counts
+        toward `max_pages` as well.
 
         The pages listed in the sitemaps `sitemap_urls` are crawled too, and
         with `robots_sitemaps` so are those of the sitemaps that robots.txt
@@ -741,9 +745,9 @@ class AsyncCrawler:
         cache and the states of the circuit breaker carry over.
 
         Raises:
-            TypeError: a single string is passed instead of a list of URLs or patterns.
-            ValueError: `max_pages` is not positive, a start URL, a sitemap URL or a pattern is invalid,
-                `robots_sitemaps` is asked of a crawler that does not read robots.txt.
+            TypeError: a single string is passed instead of a list of URLs, patterns or extensions.
+            ValueError: `max_pages` is not positive, a start URL, a sitemap URL, a pattern or an extension
+                is invalid, `robots_sitemaps` is asked of a crawler that does not read robots.txt.
             RuntimeError: another crawl is running on this crawler.
         """
         if isinstance(start_urls, str):
@@ -769,6 +773,7 @@ class AsyncCrawler:
             allowed_hosts={get_host(url) for url in start_urls + sitemap_urls} if same_domain_only else None,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            exclude_extensions=exclude_extensions,
         )
         self._queue = CrawlerQueue()
         self.processed_urls = {}
@@ -979,6 +984,10 @@ class AsyncCrawler:
         if result.error is not None:
             self._fail_page(url, queue, result.error, result)
             return
+        if skip_reason is None and not is_html_content_type(result.content_type):
+            # A link without a file extension may still lead to a PDF or an
+            # image. Not a failure: the page is fine, just not one to parse.
+            skip_reason = f"not HTML: {result.content_type}"
         if skip_reason is not None:
             logger.info("Skipped %s: %s", url, skip_reason)
             queue.mark_skipped(url, skip_reason)

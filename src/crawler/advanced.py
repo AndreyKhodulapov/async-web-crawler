@@ -155,6 +155,7 @@ class AdvancedCrawler:
             same_domain_only=config.filters.same_domain_only,
             include_patterns=config.filters.include,
             exclude_patterns=config.filters.exclude,
+            exclude_extensions=config.filters.exclude_extensions,
             sitemap_urls=config.sitemaps.urls,
             robots_sitemaps=config.sitemaps.from_robots,
         )

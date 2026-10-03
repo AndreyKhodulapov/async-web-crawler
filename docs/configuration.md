@@ -117,9 +117,18 @@ not to the start URLs.
 | `same_domain_only` | true or false | `false` | follow links on the hosts of the start URLs and of `sitemaps.urls` only |
 | `include` | list of regular expressions | `[]` | a link must match at least one; empty means any link |
 | `exclude` | list of regular expressions | `[]` | a matching link is skipped, even if included |
+| `exclude_extensions` | list of file extensions | documents, images, archives, media, programs, `css`, `js` (see `config.example.yaml`) | a link to a file with one of them is not followed; `[]` follows every link |
 
 A pattern is searched anywhere in the URL. In YAML write patterns in single
 quotes, where a backslash is a backslash: `'\.pdf$'`.
+
+An extension is compared with the last one of the file the URL path names,
+in any case and with or without the dot: `pdf` rejects `/files/Manual.PDF`
+and `/report.pdf?v=2`, but not `/view?file=report.pdf`. Write `gz`, not
+`tar.gz`. A page that turns out not to be HTML anyway, such as a PDF behind
+a link without an extension, is requested but not downloaded: it is listed
+as skipped and counts toward `max_pages`. The library itself, `AsyncCrawler.crawl()`,
+follows links to files unless given `exclude_extensions`.
 
 ### `storage`
 

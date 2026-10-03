@@ -52,6 +52,13 @@ filters:
   same_domain_only: false
   include: []           # e.g. ['^https://example\.com/blog/']
   exclude: []           # e.g. ['\.pdf$', '/login']
+  # Links to files with these extensions are not followed; [] follows them all.
+  exclude_extensions: [pdf, doc, docx, xls, xlsx, ppt, pptx,
+                       jpg, jpeg, png, gif, webp, svg, ico,
+                       zip, gz, tar, rar, 7z,
+                       mp3, mp4, avi, mov, webm,
+                       exe, dmg, iso,
+                       css, js]
 
 # Where the crawled pages are saved: files, by extension (.jsonl, .json,
 # .csv, .db), or database URLs (sqlite:///pages.db, postgresql://...).

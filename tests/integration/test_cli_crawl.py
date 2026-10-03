@@ -46,26 +46,27 @@ async def test_crawl_by_a_file_and_options(url, config_file, tmp_path, capsys):
     code = await run(build_config(parse_args(argv)))
 
     assert code == 0
-    # The start page and its links on the same host; two more of them are a 404.
+    # The start page and its links on the same host; one more of them is a 404,
+    # and the link to files/manual.pdf is not followed by default.
     crawled = {url("/site/"), url("/site/a.html"), url("/site/b.html")}
     assert saved_urls(out / "pages.jsonl") == crawled
     stats = json.loads((out / "stats.json").read_text(encoding="utf-8"))
-    assert (stats["total_pages"], stats["successful"], stats["failed"]) == (5, 3, 2)
+    assert (stats["total_pages"], stats["successful"], stats["failed"]) == (4, 3, 1)
     assert "data:image/png" in (out / "report.html").read_text(encoding="utf-8")  # a chart
     assert (out / "crawler.log").exists()
 
     captured = capsys.readouterr()
     summary = captured.out
     assert "=== Crawl finished (" in summary
-    assert "Pages: 5 (3 successful, 2 failed, 0 skipped)" in summary
-    assert "Status codes: 200: 3, 404: 2" in summary
-    assert "Top domains: 127.0.0.1: 5" in summary
-    assert "Errors: PermanentHTTPError: 2" in summary
+    assert "Pages: 4 (3 successful, 1 failed, 0 skipped)" in summary
+    assert "Status codes: 200: 3, 404: 1" in summary
+    assert "Top domains: 127.0.0.1: 4" in summary
+    assert "Errors: PermanentHTTPError: 1" in summary
     assert f"Saved: 3 pages to {out / 'pages.jsonl'}\n" in summary
     assert f"Reports: {out / 'stats.json'}, {out / 'report.html'}\n" in summary
     assert f"Log: {out / 'crawler.log'}\n" in summary
     # The progress line goes to stderr and ends with the crawl done.
-    assert "| 5/100 pages, 2 failed |" in captured.err.splitlines()[-1]
+    assert "| 4/100 pages, 1 failed |" in captured.err.splitlines()[-1]
 
 
 async def test_options_limit_the_crawl_of_the_file(url, site, config_file, capsys):
