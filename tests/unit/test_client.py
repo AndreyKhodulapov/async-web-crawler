@@ -852,6 +852,40 @@ class TestRedirectLimit:
         assert fake_session.requested.count("http://a/11") == 1
 
 
+class TestHostQueueLimit:
+    async def test_host_over_its_limit_leaves_room_for_the_others(self, make_crawler, fake_session, caplog):
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(max_concurrent=1, max_depth=1)
+        links = [f"http://a/{n}" for n in range(1, 101)] + ["http://b/", "http://c/", "http://d/"]
+        fake_session.routes["http://a/0"] = FakeResponse("".join(f'<a href="{link}">x</a>' for link in links).encode())
+
+        # The queue holds 3 x 12 pages; a host with a limit of 3 pages gets 3 x 3 of them.
+        await crawler.crawl(["http://a/0"], max_pages=12, max_pages_per_host=3, same_domain_only=False)
+
+        assert crawler.processed_urls.keys() == {
+            "http://a/0",
+            "http://a/1",
+            "http://a/2",
+            "http://b/",
+            "http://c/",
+            "http://d/",
+        }
+        assert len(crawler.skipped_urls) == 6  # a/3 to a/8, over max_pages_per_host
+        messages = [record.getMessage() for record in caplog.records]
+        assert "Host a has 9 pages queued (3 x max_pages_per_host): its new links are not queued" in messages
+        assert "92 links were not queued: their host had 3 x max_pages_per_host pages queued" in messages
+
+    async def test_no_limit_by_host_without_max_pages_per_host(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=1, max_depth=1)
+        fake_session.routes["http://a/0"] = FakeResponse(
+            "".join(f'<a href="http://a/{n}">x</a>' for n in range(1, 11)).encode()
+        )
+
+        await crawler.crawl(["http://a/0"], max_pages=20)
+
+        assert len(crawler.processed_urls) == 11
+
+
 class TestCrawlDuplicates:
     async def test_variant_of_a_page_that_failed_is_kept(self, make_crawler, fake_session):
         crawler = make_crawler(max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=0))

@@ -382,8 +382,11 @@ work. Once the pages queued, in progress and requested reach
 queued, nor remembered, so a page found again later is queued if there is
 room by then. The spare room is for pages that do not count toward
 `max_pages` (disallowed by robots.txt, over `max_pages_per_host`); a crawl
-whose queue is mostly such pages may end before `max_pages`. How many links
-were left out is logged at the end of the crawl.
+whose queue is mostly such pages may end before `max_pages`. With
+`max_pages_per_host`, a host gets at most `FRONTIER_FACTOR` times that many
+pages queued in the whole crawl, so a large site cannot fill the queue
+with pages it would skip and crowd out the other hosts. How many links
+were left out, and why, is logged at the end of the crawl.
 
 After a crawl, and during one, the crawler exposes its state:
 

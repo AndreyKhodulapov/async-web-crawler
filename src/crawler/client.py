@@ -174,6 +174,7 @@ class AsyncCrawler:
     MAX_URL_LENGTH = 2048
     # In crawl(), new links are not queued once the pages queued, in progress
     # and requested reach this many times max_pages: most would never be fetched.
+    # Likewise a host has at most this many times max_pages_per_host queued.
     FRONTIER_FACTOR = 3
 
     def __init__(
@@ -260,6 +261,9 @@ class AsyncCrawler:
         self._host_pages: Counter[str] = Counter()  # pages requested by host
         self._max_frontier = 0  # pages queued, in progress and requested that crawl() allows
         self._links_dropped = 0
+        self._host_queued: Counter[str] = Counter()  # pages ever queued by host
+        self._max_host_queued: int | None = None  # pages queued by host that crawl() allows
+        self._links_dropped_by_host = 0
         self._pages_to_save = 0
         self._written_before = 0
         self._pending_before = 0
@@ -774,6 +778,9 @@ class AsyncCrawler:
         later may be queued then). The spare room is for pages that do not
         count toward `max_pages`, such as those robots.txt disallows; a
         crawl whose queue is mostly such pages may end before `max_pages`.
+        With `max_pages_per_host`, a host has at most `FRONTIER_FACTOR`
+        times that many pages queued in the whole crawl, so that one large
+        site does not fill the queue with pages it will skip.
 
         The pages listed in the sitemaps `sitemap_urls` are crawled too, and
         with `robots_sitemaps` so are those of the sitemaps that robots.txt
@@ -841,6 +848,8 @@ class AsyncCrawler:
         self._host_pages = Counter()
         self._max_frontier = self.FRONTIER_FACTOR * max_pages
         self._links_dropped = 0
+        self._max_host_queued = None if max_pages_per_host is None else self.FRONTIER_FACTOR * max_pages_per_host
+        self._links_dropped_by_host = 0
         self._pages_to_save = 0
         self._written_before = self.storage.written if self.storage is not None else 0
         self._pending_before = self.storage.pending if self.storage is not None else 0
@@ -851,6 +860,7 @@ class AsyncCrawler:
         for url in start_urls:
             self._queue.add_url(url, priority=0, depth=0)
         self._start_urls = set(self._queue.depths)
+        self._host_queued = Counter(get_host(url) for url in self._start_urls)
 
         logger.info(
             "Crawl started: %d start URLs, max_depth=%d, max_pages=%d", len(start_urls), self.max_depth, max_pages
@@ -880,6 +890,12 @@ class AsyncCrawler:
         )
         if self._links_dropped:
             logger.info("%d links were not queued: the queue was full", self._links_dropped)
+        if self._links_dropped_by_host:
+            logger.info(
+                "%d links were not queued: their host had %d x max_pages_per_host pages queued",
+                self._links_dropped_by_host,
+                self.FRONTIER_FACTOR,
+            )
         if self.storage is not None:
             logger.info(
                 "Saved %d pages to %s, %d not saved", stats.saved, type(self.storage).__name__, stats.save_failed
@@ -930,10 +946,15 @@ class AsyncCrawler:
         self._sitemap_pages_out_of_scope = out_of_scope
 
     def _queue_found(self, queue: CrawlerQueue, url: str, *, depth: int) -> bool:
-        """Queue a link or a sitemap page unless the queue is full; True if it was queued.
+        """Queue a link or a sitemap page unless the queue, or the share of its host, is full; True if it was queued.
 
         Its priority is its depth: breadth-first.
         """
+        host = get_host(url)
+        if self._max_host_queued is not None and self._host_queued[host] >= self._max_host_queued:
+            if not queue.closed and not queue.is_seen(url):
+                self._links_dropped_by_host += 1
+            return False
         if not queue.closed and queue.unfinished + self._pages_requested >= self._max_frontier:
             if not queue.is_seen(url):
                 if not self._links_dropped:
@@ -945,7 +966,17 @@ class AsyncCrawler:
                     )
                 self._links_dropped += 1
             return False
-        return queue.add_url(url, priority=depth, depth=depth)
+        if not queue.add_url(url, priority=depth, depth=depth):
+            return False
+        self._host_queued[host] += 1
+        if self._host_queued[host] == self._max_host_queued:
+            logger.info(
+                "Host %s has %d pages queued (%d x max_pages_per_host): its new links are not queued",
+                host,
+                self._max_host_queued,
+                self.FRONTIER_FACTOR,
+            )
+        return True
 
     async def _sitemaps_in_robots(self, url: str) -> list[str]:
         """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read."""
