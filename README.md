@@ -14,7 +14,8 @@ configuration file, by command-line options, or from Python.
 - **Crawling**: a priority queue of URLs and a pool of workers, depth and
   page limits, deduplication of normalized URLs, filters by domain, by
   regular expressions and by file extension (by default the crawl stays on
-  the start hosts, and documents, images and archives are not followed);
+  the start hosts and their subdomains, and documents, images and archives
+  are not followed);
   guards against endless URL spaces: tracking parameters dropped, a URL
   length limit, `<link rel="canonical">` for variants of a page, a page
   limit per host; a queue bounded by the page limit, so memory does not
@@ -210,6 +211,39 @@ async with AsyncCrawler(max_concurrent=5, requests_per_second=2.0, storage=JSONS
 The parts work on their own too: `RateLimiter`, `RobotsParser`,
 `SitemapParser`, `RetryStrategy`, `CircuitBreaker`, `HTMLParser`, the
 storages. All of it is described in the [API reference](docs/api.md).
+
+## Limitations
+
+- **`max_pages` counts requests, not saved pages.** Every page requested
+  counts: one that failed, one that turned out not to be HTML, one marked
+  `noindex`, one that is a variant of another page by its canonical URL.
+  So `--max-pages 100` may save fewer than 100 pages; the summary shows how
+  many were skipped and why. Pages that robots.txt disallows are not
+  requested and do not count.
+- **A site is a host name.** `same_domain_only` keeps the crawl on the
+  start hosts and their subdomains, `www.example.com` and `example.com`
+  being one host. There is no public suffix list: a start URL on
+  `docs.example.com` does not bring in `example.com`, and a site spread over
+  unrelated domains needs `same_domain_only: false` with an `include`
+  pattern for each of them.
+- **A crawl cannot be resumed.** Ctrl-C keeps the pages fetched so far,
+  but the queue is lost: the next run starts from the start URLs again,
+  adding to the output files or starting them anew with `--overwrite`.
+- **A storage that keeps failing fills memory.** Pages that could not be
+  written stay buffered and are retried; a database that is down for long
+  holds every page since the outage in memory.
+- **Not for URLs from strangers.** Links to private addresses
+  (`127.0.0.1`, `10.0.0.0/8`, the cloud metadata address) are followed
+  like any other. The crawler is a command-line tool for sites you choose,
+  not a service that takes URLs from users.
+- **Parsing is bound by one CPU.** HTML is parsed in a worker thread of
+  one process; a few heavy pages per second is the ceiling whatever
+  `max_concurrent` says. With a rate limit per host it never matters; a
+  crawl of many hosts without one is parsing-bound.
+- **Some guards are constants, not options.** The URL length limit (2048),
+  the redirect limit (10), the queue size (3 times the page limit) and the
+  wait at which a host's pages are put off (1 second) are class attributes
+  of `AsyncCrawler`.
 
 ## Documentation
 

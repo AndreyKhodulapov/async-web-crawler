@@ -65,7 +65,7 @@ leaves a failing site alone.
 - **Retry-After** (seconds or an HTTP date, with 429 or 503) tells when to
   come back: wait `max(backoff, Retry-After)`. When it asks for longer than
   the cap, do not retry: coming back early earns another refusal. The rest of
-  the crawler still honors it in full, up to a cap of its own (10 minutes),
+  the crawler still honors it in full, up to a cap of its own (`max_retry_after`, 10 minutes by default),
   see [politeness.md](politeness.md#backing-off-a-struggling-site).
 - **Make the wait injectable**. `RetryStrategy(wait=...)` sleeps by default;
   the crawler instead holds back the whole host in the rate limiter after a

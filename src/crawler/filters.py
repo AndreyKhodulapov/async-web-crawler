@@ -11,8 +11,9 @@ from crawler.urls import get_host
 class UrlFilter:
     """Accepts or rejects URLs by host and by regular expressions.
 
-    - `allowed_hosts`: if given, only URLs on these exact hosts pass
-      ("www.example.com" and "example.com" are different hosts).
+    - `allowed_hosts`: if given, only URLs on these hosts and on their
+      subdomains pass: "example.com" lets "docs.example.com" through, not
+      the other way round. "www.example.com" and "example.com" are one host.
     - `include_patterns`: if given, a URL must match at least one of them.
     - `exclude_patterns`: a URL matching any of them is rejected, even if it
       also matches an include pattern.
@@ -55,7 +56,7 @@ class UrlFilter:
     def allows(self, url: str) -> bool:
         if self.max_url_length is not None and len(url) > self.max_url_length:
             return False
-        if self.allowed_hosts is not None and get_host(url) not in self.allowed_hosts:
+        if self.allowed_hosts is not None and not self._host_allowed(get_host(url)):
             return False
         if self._extensions and _file_extension(url) in self._extensions:
             return False
@@ -63,6 +64,18 @@ class UrlFilter:
         if _matches(self._exclude, forms):
             return False
         return not self._include or _matches(self._include, forms)
+
+    def _host_allowed(self, host: str | None) -> bool:
+        assert self.allowed_hosts is not None  # called only when hosts are restricted
+        if host is None:
+            return False
+        site = _site(host)
+        return any(site == allowed or site.endswith(f".{allowed}") for allowed in map(_site, self.allowed_hosts))
+
+
+def _site(host: str) -> str:
+    """The host without a leading "www.": the two name the same site. "www.com" is left alone."""
+    return host[4:] if host.startswith("www.") and "." in host[4:] else host
 
 
 def _file_extension(url: str) -> str:

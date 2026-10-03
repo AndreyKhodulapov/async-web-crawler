@@ -53,6 +53,7 @@ FULL = {
         "read_timeout": 15.0,
         "timeout_growth": 2.0,
         "max_page_size": 1_000_000,
+        "max_retry_after": 120.0,
         "keep_pages": False,
     },
     "retry": {"max_retries": 5, "backoff_factor": 3.0, "base_delay": 0.5, "max_delay": 10.0},
@@ -135,6 +136,7 @@ class TestDefaults:
             "read_timeout",
             "timeout_growth",
             "max_page_size",
+            "max_retry_after",
             "keep_pages",
         ):
             assert getattr(options, name) == crawler[name], name
@@ -297,6 +299,7 @@ class TestInvalid:
             ({"crawler": {"jitter": -0.5}}, "crawler.jitter: must be >= 0, got -0.5"),
             ({"crawler": {"read_timeout": 0}}, "crawler.read_timeout: must be > 0, got 0.0"),
             ({"crawler": {"timeout_growth": 0.5}}, "crawler.timeout_growth: must be >= 1, got 0.5"),
+            ({"crawler": {"max_retry_after": 0}}, "crawler.max_retry_after: must be > 0, got 0.0"),
             ({"crawler": {"user_agent": "  "}}, 'crawler.user_agent: must not be empty, got ""'),
             ({"sitemaps": {"max_urls": 0}}, "sitemaps.max_urls: must be >= 1, got 0"),
             ({"retry": {"max_retries": -1}}, "retry.max_retries: must be >= 0, got -1"),

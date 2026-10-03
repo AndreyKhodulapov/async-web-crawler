@@ -81,6 +81,7 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `read_timeout` | number, > 0 | `20.0` | the longest pause between two chunks of the response |
 | `timeout_growth` | number, >= 1 | `1.5` | the timeouts grow by this factor on every retry |
 | `max_page_size` | whole number, >= 1, or `null` | `10485760` | bytes of a page body (10 MiB); a larger page fails unread; `null` lifts the limit |
+| `max_retry_after` | number, > 0 | `600.0` | the longest wait a `Retry-After` header is obeyed for (10 minutes); a host that asks for more is asked again after this long |
 | `keep_pages` | true or false | `true` | `false` drops a page from memory once it is saved, for large crawls |
 
 ### `retry`
@@ -114,7 +115,7 @@ not to the start URLs.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `same_domain_only` | true or false | `true` | follow links on the hosts of the start URLs and of `sitemaps.urls` only; `false` follows links to any host |
+| `same_domain_only` | true or false | `true` | follow links on the hosts of the start URLs and of `sitemaps.urls` only, and on their subdomains; `false` follows links to any host |
 | `include` | list of regular expressions | `[]` | a link must match at least one; empty means any link |
 | `exclude` | list of regular expressions | `[]` | a matching link is skipped, even if included |
 | `exclude_extensions` | list of file extensions | documents, images, archives, media, programs, `css`, `js` (see `config.example.yaml`) | a link to a file with one of them is not followed; `[]` follows every link |
@@ -128,6 +129,13 @@ and `/report.pdf?v=2`, but not `/view?file=report.pdf`. Write `gz`, not
 `tar.gz`. A page that turns out not to be HTML anyway, such as a PDF behind
 a link without an extension, is requested but not downloaded: it is listed
 as skipped and counts toward `max_pages`.
+
+A site is its host name: with a start URL on `example.com`, links to
+`www.example.com` (the same host) and to `docs.example.com` (a subdomain)
+are followed, links to `example.org` are not. A start URL on
+`docs.example.com` keeps the crawl there: `example.com` and `blog.example.com`
+are outside. A site spread over unrelated domains needs
+`same_domain_only: false` with an `include` pattern for each of them.
 
 The library itself, `AsyncCrawler.crawl()`, follows links to any host and
 to files unless given `same_domain_only=True` and `exclude_extensions`; the

@@ -80,6 +80,7 @@ class AdvancedCrawler:
             read_timeout=options.read_timeout,
             timeout_growth=options.timeout_growth,
             max_page_size=options.max_page_size,
+            max_retry_after=options.max_retry_after,
             user_agent=options.user_agent,
             user_agents=options.user_agents,
             storage=self.storage,

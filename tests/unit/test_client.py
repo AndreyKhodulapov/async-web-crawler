@@ -192,6 +192,11 @@ class TestInit:
         with pytest.raises(ValueError, match="timeout_growth"):
             AsyncCrawler(timeout_growth=value)
 
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_rejects_non_positive_max_retry_after(self, value):
+        with pytest.raises(ValueError, match="max_retry_after"):
+            AsyncCrawler(max_retry_after=value)
+
     def test_does_not_create_session_eagerly(self):
         crawler = AsyncCrawler()
         assert crawler._session is None
@@ -486,8 +491,17 @@ class TestRetries:
         with pytest.raises(HTTPStatusError):
             await crawler.fetch_url("http://a")
 
-        assert crawler.rate_limiter.reserve("a") == pytest.approx(AsyncCrawler.MAX_RETRY_AFTER, abs=0.1)
+        assert crawler.rate_limiter.reserve("a") == pytest.approx(AsyncCrawler.DEFAULT_MAX_RETRY_AFTER, abs=0.1)
         assert "a asked to wait 86400s (Retry-After), waiting 600s" in caplog.text
+
+    async def test_retry_after_cap_is_an_option(self, make_crawler, fake_session, caplog):
+        crawler = make_crawler(retry_strategy=RetryStrategy(max_retries=0), max_retry_after=5)
+        fake_session.routes["http://a"] = FakeResponse(status=429, retry_after="120")
+        with pytest.raises(HTTPStatusError):
+            await crawler.fetch_url("http://a")
+
+        assert crawler.rate_limiter.reserve("a") == pytest.approx(5.0, abs=0.1)
+        assert "a asked to wait 120s (Retry-After), waiting 5s" in caplog.text
 
     async def test_timeouts_grow_with_every_retry(self, make_crawler, fake_session):
         crawler = make_crawler(
@@ -840,6 +854,61 @@ class TestCrawlBlockedHost:
         assert crawler.failed_urls.keys() == {"http://a/1"}
         assert crawler.processed_urls.keys() == {"http://a/2"}
         assert crawler.crawl_stats().queued == 0
+
+
+class TestCrawlHeldBackHost:
+    async def test_long_retry_after_is_a_warning_once_per_host(self, make_crawler, fake_session, caplog):
+        # The host asks for 1 s, longer than any retry may wait (0.5 s): the
+        # request is not retried, its other pages are put off, which is said
+        # once at WARNING.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(
+            max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=1, max_delay=0.5)
+        )
+        crawler.MIN_PENALTY_TO_DEFER = 0.05
+        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
+        for page in ("http://a/2", "http://a/3", "http://b/"):
+            fake_session.routes[page] = FakeResponse(b"ok")
+
+        await crawler.crawl(["http://a/1", "http://a/2", "http://a/3", "http://b/"])
+
+        assert fake_session.requested == ["http://a/1", "http://b/", "http://a/2", "http://a/3"]
+        assert set(crawler.processed_urls) == {"http://a/2", "http://a/3", "http://b/"}
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert warnings.count("a asked to wait 1s (Retry-After); its pages are put off until then") == 1
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/")]
+        assert len(deferred) == 2
+
+    async def test_pause_before_a_retry_is_not_a_warning(self, make_crawler, fake_session, caplog):
+        # A 429 without Retry-After holds the host back for the retry pause,
+        # which is logged as the retry itself is; the other page is just put off.
+        crawler = make_crawler(
+            max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=1, base_delay=0.3)
+        )
+        crawler.MIN_PENALTY_TO_DEFER = 0.05
+        fake_session.routes["http://a/1"] = [FakeResponse(status=429), FakeResponse(b"ok")]
+        fake_session.routes["http://a/2"] = FakeResponse(b"ok")
+
+        await crawler.crawl(["http://a/1", "http://a/2"])
+
+        assert set(crawler.processed_urls) == {"http://a/1", "http://a/2"}
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert not [message for message in warnings if "put off" in message]
+
+
+class TestCrawlScope:
+    async def test_same_domain_only_keeps_www_and_subdomains(self, make_crawler, fake_session):
+        crawler = make_crawler(max_depth=1)
+        links = ["http://www.example.com/a", "http://docs.example.com/b", "http://example.com.other.org/c"]
+        fake_session.routes["http://example.com/"] = FakeResponse(
+            "".join(f'<a href="{link}">x</a>' for link in links).encode()
+        )
+        for link in links:
+            fake_session.routes[link] = FakeResponse(b"ok")
+
+        await crawler.crawl(["http://example.com/"], same_domain_only=True)
+
+        assert set(crawler.processed_urls) == {"http://example.com/", *links[:2]}
 
 
 class TestRedirectLimit:

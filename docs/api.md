@@ -111,10 +111,10 @@ its retry, the whole host waits with it: such a failure usually means the
 site is overloaded. After any other failure (HTTP 500, a reset connection)
 only that request waits, and the other pages of the host are fetched
 meanwhile. A Retry-After header holds back the host for
-as long as it asks, up to `AsyncCrawler.MAX_RETRY_AFTER` (10 minutes), even
-when the request is not retried; a request whose Retry-After is longer than
-`max_delay` of the retry strategy is not retried. Later `fetch_url()` calls
-to the host wait for that time too.
+as long as it asks, up to `AsyncCrawler(max_retry_after=600.0)` seconds
+(10 minutes), even when the request is not retried; a request whose
+Retry-After is longer than `max_delay` of the retry strategy is not
+retried. Later `fetch_url()` calls to the host wait for that time too.
 
 ## Retries
 
@@ -217,7 +217,10 @@ The same goes for a host held back longer than
 pause before the retry of a request that found it overloaded (HTTP 429, a
 timeout): its pages are put off until the host may be asked
 again, instead of holding workers in the rate limiter, and count toward
-`max_pages` only when they are taken again.
+`max_pages` only when they are taken again. A Retry-After longer than
+`max_delay` of the retry strategy is logged as a warning once per host
+(`example.com asked to wait 300s (Retry-After); its pages are put off until
+then`): with one host in the crawl, nothing is requested until it ends.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
@@ -338,7 +341,7 @@ after the crawler: the robots.txt name of its `user_agent`,
 | `AsyncCrawler(max_depth=2)` | how far from the start pages to go; 0 fetches the start pages only |
 | `AsyncCrawler(max_per_domain=None)` | parallel requests to one host; `None` means only `max_concurrent` applies |
 | `max_pages_per_host=None` | pages requested from one host; `None` means only `max_pages` applies |
-| `same_domain_only=False` | follow links on the start hosts only (and on the hosts their redirects end on, not those they pass through); the configuration turns it on by default |
+| `same_domain_only=False` | follow links on the start hosts only (and on the hosts their redirects end on, not those they pass through) and on their subdomains: `docs.example.com` for a start URL on `example.com`, not the other way round; `www.example.com` and `example.com` are one host. The configuration turns it on by default |
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
 | `exclude_extensions=()` | file extensions such as `"pdf"`; a link to such a file is skipped. Only the last extension of the URL path counts, in any case, the query does not. The configuration sets a list of documents, images, archives and media by default |
@@ -374,7 +377,7 @@ a start URL, so its links are followed up to `max_depth`; unlike a start
 URL, it must pass the filters, and a redirect does not bring another host
 into the crawl. `same_domain_only` keeps the hosts of `sitemap_urls` as well
 as those of the start URLs; when a start URL redirects to another host
-("example.com" to "www.example.com"), the sitemap pages on that host are
+("example.org" to "example.com"), the sitemap pages on that host are
 crawled too. A sitemap that cannot be downloaded or read is logged and
 listed in `failed_sitemaps`, and the crawl goes on.
 

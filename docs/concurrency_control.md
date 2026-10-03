@@ -118,8 +118,11 @@ load under control.
 
 ## URL filters
 
-- Host filter: stay on the start hosts. A start URL that redirects
-  (`example.com` -> `www.example.com`) adds its final host too.
+- Host filter: stay on the start hosts and their subdomains, `www` and
+  the apex being one host. A start URL that redirects (`example.org` ->
+  `example.com`) adds its final host too. A public suffix list would tell
+  `example.co.uk` from `co.uk`; without one, only subdomains of a start
+  host are let in, never its parent domain.
 - Include/exclude regular expressions, compiled once up front so that a
   bad pattern fails fast. Exclude wins over include.
 - Filters apply to discovered links only: the start URLs are an explicit choice.

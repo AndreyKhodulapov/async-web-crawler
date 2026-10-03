@@ -157,8 +157,10 @@ sites it visits and follows their rules.
   crawler: it holds back the host for as long as it asks, even when the
   failed URL is not retried and the wait is longer than any retry pause.
   Coming back after 30 seconds when asked for 2 minutes is what gets a bot
-  blocked. Cap it all the same (here 10 minutes): a misconfigured server
-  must not stop the crawl for a day.
+  blocked. Cap it all the same (here 10 minutes by default,
+  `max_retry_after`): a misconfigured server must not stop the crawl for a
+  day. And say so in the log: a crawl that makes no requests for minutes
+  looks stuck to the user.
 - A 500 or 502 on one URL, or a reset connection, more often means **one
   page** or one backend is broken. Let only that request wait for its
   retry: holding the host for every retry lets a few broken pages stall

@@ -13,9 +13,29 @@ def test_allowed_hosts():
     url_filter = UrlFilter(allowed_hosts={"example.com"})
     assert url_filter.allows("https://example.com/page")
     assert url_filter.allows("http://EXAMPLE.com:8080/page")  # ports are ignored
-    assert not url_filter.allows("https://www.example.com/page")
     assert not url_filter.allows("https://other.org/")
+    assert not url_filter.allows("https://example.com.other.org/")
+    assert not url_filter.allows("https://notexample.com/")
     assert not url_filter.allows("not a url")
+
+
+def test_www_and_the_apex_are_one_host():
+    assert UrlFilter(allowed_hosts={"example.com"}).allows("https://www.example.com/page")
+    assert UrlFilter(allowed_hosts={"www.example.com"}).allows("https://example.com/page")
+    # "www" is a host of its own only when nothing follows it.
+    assert not UrlFilter(allowed_hosts={"www.com"}).allows("https://example.com/")
+    assert not UrlFilter(allowed_hosts={"example.com"}).allows("https://www.com/")
+
+
+def test_subdomains_of_an_allowed_host_pass():
+    url_filter = UrlFilter(allowed_hosts={"example.com"})
+    assert url_filter.allows("https://docs.example.com/")
+    assert url_filter.allows("https://www.docs.example.com/")
+    assert url_filter.allows("https://api.v2.example.com/")
+    # Not the other way round: the site is docs.example.com, not everything under example.com.
+    assert not UrlFilter(allowed_hosts={"docs.example.com"}).allows("https://example.com/")
+    assert not UrlFilter(allowed_hosts={"docs.example.com"}).allows("https://blog.example.com/")
+    assert UrlFilter(allowed_hosts={"www.example.com"}).allows("https://docs.example.com/")
 
 
 def test_allow_host_of_extends_the_set():

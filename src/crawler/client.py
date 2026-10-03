@@ -101,7 +101,7 @@ class AsyncCrawler:
       a Retry-After header or a timeout, which say the whole site is
       overloaded, the pause before the retry is spent in the rate limiter:
       the whole host waits with it; so it does for as long as a Retry-After
-      header asks, up to `MAX_RETRY_AFTER` seconds, even when the request
+      header asks, up to `max_retry_after` seconds, even when the request
       is not retried. After any other failure (HTTP 500, a reset
       connection) only the failed request waits: the other pages of the
       host are fetched meanwhile.
@@ -171,7 +171,7 @@ class AsyncCrawler:
     REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
     MAX_CIRCUIT_OPENINGS = 3
     # The longest Retry-After a host is held back for, in seconds.
-    MAX_RETRY_AFTER = 600.0
+    DEFAULT_MAX_RETRY_AFTER = 600.0
     # In crawl(), a page whose host is held back longer than this is put off.
     MIN_PENALTY_TO_DEFER = 1.0
     # In crawl(), longer links are not followed: they are mostly generated ones.
@@ -199,6 +199,7 @@ class AsyncCrawler:
         read_timeout: float = 20.0,
         timeout_growth: float = 1.5,
         max_page_size: int | None = DEFAULT_MAX_PAGE_SIZE,
+        max_retry_after: float = DEFAULT_MAX_RETRY_AFTER,
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
         parser: HTMLParser | None = None,
@@ -218,6 +219,8 @@ class AsyncCrawler:
             raise ValueError(f"timeout_growth must be a number >= 1, got {timeout_growth}")
         if max_page_size is not None and max_page_size < 1:
             raise ValueError(f"max_page_size must be >= 1 or None, got {max_page_size}")
+        if max_retry_after <= 0:
+            raise ValueError(f"max_retry_after must be positive, got {max_retry_after}")
         if isinstance(user_agents, str):
             raise TypeError(f"expected a list of user agents, got a string: {user_agents!r}")
         robots_name = product_token(user_agent)
@@ -245,6 +248,7 @@ class AsyncCrawler:
         )
         self.timeout_growth = timeout_growth
         self.max_page_size = max_page_size
+        self.max_retry_after = max_retry_after
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
         # Links marked rel="nofollow" are left out of the pages, as robots.txt is followed;
@@ -265,6 +269,7 @@ class AsyncCrawler:
         self._pages_requested = 0
         self._host_pages: Counter[str] = Counter()  # pages requested by host
         self._over_host_limit = 0  # pages skipped without a request over max_pages_per_host
+        self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
         self._max_frontier = 0  # pages queued, in progress and requested that crawl() allows
         self._links_dropped = 0
         self._host_queued: Counter[str] = Counter()  # pages ever queued by host
@@ -526,11 +531,11 @@ class AsyncCrawler:
             # The server asked to wait: the other requests to the host wait
             # as long as it asked, even when this one is not retried.
             if isinstance(error, HTTPStatusError) and error.retry_after and host is not None:
-                if error.retry_after > self.MAX_RETRY_AFTER:
+                if error.retry_after > self.max_retry_after:
                     logger.warning(
-                        "%s asked to wait %gs (Retry-After), waiting %gs", host, error.retry_after, self.MAX_RETRY_AFTER
+                        "%s asked to wait %gs (Retry-After), waiting %gs", host, error.retry_after, self.max_retry_after
                     )
-                self.rate_limiter.penalize(host, min(error.retry_after, self.MAX_RETRY_AFTER))
+                self.rate_limiter.penalize(host, min(error.retry_after, self.max_retry_after))
             return last, attempts
         return result, attempts
 
@@ -753,7 +758,10 @@ class AsyncCrawler:
         for longer than `MIN_PENALTY_TO_DEFER` seconds, by a Retry-After or
         the pause before the retry of a request that found the host
         overloaded (HTTP 429, a timeout), is put off until the host may be
-        asked again, without counting toward `max_pages` before then.
+        asked again, without counting toward `max_pages` before then. A
+        Retry-After longer than `max_delay` of the retry strategy is
+        logged as a warning once per host, as the crawl may be quiet for
+        that long.
 
         With `respect_robots`, the links of a page whose <meta name="robots">
         (or <meta> with the robots.txt name of the crawler, "asyncwebcrawler")
@@ -764,7 +772,8 @@ class AsyncCrawler:
 
         Filters apply to discovered links, not to the start URLs:
         `same_domain_only` keeps links on the hosts of the start URLs (and of
-        the pages they redirect to); `include_patterns` and `exclude_patterns`
+        the pages they redirect to) and on their subdomains, "www." and the
+        apex being one host; `include_patterns` and `exclude_patterns`
         are regular expressions and `exclude_extensions` file extensions
         such as "pdf", see `UrlFilter`. A link that passes the
         filters but redirects to a URL that does not is skipped, and so is a
@@ -861,6 +870,7 @@ class AsyncCrawler:
         self._pages_requested = 0
         self._host_pages = Counter()
         self._over_host_limit = 0
+        self._hosts_warned_held_back = set()
         self._max_frontier = self.FRONTIER_FACTOR * max_pages
         self._links_dropped = 0
         self._max_host_queued = None if max_pages_per_host is None else self.FRONTIER_FACTOR * max_pages_per_host
@@ -949,8 +959,8 @@ class AsyncCrawler:
         """Queue the sitemap pages that the filter let through once a start URL redirected to their host.
 
         The sitemaps are read before the first page, when only the hosts of
-        the start URLs are known: the pages of "www.example.com" are out of
-        scope until "example.com" redirects there.
+        the start URLs are known: the pages of "example.com" are out of
+        scope until "example.org" redirects there.
         """
         out_of_scope = []
         for page in self._sitemap_pages_out_of_scope:
@@ -1061,6 +1071,7 @@ class AsyncCrawler:
                 # pause before a retry: the worker takes pages of other hosts
                 # meanwhile instead of waiting in the rate limiter.
                 if (penalty := self._penalty_left(url)) > self.MIN_PENALTY_TO_DEFER:
+                    self._warn_once_held_back(url, penalty)
                     logger.info("Deferred %s for %.1fs: its host is held back", url, penalty)
                     queue.defer(url, penalty, priority=queue.depth(url))
                     continue
@@ -1147,7 +1158,7 @@ class AsyncCrawler:
             self._fail_page(url, queue, result.error, result)
             return
         if url in self._start_urls and result.redirected and skip_reason is None:
-            # A start URL that redirects ("example.com" -> "www.example.com")
+            # A start URL that redirects ("example.org" -> "example.com")
             # defines the site as much as the URL itself; the hosts the chain
             # only passed through (a consent page) do not. A page from a
             # sitemap has depth 0 too, but is filtered like a link.
@@ -1330,6 +1341,21 @@ class AsyncCrawler:
         if opened < self.MAX_CIRCUIT_OPENINGS:
             return None
         return CircuitOpenError(url, f"circuit breaker of {host} opened {opened} times, no more probes in this crawl")
+
+    def _warn_once_held_back(self, url: str, penalty: float) -> None:
+        """Tell the user, once per host and crawl, about a Retry-After that holds the host back for long.
+
+        The pauses before retries are logged as they are taken and never
+        exceed `max_delay` of the retry strategy; a longer penalty comes
+        from a Retry-After header and would otherwise show only as a crawl
+        that makes no requests.
+        """
+        host = get_host(url)
+        if penalty <= self.retry_strategy.max_delay or host in self._hosts_warned_held_back:
+            return
+        assert host is not None  # the queue holds valid URLs only
+        self._hosts_warned_held_back.add(host)
+        logger.warning("%s asked to wait %.0fs (Retry-After); its pages are put off until then", host, penalty)
 
     def _penalty_left(self, url: str) -> float:
         """Seconds the host of `url` is still held back for, after Retry-After or before a retry."""

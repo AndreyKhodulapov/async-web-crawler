@@ -50,7 +50,8 @@ BeautifulSoup is a tree API on top of a pluggable parser:
   `javascript:`, `data:`, empty and fragment-only hrefs. Reject malformed
   hosts and ports.
 - **Internal vs external**: compare hostnames. `www.example.com` and
-  `example.com` are different hosts unless you decide otherwise.
+  `example.com` are different hosts unless you decide otherwise; this
+  crawler treats them as one site, along with the subdomains of a start host.
 
 ## Character encoding
 
