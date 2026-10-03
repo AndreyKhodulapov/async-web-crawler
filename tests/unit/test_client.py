@@ -824,6 +824,27 @@ class TestCrawlBlockedHost:
         assert crawler.crawl_stats().queued == 0
 
 
+class TestCrawlDuplicates:
+    async def test_variant_of_a_page_that_failed_is_kept(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=0))
+        fake_session.routes["http://a/list"] = FakeResponse(status=404)
+        fake_session.routes["http://a/list?page=2"] = FakeResponse(b'<link rel="canonical" href="http://a/list">')
+
+        await crawler.crawl(["http://a/list", "http://a/list?page=2"])
+
+        assert crawler.failed_urls.keys() == {"http://a/list"}
+        assert crawler.processed_urls.keys() == {"http://a/list?page=2"}
+
+    async def test_variant_of_a_page_still_queued_is_skipped(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=1, max_depth=0)
+        fake_session.routes["http://a/list?page=2"] = FakeResponse(b'<link rel="canonical" href="http://a/list">')
+
+        await crawler.crawl(["http://a/list?page=2", "http://a/list"])
+
+        assert crawler.skipped_urls == {"http://a/list?page=2": "duplicate of http://a/list"}
+        assert crawler.processed_urls.keys() == {"http://a/list"}
+
+
 class TestCrawlPageStats:
     async def test_bug_while_crawling_a_page_fails_that_page_only(self, make_crawler, fake_session, monkeypatch):
         crawler = make_crawler(max_concurrent=1, max_depth=0)

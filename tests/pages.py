@@ -64,7 +64,8 @@ ENCODING_PAGES: dict[str, tuple[bytes, str | None, str]] = {
 # /site/long.html links to a page with a query of LONG_QUERY characters.
 # /site/variant.html names itself as canonical, so with any query it is a
 # variant; /site/points-home.html names the home page, a canonical URL
-# with another path.
+# with another path. /site/lang redirects to /site/lang?hl=en, which names
+# /site/lang as canonical; /site/search names itself with "%2F" in its query.
 LONG_QUERY = 3000
 SITE_PAGES: dict[str, str] = {
     "/site/": """
@@ -98,6 +99,8 @@ SITE_PAGES: dict[str, str] = {
     "/site/tagged.html": '<title>Tagged</title><a href="a/deeper.html">Deeper</a>',
     "/site/variant.html": '<link rel="canonical" href="variant.html"><title>Variant</title><a href="c.html">C</a>',
     "/site/points-home.html": '<link rel="canonical" href="/site/"><title>Points home</title>',
+    "/site/lang": '<link rel="canonical" href="lang"><title>Lang</title><a href="c.html">C</a>',
+    "/site/search": '<link rel="canonical" href="search?path=%2Fdocs"><title>Search</title><a href="c.html">C</a>',
     "/site/long.html": f'<title>Long</title><a href="c.html?q={"x" * LONG_QUERY}">Long</a> <a href="b.html">B</a>',
 }
 # Response headers of some of SITE_PAGES.

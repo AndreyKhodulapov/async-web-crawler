@@ -208,6 +208,8 @@ async def site_page(request: web.Request) -> web.Response:
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/")
     if request.path == "/site/go":
         raise web.HTTPFound("/site/private/secret")
+    if request.path == "/site/lang" and "hl" not in request.query:
+        raise web.HTTPFound("/site/lang?hl=en")
     if request.path == "/site/cookie-check" and "checked" not in request.cookies:
         # Sends the client back to the same page with a cookie.
         response = web.HTTPFound("/site/cookie-check")

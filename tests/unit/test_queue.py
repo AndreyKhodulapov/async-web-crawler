@@ -239,6 +239,24 @@ class TestStatus:
         assert queue.blocked == {d: "disallowed by robots.txt"}
         assert queue.unreachable == {e: "robots.txt is unreachable (HTTP 503)"}
 
+    async def test_pending_or_processed_urls(self):
+        queue = CrawlerQueue()
+        for name in "abcd":
+            queue.add_url(f"http://site/{name}")
+        queue.mark_seen("http://site/target")
+        a, b = await take(queue), await take(queue)
+        queue.mark_processed(a)
+        queue.mark_failed(b, "error")
+        c = await take(queue)
+
+        assert queue.is_pending_or_processed("http://site/a?utm_source=x")
+        assert queue.is_pending_or_processed(c)
+        assert queue.is_pending_or_processed("http://site/d")
+        assert not queue.is_pending_or_processed(b)
+        assert not queue.is_pending_or_processed("http://site/target")
+        assert not queue.is_pending_or_processed("http://site/never")
+        assert not queue.is_pending_or_processed("not a url")
+
     async def test_requeue_puts_a_url_back_even_after_close(self):
         queue = CrawlerQueue()
         queue.add_url("http://site/a", priority=1, depth=1)

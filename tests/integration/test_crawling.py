@@ -187,6 +187,19 @@ class TestUrlTraps:
         assert set(crawler.processed_urls) == set(start)
         assert crawler.skipped_urls == {}
 
+    async def test_page_redirected_to_a_variant_of_itself_is_not_its_own_duplicate(self, url):
+        crawler = await crawl(url("/site/lang"), max_depth=1)
+
+        assert set(crawler.processed_urls) == {url("/site/lang"), url("/site/c.html")}
+        assert crawler.skipped_urls == {}
+
+    async def test_canonical_url_spelled_otherwise_is_the_page_itself(self, url):
+        # The client decodes "%2F" in the query of the URL it was sent to; the canonical URL keeps it.
+        crawler = await crawl(url("/site/search?path=%2Fdocs"), max_depth=1)
+
+        assert set(crawler.processed_urls) == {url("/site/search?path=%2Fdocs"), url("/site/c.html")}
+        assert crawler.skipped_urls == {}
+
     async def test_long_links_are_not_followed(self, url, site):
         crawler = await crawl(url("/site/long.html"), max_depth=1)
 

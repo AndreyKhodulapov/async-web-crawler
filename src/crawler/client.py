@@ -43,7 +43,7 @@ from crawler.exceptions import (
 from crawler.filters import UrlFilter
 from crawler.models import CrawlStats, ErrorStats, FetchResult, PageRecord, ParsedPage
 from crawler.parser import HTMLParser, is_html_content_type
-from crawler.queue import CrawlerQueue
+from crawler.queue import CrawlerQueue, queue_form
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryStrategy, parse_retry_after
 from crawler.robots import RobotsParser, product_token, robots_tag_directives
@@ -1105,7 +1105,7 @@ class AsyncCrawler:
             logger.warning("Failed to parse %s: %s", url, error.message)
             self._fail_page(url, queue, error, result)
             return
-        duplicate = self._duplicate_of(result.final_url or url, page, queue)
+        duplicate = self._duplicate_of(url, result.final_url, page, queue)
         if duplicate is not None:
             # A variant of a page already seen ("?sort=price" of "/list"):
             # its links are variants too, so they are not followed.
@@ -1135,23 +1135,28 @@ class AsyncCrawler:
             await self._save_page(_page_record(result, page, depth))
 
     @staticmethod
-    def _duplicate_of(url: str, page: ParsedPage, queue: CrawlerQueue) -> str | None:
-        """The canonical URL of the page at `url` if it is another page of the crawl it is a variant of; else None.
+    def _duplicate_of(url: str, final_url: str | None, page: ParsedPage, queue: CrawlerQueue) -> str | None:
+        """The canonical URL of the page `url` if it is another page of the crawl it is a variant of; else None.
 
-        Only a canonical URL that differs from `url` in the query alone and
-        is already seen counts: a page with "?sort=price" or "?sessionid=1"
-        whose canonical URL is the plain one. A canonical URL elsewhere is
-        not trusted, as a site that gets it wrong (every page pointing to
-        the home page) would lose all its pages.
+        `final_url` is where the page was served from after its redirects.
+        Only a canonical URL that differs from it in the query alone counts:
+        a page with "?sort=price" or "?sessionid=1" whose canonical URL is
+        the plain one. A canonical URL elsewhere is not trusted, as a site
+        that gets it wrong (every page pointing to the home page) would lose
+        all its pages. The canonical page must be processed or still to be
+        crawled: if it failed or was left out, the variant is all there is.
+        URLs are compared in the form the queue keeps them in.
         """
         canonical = page["metadata"]["canonical"]
-        if canonical is None:
+        target = None if canonical is None else queue_form(canonical)
+        served = queue_form(final_url or url)
+        if target is None or served is None or target in (url, served):
+            # The page names itself, under its own URL or the one it was redirected to.
             return None
-        target, parts = urlsplit(canonical), urlsplit(url)
-        same_page = (target.netloc, target.path) == (parts.netloc, parts.path)
-        if not same_page or strip_tracking_params(canonical) == strip_tracking_params(url):
+        target_parts, served_parts = urlsplit(target), urlsplit(served)
+        if (target_parts.netloc, target_parts.path) != (served_parts.netloc, served_parts.path):
             return None
-        return canonical if queue.is_seen(canonical) else None
+        return canonical if queue.is_pending_or_processed(target) else None
 
     def _robots_directives(self, result: FetchResult, page: ParsedPage) -> tuple[str | None, bool]:
         """Whether the page asks not to be kept, and why (None if it does not); whether not to follow its links.

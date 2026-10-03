@@ -60,7 +60,7 @@ class CrawlerQueue:
 
     def add_url(self, url: str, priority: int = 0, *, depth: int = 0) -> bool:
         """Queue a URL; return False if it is invalid, already seen, or the queue is closed."""
-        normalized = _queue_form(url)
+        normalized = queue_form(url)
         if normalized is None or normalized in self._seen or self._closed:
             return False
         self._seen.add(normalized)
@@ -69,15 +69,27 @@ class CrawlerQueue:
         self._wakeup.set()
         return True
 
+    def is_pending_or_processed(self, url: str) -> bool:
+        """Whether a URL was accepted and is still queued, deferred, in progress or processed.
+
+        False for a URL never accepted (one only remembered with `mark_seen`
+        too) and for one failed, skipped, blocked or unreachable.
+        """
+        normalized = queue_form(url)
+        if normalized is None or normalized not in self._depths:
+            return False
+        finished = (self.failed, self.skipped, self.blocked, self.unreachable)
+        return not any(normalized in outcomes for outcomes in finished)
+
     def mark_seen(self, url: str) -> None:
         """Remember a URL without queuing it, e.g. the target of a redirect."""
-        normalized = _queue_form(url)
+        normalized = queue_form(url)
         if normalized is not None:
             self._seen.add(normalized)
 
     def is_seen(self, url: str) -> bool:
         """Whether a URL was accepted or remembered with `mark_seen`."""
-        normalized = _queue_form(url)
+        normalized = queue_form(url)
         return normalized is not None and normalized in self._seen
 
     async def get_next(self) -> str | None:
@@ -201,7 +213,7 @@ class CrawlerQueue:
         self._wakeup.set()
 
 
-def _queue_form(url: str) -> str | None:
-    """The form in which the queue keeps a URL; None if the URL is invalid."""
+def queue_form(url: str) -> str | None:
+    """The form in which the queue keeps a URL: normalized, without tracking parameters; None if the URL is invalid."""
     normalized = normalize_url(url)
     return None if normalized is None else strip_tracking_params(normalized)

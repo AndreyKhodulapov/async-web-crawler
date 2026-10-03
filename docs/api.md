@@ -295,11 +295,14 @@ filter, a calendar, a session ID in every link. Against them a crawl:
   they are (`strip_tracking_params`);
 - does not follow a link longer than `MAX_URL_LENGTH` (2048 characters);
 - skips a page whose `<link rel="canonical">` is the same URL with another
-  query and has been seen already, such as `/list?page=2&sort=price` with
-  the canonical `/list?page=2`: it is listed in `skipped_urls` as
-  `duplicate of <canonical>`, not returned or saved, and its links, being
-  variants too, are not followed. A canonical URL with another path is not
-  trusted: a site that points every page to its home page would lose them all;
+  query and is processed or still to be crawled, such as
+  `/list?page=2&sort=price` with the canonical `/list?page=2`: it is listed
+  in `skipped_urls` as `duplicate of <canonical>`, not returned or saved,
+  and its links, being variants too, are not followed. A canonical URL with
+  another path is not trusted: a site that points every page to its home
+  page would lose them all. Nor is one that failed or was left out: the
+  variant is kept then. A page that names itself, also under the URL it
+  was redirected to, is not a duplicate;
 - with `max_pages_per_host`, requests at most that many pages of one host:
   the other pages of the host are listed in `skipped_urls` without a
   request and do not count toward `max_pages`.
