@@ -24,6 +24,13 @@ class TestProgressTracker:
         assert (progress.active, progress.in_flight, progress.queued) == (6, 2, 7)
         assert not progress.finished
 
+    def test_queued_shows_no_more_than_the_limit_leaves_to_request(self):
+        tracker = ProgressTracker(max_pages=40)
+
+        assert tracker.update(snapshot(1.0, 30, queued=100, in_progress=6)).queued == 4
+        assert tracker.update(snapshot(2.0, 40, queued=100)).queued == 0
+        assert tracker.update(snapshot(3.0, 10, queued=3)).queued == 3
+
     def test_first_snapshot_uses_the_average_speed(self):
         progress = ProgressTracker(max_pages=100).update(snapshot(5.0, 10))
 

@@ -54,7 +54,7 @@ and web-scraping.dev sets `Crawl-delay: 2`.
 While it runs, a progress line is updated every second:
 
 ```
-[######--------------]  30% | 9/30 pages, 1 failed | 1.6 pages/s | ETA 14s | active 6 (2 in flight) | queued 88 | 7s
+[######--------------]  30% | 9/30 pages, 1 failed | 1.6 pages/s | ETA 14s | active 6 (2 in flight) | queued 15 | 7s
 ```
 
 The percent is the share of `--max-pages` done, `pages/s` the speed over the

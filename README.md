@@ -17,7 +17,8 @@ configuration file, by command-line options, or from Python.
   the start hosts, and documents, images and archives are not followed);
   guards against endless URL spaces: tracking parameters dropped, a URL
   length limit, `<link rel="canonical">` for variants of a page, a page
-  limit per host
+  limit per host; a queue bounded by the page limit, so memory does not
+  grow with the size of the site
 - **Sitemaps** as a source of pages: plain and index sitemaps, gzip, the
   sitemaps named in robots.txt
 - **Concurrency**: one connection pool, a global limit of requests in
@@ -130,7 +131,7 @@ is set in the file. The command line never keeps the pages in memory
 The log and the progress line go to stderr, the summary to stdout:
 
 ```
-[####################] 100% | 8/8 pages, 0 failed | 1.1 pages/s | done | active 0 (0 in flight) | queued 66 | 8s
+[####################] 100% | 8/8 pages, 0 failed | 1.1 pages/s | done | active 0 (0 in flight) | queued 0 | 8s
 
 === Crawl finished (8.06s) ===
 Pages: 8 (8 successful, 0 failed, 0 skipped), 1.0 pages/s, average response time 2.37s

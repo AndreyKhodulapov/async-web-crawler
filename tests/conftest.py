@@ -182,6 +182,17 @@ async def shop_item(request: web.Request) -> web.Response:
     return web.Response(text=f"<title>Item {request.match_info['n']}</title>", content_type="text/html")
 
 
+WIDE_LINKS = 50
+
+
+async def wide_page(request: web.Request) -> web.Response:
+    """Page N links to WIDE_LINKS pages of its own: a site far larger than any crawl of it."""
+    request.app[SITE_STATE].record(request)
+    first = int(request.match_info["n"]) * WIDE_LINKS + 1
+    html = " ".join(f'<a href="{n}">{n}</a>' for n in range(first, first + WIDE_LINKS))
+    return web.Response(text=f"<title>Wide</title>{html}", content_type="text/html")
+
+
 async def site_page(request: web.Request) -> web.Response:
     state = request.app[SITE_STATE]
     state.record(request)
@@ -240,6 +251,7 @@ async def server(aiohttp_server):
     app.router.add_get("/busy/{seconds}", busy)
     app.router.add_get("/shop/list", shop_list)
     app.router.add_get("/shop/item/{n}", shop_item)
+    app.router.add_get("/wide/{n}", wide_page)
     return await aiohttp_server(app)
 
 

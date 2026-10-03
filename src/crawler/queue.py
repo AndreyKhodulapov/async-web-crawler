@@ -49,6 +49,11 @@ class CrawlerQueue:
         return self._closed
 
     @property
+    def unfinished(self) -> int:
+        """URLs queued, deferred or in progress: accepted and not finished yet."""
+        return len(self._heap) + len(self._deferred) + len(self._in_progress)
+
+    @property
     def depths(self) -> Mapping[str, int]:
         """Read-only view: accepted URL -> depth it was found at."""
         return MappingProxyType(self._depths)

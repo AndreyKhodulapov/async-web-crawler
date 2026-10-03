@@ -1,6 +1,7 @@
 """Integration tests: crawl a small site served by a local aiohttp server."""
 
 import asyncio
+import logging
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -119,6 +120,28 @@ async def test_max_pages_counts_failed_pages_too(url, site):
     assert len(crawler.visited_urls) == 4
     assert site.hits.total() == 4
     assert crawler.crawl_stats().queued > 0
+
+
+class TestBoundedQueue:
+    @pytest.mark.parametrize("max_concurrent", [1, 5])
+    async def test_queue_of_a_wide_site_stays_bounded(self, url, max_concurrent, caplog):
+        # Every page links to 50 new ones. Without the bound all of the 1001
+        # links found were queued, though 20 pages were to be requested.
+        caplog.set_level(logging.INFO, logger="crawler.client")
+        crawler = await crawl(url("/wide/0"), max_concurrent=max_concurrent, max_depth=10, max_pages=20)
+
+        assert len(crawler.processed_urls) == 20
+        assert len(crawler.url_depths) <= AsyncCrawler.FRONTIER_FACTOR * 20
+        assert crawler.crawl_stats().queued <= (AsyncCrawler.FRONTIER_FACTOR - 1) * 20
+        assert "links were not queued: the queue was full" in caplog.text
+
+    async def test_queue_is_breadth_first_within_the_bound(self, url, site):
+        crawler = await crawl(url("/wide/0"), max_concurrent=1, max_depth=10, max_pages=3)
+
+        # Room for 3 * 3 pages; the start page counts twice, in progress and
+        # requested, so it queues 7 of its links, and the first two are crawled.
+        assert list(crawler.processed_urls) == [url("/wide/0"), url("/wide/1"), url("/wide/2")]
+        assert sorted(crawler.url_depths.values()) == [0] + [1] * 7
 
 
 class TestUrlTraps:

@@ -367,6 +367,16 @@ is saved and its links are queued. `crawl()` then returns an empty dict,
 the pages are in the storage and the counts in `stats` and `crawl_stats()`;
 memory stays nearly flat (see [performance.md](performance.md)).
 
+The queue is bounded by `max_pages` as well: a large site can have far more
+links than a crawl will ever request, and each one queued costs memory and
+work. Once the pages queued, in progress and requested reach
+`FRONTIER_FACTOR` (3) times `max_pages`, new links and sitemap pages are not
+queued, nor remembered, so a page found again later is queued if there is
+room by then. The spare room is for pages that do not count toward
+`max_pages` (disallowed by robots.txt, over `max_pages_per_host`); a crawl
+whose queue is mostly such pages may end before `max_pages`. How many links
+were left out is logged at the end of the crawl.
+
 After a crawl, and during one, the crawler exposes its state:
 
 | Attribute | Content |
@@ -511,7 +521,7 @@ async with AsyncCrawler() as crawler:
 ```
 
 ```
-[######--------------]  30% | 30/100 pages, 1 failed | 1.6 pages/s | ETA 44s | active 6 (2 in flight) | queued 88 | 19s
+[######--------------]  30% | 30/100 pages, 1 failed | 1.6 pages/s | ETA 44s | active 6 (2 in flight) | queued 64 | 19s
 ```
 
 | Part | Meaning |
@@ -521,7 +531,7 @@ async with AsyncCrawler() as crawler:
 | `pages/s` | the speed over the last 10 seconds |
 | `ETA` | the time the remaining pages take at that speed; `--` while the speed is 0, `done` once the crawl has ended |
 | `active`, `in flight` | pages taken by workers, and the HTTP requests being made |
-| `queued` | pages waiting in the queue |
+| `queued` | pages waiting in the queue, but no more than `max_pages` leaves to request: the rest will not be fetched |
 | the last value | the time since the crawl started |
 
 The percent and the time left are measured against `max_pages`: a site with

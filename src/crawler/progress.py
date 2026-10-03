@@ -24,7 +24,8 @@ class Progress:
     last seconds, `eta` the seconds left at that speed until `total` pages
     are done: `None` while the speed is 0, and 0 once the crawl has
     finished. `active` counts the pages taken by workers, `in_flight` the
-    HTTP requests being made, `queued` the pages waiting.
+    HTTP requests being made, `queued` the pages waiting, but no more than
+    the limit leaves to request: the rest of the queue will not be fetched.
     """
 
     done: int
@@ -97,7 +98,7 @@ class ProgressTracker:
             eta=eta,
             active=stats.in_progress,
             in_flight=stats.active_requests,
-            queued=stats.queued,
+            queued=min(stats.queued, max(self.max_pages - done - stats.in_progress, 0)),
             elapsed=stats.elapsed,
             finished=finished,
         )

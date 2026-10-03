@@ -150,6 +150,7 @@ class AsyncCrawler:
     lets a page go once it is saved and its links are queued:
     `processed_urls` stays empty, the pages are in the storage, the counts
     in `stats` and `crawl_stats()`. That is the setting for a large crawl.
+    The queue of `crawl()` is bounded by `max_pages` too, see `crawl()`.
 
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
     the same way as any other per-URL failure. Closing does not interrupt
@@ -171,6 +172,9 @@ class AsyncCrawler:
     MIN_PENALTY_TO_DEFER = 1.0
     # In crawl(), longer links are not followed: they are mostly generated ones.
     MAX_URL_LENGTH = 2048
+    # In crawl(), new links are not queued once the pages queued, in progress
+    # and requested reach this many times max_pages: most would never be fetched.
+    FRONTIER_FACTOR = 3
 
     def __init__(
         self,
@@ -254,6 +258,8 @@ class AsyncCrawler:
         self.stats = CrawlerStats()
         self._pages_requested = 0
         self._host_pages: Counter[str] = Counter()  # pages requested by host
+        self._max_frontier = 0  # pages queued, in progress and requested that crawl() allows
+        self._links_dropped = 0
         self._pages_to_save = 0
         self._written_before = 0
         self._pending_before = 0
@@ -761,6 +767,14 @@ class AsyncCrawler:
         requested from one host; the others are skipped without a request
         and do not count toward `max_pages`.
 
+        The queue is bounded, so that the memory does not grow with every
+        link of a large site: once the pages queued, in progress and
+        requested reach `FRONTIER_FACTOR` times `max_pages`, new links and
+        sitemap pages are not queued (nor remembered: a page found again
+        later may be queued then). The spare room is for pages that do not
+        count toward `max_pages`, such as those robots.txt disallows; a
+        crawl whose queue is mostly such pages may end before `max_pages`.
+
         The pages listed in the sitemaps `sitemap_urls` are crawled too, and
         with `robots_sitemaps` so are those of the sitemaps that robots.txt
         of the start URLs' sites names. The sitemaps are read before the
@@ -825,6 +839,8 @@ class AsyncCrawler:
         self._redirect_sources = {}
         self._pages_requested = 0
         self._host_pages = Counter()
+        self._max_frontier = self.FRONTIER_FACTOR * max_pages
+        self._links_dropped = 0
         self._pages_to_save = 0
         self._written_before = self.storage.written if self.storage is not None else 0
         self._pending_before = self.storage.pending if self.storage is not None else 0
@@ -862,6 +878,8 @@ class AsyncCrawler:
             stats.queued,
             stats.elapsed,
         )
+        if self._links_dropped:
+            logger.info("%d links were not queued: the queue was full", self._links_dropped)
         if self.storage is not None:
             logger.info(
                 "Saved %d pages to %s, %d not saved", stats.saved, type(self.storage).__name__, stats.save_failed
@@ -886,7 +904,7 @@ class AsyncCrawler:
                     # Hosts join the scope only under `same_domain_only`.
                     if url_filter.allowed_hosts is not None:
                         self._sitemap_pages_out_of_scope.append(page)
-                elif self._queue.add_url(page, priority=0, depth=0):
+                elif self._queue_found(self._queue, page, depth=0):
                     queued += 1
         logger.info(
             "Sitemaps: %d read, %d failed, %d pages listed, %d new queued",
@@ -906,10 +924,28 @@ class AsyncCrawler:
         out_of_scope = []
         for page in self._sitemap_pages_out_of_scope:
             if url_filter.allows(page):
-                queue.add_url(page, priority=0, depth=0)
+                self._queue_found(queue, page, depth=0)
             else:
                 out_of_scope.append(page)
         self._sitemap_pages_out_of_scope = out_of_scope
+
+    def _queue_found(self, queue: CrawlerQueue, url: str, *, depth: int) -> bool:
+        """Queue a link or a sitemap page unless the queue is full; True if it was queued.
+
+        Its priority is its depth: breadth-first.
+        """
+        if not queue.closed and queue.unfinished + self._pages_requested >= self._max_frontier:
+            if not queue.is_seen(url):
+                if not self._links_dropped:
+                    logger.info(
+                        "Queue is full: pages queued, in progress and requested reached %d (%d x max_pages); "
+                        "new links are not queued until it has room",
+                        self._max_frontier,
+                        self.FRONTIER_FACTOR,
+                    )
+                self._links_dropped += 1
+            return False
+        return queue.add_url(url, priority=depth, depth=depth)
 
     async def _sitemaps_in_robots(self, url: str) -> list[str]:
         """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read."""
@@ -1077,7 +1113,7 @@ class AsyncCrawler:
         queued = 0
         if depth < self.max_depth and not nofollow:
             for link in page["links"]:
-                if url_filter.allows(link) and queue.add_url(link, priority=depth + 1, depth=depth + 1):
+                if url_filter.allows(link) and self._queue_found(queue, link, depth=depth + 1):
                     queued += 1
         if noindex is not None:
             # The site asks not to keep the page; its links may still be followed.

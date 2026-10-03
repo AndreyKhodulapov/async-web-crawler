@@ -172,6 +172,19 @@ class TestDefer:
 
 
 class TestStatus:
+    async def test_unfinished_counts_queued_deferred_and_in_progress_urls(self):
+        queue = CrawlerQueue()
+        for name in "abcd":
+            queue.add_url(f"http://site/{name}")
+        a, b, _ = [await take(queue) for _ in range(3)]
+        assert queue.unfinished == 4
+
+        queue.defer(a, 60)
+        queue.mark_processed(b)
+
+        assert queue.unfinished == 3
+        queue.close()
+
     async def test_stats_follow_the_lifecycle(self):
         queue = CrawlerQueue()
         for name in ("a", "b", "c", "d", "e", "f"):

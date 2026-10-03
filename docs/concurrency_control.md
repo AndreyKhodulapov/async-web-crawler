@@ -11,6 +11,12 @@ load under control.
   `take URL -> fetch -> parse -> queue new links`. Memory stays bounded (the
   queue holds strings, not thousands of pending tasks), and N is the natural
   concurrency knob.
+- The **frontier** (the queue of URLs found and not yet fetched) grows much
+  faster than the crawl: a page links to tens of new pages. With a page
+  limit, bound it too: here new links are dropped once queued, in progress
+  and requested reach 3x `max_pages`. Dropped links are not marked seen, so
+  they can come back later; the spare 2x covers pages that do not count
+  toward the limit, such as those robots.txt disallows.
 - Workers run in an `asyncio.TaskGroup`: the crawl returns only when all of
   them have finished, and no worker outlives it.
 
