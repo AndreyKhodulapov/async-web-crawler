@@ -630,7 +630,7 @@ line of it.
 `CrawlerConfig`, checked as it is loaded; `CrawlerConfig.from_dict(mapping)`
 does the same for a mapping. `load_urls(path)` reads start URLs from a
 text file, one per line (`"-"` is stdin), and raises `ConfigError` listing
-every line that is not an http(s) URL. The keys, their limits, the errors
+every line that is not an http(s) URL or has a space inside. The keys, their limits, the errors
 and the overrides are described in the [configuration guide](configuration.md).
 
 ## Logging

@@ -60,8 +60,18 @@ def _option(
     return field(default=default, metadata={name: limit for name, limit in limits.items() if limit is not None})
 
 
+# Whitespace, C0 and C1 controls. Inside a URL they are a mistake rather than
+# a part of it, e.g. a comment after the URL on its line.
+_SPACE_OR_CONTROL = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
+
+
 def _http_url(value: str) -> str | None:
-    return None if is_valid_http_url(value) else "expected an http:// or https:// URL"
+    if not is_valid_http_url(value):
+        return "expected an http:// or https:// URL"
+    # Valid all the same: a space would be sent as %20, a tab or a line break dropped.
+    if _SPACE_OR_CONTROL.search(value.strip()):
+        return "a URL cannot contain spaces or control characters (a space is written %20)"
+    return None
 
 
 def _pattern(value: str) -> str | None:
@@ -287,15 +297,21 @@ def load_config(path: str | Path, overrides: Mapping[str, Any] | None = None) ->
 def load_urls(path: str | Path) -> list[str]:
     """Read start URLs from a text file, one per line; "-" reads them from stdin.
 
-    The file is UTF-8, with or without a BOM. Blank lines and lines that
-    start with "#" are skipped, spaces around a URL are dropped, and a URL
-    given again is dropped too: the first one keeps its place.
+    The file is UTF-8, with or without a BOM, and its lines may end in
+    "\n", "\r\n" or "\r". Blank lines and lines that start with "#" are
+    skipped, spaces around a URL are dropped, and a URL given again is
+    dropped too: the first one keeps its place. A comment takes a line of
+    its own: spaces inside a URL are an error.
 
     Raises:
-        ConfigError: the file cannot be read or is not UTF-8, or lines of it
-            are not http(s) URLs; every such line is listed by its number.
+        ConfigError: the file cannot be read or is not UTF-8, there is no
+            stdin to read, or lines of it are not http(s) URLs; every such
+            line is listed by its number.
     """
     name = "<stdin>" if path == "-" else str(path)
+    if path == "-" and sys.stdin is None:
+        # Started with stdin closed, e.g. `<&-` in a shell.
+        raise ConfigError(["there is no standard input to read URLs from"], name)
     try:
         content = sys.stdin.buffer.read() if path == "-" else Path(path).read_bytes()
         text = content.decode("utf-8-sig")
@@ -305,7 +321,7 @@ def load_urls(path: str | Path) -> list[str]:
     problems: list[str] = []
     # Not splitlines(): it also breaks at form feeds and Unicode separators,
     # and the line numbers would not be those an editor shows.
-    for number, line in enumerate(text.split("\n"), start=1):
+    for number, line in enumerate(re.split(r"\r\n|\r|\n", text), start=1):
         url = line.strip()
         if not url or url.startswith("#"):
             continue

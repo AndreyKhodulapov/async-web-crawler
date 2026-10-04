@@ -8,6 +8,8 @@ import pytest
 
 from crawler import ConfigError, load_urls
 
+SPACES = "a URL cannot contain spaces or control characters (a space is written %20)"
+
 
 def write_list(tmp_path, content: bytes | str, name: str = "urls.txt") -> str:
     path = tmp_path / name
@@ -80,6 +82,35 @@ def test_one_invalid_line_is_counted_in_the_singular(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    ("line", "shown"),
+    [
+        ("https://one.example/ # the home page", '"https://one.example/ # the home page"'),
+        ("https://one.example/my page", '"https://one.example/my page"'),
+        ("https://one.example/a\tb", '"https://one.example/a\\tb"'),
+        ("https://one.example/a\u00a0b", '"https://one.example/a\\u00a0b"'),
+        ("https://one.example/a\x00b", '"https://one.example/a\\u0000b"'),
+    ],
+    ids=["comment", "space", "tab", "no-break-space", "null"],
+)
+def test_spaces_and_control_characters_inside_a_url_are_reported(line, shown, tmp_path):
+    path = write_list(tmp_path, f"https://ok.example/\n{line}\n")
+
+    assert problems_of(path).problems == [
+        f"{path}:2: a URL cannot contain spaces or control characters (a space is written %20), got {shown}"
+    ]
+
+
+def test_lines_may_end_in_a_lone_carriage_return(tmp_path):
+    path = write_list(tmp_path, "https://one.example/\rhttps://two.example/\r\nexample.com\rhttps://three.example/")
+
+    error = problems_of(path)
+
+    # Numbered as an editor shows them, not glued into one line.
+    assert error.problems == [f'{path}:3: expected an http:// or https:// URL, got "example.com"']
+    assert str(error).startswith(f"Invalid configuration: {path}: 3 URLs are valid, 1 line is not")
+
+
 def test_long_invalid_line_is_shortened_in_the_message(tmp_path):
     path = write_list(tmp_path, "x" * 5000)
 
@@ -140,6 +171,15 @@ def test_stdin_is_named_in_the_problems(monkeypatch):
 
     assert error.source == "<stdin>"
     assert error.problems == ['<stdin>:1: expected an http:// or https:// URL, got "example.com"']
+
+
+def test_missing_stdin_is_a_configuration_error(monkeypatch):
+    # As Python sets it when the program starts with stdin closed (`<&-`).
+    monkeypatch.setattr(sys, "stdin", None)
+
+    error = problems_of("-")
+
+    assert (error.source, error.problems) == ("<stdin>", ["there is no standard input to read URLs from"])
 
 
 def test_example_list_is_valid():

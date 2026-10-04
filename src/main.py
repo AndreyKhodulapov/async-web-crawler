@@ -140,6 +140,11 @@ def build_config(args: argparse.Namespace) -> CrawlerConfig:
     overrides.setdefault("crawler", {})["keep_pages"] = False
     config = CrawlerConfig.from_dict(overrides) if args.config is None else load_config(args.config, overrides)
     if not config.urls and not config.sitemaps.urls:
+        if args.urls_file is not None:
+            # An empty list is not an error by itself: sitemaps may give the pages.
+            name = "the standard input" if args.urls_file == "-" else args.urls_file
+            replaced = "" if args.config is None else ", and it replaces `urls` of the configuration"
+            raise ConfigError([f"nothing to crawl: {name} lists no URLs{replaced}"])
         where = (
             "--urls or --urls-file"
             if args.config is None
@@ -218,6 +223,8 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2  # as argparse exits for a wrong flag
+    except KeyboardInterrupt:  # while the URLs are typed into stdin
+        return 130
     try:
         return asyncio.run(run(config, progress=not args.no_progress))
     except (OSError, StorageError) as error:

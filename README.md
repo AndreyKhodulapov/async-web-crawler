@@ -116,9 +116,11 @@ or the default without a file.
 A long list of start URLs can be kept in a text file, one URL per line
 ([examples/urls.txt](examples/urls.txt)): `#` starts a comment line, blank
 lines are skipped, a URL given twice is crawled once. One file of settings
-then serves many lists. A line that is not an http(s) URL stops the run
-before anything is requested; the error counts the valid and the invalid
-lines and lists the first 20 of the invalid ones by number.
+then serves many lists. A line that is not an http(s) URL, or has a space
+inside (a comment after the URL), stops the run before anything is
+requested; the error counts the valid and the invalid lines and lists the
+first 20 of the invalid ones by number. A list without URLs is no error
+when the configuration has sitemaps to crawl.
 
 | Option | Configuration key | Effect |
 |--------|-------------------|--------|

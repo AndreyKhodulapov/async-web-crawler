@@ -33,7 +33,9 @@ The options and the keys they stand for are listed in the
 
 The start URLs come from `urls` of the file, or from the command line:
 `--urls` and `--urls-file` (a text file with a URL per line, or `-` for
-stdin; see [examples/urls.txt](../examples/urls.txt)). Given together, both
+stdin; see [examples/urls.txt](../examples/urls.txt)). A comment takes a
+line of its own, as a space inside a URL is an error, and lines may end in
+`\n`, `\r\n` or a lone `\r`. Given together, both
 are crawled, those of `--urls` first, and a URL given twice is crawled
 once; either of them replaces `urls` of the file, and `sitemaps.urls` stay.
 A list file is an option of the command line only: the configuration has
@@ -208,6 +210,8 @@ written. A problem is reported by the path of its key:
 - a value of the wrong type (`max_pages: yes` is not a number, `"10"` is
   not one either) or out of its limits;
 - an invalid URL or regular expression, an unknown log level or encoding;
+  a URL with a space or a control character inside, which a client would
+  send as `%20` or drop, so it is not the URL that was meant;
 - an output with an unknown extension, or a URL of an unknown database;
 - a User-Agent with a line break or another control character in it, a path
   with a null character or in the home directory of an unknown user;
@@ -216,7 +220,8 @@ written. A problem is reported by the path of its key:
   `crawler.respect_robots`, a `user_agents` entry with another bot name;
 - a file that cannot be read, has another extension or is not valid YAML or JSON;
 - in the file of `--urls-file`, a line that is not an http(s) URL, reported
-  by its number, or a file that cannot be read or is not UTF-8.
+  by its number, or a file that cannot be read or is not UTF-8; `-` with
+  stdin closed.
 
 All the problems are listed at once:
 

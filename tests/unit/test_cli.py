@@ -232,8 +232,39 @@ def test_nothing_to_crawl_is_an_error(with_file, hint, tmp_path):
 
 
 def test_empty_urls_file_alone_is_nothing_to_crawl(tmp_path):
-    with pytest.raises(ConfigError, match="nothing to crawl: give --urls or --urls-file"):
-        build_config(parse_args(["--urls-file", write_urls(tmp_path)]))
+    path = write_urls(tmp_path)
+
+    with pytest.raises(ConfigError) as error:
+        build_config(parse_args(["--urls-file", path]))
+
+    assert error.value.problems == [f"nothing to crawl: {path} lists no URLs"]
+
+
+def test_empty_urls_file_is_said_to_replace_the_urls_of_the_file(tmp_path, monkeypatch):
+    config = write_config(tmp_path, {"urls": ["https://file.example/"]})
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"# none yet\n")))
+
+    with pytest.raises(ConfigError) as error:
+        build_config(parse_args(["--config", config, "--urls-file", "-"]))
+
+    assert error.value.problems == [
+        "nothing to crawl: the standard input lists no URLs, and it replaces `urls` of the configuration"
+    ]
+
+
+def test_ctrl_c_while_reading_stdin_exits_with_130(monkeypatch, capsys):
+    class Interrupted:
+        def read(self):
+            raise KeyboardInterrupt
+
+    class Stdin:
+        buffer = Interrupted()
+
+    monkeypatch.setattr(sys, "stdin", Stdin())
+    monkeypatch.setattr(main, "run", None)  # would fail if called
+
+    assert main.main(["--urls-file", "-"]) == 130
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize(

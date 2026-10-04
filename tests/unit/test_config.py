@@ -333,6 +333,15 @@ class TestInvalid:
             'sitemaps.urls[0]: expected an http:// or https:// URL, got "sitemap.xml"'
         ]
 
+    def test_urls_with_spaces_inside_are_invalid(self):
+        # Valid for a client, which sends the space as %20, but not what was meant.
+        assert problems({"urls": ["https://a.example/ # home", " https://b.example/ "]}) == [
+            'urls[0]: a URL cannot contain spaces or control characters (a space is written %20), got "https://a.example/ # home"'
+        ]
+        assert problems({"sitemaps": {"urls": ["https://a.example/site\tmap.xml"]}}) == [
+            'sitemaps.urls[0]: a URL cannot contain spaces or control characters (a space is written %20), got "https://a.example/site\\tmap.xml"'
+        ]
+
     def test_invalid_pattern(self):
         (problem,) = problems({"filters": {"exclude": ["\\.pdf$", "("]}})
 
