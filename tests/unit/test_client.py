@@ -362,6 +362,25 @@ class TestErrorMapping:
         with pytest.raises(kind):
             await crawler.fetch_url("http://a")
 
+    @pytest.mark.parametrize(
+        ("os_error", "kind"),
+        [
+            (socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known"), DNSError),
+            (socket.gaierror(socket.EAI_NODATA, "No address associated with hostname"), DNSError),
+            # aiodns gives no code: its "Domain name not found" is taken at its word.
+            (OSError(None, "Domain name not found"), DNSError),
+            # The resolver could not be asked for now: an outage, not a typo.
+            (socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution"), NetworkError),
+            (socket.gaierror(socket.EAI_FAIL, "Non-recoverable failure in name resolution"), NetworkError),
+        ],
+    )
+    async def test_only_a_name_that_does_not_exist_is_a_dns_error(self, crawler, fake_session, os_error, kind):
+        fake_session.routes["http://a"] = aiohttp.ClientConnectorDNSError(MagicMock(), os_error)
+        with pytest.raises(NetworkError) as raised:
+            await crawler.fetch_url("http://a")
+        assert type(raised.value) is kind
+        assert os_error.strerror in raised.value.message
+
     async def test_server_timeout_is_a_timeout(self, crawler, fake_session):
         # aiohttp.ServerTimeoutError is also a ClientError: it must still be
         # reported as a timeout, not as a generic network error.
@@ -1502,6 +1521,24 @@ class TestRobots:
         assert all(why.startswith(reason) for why in crawler.unreachable_urls.values())
         assert set(crawler.unreachable_urls) == {"http://a/1", "http://a/2"}
         assert not [r for r in caplog.records if r.getMessage().startswith("Deferred ")]
+
+    async def test_crawl_waits_for_a_robots_txt_whose_lookup_failed_for_now(self, make_crawler, fake_session):
+        # A resolver that cannot be reached is an outage like any other: the
+        # site is downloaded again, and its pages are crawled once it is back.
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = [
+            aiohttp.ClientConnectorDNSError(
+                MagicMock(), socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+            ),
+            FakeResponse(status=404),
+        ]
+
+        await crawler.crawl(["http://a/1"])
+
+        assert fake_session.requested == ["http://a/robots.txt", "http://a/robots.txt", "http://a/1"]
+        assert crawler.processed_urls.keys() == {"http://a/1"}
+        assert not crawler.unreachable_urls
 
     async def test_sitemaps_and_pages_share_the_downloads_of_an_unreachable_robots_txt(
         self, make_crawler, fake_session, caplog

@@ -4,6 +4,7 @@ import codecs
 import contextlib
 import itertools
 import logging
+import socket
 import ssl
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -28,6 +29,10 @@ from crawler.retry import parse_retry_after
 from crawler.urls import is_valid_http_url
 
 logger = logging.getLogger(__name__)
+
+# The getaddrinfo() codes for a host name that has no address. The others,
+# such as EAI_AGAIN, say that the lookup failed for now.
+_NO_SUCH_HOST = frozenset(getattr(socket, name) for name in ("EAI_NONAME", "EAI_NODATA") if hasattr(socket, name))
 
 
 class Response(NamedTuple):
@@ -191,7 +196,8 @@ class HttpTransport:
         except aiohttp.ClientConnectorCertificateError as exc:
             raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientConnectorDNSError as exc:
-            raise DNSError(url, f"{type(exc).__name__}: {exc}") from exc
+            error = DNSError if _no_such_host(exc.os_error) else NetworkError
+            raise error(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
 
@@ -222,6 +228,15 @@ class HttpTransport:
             chunks.append(chunk)
             size += len(chunk)
         return b"".join(chunks)
+
+
+def _no_such_host(exc: OSError) -> bool:
+    """Whether a failed lookup says the host name does not exist, not that the resolver failed for now.
+
+    A resolver that gives no code, such as aiodns, is taken at its word:
+    the name does not resolve.
+    """
+    return exc.errno is None or exc.errno in _NO_SUCH_HOST
 
 
 def _describe_timeout(exc: TimeoutError, timeout: aiohttp.ClientTimeout) -> str:

@@ -25,10 +25,13 @@ leaves a failing site alone.
   - 500 often comes from a bug, not from load: retry it once, not three times.
   - 429 means "too fast": retry, but with longer pauses (here 4x).
   - 501 and 505 are server errors that never pass.
-  - A DNS failure is permanent for a mistyped domain, but a resolver timeout
-    looks the same to the client; a retry costs little. Waiting minutes for
-    it does not: once the retries are spent, `DNSError` is taken for good,
-    and a crawl does not wait for the robots.txt of such a host.
+  - A DNS failure is permanent for a mistyped domain, but not when the
+    resolver itself is down for a moment. The resolver tells them apart:
+    "no such name" (`EAI_NONAME`, `EAI_NODATA`) is `DNSError`, "try again"
+    (`EAI_AGAIN`) a plain `NetworkError`. A retry costs little for both.
+    Waiting minutes does not: once the retries are spent, `DNSError` is
+    taken for good, and a crawl does not wait for the robots.txt of such a
+    host; it waits out the other one like any outage.
 - Some failures are not about the request at all: the crawler is closed, the
   host's circuit is open, robots.txt is unreachable. Retrying the request
   cannot fix them.

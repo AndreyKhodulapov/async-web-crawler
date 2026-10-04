@@ -104,8 +104,9 @@ is fetched again, so a site whose robots.txt failed for a moment is crawled
 once it is back; only after `AsyncCrawler.MAX_ROBOTS_RETRIES` (3) failed
 downloads in a row, about three minutes, do its pages go to
 `unreachable_urls`. A failure that does not pass by itself, a bad
-certificate or a host name that does not resolve (`DNSError`), is not
-waited for at all: the pages go there at once. A page that redirects to
+certificate or a host name that does not exist (`DNSError`), is not
+waited for at all: the pages go there at once. A resolver that fails for
+now (`EAI_AGAIN`) is an outage, not `DNSError`, and is waited for. A page that redirects to
 such a site waits the same way and is requested again, and so does a
 sitemap of the site (see [Crawling](#crawling)); they all share the
 downloads of the site. Each download after the first is a single attempt,

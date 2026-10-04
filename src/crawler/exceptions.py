@@ -9,7 +9,8 @@ Most errors fall into one of four kinds that decide whether a retry can help:
   (a timeout, HTTP 429, 503); the same request may succeed later.
 - `NetworkError`: the request did not reach the server (DNS, a refused or
   reset connection); worth retrying too. `DNSError` is the one of them
-  that is mostly for good: a host name that does not resolve.
+  that is mostly for good: a host name that does not exist. A resolver
+  that fails for now (EAI_AGAIN) gives a plain `NetworkError`.
 - `PermanentError`: the request is wrong or forbidden (HTTP 404, 403, a bad
   certificate, a page over the size limit, a sitemap that is not one); every
   attempt would fail the same way.
@@ -49,7 +50,11 @@ class NetworkError(FetchError):
 
 
 class DNSError(NetworkError):
-    """The host name could not be resolved: mostly a name that does not exist."""
+    """The resolver says the host name has no address: mostly a name that does not exist.
+
+    A lookup that failed for now, such as a resolver that cannot be
+    reached, is a plain `NetworkError`.
+    """
 
 
 class ParseError(FetchError):

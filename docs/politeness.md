@@ -118,9 +118,10 @@ sites it visits and follows their rules.
   (here three downloads in a row), not per page or per sitemap, or a dead
   site is waited for once by its sitemaps and again by its pages; and do
   not wait at all for a failure that does not pass by itself: a host name
-  that does not resolve is a typo, and three minutes change nothing about
-  it. Mind the cost of each try, too: a host that accepts the connection
-  and never answers fails only by timeout, and a download with retries
+  that does not exist is a typo, and three minutes change nothing about
+  it (but a resolver that answers "try again" is an outage). Mind the
+  cost of each try, too: a host that accepts the connection and never
+  answers fails only by timeout, and a download with retries
   and growing timeouts takes minutes, so download again with a single
   attempt, and let no page wait for a download for long (here two
   seconds; the download goes on by itself and the page comes back
