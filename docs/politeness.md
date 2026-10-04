@@ -196,6 +196,19 @@ sites it visits and follows their rules.
   User-Agents is evasion: robots.txt no longer knows who you are, and
   anti-bot systems look at TLS and header fingerprints anyway.
 
+## Proxies
+
+- A proxy changes the address a site sees, not the load it gets. The
+  rate limit, robots.txt, Crawl-delay, `max_per_domain` and the circuit
+  breaker go by the host of the URL, whatever proxy a request goes
+  through: ten proxies do not make ten times the rate allowed.
+- Spreading requests over proxies to get past the limits of a site is
+  evasion, like rotating browser User-Agents. Proxies are for reaching
+  sites from a network that requires them, or from another region.
+- Keep a site on one proxy (`per_host`, the default): its session and
+  cookies stay on one address. A session that jumps between addresses
+  looks stolen, and some sites end it.
+
 ## Measuring politeness
 
 - Current requests per second over a sliding window (the last 5 seconds),

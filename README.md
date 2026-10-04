@@ -33,6 +33,11 @@ configuration file, by command-line options, or from Python.
   taken from a `cookies.txt` file exported by the browser and saved back
   after the crawl; extra headers of every request; their values never
   reach the log or the reports
+- **Proxies**: http and https proxies with a password, a site kept on one
+  proxy or the proxies taking turns per request, `HTTP_PROXY` and
+  `NO_PROXY` of the environment; a proxy that keeps failing is taken out
+  of rotation for a while without blocking the sites behind it; requests
+  and failures per proxy in the summary and the reports, passwords hidden
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that
   grow with every retry
@@ -137,6 +142,7 @@ when the configuration has sitemaps to crawl.
 | `--overwrite`, `--no-overwrite` | `storage.overwrite` | start output files anew, or add to them (the default; the log warns about a file that is not empty); a database keeps a row per URL either way |
 | `--cookies-file PATH` | `session.cookies_file` | send the cookies of a Netscape `cookies.txt` file, as a browser extension or `curl -c` exports it |
 | `--save-cookies PATH` | `session.save_cookies` | write the cookies to a `cookies.txt` file after the crawl, readable by its owner only |
+| `--proxy URL` | `proxy.urls` | send the requests through a proxy, `http://[user:password@]host:port`; repeat for several, in place of those of the file (`proxy.from_env` is turned off) |
 | `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, `nofollow` and `noindex`, or do not |
 | `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
@@ -146,8 +152,8 @@ when the configuration has sitemaps to crawl.
 | `--log-file PATH` | `logging.file` | also write the log to a file, as JSON Lines |
 | `--no-progress` | | do not show the progress line |
 
-Everything else (sitemaps, the other filters, retries, the circuit breaker, timeouts)
-is set in the file. The command line never keeps the pages in memory
+Everything else (sitemaps, the other filters, retries, the circuit breaker, timeouts,
+the rotation of proxies) is set in the file. The command line never keeps the pages in memory
 (`crawler.keep_pages` is off whatever the file says): they go to `--output`.
 The log and the progress line go to stderr, the summary to stdout:
 
@@ -165,7 +171,8 @@ Log: out/crawler.log
 
 At the default level `INFO` the log has a line per request; `--log-level
 WARNING` leaves the progress line and the failures. A password in a database
-URL is shown as `***`.
+or a proxy URL is shown as `***`. With proxies, the summary has a line of
+them: `Proxies: http://user:***@proxy-1:3128 (41 sent, 0 failed), ...`.
 
 | Exit code | Meaning |
 |-----------|---------|
@@ -276,6 +283,21 @@ storages. All of it is described in the [API reference](docs/api.md).
   are sent to every request, robots.txt and other sites included: an
   `Authorization` header reaches a third-party site that the crawl follows
   a link or a redirect to. Use it with `same_domain_only`, the default.
+- **No SOCKS proxies.** Only http and https proxies; `socks5://` is a
+  configuration error. A local bridge from HTTP to SOCKS (such as
+  `gost` or `privoxy`) makes a SOCKS proxy usable.
+- **A timeout through a proxy is the site's.** The crawler cannot tell a
+  slow proxy from a slow site, so a timeout counts against the site, in
+  its circuit breaker, and never takes the proxy out of rotation. A proxy
+  that loses packets looks like slow sites; a proxy that cannot be reached
+  or refuses the password is taken out as it should be.
+- **A proxy sees what plain HTTP carries.** Through an http proxy the
+  cookies and the headers of `session` reach `http://` sites in the clear,
+  as the proxy reads the request; `https://` sites go through a tunnel the
+  proxy cannot read. Use proxies you trust with the session.
+- **`https://` proxies are not tested end to end.** The tests run an
+  http proxy, with CONNECT for https sites; a proxy reached over TLS is
+  left to aiohttp.
 - **Not for URLs from strangers.** Links to private addresses
   (`127.0.0.1`, `10.0.0.0/8`, the cloud metadata address) are followed
   like any other. The crawler is a command-line tool for sites you choose,
@@ -300,7 +322,7 @@ storages. All of it is described in the [API reference](docs/api.md).
 
 | Document | Content |
 |----------|---------|
-| [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page, the internal layers |
+| [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, cookies and headers, proxies, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page, the internal layers |
 | [docs/configuration.md](docs/configuration.md) | configuration guide: every key with its type and default, validation, overrides, recipes |
 | [docs/demo.md](docs/demo.md) | the demo commands and their output |
 | [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler, memory, bottlenecks found and fixed |

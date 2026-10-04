@@ -14,6 +14,7 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Error statistics](#error-statistics) | `error_stats()` |
 | [Timeouts](#timeouts) | connect, read and total timeouts |
 | [Cookies and headers](#cookies-and-headers) | the session of the crawler, `cookies.txt` files |
+| [Proxies](#proxies) | `ProxyPool`: rotation, proxies taken out of it, their errors |
 | [Crawling](#crawling) | `crawl()`: depth, filters, sitemaps, state of a crawl |
 | [Page statistics](#page-statistics) | `CrawlerStats`, export to JSON and HTML |
 | [AdvancedCrawler](#advancedcrawler) | the crawler set up by a configuration |
@@ -77,7 +78,9 @@ Every method checks robots.txt, waits for the rate limit and retries transient
 failures; a URL that robots.txt disallows fails with `RobotsDisallowedError`
 without being requested, and a URL of a site whose robots.txt cannot be read
 fails with `RobotsUnreachableError`. A request to a host blocked by the
-circuit breaker fails with `CircuitOpenError` without being sent.
+circuit breaker fails with `CircuitOpenError` without being sent, and one
+for which every proxy is out of rotation with `NoProxyError` (see
+[Proxies](#proxies)).
 
 ## Politeness
 
@@ -229,7 +232,13 @@ slot of a host behind the one that opened its circuit is refused too. A
 retry the breaker would refuse is not made, so the request fails with the
 error of its last attempt, not with `CircuitOpenError`. When the breaker
 refuses the download of robots.txt, the page fails with `CircuitOpenError`
-under its own URL, and robots.txt is not cached as unreachable.
+under its own URL, and robots.txt is not cached as unreachable. The same
+goes for a download of robots.txt that failed in a proxy (`ProxyError`):
+it says nothing of the site.
+
+Errors of proxies (`ProxyError`) are not counted at all: a dead proxy
+must not open the circuits of healthy sites. Proxies have states of their
+own, see [Proxies](#proxies).
 
 In a crawl, a page the breaker refuses is not failed: it is put off until
 the circuit may let a probe through, or for a second while the probe is in
@@ -372,6 +381,86 @@ aiohttp keeps cookies of host names only.
 `AdvancedCrawler` takes all of it from the `session` section (see the
 [configuration guide](configuration.md#session)) and writes `save_cookies`
 when the crawl ends; `save_cookies()` writes it after a cancelled crawl.
+
+## Proxies
+
+With a `ProxyPool`, every request goes through a proxy of the pool: pages,
+robots.txt and sitemaps alike.
+
+```python
+from crawler import AsyncCrawler, ProxyPool
+
+proxies = ProxyPool(
+    ["http://user:secret@proxy-1.example:3128", "http://proxy-2.example:3128"],
+    rotation="per_host",
+    max_failures=3,
+    cooldown=60.0,
+)
+async with AsyncCrawler(proxies=proxies) as crawler:
+    await crawler.crawl(["https://example.com/"], same_domain_only=True)
+for label, stats in crawler.proxy_stats().items():
+    print(label, stats.state, stats.requests, stats.failures)  # http://user:***@proxy-1.example:3128 active 41 0
+```
+
+| Name | What it does |
+|------|--------------|
+| `ProxyPool(urls, rotation=, max_failures=, cooldown=)` | the proxies, `http://` or `https://` with a port; `ValueError` for a URL that is not one, a SOCKS proxy or a proxy listed twice; the message never shows a password |
+| `ProxyPool.from_env(max_failures=, cooldown=)` | a pool of the proxies of `HTTP_PROXY` and `HTTPS_PROXY`, with `NO_PROXY`; `None` if neither is set |
+| `AsyncCrawler(proxies=)` | send the requests through the pool; `None`, the default, sends them directly |
+| `crawler.proxies` | the pool, `None` without one |
+| `proxy_stats()` | `{label: ProxyStats}`: `state` (`"active"` or `"out"`), `requests`, `failures`, `times_removed`; empty without a pool |
+| `pick(url)`, `record(proxy, url, error)` | the proxy for a request (`None`: directly), and how it went; for a transport of your own |
+
+`rotation="per_host"`, the default, sends every host through a proxy of
+its own, chosen by a hash of the host that is the same in every run, so a
+site sees one address and its session does not move between addresses.
+`"per_request"` lets the proxies take turns, one request each.
+
+A proxy that fails `max_failures` requests in a row is out of rotation for
+`cooldown` seconds, logged as a warning, and its return as INFO; any
+response through it clears the count, and once back, one more failure
+takes it out again. A request through a proxy fails with:
+
+| Error | When | Retried |
+|-------|------|---------|
+| `ProxyNetworkError` (a `ProxyError` and a `NetworkError`) | the proxy cannot be reached, its name does not resolve, or it answers HTTP 407 to the request or to CONNECT | yes, through the next proxy at once; with `per_host` the host stays on that proxy |
+| `NoProxyError` (a `ProxyError`) | every proxy for the URL is out of rotation: the request is not sent; the message says when the first is back | no |
+| `NetworkError` | the proxy answered CONNECT with another status: it cannot or may not reach the site | yes, as any network error of the site |
+| `FetchTimeoutError` | a timeout: the proxy and the site cannot be told apart | yes, as any timeout of the site |
+
+Whatever the site answers through a proxy (a 404, a 503) is the site's,
+and the proxy is up. The circuit breaker counts no `ProxyError`: a dead
+proxy does not open the circuits of healthy sites. A download of robots.txt
+that fails with one is not cached: the page fails with the error of the
+proxy. `error_stats()` counts these errors under their own classes,
+`ProxyNetworkError` as a `NetworkError`.
+
+The rate limit, robots.txt, Crawl-delay, `max_per_domain` and the circuit
+breaker go by the host of the URL, whatever proxy a request goes through.
+`crawl()` counts `requests`, `failures` and `times_removed` anew, as it
+does the counters of the breaker; the proxies out of rotation stay out.
+
+The user name and the password of a proxy are taken out of its URL:
+aiohttp gets the URL without them, and the password goes in the
+`Proxy-Authorization` header, with CONNECT for an `https://` site, so the
+site never sees it, and with the request itself for an `http://` one, which
+the proxy takes out. A proxy is named by its `label`, the URL with the
+password hidden (`http://user:***@host:port`), in the log, the errors and
+the statistics; `repr()` of a `Proxy` leaves the header out.
+
+`from_env()` reads the variables once, in either case, without
+`ALL_PROXY`, `~/.netrc` or the proxies of the system settings, unlike
+aiohttp's `trust_env`: a URL goes through the proxy of its scheme, or
+directly when its scheme has none or `NO_PROXY` names its host. A proxy
+without a scheme is an `http://` one. Each scheme has one proxy, so the
+rotation does not matter. A variable that is not a proxy URL raises
+`ValueError` with the name of the variable, not its value.
+
+SOCKS proxies are not supported; an http proxy, or a local bridge from
+HTTP to SOCKS, does instead.
+
+`AdvancedCrawler` makes the pool of the `proxy` section (see the
+[configuration guide](configuration.md#proxy)).
 
 ## Crawling
 
@@ -603,7 +692,7 @@ asyncio.run(main())
 | `AdvancedCrawler.from_config(path, overrides, configure_logging=True)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
 | `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section and the cookies of `session.save_cookies`; returns the pages by URL |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
-| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics) |
+| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
 | `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats` |
@@ -899,7 +988,7 @@ and may change. A layer calls only the one below it.
 | Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
 | Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
-| HTTP | `transport.py` | `HttpTransport` | a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
+| HTTP | `transport.py` | `HttpTransport` | a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
 
 Who owns what:
 

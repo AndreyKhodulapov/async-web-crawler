@@ -20,7 +20,10 @@ listed in the [API reference](api.md#internals).
   share one request path, and the robots.txt and sitemap downloads go
   through it as well.
 - A feature then lands in one layer:
-  - proxies and cookies change the HTTP session;
+  - proxies and cookies change the HTTP session: the transport picks the
+    proxy of every request and tells the pool how it went, and the
+    request layer sees only the class of the error (`ProxyNetworkError`
+    is retried, `NoProxyError` is not), never a proxy;
   - rendering JavaScript in a headless browser is a second transport with the same contract;
   - a crawl shared by several machines replaces the queue and the set of seen URLs of the crawl layer.
 

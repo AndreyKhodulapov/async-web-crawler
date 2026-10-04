@@ -209,6 +209,71 @@ validation, and `repr()` of the configuration leaves them out.
 `CrawlerConfig.to_dict()` keeps them, so that `from_dict()` can read it
 back. Keep a file with them private, or keep them in `cookies_file`.
 
+### `proxy`
+
+The proxies the requests go through; without any, requests go directly.
+See [Proxies](api.md#proxies).
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `urls` | list of URLs | `[]` | the proxies, `http://[user:password@]host:port` or `https://...`; the port is required |
+| `rotation` | `per_host` or `per_request` | `per_host` | `per_host`: a host always goes through one proxy, chosen by a hash of the host; `per_request`: the proxies take turns, one request each |
+| `from_env` | true or false | `false` | take the proxies of `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` instead of `urls` |
+| `max_failures` | whole number, >= 1 | `3` | failures in a row that take a proxy out of rotation |
+| `cooldown` | number, > 0 | `60.0` | seconds a proxy stays out of rotation |
+
+```yaml
+proxy:
+  urls:
+    - http://user:password@proxy-1.example:3128
+    - http://proxy-2.example:3128
+  rotation: per_host
+```
+
+Every request goes through a proxy: pages, robots.txt and sitemaps.
+`per_host` keeps the session of a site on one address: its cookies do not
+move between the addresses of several proxies, which a site may take for
+a stolen session. `per_request` spreads the requests of one site over all
+the proxies.
+
+A proxy fails a request when it cannot be reached, its name does not
+resolve, or it asks for a password (HTTP 407). After `max_failures` such
+failures in a row it is out of rotation for `cooldown` seconds, and the
+requests go through the other proxies; any response through it clears
+the count. Once back, one more failure takes it out again. The request
+that failed is retried through the next proxy at once, and with
+`per_host` its host stays on that proxy. When every proxy is out, a page
+fails at once with "no proxy available" and is not retried, and the crawl
+ends instead of waiting. A proxy that answers, whatever the site says
+through it, is up: a 404, a 503 or a refused CONNECT (the proxy cannot or
+may not reach the site) count against the site, and so does a timeout,
+since the proxy and the site cannot be told apart then.
+
+`from_env` reads the variables once, when the crawler is made, in either
+case (`https_proxy` too): an `https://` URL goes through `HTTPS_PROXY`,
+an `http://` one through `HTTP_PROXY`, and a host of `NO_PROXY` or a
+scheme without a proxy goes directly. A proxy without a scheme
+(`proxy:3128`) is an `http://` one, as curl takes it. `ALL_PROXY`,
+`~/.netrc` and the proxies of the system settings are not read, unlike
+aiohttp's `trust_env`. Neither variable set is no error: the log warns
+and the requests go directly. `rotation` does not apply: each scheme has
+one proxy.
+
+SOCKS proxies are not supported: `socks5://` is an error that suggests an
+http proxy or a local bridge from HTTP to SOCKS. `--proxy` on the command
+line replaces `urls` and turns `from_env` off.
+
+The passwords of proxies are secrets like the values of `session`: a
+proxy is shown as `http://user:***@host:port` in the log, the summary,
+the reports and the errors, and `repr()` of the configuration leaves the
+URLs out. The password goes to the proxy in the `Proxy-Authorization`
+header, never to the site.
+
+Politeness stays with the sites: the rate limit, robots.txt, Crawl-delay,
+`max_per_domain` and the circuit breaker go by the host of the URL,
+whatever proxy a request goes through. Proxies are not a way around the
+limits of a site.
+
 ### `storage`
 
 Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
@@ -269,11 +334,16 @@ written. A problem is reported by the path of its key:
   a header that has a key of its own (`User-Agent`, `Cookie`, `Host`) or is
   given twice in different case; the values of cookies and headers are not
   shown;
+- a proxy URL that is not `http://` or `https://`, has no port, or has a
+  path; a SOCKS proxy; the same proxy listed twice; the URL is not shown,
+  a repeated one with its password hidden;
 - a key written twice in YAML (plain YAML would keep the last one silently);
 - keys that do not go together: `sitemaps.from_robots` without
   `crawler.respect_robots`, a `user_agents` entry with another bot name,
   `session.cookies`, `cookies_file` or `save_cookies` with
-  `session.keep_cookies: false`;
+  `session.keep_cookies: false`, `proxy.from_env` with `proxy.urls`;
+- with `proxy.from_env`, a variable that is not the URL of a proxy, when
+  the crawler is made, reported by the name of the variable;
 - a file that cannot be read, has another extension or is not valid YAML or JSON;
 - in the file of `--urls-file`, a line that is not an http(s) URL, reported
   by its number, or a file that cannot be read or is not UTF-8; `-` with
@@ -383,4 +453,19 @@ retry:
   max_delay: 60.0
 circuit_breaker:
   cooldown: 120
+```
+
+Through a few proxies, each site on one of them, a dead proxy left alone
+for five minutes:
+
+```yaml
+urls: [https://example.com/]
+proxy:
+  urls:
+    - http://user:password@proxy-1.example:3128
+    - http://user:password@proxy-2.example:3128
+  max_failures: 2
+  cooldown: 300
+report:
+  html: reports/site.html   # the requests and failures of every proxy
 ```
