@@ -2,6 +2,7 @@
 
 import inspect
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from crawler import (
     CSVStorage,
     JSONStorage,
     ProxyPool,
+    Rendering,
     RetryStrategy,
     load_config,
 )
@@ -26,6 +28,7 @@ from crawler.config import (
     FilterOptions,
     LoggingOptions,
     ProxyOptions,
+    RenderingOptions,
     ReportOptions,
     RetryOptions,
     SessionOptions,
@@ -82,6 +85,15 @@ FULL = {
         "max_failures": 5,
         "cooldown": 30.0,
     },
+    "rendering": {
+        "mode": "patterns",
+        "include": ["^https://example\\.com/app/"],
+        "wait_until": "networkidle",
+        "wait_for": "#content",
+        "timeout": 10.0,
+        "max_open_pages": 4,
+        "block_resources": ["image", "stylesheet"],
+    },
     "storage": {
         "outputs": ["pages.jsonl", "pages.csv"],
         "batch_size": 50,
@@ -137,6 +149,15 @@ class TestDefaults:
             keep_cookies=True, cookies=(), cookies_file=None, save_cookies=None, headers={}
         )
         assert config.proxy == ProxyOptions(urls=(), rotation="per_host", from_env=False, max_failures=3, cooldown=60.0)
+        assert config.rendering == RenderingOptions(
+            mode="off",
+            include=(),
+            wait_until="load",
+            wait_for=None,
+            timeout=30.0,
+            max_open_pages=2,
+            block_resources=("image", "font", "media"),
+        )
 
     def test_defaults_are_those_of_the_components(self):
         """The crawler built without a configuration and with an empty one behave the same."""
@@ -176,6 +197,7 @@ class TestDefaults:
         pool = defaults(ProxyPool.__init__)
         for name in ("rotation", "max_failures", "cooldown"):
             assert getattr(ProxyOptions(), name) == pool[name], name
+        assert RenderingOptions(mode="always").build() == Rendering()
 
     def test_configuration_cannot_be_changed(self):
         config = CrawlerConfig()
@@ -889,3 +911,87 @@ class TestProxy:
         (problem,) = error.value.problems
         assert problem.startswith("proxy.from_env: HTTPS_PROXY: SOCKS proxies are not supported")
         assert "pr0xyp4ss" not in str(error.value)
+
+
+class TestRendering:
+    def test_off_builds_no_settings(self):
+        assert RenderingOptions().build() is None
+
+    def test_patterns_build_the_settings_of_the_browser(self):
+        rendering = CrawlerConfig.from_dict(FULL).rendering.build()
+
+        assert rendering == Rendering(
+            include=("^https://example\\.com/app/",),
+            wait_until="networkidle",
+            wait_for="#content",
+            timeout=10.0,
+            max_open_pages=4,
+            block_resources=frozenset({"image", "stylesheet"}),
+        )
+        assert rendering.renders("https://example.com/app/page")
+        assert not rendering.renders("https://example.com/blog/")
+
+    def test_always_renders_every_page(self):
+        rendering = CrawlerConfig.from_dict({"rendering": {"mode": "always"}}).rendering.build()
+
+        assert rendering.renders("https://example.com/any/page")
+
+    @pytest.mark.parametrize(
+        "section, problem",
+        [
+            ({"mode": "sometimes"}, 'rendering.mode: expected one of off, always, patterns, got "sometimes"'),
+            ({"wait_until": "idle"}, "rendering.wait_until: expected one of load, domcontentloaded, networkidle"),
+            ({"wait_for": " "}, 'rendering.wait_for: must not be empty, got " "'),
+            ({"timeout": 0}, "rendering.timeout: must be > 0, got 0.0"),
+            ({"max_open_pages": 0}, "rendering.max_open_pages: must be >= 1, got 0"),
+            ({"block_resources": ["document"]}, "rendering.block_resources[0]: expected one of eventsource, fetch"),
+            ({"block_resources": "image"}, 'rendering.block_resources: expected a list, got "image"'),
+        ],
+    )
+    def test_invalid_values(self, section, problem):
+        (found,) = problems({"rendering": section})
+
+        assert found.startswith(problem)
+
+    def test_invalid_pattern(self):
+        (found,) = problems({"rendering": {"mode": "patterns", "include": ["/app/(", "/ok/"]}})
+
+        assert found.startswith("rendering.include[0]: not a regular expression: missing ), unterminated subpattern")
+
+    def test_off_written_bare_in_yaml_is_explained(self, tmp_path):
+        path = write(tmp_path, "rendering:\n  mode: off\n")
+
+        with pytest.raises(ConfigError) as error:
+            load_config(path)
+
+        assert error.value.problems == [
+            (
+                "rendering.mode: expected a string, got false; "
+                "YAML reads off, on, no and yes as false or true: put the word in quotes"
+            )
+        ]
+        assert load_config(write(tmp_path, 'rendering:\n  mode: "off"\n')).rendering.mode == "off"
+
+    def test_patterns_need_include(self):
+        assert problems({"rendering": {"mode": "patterns"}}) == [
+            "rendering.mode: patterns needs rendering.include, which is empty"
+        ]
+
+    @pytest.mark.parametrize("mode", ["off", "always"])
+    def test_include_needs_patterns(self, mode):
+        assert problems({"rendering": {"mode": mode, "include": ["/app/"]}}) == [
+            f'rendering.include: needs rendering.mode: patterns, got "{mode}"'
+        ]
+
+    @pytest.mark.parametrize("section", [{"mode": "always"}, {"mode": "patterns", "include": ["/app/"]}])
+    def test_rendering_without_playwright_is_an_error_with_the_command_to_install_it(self, section, monkeypatch):
+        monkeypatch.setitem(sys.modules, "playwright", None)  # find_spec() takes it for a missing package
+
+        assert problems({"rendering": section}) == [
+            'rendering.mode: Playwright is not installed; run: pip install -e ".[js]"'
+        ]
+
+    def test_off_needs_no_playwright(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "playwright", None)
+
+        assert CrawlerConfig.from_dict({"rendering": {"mode": "off", "timeout": 5}}).rendering.build() is None

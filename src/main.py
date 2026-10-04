@@ -5,6 +5,7 @@ Usage:
     python src/main.py --urls https://example.com --max-pages 100 --output results.json
     python src/main.py --config config.yaml --max-pages 500 --report report.html
     python src/main.py --config config.yaml --urls-file urls.txt
+    python src/main.py --urls https://quotes.toscrape.com/js/ --render
     cat urls.txt | python src/main.py --config config.yaml --urls-file -
 
 A crawl is set up by a configuration file (see config.example.yaml), by
@@ -25,6 +26,7 @@ from typing import Any
 from cli_options import http_url, positive, proxy_url
 from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, StorageError, load_config, load_urls, show_progress
 from crawler.config import LOG_LEVELS
+from crawler.rendering import browser_problem
 from crawler.urls import hide_password
 
 
@@ -77,6 +79,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="URL",
         help="send the requests through a proxy, http://[user:password@]host:port; "
         "repeat for several, in place of those of the configuration",
+    )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="render every HTML page in a headless Chromium, so that links JavaScript makes are found; "
+        'in place of rendering.mode and rendering.include of the configuration. Needs pip install -e ".[js]" '
+        "and playwright install chromium",
     )
     parser.add_argument(
         "--respect-robots",
@@ -143,6 +152,9 @@ def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
             target[key] = value
     if args.proxy is not None:
         overrides["proxy"] = {"urls": args.proxy, "from_env": False}
+    if args.render:
+        # Every page: the patterns of the file would name only some of them.
+        overrides["rendering"] = {"mode": "always", "include": []}
     if args.rate_limit is not None:
         # The configuration spells "no limit" as null.
         overrides.setdefault("crawler", {})["rate_limit"] = args.rate_limit or None
@@ -220,11 +232,17 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
     that was closed.
 
     Raises:
-        ConfigError: the file of `session.cookies_file` cannot be read, or with
-            `proxy.from_env` a variable is not the URL of a proxy.
+        ConfigError: the file of `session.cookies_file` cannot be read, with
+            `proxy.from_env` a variable is not the URL of a proxy, or pages are
+            to be rendered and Chromium is not installed; nothing is requested.
         OSError: a directory cannot be created, or the log file cannot be opened.
         StorageError: an output file or the database cannot be opened; nothing is requested.
     """
+    if config.rendering.mode != "off":
+        # Before anything is created: without the check, every page would fail.
+        problem = await browser_problem()
+        if problem is not None:
+            raise ConfigError([f"rendering.mode: {problem}"])
     async with AdvancedCrawler(config) as crawler:
         crawl = asyncio.create_task(crawler.crawl())
         try:

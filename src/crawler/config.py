@@ -19,6 +19,7 @@ from crawler.client import AsyncCrawler
 from crawler.exceptions import ConfigError
 from crawler.filters import extension_problem, normalize_extension
 from crawler.proxy import Proxy, ProxyPool, proxy_url_problem
+from crawler.rendering import RESOURCE_TYPES, WAIT_STATES, Rendering, playwright_problem
 from crawler.robots import product_token
 from crawler.session import (
     cookie_domain_problem,
@@ -33,6 +34,8 @@ from crawler.storage import CompositeStorage, DataStorage, storage_from_output
 from crawler.urls import is_valid_http_url
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+# Which pages a headless browser renders: none, every HTML page, or those of `rendering.include`.
+RENDER_MODES = ("off", "always", "patterns")
 
 # Links to files a crawl of web pages has no use for: documents, images,
 # archives, media, programs, styles and scripts.
@@ -126,6 +129,18 @@ def _not_blank(value: str) -> str | None:
 
 def _rotation(value: str) -> str | None:
     return None if value in ("per_host", "per_request") else "expected per_host or per_request"
+
+
+def _render_mode(value: str) -> str | None:
+    return None if value in RENDER_MODES else f"expected one of {', '.join(RENDER_MODES)}"
+
+
+def _wait_state(value: str) -> str | None:
+    return None if value in WAIT_STATES else f"expected one of {', '.join(WAIT_STATES)}"
+
+
+def _resource_type(value: str) -> str | None:
+    return None if value in RESOURCE_TYPES else f"expected one of {', '.join(sorted(RESOURCE_TYPES))}"
 
 
 def _cookie_path(value: str) -> str | None:
@@ -288,6 +303,34 @@ class ProxyOptions:
 
 
 @dataclass(frozen=True)
+class RenderingOptions:
+    """Section `rendering`: pages rendered in a headless browser, see `Rendering`. Off by default."""
+
+    mode: str = _option("off", check=_render_mode)  # always: every HTML page; patterns: those that `include` names
+    include: tuple[str, ...] = _option((), check=_pattern)  # with mode: patterns, searched in the URL as in `filters`
+    wait_until: str = _option("load", check=_wait_state)  # load, domcontentloaded or networkidle
+    wait_for: str | None = _option(None, check=_not_blank)  # a CSS selector to wait for after that
+    timeout: float = _option(30.0, above=0)  # the browser's time for a page, the waits included
+    max_open_pages: int = _option(2, minimum=1)  # pages rendered at once; a browser tab takes 50 to 100 MB
+    block_resources: tuple[str, ...] = _option(
+        ("image", "font", "media"), check=_resource_type
+    )  # the types of requests the browser does not make
+
+    def build(self) -> Rendering | None:
+        """The settings of the rendering; None if it is off."""
+        if self.mode == "off":
+            return None
+        return Rendering(
+            include=self.include,
+            wait_until=self.wait_until,
+            wait_for=self.wait_for,
+            timeout=self.timeout,
+            max_open_pages=self.max_open_pages,
+            block_resources=frozenset(self.block_resources),
+        )
+
+
+@dataclass(frozen=True)
 class StorageOptions:
     """Section `storage`: where the crawled pages are saved, see `storage_from_output`."""
 
@@ -359,6 +402,7 @@ class CrawlerConfig:
     filters: FilterOptions = field(default_factory=FilterOptions)
     session: SessionOptions = field(default_factory=SessionOptions)
     proxy: ProxyOptions = field(default_factory=ProxyOptions)
+    rendering: RenderingOptions = field(default_factory=RenderingOptions)
     storage: StorageOptions = field(default_factory=StorageOptions)
     logging: LoggingOptions = field(default_factory=LoggingOptions)
     report: ReportOptions = field(default_factory=ReportOptions)
@@ -563,7 +607,13 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
         except OverflowError:  # a whole number above 1e308
             fits = False
     if not fits or (hint is float and not math.isfinite(value)):
-        problems.append(f"{path}: expected {expected}{_got(value, limits)}")
+        # `mode: off` is `mode: false` in YAML, as are no, yes and on.
+        quote = (
+            "; YAML reads off, on, no and yes as false or true: put the word in quotes"
+            if hint is str and isinstance(value, bool)
+            else ""
+        )
+        problems.append(f"{path}: expected {expected}{_got(value, limits)}{quote}")
         return _INVALID
     if "normalize" in limits:
         value = limits["normalize"](value)
@@ -632,6 +682,14 @@ def _check_together(config: CrawlerConfig, problems: list[str]) -> None:
     for index, label in enumerate(labels):
         if label in labels[:index]:
             problems.append(f"proxy.urls[{index}]: {label} is listed twice")
+    rendering = config.rendering
+    if rendering.mode == "patterns" and not rendering.include:
+        problems.append("rendering.mode: patterns needs rendering.include, which is empty")
+    if rendering.mode != "patterns" and rendering.include:
+        problems.append(f'rendering.include: needs rendering.mode: patterns, got "{rendering.mode}"')
+    missing = playwright_problem() if rendering.mode != "off" else None
+    if missing is not None:
+        problems.append(f"rendering.mode: {missing}")
     try:
         "".encode(config.storage.csv_encoding)
     except (LookupError, ValueError):  # ValueError: a name with a null character, or the codec "undefined"

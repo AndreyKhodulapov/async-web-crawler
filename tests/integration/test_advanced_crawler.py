@@ -9,7 +9,15 @@ import pytest
 import yaml
 from helpers import BOT, FAST_CONFIG, urlset
 
-from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, CSVStorage, JSONStorage, configure_logging
+from crawler import (
+    AdvancedCrawler,
+    ConfigError,
+    CrawlerConfig,
+    CSVStorage,
+    JSONStorage,
+    Rendering,
+    configure_logging,
+)
 from demo_site import free_port
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
@@ -97,6 +105,7 @@ async def test_configuration_reaches_every_part(tmp_path):
         storage={"outputs": [str(tmp_path / "pages.jsonl"), str(tmp_path / "pages.csv")]},
         logging={"level": "ERROR"},
         report={"top_domains": 3},
+        rendering={"mode": "always", "wait_for": "#content"},
     )
     async with AdvancedCrawler(config) as advanced:
         crawler = advanced.crawler
@@ -109,6 +118,7 @@ async def test_configuration_reaches_every_part(tmp_path):
         assert advanced.storage is crawler.storage
         assert [type(storage) for storage in advanced.storage.storages] == [JSONStorage, CSVStorage]
         assert logging.getLogger().level == logging.ERROR
+        assert crawler.rendering == Rendering(wait_for="#content")
 
 
 async def test_defaults_without_a_configuration():

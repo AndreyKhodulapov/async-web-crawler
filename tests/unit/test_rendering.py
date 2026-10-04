@@ -7,7 +7,7 @@ import pytest
 from test_transport_contract import ScriptedTransport, make_fetcher, page
 
 from crawler import AsyncCrawler, CrawlerClosedError, PageTooLargeError, RenderError, Rendering
-from crawler.rendering import BrowserTransport, Rendered, Renderer
+from crawler.rendering import BrowserTransport, Rendered, Renderer, browser_problem, playwright_problem
 from crawler.transport import HttpTransport, Response, Transport
 
 URL = "https://a.test/page"
@@ -218,3 +218,25 @@ class TestRenderErrors:
         assert http.requests == [URL]
         circuit = fetcher.circuit_breaker.get_stats()["a.test"]
         assert (circuit.requests, circuit.failures) == (0, 0)
+
+
+class TestInstallation:
+    def test_playwright_is_found_without_being_imported(self, monkeypatch) -> None:
+        pytest.importorskip("playwright")
+        for name in [name for name in sys.modules if name == "playwright" or name.startswith("playwright.")]:
+            monkeypatch.delitem(sys.modules, name)
+
+        assert playwright_problem() is None
+        assert "playwright" not in sys.modules
+
+    async def test_without_playwright_the_command_to_install_it(self, monkeypatch) -> None:
+        monkeypatch.setitem(sys.modules, "playwright", None)  # find_spec() takes it for a missing package
+
+        assert playwright_problem() == 'Playwright is not installed; run: pip install -e ".[js]"'
+        assert await browser_problem() == playwright_problem()
+
+    async def test_without_chromium_the_command_to_install_it(self, monkeypatch, tmp_path) -> None:
+        pytest.importorskip("playwright")
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))  # where Playwright looks for its browsers
+
+        assert await browser_problem() == "Chromium is not installed; run: playwright install chromium"

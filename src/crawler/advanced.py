@@ -38,8 +38,10 @@ class AdvancedCrawler:
     retries, the circuit breaker), where to save the pages, where to write
     the log and the reports. The parts are there to be used directly:
     `crawler` is the `AsyncCrawler` that does the work, `storage` its
-    storage (None without outputs), `stats` its `CrawlerStats`, and
-    `crawler.proxies` its proxies (None without any). `reports`
+    storage (None without outputs), `stats` its `CrawlerStats`,
+    `crawler.proxies` its proxies (None without any) and
+    `crawler.rendering` the settings of its browser (None if pages are
+    not rendered). `reports`
     are the report files the latest crawl wrote, `cookie_file` the file the
     cookies were saved to.
 
@@ -97,6 +99,7 @@ class AdvancedCrawler:
             cookies=cookies,
             keep_cookies=config.session.keep_cookies,
             proxies=proxies,
+            rendering=config.rendering.build(),
             storage=self.storage,
             keep_pages=options.keep_pages,
         )

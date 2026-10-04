@@ -85,6 +85,19 @@ proxy:
   max_failures: 3       # failures in a row that take a proxy out of rotation
   cooldown: 60.0        # seconds a proxy stays out of rotation
 
+# Pages rendered in a headless Chromium, for sites whose links and text
+# JavaScript makes. Needs pip install -e ".[js]" and playwright install chromium.
+# The page itself is downloaded as without a browser; the browser loads its
+# scripts, styles and data, which robots.txt is not asked about.
+rendering:
+  mode: "off"           # always: every HTML page; patterns: the pages of include; quote "off"
+  include: []           # with mode: patterns, e.g. ['^https://example\.com/app/']
+  wait_until: load      # load, domcontentloaded or networkidle (no request for half a second)
+  wait_for: null        # a CSS selector to wait for after that, e.g. "#content"
+  timeout: 30.0         # the browser's time for a page, the waits included
+  max_open_pages: 2     # pages rendered at once; a browser tab takes 50 to 100 MB
+  block_resources: [image, font, media]  # requests the browser does not make
+
 # Where the crawled pages are saved: files, by extension (.jsonl, .json,
 # .csv, .db), or database URLs (sqlite:///pages.db, postgresql://...).
 storage:

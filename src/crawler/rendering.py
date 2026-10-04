@@ -7,7 +7,9 @@ rendered, so the crawler works without it as long as nothing is.
 
 import asyncio
 import contextlib
+import importlib.util
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from http.cookiejar import Cookie
@@ -27,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 INSTALL_PACKAGE = 'pip install -e ".[js]"'
 INSTALL_BROWSER = "playwright install chromium"
+_NO_PLAYWRIGHT = f"Playwright is not installed; run: {INSTALL_PACKAGE}"
+_NO_CHROMIUM = f"Chromium is not installed; run: {INSTALL_BROWSER}"
 # When the page has fired its event: "networkidle" is no request for 500 ms.
 WAIT_STATES = ("load", "domcontentloaded", "networkidle")
 # The types of the requests a page makes, as Playwright names them, but
@@ -103,6 +107,34 @@ class Rendering:
     def renders(self, url: str) -> bool:
         """Whether the page at `url` is rendered, if it is HTML."""
         return self._filter.allows(url)
+
+
+def playwright_problem() -> str | None:
+    """Why pages cannot be rendered if the Playwright package is missing, with the command to install it; else None.
+
+    The package is looked for, not imported.
+    """
+    return _NO_PLAYWRIGHT if importlib.util.find_spec("playwright") is None else None
+
+
+async def browser_problem() -> str | None:
+    """Why pages cannot be rendered: Playwright or its Chromium is not installed; None if both are.
+
+    The message holds the command to install what is missing. The driver
+    of Playwright is started for a moment to ask where Chromium is, the
+    browser is not.
+    """
+    problem = playwright_problem()
+    if problem is not None:
+        return problem
+    from playwright.async_api import Error, async_playwright
+
+    try:
+        async with async_playwright() as playwright:
+            executable = playwright.chromium.executable_path
+    except (Error, OSError) as exc:  # OSError: the driver cannot be run
+        return f"Playwright could not start: {_first_line(exc)}"
+    return None if os.path.exists(executable) else _NO_CHROMIUM
 
 
 class Rendered(NamedTuple):
@@ -376,7 +408,7 @@ class Renderer:
         try:
             from playwright.async_api import Error, async_playwright
         except ImportError as exc:
-            raise _LaunchError(f"Playwright is not installed; run: {INSTALL_PACKAGE}") from exc
+            raise _LaunchError(_NO_PLAYWRIGHT) from exc
         try:
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch()
@@ -386,7 +418,7 @@ class Renderer:
             await context.route("**/*", self._route)
         except Error as exc:
             if "Executable doesn't exist" in str(exc):
-                raise _LaunchError(f"Chromium is not installed; run: {INSTALL_BROWSER}") from exc
+                raise _LaunchError(_NO_CHROMIUM) from exc
             raise _LaunchError(f"the browser could not start: {_first_line(exc)}") from exc
         self._context = context
         logger.info("Started Chromium %s to render pages", self._browser.version)

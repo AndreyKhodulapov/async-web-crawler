@@ -1,12 +1,14 @@
 """Integration tests: pages are rendered in a headless Chromium, and what they do on their own is checked."""
 
 import asyncio
+import json
 import os
 import subprocess
 
 import pytest
-from helpers import BOT, UNTHROTTLED
+from helpers import BOT, FAST_CONFIG, UNTHROTTLED
 
+import main
 from crawler import (
     AsyncCrawler,
     CircuitBreaker,
@@ -16,6 +18,7 @@ from crawler import (
     Rendering,
     RobotsDisallowedError,
 )
+from crawler.rendering import browser_problem
 
 pytestmark = [pytest.mark.browser, pytest.mark.usefixtures("restore_logging", "chromium")]
 
@@ -189,3 +192,22 @@ async def test_close_ends_the_browser_and_its_processes(url):
         await asyncio.sleep(0.1)
     assert not child_processes() - before
     assert not crawler._transport.renderer.running
+
+
+async def test_chromium_is_found():
+    assert await browser_problem() is None
+
+
+async def test_the_command_line_renders_with_render(url, tmp_path, capsys):
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({**FAST_CONFIG, "logging": {"level": "WARNING"}}), encoding="utf-8")
+    output = tmp_path / "pages.jsonl"
+    argv = ["--config", str(config), "--urls", url("/js/links"), "--render", "--output", str(output)]
+
+    code = await main.run(main.build_config(main.parse_args(argv)), progress=False)
+
+    assert code == 0
+    # The one link of the page is made by JavaScript.
+    saved = {json.loads(line)["url"] for line in output.read_text(encoding="utf-8").splitlines()}
+    assert saved == {url("/js/links"), url("/js/target")}
+    assert "Pages: 2 (2 successful" in capsys.readouterr().out
