@@ -11,7 +11,7 @@ listed in the [API reference](api.md#internals).
   by **reason to change**: how bytes are fetched, how one URL is fetched
   politely, how a crawl walks a site, what the user calls.
 - The layers here, from the bottom:
-  - **HTTP** (`HttpTransport`): one GET, no redirects.
+  - **HTTP** (a `Transport`, such as `HttpTransport`): one GET, no redirects.
   - **Request** (`Fetcher`): robots.txt, rate limit, circuit breaker, retries, redirects.
   - **Crawl** (`CrawlRun`): queue, filters, limits, deferred pages, counters.
   - **Facade** (`AsyncCrawler`): the public API.
@@ -38,10 +38,12 @@ listed in the [API reference](api.md#internals).
   and as **results** above it (`FetchResult.error`). A crawl worker has to
   go on after any failure, so it should not have to catch exceptions.
 - **Add an abstraction when the second implementation comes.** With one
-  transport, a `Protocol` would be a guess at the interface. The contract
-  is written in the docstring, and the `Protocol` (structural typing, no
-  base class to inherit) comes with the browser transport, shaped by what
-  both need.
+  transport, a `Protocol` would be a guess at the interface, so the
+  contract lived in the docstring of `HttpTransport`. The `Protocol`
+  (`Transport`: structural typing, no base class to inherit) is made for
+  the browser transport, shaped by what both need: `get()`, `close()`,
+  `reset_stats()` and `cookies()`. The request layer knows only
+  `Transport`; the facade builds the transports and knows what they are.
 
 ## State of a unit of work
 

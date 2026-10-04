@@ -31,7 +31,7 @@ from crawler.session import (
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
 from crawler.storage.base import DataStorage
-from crawler.transport import HttpTransport
+from crawler.transport import HttpTransport, Transport
 from crawler.urls import get_host, is_valid_http_url
 
 logger = logging.getLogger(__name__)
@@ -300,7 +300,8 @@ class AsyncCrawler:
             keep_cookies=keep_cookies,
             proxies=proxies,
         )
-        self._transport = transport
+        self._transport: Transport = transport
+        self._proxies = proxies
         self._fetcher = Fetcher(
             transport,
             limits=self._limits,
@@ -385,7 +386,7 @@ class AsyncCrawler:
 
     @property
     def proxies(self) -> ProxyPool | None:
-        return self._transport.proxies
+        return self._proxies
 
     @property
     def robots(self) -> RobotsParser | None:

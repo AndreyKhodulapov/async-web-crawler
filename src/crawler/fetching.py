@@ -31,7 +31,7 @@ from crawler.retry import RetryStrategy
 from crawler.robots import RobotsParser, robots_tag_directives
 from crawler.semaphores import SemaphoreManager
 from crawler.sitemap import SitemapParser
-from crawler.transport import HttpTransport
+from crawler.transport import Transport
 from crawler.urls import get_host, resolve_url
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ class Fetcher:
     the rate limit and the concurrency limits of its host, and is retried
     as `retry_strategy` says; redirects are followed one request at a
     time, each target checked the same way. `fetch()` reports every
-    outcome in its `FetchResult`. The requests are sent by `transport`.
+    outcome in its `FetchResult`. The requests are sent by `transport` (see `Transport`).
 
     `robots` and `sitemaps` download through it. `errors` and `retries`
     count the attempts since the last `reset_stats()`.
@@ -57,7 +57,7 @@ class Fetcher:
 
     def __init__(
         self,
-        transport: HttpTransport,
+        transport: Transport,
         *,
         limits: SemaphoreManager,
         rate_limiter: RateLimiter,

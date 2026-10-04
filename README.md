@@ -410,7 +410,7 @@ src/
     ├── client.py           # AsyncCrawler: the public API — fetch_*, crawl(), statistics, close()
     ├── crawl_run.py        # CrawlRun: one crawl — queue, filters, limits, deferred pages, counters, saving
     ├── fetching.py         # Fetcher: one URL with robots.txt, circuit breaker, rate limit, retries and redirects
-    ├── transport.py        # HttpTransport: single GET requests over an aiohttp session, decoding, size limits
+    ├── transport.py        # Transport contract; HttpTransport: single GET requests over an aiohttp session, decoding, size limits
     ├── queue.py            # CrawlerQueue: URL priority queue and statuses
     ├── semaphores.py       # SemaphoreManager: global and per-domain limits
     ├── rate_limiter.py     # RateLimiter: requests per second, delays, jitter, rate stats

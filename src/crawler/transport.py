@@ -1,4 +1,4 @@
-"""HTTP layer of the crawler: single GET requests over a shared aiohttp session."""
+"""HTTP layer of the crawler: the contract of a transport, and single GET requests over a shared aiohttp session."""
 
 import codecs
 import contextlib
@@ -8,7 +8,7 @@ import socket
 import ssl
 from collections.abc import Iterable, Mapping, Sequence
 from http.cookiejar import Cookie
-from typing import NamedTuple
+from typing import NamedTuple, Protocol, runtime_checkable
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -55,8 +55,51 @@ class Response(NamedTuple):
     robots_tag: tuple[str, ...] = ()  # the X-Robots-Tag headers as sent
 
 
+@runtime_checkable
+class Transport(Protocol):
+    """The contract of the HTTP layer, which the request layer sends its requests through.
+
+    `get()` makes a single GET request and returns a `Response`; a
+    redirect comes back as one, with `redirected` set and its target as
+    `final_url`, for the caller to check and follow. Every failure is
+    raised as a `FetchError`, `CrawlerClosedError` after `close()`.
+    """
+
+    async def get(
+        self,
+        url: str,
+        *,
+        html_only: bool,
+        raw_limit: int | None,
+        truncate_at: int | None,
+        timeout: aiohttp.ClientTimeout,
+    ) -> Response:
+        """Perform the GET request and read the body up to its size limit.
+
+        With `html_only`, the body of a response whose Content-Type is not
+        HTML is not read: the content is empty and the size is 0. With
+        `raw_limit`, the body is returned as bytes and the content is empty;
+        over `raw_limit` bytes it fails with `SitemapError`. With
+        `truncate_at`, the body is cut to that many bytes. Otherwise a body
+        over the size limit of the transport fails with `PageTooLargeError`.
+        """
+        ...
+
+    async def close(self) -> None:
+        """Release what the transport holds. Safe to call more than once; later requests fail."""
+        ...
+
+    def reset_stats(self) -> None:
+        """Count the requests anew."""
+        ...
+
+    def cookies(self) -> list[Cookie]:
+        """The cookies the transport keeps, those sites have set included."""
+        ...
+
+
 class HttpTransport:
-    """Sends GET requests over one aiohttp session, without following redirects.
+    """Sends GET requests over one aiohttp session, without following redirects: a `Transport`.
 
     `get()` makes a single request and returns a `Response`; a redirect
     comes back as one, with its Location header as `final_url`, for the
@@ -167,16 +210,11 @@ class HttpTransport:
         truncate_at: int | None,
         timeout: aiohttp.ClientTimeout,
     ) -> Response:
-        """Perform the GET request and read the body up to its size limit.
+        """Perform the GET request and read the body up to its size limit, as `Transport.get` says.
 
-        With `html_only`, the body of a response whose Content-Type is not
-        HTML is not read: the content is empty and the size is 0. With
-        `raw_limit`, the body is returned as bytes and the content is empty;
-        over `raw_limit` bytes it fails with `SitemapError`. With
-        `truncate_at`, the body is cut to that many bytes. Otherwise a body
-        over `max_page_size` fails with `PageTooLargeError`.
-        The size is measured after content decoding (gzip, deflate, ...),
-        so it may be larger than the number of bytes sent over the network.
+        The size limit is `max_page_size`. The size is measured after
+        content decoding (gzip, deflate, ...), so it may be larger than the
+        number of bytes sent over the network.
         """
         # Checked on every request: close() may run while the caller waits
         # for its turn, and the failure is that of one URL only.
