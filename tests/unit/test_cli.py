@@ -37,6 +37,8 @@ def test_options_are_shaped_like_the_configuration():
             "--output", "pages.jsonl",
             "--output", "sqlite:///pages.db",
             "--overwrite",
+            "--cookies-file", "cookies.txt",
+            "--save-cookies", "saved.txt",
             "--no-respect-robots",
             "--no-same-domain-only",
             "--rate-limit", "2.5",
@@ -52,6 +54,7 @@ def test_options_are_shaped_like_the_configuration():
         "crawler": {"max_pages": 7, "max_depth": 0, "respect_robots": False, "rate_limit": 2.5},
         "filters": {"same_domain_only": False},
         "storage": {"outputs": ["pages.jsonl", "sqlite:///pages.db"], "overwrite": True},
+        "session": {"cookies_file": "cookies.txt", "save_cookies": "saved.txt"},
         "report": {"stats_json": "stats.json", "html": "report.html"},
         "logging": {"level": "DEBUG", "file": "crawler.log"},
     }
@@ -78,6 +81,20 @@ def test_overwrite_wins_over_the_file(option, expected, tmp_path):
 
     assert build_config(parse_args(["--config", config, option])).storage.overwrite is expected
     assert build_config(parse_args(["--config", config])).storage.overwrite is not expected
+
+
+def test_cookie_options_keep_the_rest_of_the_session_of_the_file(tmp_path):
+    config = write_config(
+        tmp_path,
+        {
+            "urls": ["https://example.com/"],
+            "session": {"save_cookies": "file.txt", "headers": {"Accept-Language": "en"}},
+        },
+    )
+
+    session = build_config(parse_args(["--config", config, "--save-cookies", "flag.txt"])).session
+
+    assert (session.save_cookies, session.headers) == ("flag.txt", {"Accept-Language": "en"})
 
 
 def test_crawl_stays_on_the_start_hosts_by_default():

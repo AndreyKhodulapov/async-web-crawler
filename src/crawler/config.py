@@ -8,7 +8,8 @@ import re
 import sys
 import types
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field
+from http.cookiejar import Cookie
 from pathlib import Path
 from typing import Any, Self, Union, get_args, get_origin, get_type_hints
 
@@ -18,6 +19,15 @@ from crawler.client import AsyncCrawler
 from crawler.exceptions import ConfigError
 from crawler.filters import extension_problem, normalize_extension
 from crawler.robots import product_token
+from crawler.session import (
+    cookie_domain_problem,
+    cookie_name_problem,
+    cookie_value_problem,
+    header_name_problem,
+    header_value_problem,
+    load_cookies_file,
+    make_cookie,
+)
 from crawler.storage import CompositeStorage, DataStorage, storage_from_output
 from crawler.urls import is_valid_http_url
 
@@ -43,21 +53,39 @@ Check = Callable[[Any], str | None]
 
 
 def _option(
-    default: Any,
+    default: Any = MISSING,
     *,
+    default_factory: Callable[[], Any] | None = None,
     minimum: float | None = None,
     above: float | None = None,
     maximum: float | None = None,
     check: Check | None = None,
+    check_name: Check | None = None,
     normalize: Callable[[Any], Any] | None = None,
+    secret: bool = False,
 ) -> Any:
     """A field of a section with the limits of its value: `minimum <= value <= maximum`, `value > above`.
 
-    `check` looks at a value, or at every item of a list; `normalize`
-    changes the value before the checks.
+    A field without a default or a `default_factory` is a key that must be
+    given. `check` looks at a value, or at every item of a list or a
+    mapping; `check_name` at every name of a mapping; `normalize` changes
+    the value before the checks. A `secret` value, such as a token, is
+    shown neither in the messages of the checks nor in the `repr()` of its
+    section.
     """
-    limits = {"minimum": minimum, "above": above, "maximum": maximum, "check": check, "normalize": normalize}
-    return field(default=default, metadata={name: limit for name, limit in limits.items() if limit is not None})
+    limits = {
+        "minimum": minimum,
+        "above": above,
+        "maximum": maximum,
+        "check": check,
+        "check_name": check_name,
+        "normalize": normalize,
+        "secret": secret or None,
+    }
+    metadata = {name: limit for name, limit in limits.items() if limit is not None}
+    if default_factory is not None:
+        return field(default_factory=default_factory, metadata=metadata, repr=not secret)
+    return field(default=default, metadata=metadata, repr=not secret)
 
 
 # Whitespace, C0 and C1 controls. Inside a URL they are a mistake rather than
@@ -95,11 +123,8 @@ def _not_blank(value: str) -> str | None:
     return None if value.strip() else "must not be empty"
 
 
-def _header_value(value: str) -> str | None:
-    if not value:
-        return "must not be empty"
-    # A line break would end the header and start another one; aiohttp refuses to send it.
-    return None if value.isprintable() else "must be one line without control characters"
+def _cookie_path(value: str) -> str | None:
+    return None if value.startswith("/") and value.isprintable() else 'expected a path that starts with "/"'
 
 
 def _file_path(value: str) -> str | None:
@@ -126,9 +151,9 @@ class CrawlOptions:
     min_delay: float = _option(0.0, minimum=0)
     jitter: float = _option(0.0, minimum=0)
     respect_robots: bool = True
-    user_agent: str = _option(AsyncCrawler.DEFAULT_USER_AGENT, check=_header_value, normalize=str.strip)
+    user_agent: str = _option(AsyncCrawler.DEFAULT_USER_AGENT, check=header_value_problem, normalize=str.strip)
     user_agents: tuple[str, ...] = _option(
-        (), check=_header_value, normalize=str.strip
+        (), check=header_value_problem, normalize=str.strip
     )  # rotated; same robots.txt name as `user_agent`
     total_timeout: float = _option(30.0, above=0)
     connect_timeout: float = _option(10.0, above=0)
@@ -181,6 +206,52 @@ class FilterOptions:
     exclude_extensions: tuple[str, ...] = _option(
         EXCLUDED_EXTENSIONS, check=extension_problem, normalize=normalize_extension
     )  # links to files with these extensions are not followed; [] follows them all
+
+
+@dataclass(frozen=True)
+class CookieOptions:
+    """A cookie of `session.cookies`: sent from the first request to the hosts of its domain only.
+
+    A `domain` such as "example.com" is that host only; ".example.com" is
+    the host and its subdomains.
+    """
+
+    name: str = _option(check=cookie_name_problem)
+    value: str = _option(check=cookie_value_problem, secret=True)
+    domain: str = _option(check=cookie_domain_problem, normalize=lambda domain: domain.strip().lower())
+    path: str = _option("/", check=_cookie_path)
+    secure: bool = False  # sent over https only
+
+
+@dataclass(frozen=True)
+class SessionOptions:
+    """Section `session`: the cookies and the headers of the requests, see `AsyncCrawler`."""
+
+    keep_cookies: bool = True  # false sends no cookies and keeps none: a site cannot keep a session of the crawler
+    cookies: tuple[CookieOptions, ...] = ()
+    cookies_file: str | None = _option(None, check=_file_path)  # Netscape cookies.txt, as browsers and curl export it
+    save_cookies: str | None = _option(None, check=_file_path)  # the cookies are written there after the crawl
+    headers: Mapping[str, str] = _option(
+        default_factory=dict, check=header_value_problem, check_name=header_name_problem, secret=True
+    )  # sent with every request, to every host
+
+    def initial_cookies(self) -> list[Cookie]:
+        """The cookies of `cookies_file`, then those of `cookies`, which win over them.
+
+        Raises:
+            ConfigError: `cookies_file` cannot be read or is not a cookies.txt file.
+        """
+        cookies = []
+        if self.cookies_file is not None:
+            try:
+                cookies = load_cookies_file(self.cookies_file)
+            except (OSError, ValueError) as error:
+                raise ConfigError([f"session.cookies_file: cannot read the cookies: {error}"]) from error
+        cookies += [
+            make_cookie(cookie.name, cookie.value, cookie.domain, path=cookie.path, secure=cookie.secure)
+            for cookie in self.cookies
+        ]
+        return cookies
 
 
 @dataclass(frozen=True)
@@ -253,6 +324,7 @@ class CrawlerConfig:
     retry: RetryOptions = field(default_factory=RetryOptions)
     circuit_breaker: CircuitBreakerOptions = field(default_factory=CircuitBreakerOptions)
     filters: FilterOptions = field(default_factory=FilterOptions)
+    session: SessionOptions = field(default_factory=SessionOptions)
     storage: StorageOptions = field(default_factory=StorageOptions)
     logging: LoggingOptions = field(default_factory=LoggingOptions)
     report: ReportOptions = field(default_factory=ReportOptions)
@@ -275,7 +347,11 @@ class CrawlerConfig:
         return config
 
     def to_dict(self) -> dict[str, Any]:
-        """The configuration as a mapping that `from_dict` takes and JSON or YAML can hold."""
+        """The configuration as a mapping that `from_dict` takes and JSON or YAML can hold.
+
+        It holds the secrets of the configuration, such as the values of
+        cookies and headers, which `repr()` leaves out: it is not for logs.
+        """
         return _plain(dataclasses.asdict(self))
 
 
@@ -391,14 +467,19 @@ def _merge(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> dict[str, A
 
 
 def _build(section: type, mapping: Any, path: str, problems: list[str]) -> Any:
-    """An instance of a section for its mapping; what is wrong goes to `problems`, the defaults stay."""
-    if mapping is None and path:  # a section with every key commented out
+    """An instance of a section for its mapping; what is wrong goes to `problems`, the defaults stay.
+
+    A section with keys that must be given, such as an item of a list, is
+    `_INVALID` instead when one of them is missing or wrong.
+    """
+    fields = {item.name: item for item in dataclasses.fields(section)}
+    required = [name for name, item in fields.items() if item.default is MISSING and item.default_factory is MISSING]
+    if mapping is None and path and not required:  # a section with every key commented out
         return section()
     if not isinstance(mapping, Mapping):
         problems.append(f"{path or 'the top level'}: expected a mapping of keys to values, got {_show(mapping)}")
-        return section()
+        return _INVALID if required else section()
     hints = get_type_hints(section)
-    fields = {item.name: item for item in dataclasses.fields(section)}
     values = {}
     for key, value in mapping.items():
         where = f"{path}.{key}" if path else str(key)
@@ -412,15 +493,24 @@ def _build(section: type, mapping: Any, path: str, problems: list[str]) -> Any:
             converted = _convert(value, hints[key], fields[key].metadata, where, problems)
             if converted is not _INVALID:
                 values[key] = converted
+    for name in required:
+        if name not in mapping:
+            problems.append(f'{path}: the key "{name}" is required')
+    if any(name not in values for name in required):
+        return _INVALID
     return section(**values)
 
 
 def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, problems: list[str]) -> Any:
     """The value as the type `hint` of its field, or `_INVALID` with the reason in `problems`."""
+    if dataclasses.is_dataclass(hint):  # an item of a list of sections
+        return _build(hint, value, path, problems)
     if get_origin(hint) in (Union, types.UnionType):  # only `X | None` is used
         if value is None:
             return None
         hint = next(option for option in get_args(hint) if option is not type(None))
+    if get_origin(hint) is Mapping:
+        return _convert_mapping(value, hint, limits, path, problems)
     if get_origin(hint) is tuple:
         if not isinstance(value, list):
             problems.append(f"{path}: expected a list, got {_show(value)}")
@@ -438,15 +528,37 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
         except OverflowError:  # a whole number above 1e308
             fits = False
     if not fits or (hint is float and not math.isfinite(value)):
-        problems.append(f"{path}: expected {expected}, got {_show(value)}")
+        problems.append(f"{path}: expected {expected}{_got(value, limits)}")
         return _INVALID
     if "normalize" in limits:
         value = limits["normalize"](value)
     problem = _out_of_limits(value, limits)
     if problem:
-        problems.append(f"{path}: {problem}, got {_show(value)}")
+        problems.append(f"{path}: {problem}{_got(value, limits)}")
         return _INVALID
     return value
+
+
+def _got(value: Any, limits: Mapping[str, Any]) -> str:
+    """The end of a message about a value: the value, unless it is a secret."""
+    return "" if "secret" in limits else f", got {_show(value)}"
+
+
+def _convert_mapping(value: Any, hint: Any, limits: Mapping[str, Any], path: str, problems: list[str]) -> Any:
+    """A mapping of names to values, such as `session.headers`; `check_name` looks at the names."""
+    if not isinstance(value, Mapping):
+        problems.append(f"{path}: expected a mapping of names to values, got {_show(value)}")
+        return _INVALID
+    name_hint, item_hint = get_args(hint)
+    name_limits = {"check": limits["check_name"]} if "check_name" in limits else {}
+    item_limits = {name: limit for name, limit in limits.items() if name != "check_name"}
+    converted = {}
+    for name, item in value.items():
+        where = f"{path}.{name}"
+        converted[_convert(name, name_hint, name_limits, where, problems)] = _convert(
+            item, item_hint, item_limits, where, problems
+        )
+    return _INVALID if _INVALID in converted or _INVALID in converted.values() else converted
 
 
 def _out_of_limits(value: Any, limits: Mapping[str, Any]) -> str | None:
@@ -470,6 +582,14 @@ def _check_together(config: CrawlerConfig, problems: list[str]) -> None:
                 f'crawler.user_agents[{index}]: must use the robots.txt name "{name}" of crawler.user_agent, '
                 f"got {_show(agent)}"
             )
+    session = config.session
+    if not session.keep_cookies:
+        for key in ("cookies", "cookies_file", "save_cookies"):
+            if getattr(session, key):
+                problems.append(f"session.{key}: needs session.keep_cookies, which is false")
+    names = [name.lower() for name in session.headers]
+    for name in sorted({name for name in names if names.count(name) > 1}):
+        problems.append(f'session.headers: the header "{name}" is given twice, in different case')
     try:
         "".encode(config.storage.csv_encoding)
     except (LookupError, ValueError):  # ValueError: a name with a null character, or the codec "undefined"

@@ -63,6 +63,19 @@ filters:
                        exe, dmg, iso,
                        css, js]
 
+# Cookies and headers of the requests. Their values are secrets: they stay
+# out of the log, the summary and the reports, so keep this file private too.
+session:
+  keep_cookies: true    # send back the cookies sites set; false keeps none, so no site can keep a session
+  # Cookies sent from the first request, each to its own domain only:
+  # example.com is that host, .example.com the host and its subdomains.
+  cookies: []           # e.g. [{name: sessionid, value: "...", domain: example.com, path: /, secure: true}]
+  cookies_file: null    # e.g. cookies.txt, in the Netscape format browser extensions and curl -c export
+  save_cookies: null    # e.g. cookies.txt; written after the crawl, readable by its owner only
+  # Sent with every request to every host, robots.txt and redirects to other
+  # sites included; User-Agent, Cookie and Host have keys of their own.
+  headers: {}           # e.g. {Accept-Language: en, Authorization: "Bearer ..."}
+
 # Where the crawled pages are saved: files, by extension (.jsonl, .json,
 # .csv, .db), or database URLs (sqlite:///pages.db, postgresql://...).
 storage:

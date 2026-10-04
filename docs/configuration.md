@@ -159,6 +159,56 @@ to files unless given `same_domain_only=True` and `exclude_extensions`; the
 configuration turns both on, so that a crawl stays on the site it was
 started on.
 
+### `session`
+
+The cookies and the headers of the requests; see
+[Cookies and headers](api.md#cookies-and-headers).
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `keep_cookies` | true or false | `true` | keep the cookies sites set and send them back, as a browser does; `false` sends and keeps none, so no site can keep a session of the crawler |
+| `cookies` | list of cookies | `[]` | cookies sent from the first request: `{name, value, domain, path, secure}`, see below |
+| `cookies_file` | string or `null` | `null` | a Netscape `cookies.txt` file to take cookies from, as browser extensions and `curl -c` export it |
+| `save_cookies` | string or `null` | `null` | write the cookies to this `cookies.txt` file after the crawl, those sites set included; only its owner can read it |
+| `headers` | mapping of names to values | `{}` | headers sent with every request, such as `Authorization` or `Accept-Language` |
+
+A cookie of `cookies` needs `name`, `value` and `domain`; `path` is `/` and
+`secure` (sent over https only) is `false` unless given. The domain is
+required so that a cookie never goes to a host it is not for:
+`example.com` is that host only, `.example.com` the host and its subdomains,
+as in a `cookies.txt` file. The cookies of `cookies_file` come first, those
+of `cookies` win over them. A cookie of an expired date in the file is left
+out; one without a date lasts for the crawl. aiohttp keeps no cookies of IP
+addresses, so a cookie for `127.0.0.1` is an error here and is left out of
+the file with a warning: reach such a site by its name, e.g. `localhost`.
+
+```yaml
+session:
+  cookies_file: cookies.txt    # exported from the browser after logging in
+  save_cookies: cookies.txt    # the session the site renewed, for the next run
+  cookies:
+    - {name: consent, value: "yes", domain: .example.com}
+  headers:
+    Accept-Language: en
+    Authorization: "Bearer ..."
+```
+
+The headers go to every request: pages, robots.txt and sitemaps, the hosts
+of other sites and the targets of redirects to them included. So an
+`Authorization` header reaches a third-party site the crawl follows a link
+or a redirect to. Keep `filters.same_domain_only: true`, the default, with
+such a header. `User-Agent`, `Cookie` and `Host` cannot be set here: they
+come from `crawler.user_agent`, the cookies and the URL.
+
+Rotated `crawler.user_agents` with cookies show a site one session in
+several browsers; a site that ties its session to the browser may end it.
+
+The values of the cookies and the headers are secrets: they are not
+written to the log, the summary, the reports or the messages of the
+validation, and `repr()` of the configuration leaves them out.
+`CrawlerConfig.to_dict()` keeps them, so that `from_dict()` can read it
+back. Keep a file with them private, or keep them in `cookies_file`.
+
 ### `storage`
 
 Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
@@ -215,9 +265,15 @@ written. A problem is reported by the path of its key:
 - an output with an unknown extension, or a URL of an unknown database;
 - a User-Agent with a line break or another control character in it, a path
   with a null character or in the home directory of an unknown user;
+- a cookie without a name, a value or a domain, a cookie of an IP address,
+  a header that has a key of its own (`User-Agent`, `Cookie`, `Host`) or is
+  given twice in different case; the values of cookies and headers are not
+  shown;
 - a key written twice in YAML (plain YAML would keep the last one silently);
 - keys that do not go together: `sitemaps.from_robots` without
-  `crawler.respect_robots`, a `user_agents` entry with another bot name;
+  `crawler.respect_robots`, a `user_agents` entry with another bot name,
+  `session.cookies`, `cookies_file` or `save_cookies` with
+  `session.keep_cookies: false`;
 - a file that cannot be read, has another extension or is not valid YAML or JSON;
 - in the file of `--urls-file`, a line that is not an http(s) URL, reported
   by its number, or a file that cannot be read or is not UTF-8; `-` with

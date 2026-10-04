@@ -62,6 +62,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="start output files anew, or add to them; databases keep a row per URL either way",
     )
     parser.add_argument(
+        "--cookies-file",
+        metavar="PATH",
+        help="send the cookies of a Netscape cookies.txt file, as a browser extension or curl -c exports it",
+    )
+    parser.add_argument(
+        "--save-cookies", metavar="PATH", help="write the cookies to a cookies.txt file after the crawl"
+    )
+    parser.add_argument(
         "--respect-robots",
         action=argparse.BooleanOptionalAction,
         help="follow robots.txt, nofollow and noindex, or do not",
@@ -112,6 +120,8 @@ def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         ("filters", "same_domain_only", args.same_domain_only),
         ("storage", "outputs", args.output),
         ("storage", "overwrite", args.overwrite),
+        ("session", "cookies_file", args.cookies_file),
+        ("session", "save_cookies", args.save_cookies),
         ("report", "stats_json", args.stats_json),
         ("report", "html", args.report),
         ("logging", "level", args.log_level),
@@ -177,6 +187,8 @@ def print_summary(crawler: AdvancedCrawler, *, interrupted: bool = False) -> Non
         print(f"Saved: {saving.saved} pages to {', '.join(map(hide_password, outputs))}{not_saved}")
     if crawler.reports:
         print(f"Reports: {', '.join(map(str, crawler.reports))}")
+    if crawler.cookie_file is not None:
+        print(f"Cookies: {crawler.cookie_file}")
     if crawler.config.logging.file is not None:
         print(f"Log: {crawler.config.logging.file}")
 
@@ -185,11 +197,12 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
     """Crawl by the configuration, print the summary; return the exit code.
 
     Cancelled (Ctrl-C), it stops the crawl, writes the reports of the pages
-    fetched so far and saves those pages before the cancellation goes on.
+    fetched so far, the cookies and those pages before the cancellation goes on.
     So it does when the progress cannot be shown, e.g. stderr is a pipe
     that was closed.
 
     Raises:
+        ConfigError: the file of `session.cookies_file` cannot be read.
         OSError: a directory cannot be created, or the log file cannot be opened.
         StorageError: an output file or the database cannot be opened; nothing is requested.
     """
@@ -207,6 +220,7 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
                 # A storage that could not be opened stopped the crawl before
                 # it requested anything: there is nothing to report.
                 crawler.write_reports()
+                crawler.save_cookies()
             if isinstance(error, asyncio.CancelledError):
                 await crawler.close()  # writes the pages the storage still holds, so the summary counts them
                 print_summary(crawler, interrupted=True)
@@ -227,6 +241,9 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     try:
         return asyncio.run(run(config, progress=not args.no_progress))
+    except ConfigError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     except (OSError, StorageError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

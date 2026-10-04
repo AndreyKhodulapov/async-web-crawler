@@ -6,7 +6,8 @@ import itertools
 import logging
 import socket
 import ssl
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from http.cookiejar import Cookie
 from typing import NamedTuple
 
 import aiohttp
@@ -26,6 +27,7 @@ from crawler.exceptions import (
 )
 from crawler.parser import is_html_content_type
 from crawler.retry import parse_retry_after
+from crawler.session import CookieJar
 from crawler.urls import is_valid_http_url
 
 logger = logging.getLogger(__name__)
@@ -59,7 +61,11 @@ class HttpTransport:
     `FetchTimeoutError`, `CertificateError`, `DNSError`, `NetworkError`,
     `PageTooLargeError`, or `SitemapError` for a raw body over its limit.
     Requests carry `user_agent`, or the `user_agents` in turn when there
-    are any.
+    are any, and the `headers`.
+
+    The session keeps the cookies that sites set, along with the starting
+    `cookies`, and sends them back as a browser would; `cookies()` gives
+    them all. With `keep_cookies=False` it sends and keeps none.
     """
 
     REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -74,10 +80,17 @@ class HttpTransport:
         user_agent: str,
         user_agents: Sequence[str] = (),
         max_page_size: int | None,
+        headers: Mapping[str, str] | None = None,
+        cookies: Iterable[Cookie] = (),
+        keep_cookies: bool = True,
     ) -> None:
         self._max_concurrent = max_concurrent
         self._timeout = timeout
-        self._user_agent = user_agent
+        self._headers = {"User-Agent": user_agent, **(headers or {})}
+        self._initial_cookies = list(cookies)
+        self._keep_cookies = keep_cookies
+        # Made with the session, and kept after it is closed for cookies().
+        self._cookie_jar: CookieJar | None = None
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
         self._max_page_size = max_page_size
         self._session: aiohttp.ClientSession | None = None
@@ -105,11 +118,22 @@ class HttpTransport:
         ssl_context = ssl.create_default_context()
         ssl_context.load_verify_locations(cafile=certifi.where())
         connector = aiohttp.TCPConnector(limit=self._max_concurrent, ttl_dns_cache=300, ssl=ssl_context)
+        cookie_jar: aiohttp.abc.AbstractCookieJar = aiohttp.DummyCookieJar()
+        if self._keep_cookies:
+            cookie_jar = self._cookie_jar = CookieJar()
+            cookie_jar.add(self._initial_cookies)
         return aiohttp.ClientSession(
             connector=connector,
             timeout=self._timeout,
-            headers={"User-Agent": self._user_agent},
+            headers=self._headers,
+            cookie_jar=cookie_jar,
         )
+
+    def cookies(self) -> list[Cookie]:
+        """The cookies the session keeps, the starting ones before the first request; none without `keep_cookies`."""
+        if not self._keep_cookies:
+            return []
+        return list(self._initial_cookies) if self._cookie_jar is None else self._cookie_jar.export()
 
     async def get(
         self,

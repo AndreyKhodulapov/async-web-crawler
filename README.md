@@ -29,6 +29,10 @@ configuration file, by command-line options, or from Python.
   `noindex` of links, robots meta tags and `X-Robots-Tag` (also those
   that name the crawler), a
   configurable User-Agent with rotation
+- **Sessions**: cookies kept between requests as a browser keeps them,
+  taken from a `cookies.txt` file exported by the browser and saved back
+  after the crawl; extra headers of every request; their values never
+  reach the log or the reports
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that
   grow with every retry
@@ -131,6 +135,8 @@ when the configuration has sitemaps to crawl.
 | `--max-depth N` | `crawler.max_depth` | links followed from a start URL; 0 crawls the start URLs only |
 | `--output PATH` | `storage.outputs` | where to save the pages: a `.jsonl`, `.json`, `.csv` or `.db` file, or a database URL; repeat for several, in place of those of the file |
 | `--overwrite`, `--no-overwrite` | `storage.overwrite` | start output files anew, or add to them (the default; the log warns about a file that is not empty); a database keeps a row per URL either way |
+| `--cookies-file PATH` | `session.cookies_file` | send the cookies of a Netscape `cookies.txt` file, as a browser extension or `curl -c` exports it |
+| `--save-cookies PATH` | `session.save_cookies` | write the cookies to a `cookies.txt` file after the crawl, readable by its owner only |
 | `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, `nofollow` and `noindex`, or do not |
 | `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
@@ -258,6 +264,18 @@ storages. All of it is described in the [API reference](docs/api.md).
   the sitemaps of several hosts, a list of start URLs on several hosts,
   `same_domain_only: false` or a site on many subdomains, set `rate_limit`
   higher or to `null` and rely on `max_per_domain`. See [docs/concurrency_control.md](docs/concurrency_control.md).
+- **No login form.** The crawler does not fill in and send a login form.
+  A site behind a login is crawled with the cookies of a browser session:
+  log in in the browser, export its cookies to `cookies.txt` and pass it
+  with `--cookies-file`. `--save-cookies` keeps the session the site
+  renewed for the next run.
+- **No cookies for IP addresses.** aiohttp keeps cookies of host names
+  only, so a site reached as `http://127.0.0.1:8080/` cannot keep a session
+  of the crawler; reach it as `http://localhost:8080/`.
+- **Extra headers go to every host.** The headers of `session.headers`
+  are sent to every request, robots.txt and other sites included: an
+  `Authorization` header reaches a third-party site that the crawl follows
+  a link or a redirect to. Use it with `same_domain_only`, the default.
 - **Not for URLs from strangers.** Links to private addresses
   (`127.0.0.1`, `10.0.0.0/8`, the cloud metadata address) are followed
   like any other. The crawler is a command-line tool for sites you choose,

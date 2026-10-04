@@ -48,6 +48,7 @@ from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.session import load_cookies_file, make_cookie, save_cookies_file
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
 from crawler.storage import (
@@ -131,9 +132,12 @@ __all__ = [
     "is_same_host",
     "is_valid_http_url",
     "load_config",
+    "load_cookies_file",
     "load_urls",
+    "make_cookie",
     "product_token",
     "register_database",
+    "save_cookies_file",
     "show_progress",
     "storage_from_env",
     "storage_from_output",

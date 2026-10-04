@@ -28,6 +28,8 @@ class SiteState:
     `sitemaps` maps the names of the files under /sitemaps/ to their
     bodies; the first `sitemap_failures` requests for them answer 503.
     `sitemap_headers` are added to the responses with them.
+    `headers` keeps the request headers of the latest request for each
+    path recorded, /cookies/ pages included.
     """
 
     def __init__(self) -> None:
@@ -46,10 +48,12 @@ class SiteState:
         self.sitemaps: dict[str, bytes] = {}
         self.sitemap_failures = 0
         self.sitemap_headers: dict[str, str] = {}
+        self.headers: dict[str, dict[str, str]] = {}
 
     def record(self, request: web.Request) -> None:
         self.hits[request.path] += 1
         self.log.append((request.path, time.monotonic()))
+        self.headers[request.path] = dict(request.headers)
 
 
 SITE_STATE = web.AppKey("site_state", SiteState)
@@ -88,6 +92,32 @@ async def encoding_page(request: web.Request) -> web.Response:
     body, charset, _ = ENCODING_PAGES[request.match_info["name"]]
     content_type = "text/html" if charset is None else f"text/html; charset={charset}"
     return web.Response(body=body, headers={"Content-Type": content_type})
+
+
+async def set_cookies(request: web.Request) -> web.Response:
+    """Sets a cookie for every parameter of the query but `redirect`, which redirects to /cookies/echo instead.
+
+    `/cookies/set?sid=abc` answers a page that links to /cookies/echo; a
+    value may carry attributes after ";", such as "abc; Max-Age=60".
+    """
+    request.app[SITE_STATE].record(request)
+    cookies = {name: value for name, value in request.query.items() if name != "redirect"}
+    if "redirect" in request.query:
+        response = web.Response(status=302, headers={"Location": "/cookies/echo"})
+    else:
+        response = web.Response(
+            text='<html><body><a href="/cookies/echo">echo</a></body></html>', content_type="text/html"
+        )
+    for name, value in cookies.items():
+        response.headers.add("Set-Cookie", f"{name}={value}")
+    return response
+
+
+async def echo_cookies(request: web.Request) -> web.Response:
+    """A page that lists the cookies of the request, as "cookie:name=value", one per paragraph."""
+    request.app[SITE_STATE].record(request)
+    items = "".join(f"<p>cookie:{name}={value}</p>" for name, value in sorted(request.cookies.items()))
+    return web.Response(text=f"<html><body>{items}</body></html>", content_type="text/html")
 
 
 async def robots_txt(request: web.Request) -> web.StreamResponse:
@@ -281,6 +311,8 @@ async def server(aiohttp_server):
     app.router.add_get("/shop/list", shop_list)
     app.router.add_get("/shop/item/{n}", shop_item)
     app.router.add_get("/wide/{n}", wide_page)
+    app.router.add_get("/cookies/set", set_cookies)
+    app.router.add_get("/cookies/echo", echo_cookies)
     return await aiohttp_server(app)
 
 

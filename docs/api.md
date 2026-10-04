@@ -13,6 +13,7 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Circuit breaker](#circuit-breaker) | `CircuitBreaker` |
 | [Error statistics](#error-statistics) | `error_stats()` |
 | [Timeouts](#timeouts) | connect, read and total timeouts |
+| [Cookies and headers](#cookies-and-headers) | the session of the crawler, `cookies.txt` files |
 | [Crawling](#crawling) | `crawl()`: depth, filters, sitemaps, state of a crawl |
 | [Page statistics](#page-statistics) | `CrawlerStats`, export to JSON and HTML |
 | [AdvancedCrawler](#advancedcrawler) | the crawler set up by a configuration |
@@ -335,6 +336,43 @@ and the GIL runs the parses one at a time anyway. With the defaults no
 more than two pages of 3 MiB are parsed at once, about 250 MB; a site of
 larger pages needs a larger `max_page_size`, and the memory grows with it.
 
+## Cookies and headers
+
+The crawler keeps the cookies sites set and sends them back, as a browser
+does; robots.txt and sitemaps share them with the pages. Starting cookies,
+extra headers and the cookies of a `cookies.txt` file are given to the
+crawler, and its cookies are taken back after the crawl:
+
+```python
+from crawler import AsyncCrawler, load_cookies_file, make_cookie, save_cookies_file
+
+cookies = load_cookies_file("cookies.txt")  # exported from the browser
+cookies.append(make_cookie("consent", "yes", ".example.com"))  # the host and its subdomains
+
+async with AsyncCrawler(cookies=cookies, headers={"Accept-Language": "en"}) as crawler:
+    await crawler.crawl(["https://example.com/account/"], same_domain_only=True)
+    save_cookies_file(crawler.export_cookies(), "cookies.txt")
+```
+
+| Name | What it does |
+|------|--------------|
+| `AsyncCrawler(headers=)` | headers sent with every request to every host; `User-Agent`, `Cookie` and `Host` are refused (`ValueError`) |
+| `AsyncCrawler(cookies=)` | `http.cookiejar.Cookie` objects sent from the first request, each to its own domain |
+| `AsyncCrawler(keep_cookies=False)` | no cookies sent or kept (aiohttp's `DummyCookieJar`); with `cookies` it is a `ValueError` |
+| `export_cookies()` | the cookies the crawler keeps, those sites set included, as `http.cookiejar.Cookie`; also after `close()` |
+| `make_cookie(name, value, domain, path=, secure=, expires=, http_only=)` | a cookie; `example.com` is that host only, `.example.com` also its subdomains |
+| `load_cookies_file(path)` | the cookies of a Netscape `cookies.txt` file; expired ones are left out, session ones kept, those the crawler cannot send (of an IP address, with an invalid name) left out with a warning. A malformed file raises `ValueError` whose message does not quote it |
+| `save_cookies_file(cookies, path)` | writes a `cookies.txt` file with mode `0600`, session cookies included; an existing file is replaced whole, so it gets that mode too |
+
+The `cookies.txt` format is read and written by `http.cookiejar`, never with
+`pickle`, which aiohttp's `CookieJar.save()` and `load()` use: loading a
+pickle runs the code it holds. A cookie of an IP address is a `ValueError`:
+aiohttp keeps cookies of host names only.
+
+`AdvancedCrawler` takes all of it from the `session` section (see the
+[configuration guide](configuration.md#session)) and writes `save_cookies`
+when the crawl ends; `save_cookies()` writes it after a cancelled crawl.
+
 ## Crawling
 
 `crawl()` runs `max_concurrent` workers over a priority queue of URLs. A link
@@ -563,13 +601,14 @@ asyncio.run(main())
 |--------|--------------|
 | `AdvancedCrawler(config, configure_logging=True)` | takes a `CrawlerConfig`; the defaults without one |
 | `AdvancedCrawler.from_config(path, overrides, configure_logging=True)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
-| `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section; returns the pages by URL |
+| `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section and the cookies of `session.save_cookies`; returns the pages by URL |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
 | `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics) |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
 | `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats` |
 | `reports` | the report files the latest `write_reports()` wrote |
+| `save_cookies()`, `cookie_file` | writes the cookies to `session.save_cookies` and returns the file, `None` without one or when it cannot be written (logged); `crawl()` calls it, call it yourself after a crawl that was cancelled. `cookie_file` is the file it wrote |
 
 Directories of the log, the reports and the files of the storage are created
 if they are missing. A configuration with neither `urls` nor `sitemaps.urls`

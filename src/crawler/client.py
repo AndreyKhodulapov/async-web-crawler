@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from http.cookiejar import Cookie
 from types import TracebackType
 from typing import Self
 
@@ -20,6 +21,12 @@ from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryStrategy
 from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.session import (
+    cookie_domain_problem,
+    cookie_name_problem,
+    header_name_problem,
+    header_value_problem,
+)
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
 from crawler.storage.base import DataStorage
@@ -110,6 +117,17 @@ class AsyncCrawler:
     several User-Agent strings between requests; they must all carry that
     same name, so rotation cannot sidestep robots.txt.
 
+    Every request carries the `headers`, such as Authorization or
+    Accept-Language, whatever its host: pages, robots.txt and sitemaps,
+    the hosts of other sites and redirects to them included. The crawler
+    keeps the cookies that sites set and sends them back as a browser
+    does, robots.txt and sitemaps sharing them with the pages; `cookies`
+    are there from the first request (see `load_cookies_file`), and
+    `export_cookies()` gives them all (see `save_cookies_file`). With
+    `keep_cookies=False` it sends none and keeps none: a site cannot keep
+    a session of the crawler. aiohttp keeps no cookies of IP addresses, so
+    a site reached by one gets none.
+
     `error_stats()` counts the errors of page requests and their retries
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
     counted there, and neither are the requests the circuit breaker refused
@@ -191,6 +209,9 @@ class AsyncCrawler:
         max_retry_after: float = DEFAULT_MAX_RETRY_AFTER,
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
+        headers: Mapping[str, str] | None = None,
+        cookies: Iterable[Cookie] = (),
+        keep_cookies: bool = True,
         parser: HTMLParser | None = None,
         storage: DataStorage | None = None,
         keep_pages: bool = True,
@@ -220,6 +241,19 @@ class AsyncCrawler:
                 raise ValueError(
                     f"rotated user agent {agent!r} must use the robots.txt name {robots_name!r} of user_agent"
                 )
+        headers = dict(headers or {})
+        for name, value in headers.items():
+            # The value is not shown: it may be a secret, such as a token.
+            problem = header_name_problem(name) or header_value_problem(value)
+            if problem is not None:
+                raise ValueError(f"header {name!r}: {problem}")
+        cookies = list(cookies)
+        if cookies and not keep_cookies:
+            raise ValueError("cookies need keep_cookies=True")
+        for cookie in cookies:
+            problem = cookie_name_problem(cookie.name) or cookie_domain_problem(cookie.domain)
+            if problem is not None:
+                raise ValueError(f"cookie {cookie.name!r} of {cookie.domain!r}: {problem}")
 
         # These validate their own arguments.
         self._limits = SemaphoreManager(max_concurrent, max_per_domain)
@@ -244,7 +278,11 @@ class AsyncCrawler:
             user_agent=user_agent,
             user_agents=user_agents,
             max_page_size=max_page_size,
+            headers=headers,
+            cookies=cookies,
+            keep_cookies=keep_cookies,
         )
+        self._transport = transport
         self._fetcher = Fetcher(
             transport,
             limits=self._limits,
@@ -649,6 +687,13 @@ class AsyncCrawler:
     def crawl_stats(self) -> CrawlStats:
         """Progress of the running crawl, or the result of the latest one."""
         return self._run.crawl_stats()
+
+    def export_cookies(self) -> list[Cookie]:
+        """The cookies the crawler keeps, those sites have set included; empty with `keep_cookies=False`.
+
+        They stay available after `close()`.
+        """
+        return self._transport.cookies()
 
     def error_stats(self) -> ErrorStats:
         """Errors of page requests since the latest crawl() started, or since the crawler was created."""
