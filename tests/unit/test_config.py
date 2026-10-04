@@ -701,7 +701,7 @@ class TestSession:
 
         assert found == ["session.cookies[0].value: expected a string", "session.headers.X-Key: expected a string"]
 
-    @pytest.mark.parametrize("name", ["User-Agent", "user-agent", "Cookie", "HOST"])
+    @pytest.mark.parametrize("name", ["User-Agent", "user-agent", "Cookie", "HOST", "Proxy-Authorization"])
     def test_headers_with_keys_of_their_own_are_refused(self, name):
         (found,) = problems({"session": {"headers": {name: "value"}}})
 
@@ -842,7 +842,7 @@ class TestProxy:
                     "urls": [
                         "http://user:pr0xyp4ss@proxy.example:3128",
                         "http://proxy.example:3128",
-                        "http://user:other@proxy.example:3128",
+                        "http://user:other@Proxy.Example:3128",  # a host in any case is one proxy
                     ]
                 }
             }

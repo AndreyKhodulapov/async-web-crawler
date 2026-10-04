@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import aiohttp
 import certifi
 from bs4.dammit import EncodingDetector
+from yarl import URL
 
 from crawler.exceptions import (
     CertificateError,
@@ -231,7 +232,8 @@ class HttpTransport:
                 proxy=None if proxy is None else proxy.url,
                 proxy_headers=proxy_headers,
             ) as response:
-                if proxy is not None and response.status == 407:
+                # Inside the tunnel of an https URL the site answers; the proxy refuses CONNECT itself.
+                if proxy is not None and response.status == 407 and urlsplit(url).scheme.lower() == "http":
                     raise ProxyNetworkError(url, f"proxy {proxy.label} refused the request: HTTP 407 {response.reason}")
                 response.raise_for_status()
                 # aiohttp reports "application/octet-stream" when the header
@@ -293,8 +295,13 @@ class HttpTransport:
         except aiohttp.ClientProxyConnectionError as exc:
             assert proxy is not None
             raise ProxyNetworkError(url, f"proxy {proxy.label}: {type(exc).__name__}: {exc}") from exc
-        except aiohttp.ClientConnectorCertificateError as exc:
-            raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
+        except (aiohttp.ClientConnectorCertificateError, aiohttp.ClientConnectorSSLError) as exc:
+            if proxy is not None and _is_proxy_address(proxy, exc.host, exc.port):
+                # TLS with an https proxy, not with the site inside the tunnel.
+                raise ProxyNetworkError(url, f"proxy {proxy.label}: {type(exc).__name__}: {exc}") from exc
+            if isinstance(exc, aiohttp.ClientConnectorCertificateError):
+                raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
+            raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientConnectorDNSError as exc:
             if proxy is not None:
                 # The client looks up the proxy alone; the proxy looks up the site.
@@ -331,6 +338,12 @@ class HttpTransport:
             chunks.append(chunk)
             size += len(chunk)
         return b"".join(chunks)
+
+
+def _is_proxy_address(proxy: Proxy, host: str, port: int | None) -> bool:
+    """Whether a connection that failed, by its host and port, was the one to `proxy`."""
+    address = URL(proxy.url)
+    return (address.raw_host, address.port) == (host, port)
 
 
 def _no_such_host(exc: OSError) -> bool:

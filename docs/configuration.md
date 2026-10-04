@@ -197,8 +197,9 @@ The headers go to every request: pages, robots.txt and sitemaps, the hosts
 of other sites and the targets of redirects to them included. So an
 `Authorization` header reaches a third-party site the crawl follows a link
 or a redirect to. Keep `filters.same_domain_only: true`, the default, with
-such a header. `User-Agent`, `Cookie` and `Host` cannot be set here: they
-come from `crawler.user_agent`, the cookies and the URL.
+such a header. `User-Agent`, `Cookie`, `Host` and `Proxy-Authorization`
+cannot be set here: they come from `crawler.user_agent`, the cookies, the
+URL and the password in `proxy.urls`, which goes to the proxy only.
 
 Rotated `crawler.user_agents` with cookies show a site one session in
 several browsers; a site that ties its session to the browser may end it.
@@ -237,7 +238,9 @@ a stolen session. `per_request` spreads the requests of one site over all
 the proxies.
 
 A proxy fails a request when it cannot be reached, its name does not
-resolve, or it asks for a password (HTTP 407). After `max_failures` such
+resolve, the TLS of an `https://` proxy fails, or it asks for a password
+(HTTP 407, to CONNECT or to the request of an `http://` URL; a 407 from
+inside the tunnel of an `https://` URL is the site's). After `max_failures` such
 failures in a row it is out of rotation for `cooldown` seconds, and the
 requests go through the other proxies; any response through it clears
 the count. Once back, one more failure takes it out again. The request
@@ -257,7 +260,8 @@ scheme without a proxy goes directly. A proxy without a scheme
 `~/.netrc` and the proxies of the system settings are not read, unlike
 aiohttp's `trust_env`. Neither variable set is no error: the log warns
 and the requests go directly. `rotation` does not apply: each scheme has
-one proxy.
+one proxy. The same proxy in both variables with different passwords is
+an error.
 
 SOCKS proxies are not supported: `socks5://` is an error that suggests an
 http proxy or a local bridge from HTTP to SOCKS. `--proxy` on the command
@@ -331,19 +335,23 @@ written. A problem is reported by the path of its key:
 - a User-Agent with a line break or another control character in it, a path
   with a null character or in the home directory of an unknown user;
 - a cookie without a name, a value or a domain, a cookie of an IP address,
-  a header that has a key of its own (`User-Agent`, `Cookie`, `Host`) or is
+  a header that has a key of its own (`User-Agent`, `Cookie`, `Host`,
+  `Proxy-Authorization`) or is
   given twice in different case; the values of cookies and headers are not
   shown;
 - a proxy URL that is not `http://` or `https://`, has no port, or has a
-  path; a SOCKS proxy; the same proxy listed twice; the URL is not shown,
+  path; a SOCKS proxy; the same proxy listed twice, its host in any case;
+  the URL is not shown,
   a repeated one with its password hidden;
 - a key written twice in YAML (plain YAML would keep the last one silently);
 - keys that do not go together: `sitemaps.from_robots` without
   `crawler.respect_robots`, a `user_agents` entry with another bot name,
   `session.cookies`, `cookies_file` or `save_cookies` with
   `session.keep_cookies: false`, `proxy.from_env` with `proxy.urls`;
-- with `proxy.from_env`, a variable that is not the URL of a proxy, when
-  the crawler is made, reported by the name of the variable;
+- with `proxy.from_env`, a variable that is not the URL of a proxy, or
+  `HTTP_PROXY` and `HTTPS_PROXY` naming one proxy with different
+  passwords, when the crawler is made, reported by the names of the
+  variables;
 - a file that cannot be read, has another extension or is not valid YAML or JSON;
 - in the file of `--urls-file`, a line that is not an http(s) URL, reported
   by its number, or a file that cannot be read or is not UTF-8; `-` with

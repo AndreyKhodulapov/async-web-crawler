@@ -39,9 +39,11 @@ leaves a failing site alone.
   host's circuit is open, robots.txt is unreachable, every proxy is out of
   rotation. Retrying the request cannot fix them.
 - **Blame the right party.** Through a proxy, a failure may be the proxy's
-  or the site's, and only some tell which: a proxy that cannot be reached
-  or asks for a password (407) is the proxy's (`ProxyNetworkError`), a
-  response through it is the site's, whatever its status, and so is a
+  or the site's, and only some tell which: a proxy that cannot be reached,
+  fails its own TLS or asks for a password (407) is the proxy's
+  (`ProxyNetworkError`). A 407 or a bad certificate inside the tunnel of
+  an https URL is the site's. Any other response through a proxy is the
+  site's too, whatever its status, and so is a
   refused CONNECT (the proxy cannot reach the site). A timeout cannot be
   told apart: over https the connect step includes the CONNECT, so a slow
   proxy and a slow site look alike. It is put on the site, as without a

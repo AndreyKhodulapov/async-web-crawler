@@ -365,7 +365,7 @@ async with AsyncCrawler(cookies=cookies, headers={"Accept-Language": "en"}) as c
 
 | Name | What it does |
 |------|--------------|
-| `AsyncCrawler(headers=)` | headers sent with every request to every host; `User-Agent`, `Cookie` and `Host` are refused (`ValueError`) |
+| `AsyncCrawler(headers=)` | headers sent with every request to every host; `User-Agent`, `Cookie`, `Host` and `Proxy-Authorization` are refused (`ValueError`) |
 | `AsyncCrawler(cookies=)` | `http.cookiejar.Cookie` objects sent from the first request, each to its own domain |
 | `AsyncCrawler(keep_cookies=False)` | no cookies sent or kept (aiohttp's `DummyCookieJar`); with `cookies` it is a `ValueError` |
 | `export_cookies()` | the cookies the crawler keeps, those sites set included, as `http.cookiejar.Cookie`; also after `close()` |
@@ -423,7 +423,7 @@ takes it out again. A request through a proxy fails with:
 
 | Error | When | Retried |
 |-------|------|---------|
-| `ProxyNetworkError` (a `ProxyError` and a `NetworkError`) | the proxy cannot be reached, its name does not resolve, or it answers HTTP 407 to the request or to CONNECT | yes, through the next proxy at once; with `per_host` the host stays on that proxy |
+| `ProxyNetworkError` (a `ProxyError` and a `NetworkError`) | the proxy cannot be reached, its name does not resolve, the TLS of an `https://` proxy fails, or it answers HTTP 407 to CONNECT or to the request of an `http://` URL (inside the tunnel of an `https://` URL the site answers) | yes, through the next proxy at once; with `per_host` the host stays on that proxy |
 | `NoProxyError` (a `ProxyError`) | every proxy for the URL is out of rotation: the request is not sent; the message says when the first is back | no |
 | `NetworkError` | the proxy answered CONNECT with another status: it cannot or may not reach the site | yes, as any network error of the site |
 | `FetchTimeoutError` | a timeout: the proxy and the site cannot be told apart | yes, as any timeout of the site |
@@ -454,7 +454,9 @@ aiohttp's `trust_env`: a URL goes through the proxy of its scheme, or
 directly when its scheme has none or `NO_PROXY` names its host. A proxy
 without a scheme is an `http://` one. Each scheme has one proxy, so the
 rotation does not matter. A variable that is not a proxy URL raises
-`ValueError` with the name of the variable, not its value.
+`ValueError` with the name of the variable, not its value, and so does
+one proxy in both variables with different passwords. The host of a proxy
+is lowercased: `Proxy.example` and `proxy.example` are one proxy.
 
 SOCKS proxies are not supported; an http proxy, or a local bridge from
 HTTP to SOCKS, does instead.

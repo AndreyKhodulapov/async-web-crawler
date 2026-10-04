@@ -189,6 +189,18 @@ class TestStats:
             "http://proxy-2:3128": ProxyStats(state="active"),
         }
 
+    def test_reading_the_stats_brings_no_proxy_back(self, pool, clock, caplog):
+        proxy = pool.proxies[0]
+        fail(pool, proxy, 2)
+        clock.now += 60
+        with caplog.at_level(logging.INFO, logger="crawler.proxy"):
+            assert pool.get_stats()[proxy.label].state == "active"  # the cooldown is over
+            assert "back in rotation" not in caplog.text  # it comes back when a request picks it
+            fail(pool, proxy, 1)
+
+        assert pool.get_stats()[proxy.label].state == "out"
+        assert pool.get_stats()[proxy.label].times_removed == 2
+
     def test_reset_keeps_the_proxies_out(self, pool):
         proxy = pool.proxies[0]
         fail(pool, proxy, 2)
@@ -254,6 +266,13 @@ class TestFromEnv:
         with pytest.raises(NoProxyError):
             pool.pick("https://a.test/")
 
+    def test_one_proxy_with_two_passwords_is_an_error(self, monkeypatch):
+        # The label hides the password: one proxy for both would send one of the passwords for the other scheme.
+        monkeypatch.setenv("HTTP_PROXY", "http://user:secret-1@shared:3128")
+        monkeypatch.setenv("HTTPS_PROXY", "http://user:secret-2@shared:3128")
+        with pytest.raises(ValueError, match="^HTTP_PROXY and HTTPS_PROXY name one proxy with different passwords$"):
+            ProxyPool.from_env()
+
     def test_a_proxy_without_a_scheme_is_an_http_one(self, monkeypatch):
         monkeypatch.setenv("HTTP_PROXY", "plain:3128")
         assert ProxyPool.from_env().pick("http://a.test/").url == "http://plain:3128"
@@ -280,6 +299,11 @@ class TestProxyUrls:
             "http://user@proxy.example:3128",
             "Basic dXNlcjo=",
         )
+
+    def test_the_host_is_lowercased_but_not_the_user(self):
+        proxy = Proxy.from_url("http://User:Secret@Proxy.Example:3128")
+        assert (proxy.url, proxy.label) == ("http://proxy.example:3128", "http://User:***@proxy.example:3128")
+        assert proxy.authorization == "Basic VXNlcjpTZWNyZXQ="  # User:Secret
 
     def test_a_proxy_without_a_user_has_no_header(self):
         assert Proxy.from_url("https://[::1]:8443").authorization is None
@@ -323,6 +347,7 @@ class TestPoolArguments:
             (URLS, {"cooldown": float("inf")}, "cooldown"),
             (["http://proxy:3128", "socks5://user:secret@proxy:1080"], {}, "^proxy 2: SOCKS proxies"),
             (["http://user:one@proxy:3128", "http://user:two@proxy:3128"], {}, r"proxy 2: .*\*\*\*.* is listed twice"),
+            (["http://Proxy:3128", "http://proxy:3128"], {}, "proxy 2: http://proxy:3128 is listed twice"),
         ],
     )
     def test_rejects_invalid_arguments(self, urls, options, message):

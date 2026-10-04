@@ -216,6 +216,11 @@ class TestCrawlerArguments:
         with pytest.raises(ValueError, match="'User-Agent': this header is set by crawler.user_agent"):
             AsyncCrawler(headers={"User-Agent": "Other/1.0"})
 
+    def test_proxy_authorization_header_is_refused(self):
+        # Sent with every request, it would reach the sites behind an https proxy too.
+        with pytest.raises(ValueError, match="'proxy-authorization': this header is set by the user and password"):
+            AsyncCrawler(headers={"proxy-authorization": "Basic secret"})
+
     def test_invalid_header_value_is_not_shown(self):
         with pytest.raises(ValueError) as error:
             AsyncCrawler(headers={"Authorization": "Bearer secret\r\nX-Injected: 1"})

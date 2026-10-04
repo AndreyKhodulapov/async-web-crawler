@@ -31,8 +31,14 @@ def header_name_problem(name: str) -> str | None:
     """What is wrong with `name` as a header of every request, None if nothing."""
     if not _TOKEN.fullmatch(name):
         return "not a header name: letters, digits and !#$%&'*+-.^_`|~ only"
-    # They have keys of their own, and Host is that of the URL.
-    reserved = {"user-agent": "crawler.user_agent", "cookie": "session.cookies", "host": "the URL"}
+    # They have keys of their own, and Host is that of the URL. Proxy-Authorization
+    # would reach the sites behind https proxies: it goes to the proxy only.
+    reserved = {
+        "user-agent": "crawler.user_agent",
+        "cookie": "session.cookies",
+        "host": "the URL",
+        "proxy-authorization": "the user and password of proxy.urls",
+    }
     if name.lower() in reserved:
         return f"this header is set by {reserved[name.lower()]}"
     return None

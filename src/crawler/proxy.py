@@ -63,7 +63,8 @@ class Proxy:
         if (problem := proxy_url_problem(value)) is not None:
             raise ValueError(problem)
         parts = urlsplit(value.strip())
-        address = parts.netloc.rpartition("@")[2]
+        user, at, address = parts.netloc.rpartition("@")
+        address = address.lower()  # a host in any case is one proxy; the user and password keep theirs
         scheme = parts.scheme.lower()
         authorization = None
         if parts.username is not None:
@@ -72,7 +73,7 @@ class Proxy:
             authorization = "Basic " + base64.b64encode(f"{login}:{password}".encode()).decode("ascii")
         return cls(
             url=f"{scheme}://{address}",
-            label=hide_password(f"{scheme}://{parts.netloc}"),
+            label=hide_password(f"{scheme}://{user}{at}{address}"),
             authorization=authorization,
         )
 
@@ -178,7 +179,15 @@ class ProxyPool:
             urls[scheme] = value
         if not urls:
             return None
-        labels = {scheme: Proxy.from_url(url).label for scheme, url in urls.items()}
+        proxies = {scheme: Proxy.from_url(url) for scheme, url in urls.items()}
+        if (
+            len(proxies) == 2
+            and proxies["http"].label == proxies["https"].label
+            and proxies["http"] != proxies["https"]
+        ):
+            # The label hides the password: one proxy for both would send one of them with the other's.
+            raise ValueError("HTTP_PROXY and HTTPS_PROXY name one proxy with different passwords")
+        labels = {scheme: proxy.label for scheme, proxy in proxies.items()}
         # One proxy for both schemes is one proxy of the pool, with one state.
         unique = {label: urls[scheme] for scheme, label in labels.items()}
         pool = cls(unique.values(), max_failures=max_failures, cooldown=cooldown, clock=clock)
@@ -256,7 +265,8 @@ class ProxyPool:
         now = self._clock()
         return {
             proxy.label: ProxyStats(
-                state="active" if self._is_active(proxy, now) else "out",
+                # Not _is_active: a proxy comes back when a request picks it, not when the stats are read.
+                state="out" if self._is_out(proxy, now) else "active",
                 requests=(state := self._states[proxy.label]).requests,
                 failures=state.failures,
                 times_removed=state.times_removed,
@@ -288,12 +298,17 @@ class ProxyPool:
         host = get_host(url) or ""
         return (_hash(host) + self._shifts.get(host, 0)) % len(candidates)
 
+    def _is_out(self, proxy: Proxy, now: float) -> bool:
+        """Whether `proxy` is out of rotation at `now`."""
+        out_until = self._states[proxy.label].out_until
+        return out_until is not None and now < out_until
+
     def _is_active(self, proxy: Proxy, now: float) -> bool:
         """Whether `proxy` is in rotation at `now`; one whose cooldown is over comes back."""
         state = self._states[proxy.label]
         if state.out_until is None:
             return True
-        if now < state.out_until:
+        if self._is_out(proxy, now):
             return False
         state.out_until = None
         logger.info("Proxy %s is back in rotation", proxy.label)
