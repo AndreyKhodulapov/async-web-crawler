@@ -292,6 +292,10 @@ class RobotsParser:
         """Why robots.txt of the site of `url` could not be read, or None. The rules must have been fetched."""
         return self._cached(url).unreachable
 
+    def unreachable_for(self, url: str) -> float:
+        """Seconds until the unreachable robots.txt of the site of `url` is downloaded again; 0 if it is not unreachable."""
+        return max(0.0, self._expires.get(_origin(url), 0.0) - self._clock())
+
     def _cached(self, url: str) -> RobotsRules:
         origin = _origin(url)
         if origin not in self._rules:

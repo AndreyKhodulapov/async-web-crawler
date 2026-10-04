@@ -114,8 +114,9 @@ example.com  closed            2         0       0         0
 ```
 
 `REQUESTS` and `FAILURES` are counted over the breaker's window of the last
-minute and include robots.txt; `OPENED` and `REJECTED` count since the crawl
-started. With `--json`, the parsed pages (with their depth), the failed,
+minute and include robots.txt; a request made good by a retry is one success,
+one that failed after its retries one failure. `OPENED` and `REJECTED` count
+since the crawl started. With `--json`, the parsed pages (with their depth), the failed,
 skipped, blocked and unreachable URLs with the reasons, the statistics, the
 per-host table, the error statistics and the circuit breakers are saved to a file.
 
@@ -206,9 +207,9 @@ Permanent errors (2):
 
 === Circuit breaker (3 hosts: 0 open, 1 half-open) ===
 HOST                 STATE      REQUESTS  FAILURES  OPENED  REJECTED
-127.0.0.1            closed           21         6       0         0
+127.0.0.1            closed           17         1       0         0
 localhost            half-open         0         0       3         8
-unreachable.invalid  closed            4         4       0         0
+unreachable.invalid  closed            1         1       0         0
 
 Error report saved to error_report.json
 ```

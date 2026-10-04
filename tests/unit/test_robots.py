@@ -358,6 +358,21 @@ class TestRobotsParser:
         assert robots.unreachable_reason("https://site/page") is None
         assert len(fetch.requested) == 2
 
+    async def test_unreachable_for_is_the_time_until_the_next_download(self):
+        fetch = FakeFetcher((503, ""))
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        assert robots.unreachable_for("https://site/page") == 0
+        await robots.fetch_robots("https://site/")
+        assert robots.unreachable_for("https://site/page") == RobotsParser.UNREACHABLE_TTL
+        assert robots.unreachable_for("https://other/page") == 0
+
+        clock.now += RobotsParser.UNREACHABLE_TTL + 5
+        assert robots.unreachable_for("https://site/page") == 0
+        fetch.answer = (200, "")
+        await robots.fetch_robots("https://site/")
+        assert robots.unreachable_for("https://site/page") == 0
+
     async def test_robots_txt_that_was_read_is_kept(self):
         fetch = FakeFetcher((200, "User-agent: *\nDisallow: /private/"))
         clock = FakeClock()

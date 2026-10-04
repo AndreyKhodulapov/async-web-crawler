@@ -225,7 +225,10 @@ storages. All of it is described in the [API reference](docs/api.md).
   being one host. There is no public suffix list: a start URL on
   `docs.example.com` does not bring in `example.com`, and a site spread over
   unrelated domains needs `same_domain_only: false` with an `include`
-  pattern for each of them.
+  pattern for each of them. The limits go by the exact host name: the rate
+  limit, the circuit breaker and `max_pages_per_host` are kept per host, so
+  a site that spreads its links over `example.com`, `www.example.com` and
+  `docs.example.com` is asked at up to three times the rate, as one server.
 - **A crawl cannot be resumed.** Ctrl-C keeps the pages fetched so far,
   but the queue is lost: the next run starts from the start URLs again,
   adding to the output files or starting them anew with `--overwrite`.
@@ -241,9 +244,10 @@ storages. All of it is described in the [API reference](docs/api.md).
   `max_concurrent` says. With a rate limit per host it never matters; a
   crawl of many hosts without one is parsing-bound.
 - **Some guards are constants, not options.** The URL length limit (2048),
-  the redirect limit (10), the queue size (3 times the page limit) and the
-  wait at which a host's pages are put off (1 second) are class attributes
-  of `AsyncCrawler`.
+  the redirect limit (10), the queue size (3 times the page limit), the
+  wait at which a host's pages are put off (1 second) and the times a page
+  waits for a robots.txt that cannot be read or for a Retry-After too long
+  to retry (3) are class attributes of `AsyncCrawler`.
 
 ## Documentation
 

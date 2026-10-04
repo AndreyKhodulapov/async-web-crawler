@@ -36,8 +36,9 @@ async def test_crawl_reports_errors_and_circuit_breaker(url, tmp_path, capsys):
     assert (errors["total"], errors["retries"], errors["successful_retries"]) == (2, 1, 1)
     assert errors["by_class"] == {"TransientHTTPError": 1, "PermanentHTTPError": 1}
     assert errors["permanent_errors"] == {url("/status/404"): "PermanentHTTPError: HTTP 404 Not Found"}
+    # The page made good by its retry counts once, as a success.
     assert saved["circuit_breaker"] == {
-        "127.0.0.1": {"state": "closed", "requests": 3, "failures": 1, "times_opened": 0, "rejected": 0}
+        "127.0.0.1": {"state": "closed", "requests": 2, "failures": 0, "times_opened": 0, "rejected": 0}
     }
 
 

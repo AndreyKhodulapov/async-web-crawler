@@ -110,9 +110,10 @@ sites it visits and follows their rules.
   everything is disallowed. 429 is best treated like 5xx: the site asks crawlers to back off.
 - An **unreachable** robots.txt is an outage, not a rule: cache it briefly
   (here 60 seconds) and fetch it again, or one timeout closes the site for
-  the whole crawl. The TTL helps the URLs that come later: pages refused
-  during the outage are not queued again, so a crawl of that one site
-  still ends empty. Count such pages apart from the disallowed ones, so the
+  the whole crawl. The TTL alone helps only the URLs that come later; the
+  pages refused during the outage must wait for it too (here up to three
+  times), or a crawl of that one site ends empty after a 503 of a few
+  seconds. Count such pages apart from the disallowed ones, so the
   report does not blame robots.txt for a network failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
   origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB,

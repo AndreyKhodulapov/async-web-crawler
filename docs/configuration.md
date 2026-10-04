@@ -136,6 +136,11 @@ are followed, links to `example.org` are not. A start URL on
 `docs.example.com` keeps the crawl there: `example.com` and `blog.example.com`
 are outside. A site spread over unrelated domains needs
 `same_domain_only: false` with an `include` pattern for each of them.
+The limits are per exact host name, not per site: `rate_limit`,
+the circuit breaker and `max_pages_per_host` count `example.com`,
+`www.example.com` and `docs.example.com` apart, so a site that links to
+all three is asked at up to three times `rate_limit`. Most sites redirect
+the apex to `www.` (or back) and are not affected.
 
 The library itself, `AsyncCrawler.crawl()`, follows links to any host and
 to files unless given `same_domain_only=True` and `exclude_extensions`; the

@@ -119,10 +119,14 @@ leaves a failing site alone.
   site for its broken links.
 - **Per host**: one dead site must not stop the crawl of the others, and a
   host that is down fails all of its pages, so a circuit per URL learns too late.
-- **Retries under a breaker**: every attempt counts, retries included, so a
-  dead host opens its circuit after a few pages. A retry the breaker would
-  refuse is not made, and the page fails with the error of its last attempt,
-  not with `CircuitOpenError`.
+- **Retries under a breaker**: a request counts once, however many attempts
+  it takes. Its first failure counts at once, so a dead host opens its
+  circuit after a few pages, not after their retries; a failed retry adds
+  nothing, and a retry that succeeds turns the failure into a success, so one
+  broken URL retried three times does not open the circuit, and neither does a
+  slow host whose pages come through on the second attempt. A retry the
+  breaker would refuse is not made, and the page fails with the error of its
+  last attempt, not with `CircuitOpenError`.
 - Check the circuit before a request waits for the rate limit (no point in
   queueing for a blocked host) and once more when its turn comes (the circuit
   may have opened meanwhile).

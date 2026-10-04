@@ -18,7 +18,8 @@ class SiteState:
 
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
     /busy/, /shop/, sitemaps and robots.txt, in the order they arrived. `robots` is the
-    body of /robots.txt, served with `robots_status`; None means 404.
+    body of /robots.txt, served with `robots_status`; None means 404; the
+    first `robots_failures` requests for it answer 503 whatever it is.
     With `robots_endless`, comment lines follow the body for as long as
     the client reads them. `robots_by_host` gives other hosts of the server
     a robots.txt of their own.
@@ -35,6 +36,7 @@ class SiteState:
         self.peak_in_flight = 0
         self.robots: str | None = None
         self.robots_status = 200
+        self.robots_failures = 0
         self.robots_endless = False
         self.robots_by_host: dict[str, str] = {}
         self.sitemaps: dict[str, bytes] = {}
@@ -87,6 +89,8 @@ async def encoding_page(request: web.Request) -> web.Response:
 async def robots_txt(request: web.Request) -> web.StreamResponse:
     state = request.app[SITE_STATE]
     state.record(request)
+    if state.hits["/robots.txt"] <= state.robots_failures:
+        raise web.HTTPServiceUnavailable()
     if request.url.host in state.robots_by_host:
         return web.Response(text=state.robots_by_host[request.url.host])
     if state.robots is None:
@@ -151,6 +155,15 @@ async def busy(request: web.Request) -> web.Response:
     """Answers 429 with Retry-After of `seconds`."""
     request.app[SITE_STATE].record(request)
     raise web.HTTPTooManyRequests(headers={"Retry-After": request.match_info["seconds"]})
+
+
+async def overloaded(request: web.Request) -> web.Response:
+    """Answers 429 with Retry-After of `seconds` the first `fails` times, then a page."""
+    state = request.app[SITE_STATE]
+    state.record(request)
+    if state.hits[request.path] <= int(request.match_info["fails"]):
+        raise web.HTTPTooManyRequests(headers={"Retry-After": request.match_info["seconds"]})
+    return web.Response(text="<title>Recovered</title>", content_type="text/html")
 
 
 SHOP_PAGES = 20
@@ -258,6 +271,7 @@ async def server(aiohttp_server):
     app.router.add_get("/sitemaps/{name}", sitemap)
     app.router.add_get("/flaky/{fails}", flaky)
     app.router.add_get("/busy/{seconds}", busy)
+    app.router.add_get("/overloaded/{fails}/{seconds}", overloaded)
     app.router.add_get("/shop/list", shop_list)
     app.router.add_get("/shop/item/{n}", shop_item)
     app.router.add_get("/wide/{n}", wide_page)

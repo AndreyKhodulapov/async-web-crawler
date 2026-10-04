@@ -98,8 +98,11 @@ host and port) and cached for the crawler's lifetime. A missing robots.txt
 (HTTP 4xx, or a redirect loop) allows everything; an unreachable one (HTTP 5xx, 429, network
 errors, after the retries) disallows the whole site for 60 seconds, then it
 is fetched again. Such pages are counted as unreachable, not as blocked:
-the site did not forbid them. A crawl does not queue them again, so only
-the pages found after the 60 seconds are fetched. Redirects are followed by
+the site did not forbid them. In a crawl they are put off until robots.txt
+is fetched again, up to `AsyncCrawler.MAX_WAITS_PER_PAGE` (3) times, so a
+site whose robots.txt failed for a moment is crawled once it is back; only
+after three minutes of failures do its pages go to `unreachable_urls`.
+Redirects are followed by
 the crawler, one request at a time: the target of each is checked against
 robots.txt of its own site and waits for the rate limit of its own host, as
 a link to it would. Up to `AsyncCrawler.MAX_REDIRECTS` (10) redirects in a
@@ -185,8 +188,13 @@ counted in `error_stats()`. After that one request goes through as a probe
 
 Failures are timeouts, network errors, HTTP 408, 429 and any 5xx, even
 one that is not retried, such as 501; any other response, a 404 too, is a
-success, so broken links do not block a site. Every attempt counts,
-retries and robots.txt downloads included. Each request of a redirect
+success, so broken links do not block a site. A request counts once,
+however many attempts it takes, robots.txt downloads included: its first
+failure counts at once, so a host that goes down is spotted after its
+first failed requests; a failed retry adds nothing; a retry that
+succeeds turns the failure into a success. So one broken URL retried
+three times, or a slow host whose pages come through on the second
+attempt, does not open the circuit. Each request of a redirect
 chain counts for its own host: a link that redirects to a failing host
 counts against that host, not the host of the link.
 The circuit is checked before a request waits for the rate limit, where a
@@ -221,6 +229,9 @@ again, instead of holding workers in the rate limiter, and count toward
 `max_delay` of the retry strategy is logged as a warning once per host
 (`example.com asked to wait 300s (Retry-After); its pages are put off until
 then`): with one host in the crawl, nothing is requested until it ends.
+The page that got such a Retry-After is not retried by its request, as
+`RetryStrategy` says, but it comes back with the host, up to
+`AsyncCrawler.MAX_WAITS_PER_PAGE` (3) times; then it goes to `failed_urls`.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
