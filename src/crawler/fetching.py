@@ -51,6 +51,8 @@ class Fetcher:
 
     MAX_TIMEOUT_GROWTH = 4.0
     MAX_REDIRECTS = 10
+    # The constants the crawler sets on its fetcher.
+    SETTINGS = ("MAX_TIMEOUT_GROWTH", "MAX_REDIRECTS")
 
     def __init__(
         self,
@@ -124,7 +126,7 @@ class Fetcher:
 
         With `raw`, which is how a sitemap is downloaded, the result has the
         `body` as it was sent instead of the decoded `content`, and a body
-        over the size limit of a sitemap fails with `SitemapError`. With
+        over `sitemaps.MAX_SIZE` fails with `SitemapError`. With
         `truncate_at`, which is how robots.txt is downloaded, the body is
         cut to that many bytes instead of failing over `max_page_size`. With
         `track_errors`, the attempts count in `errors`. Without
@@ -418,7 +420,12 @@ class Fetcher:
         started = time.perf_counter()
         try:
             response = await self._transport.get(
-                url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout
+                url,
+                html_only=html_only,
+                # Read on every request, as the parser reads it on every sitemap.
+                raw_limit=self.sitemaps.MAX_SIZE if raw else None,
+                truncate_at=truncate_at,
+                timeout=timeout,
             )
         except FetchError as error:
             elapsed = time.perf_counter() - started

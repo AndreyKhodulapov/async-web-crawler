@@ -52,12 +52,14 @@ class HttpTransport:
     `CrawlerClosedError` after `close()`, `InvalidURLError`,
     `HTTPStatusError` (with the Retry-After of the response),
     `FetchTimeoutError`, `CertificateError`, `DNSError`, `NetworkError`,
-    `PageTooLargeError`, or `SitemapError` for a raw body over
-    `max_raw_size`. Requests carry `user_agent`, or the `user_agents` in
-    turn when there are any.
+    `PageTooLargeError`, or `SitemapError` for a raw body over its limit.
+    Requests carry `user_agent`, or the `user_agents` in turn when there
+    are any.
     """
 
     REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+    # The constants the crawler sets on its transport.
+    SETTINGS = ("REDIRECT_STATUSES",)
 
     def __init__(
         self,
@@ -67,14 +69,12 @@ class HttpTransport:
         user_agent: str,
         user_agents: Sequence[str] = (),
         max_page_size: int | None,
-        max_raw_size: int,
     ) -> None:
         self._max_concurrent = max_concurrent
         self._timeout = timeout
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
         self._max_page_size = max_page_size
-        self._max_raw_size = max_raw_size
         self._session: aiohttp.ClientSession | None = None
         self._closed = False
 
@@ -107,14 +107,20 @@ class HttpTransport:
         )
 
     async def get(
-        self, url: str, *, html_only: bool, raw: bool, truncate_at: int | None, timeout: aiohttp.ClientTimeout
+        self,
+        url: str,
+        *,
+        html_only: bool,
+        raw_limit: int | None,
+        truncate_at: int | None,
+        timeout: aiohttp.ClientTimeout,
     ) -> Response:
         """Perform the GET request and read the body up to its size limit.
 
         With `html_only`, the body of a response whose Content-Type is not
         HTML is not read: the content is empty and the size is 0. With
-        `raw`, the body is returned as bytes and the content is empty; over
-        `max_raw_size` it fails with `SitemapError`. With
+        `raw_limit`, the body is returned as bytes and the content is empty;
+        over `raw_limit` bytes it fails with `SitemapError`. With
         `truncate_at`, the body is cut to that many bytes. Otherwise a body
         over `max_page_size` fails with `PageTooLargeError`.
         The size is measured after content decoding (gzip, deflate, ...),
@@ -160,7 +166,8 @@ class HttpTransport:
                         content_type=content_type,
                         robots_tag=robots_tag,
                     )
-                body = await self._read_body(response, url, raw=raw, truncate_at=truncate_at)
+                body = await self._read_body(response, url, raw_limit=raw_limit, truncate_at=truncate_at)
+                raw = raw_limit is not None
                 return Response(
                     status=response.status,
                     content="" if raw else _decode(body, _encoding(response, body)),
@@ -189,7 +196,7 @@ class HttpTransport:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
 
     async def _read_body(
-        self, response: aiohttp.ClientResponse, url: str, *, raw: bool, truncate_at: int | None
+        self, response: aiohttp.ClientResponse, url: str, *, raw_limit: int | None, truncate_at: int | None
     ) -> bytes:
         """Read the body, giving up once it is over its size limit; the rest is not downloaded.
 
@@ -197,10 +204,10 @@ class HttpTransport:
         read, so a few hundred kilobytes may turn into gigabytes: the limit
         is on the unpacked body.
         """
-        limit = truncate_at or (self._max_raw_size if raw else self._max_page_size)
+        limit = truncate_at or raw_limit or self._max_page_size
         if limit is None:
             return await response.read()
-        too_large = SitemapError if raw else PageTooLargeError
+        too_large = SitemapError if raw_limit is not None else PageTooLargeError
         # Content-Length counts the packed bytes, never more than the unpacked ones.
         if truncate_at is None and response.content_length is not None and response.content_length > limit:
             raise too_large(url, f"larger than {limit} bytes")

@@ -280,14 +280,19 @@ async def test_sitemap_download_is_retried(url, site):
     assert crawler.crawl_stats().retries == 2
 
 
+@pytest.mark.parametrize("on_crawler", [False, True], ids=["limit-of-the-class", "limit-of-the-crawler"])
 @pytest.mark.parametrize("headers", [{}, {"Content-Encoding": "gzip"}], ids=["plain", "content-encoding"])
-async def test_oversized_sitemap_is_not_downloaded_whole(url, site, monkeypatch, caplog, headers):
-    monkeypatch.setattr(SitemapParser, "MAX_SIZE", 100_000)
+async def test_oversized_sitemap_is_not_downloaded_whole(url, site, monkeypatch, caplog, headers, on_crawler):
+    if not on_crawler:
+        monkeypatch.setattr(SitemapParser, "MAX_SIZE", 100_000)
     document = urlset(*[url(f"/site/{number}.html") for number in range(20_000)])
     # As a Content-Encoding the client undoes, the megabyte is a few kilobytes on the wire.
     site.sitemaps = {"sitemap.xml": gzip.compress(document) if headers else document}
     site.sitemap_headers = headers
     async with make_crawler() as crawler:
+        if on_crawler:
+            # Set after the crawler is made, it limits the download as well as the parsing.
+            crawler.sitemaps.MAX_SIZE = 100_000
         with caplog.at_level(logging.INFO, logger="crawler"):
             pages = await crawler.crawl([url("/site/c.html")], sitemap_urls=[url(SITEMAP)])
 

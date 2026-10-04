@@ -7,6 +7,7 @@ from helpers import FakeClock
 
 import demo_main
 from crawler import (
+    AsyncCrawler,
     CircuitBreaker,
     CSVStorage,
     FetchTimeoutError,
@@ -130,8 +131,7 @@ def test_rejects_retry_delay_longer_than_the_longest_pause():
 def test_error_report_tells_open_and_half_open_circuits_apart(capsys):
     clock = FakeClock()
     breaker = CircuitBreaker(0.5, min_requests=1, cooldown=30.0, clock=clock)
-    crawler = make_crawler(parse_args(["crawl"]))
-    crawler.circuit_breaker = breaker
+    crawler = AsyncCrawler(circuit_breaker=breaker)
 
     def request(url, error=None):
         with breaker.call(url) as call:

@@ -18,7 +18,7 @@ from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage
 from crawler.parser import HTMLParser
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryStrategy
-from crawler.robots import product_token
+from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
@@ -134,6 +134,15 @@ class AsyncCrawler:
     in `stats` and `crawl_stats()`. That is the setting for a large crawl.
     The queue of `crawl()` is bounded by `max_pages` too, see `crawl()`.
 
+    The settings of a crawler, such as `max_concurrent`, `max_page_size`
+    or `circuit_breaker`, are read-only: they are handed to the layers
+    that make the requests when the crawler is made. Only `storage` may be
+    replaced, between crawls. The constants of requests (`MAX_REDIRECTS`,
+    `MAX_TIMEOUT_GROWTH`, `REDIRECT_STATUSES`) are read when the crawler
+    is made too, so they apply when set on a subclass; those of a crawl
+    (`ROBOTS_POLL`, `MAX_ROBOTS_RETRIES` ...) are read on every `crawl()`,
+    so they apply when set on the crawler as well.
+
     Fetching from a closed crawler fails with `CrawlerClosedError`, reported
     the same way as any other per-URL failure. Closing does not interrupt
     requests that are already in flight: they finish on their own or hit
@@ -213,11 +222,9 @@ class AsyncCrawler:
 
         # These validate their own arguments.
         self._limits = SemaphoreManager(max_concurrent, max_per_domain)
-        self.rate_limiter = RateLimiter(requests_per_second, per_domain_rate, min_delay=min_delay, jitter=jitter)
-        self.retry_strategy = retry_strategy or RetryStrategy()
-        self.circuit_breaker = circuit_breaker or CircuitBreaker()
-        self.max_concurrent = max_concurrent
-        self.max_depth = max_depth
+        rate_limiter = RateLimiter(requests_per_second, per_domain_rate, min_delay=min_delay, jitter=jitter)
+        self._max_concurrent = max_concurrent
+        self._max_depth = max_depth
         # `connect` covers DNS resolution and waiting for a pooled connection,
         # unlike `sock_connect`, which is only the TCP handshake.
         timeout = aiohttp.ClientTimeout(
@@ -225,40 +232,39 @@ class AsyncCrawler:
             connect=connect_timeout,
             sock_read=read_timeout,
         )
-        self.timeout_growth = timeout_growth
-        self.max_page_size = max_page_size
-        self.max_parsing = max_parsing
+        self._max_page_size = max_page_size
+        self._max_parsing = max_parsing
         # Parsing runs in a thread per page: this keeps the trees of large
         # pages from piling up in memory, as the GIL gives them no parallelism anyway.
         self._parsing = asyncio.Semaphore(max_parsing)
-        self.max_retry_after = max_retry_after
         transport = HttpTransport(
             max_concurrent=max_concurrent,
             timeout=timeout,
             user_agent=user_agent,
             user_agents=user_agents,
             max_page_size=max_page_size,
-            max_raw_size=SitemapParser.MAX_SIZE,
         )
         self._fetcher = Fetcher(
             transport,
             limits=self._limits,
-            rate_limiter=self.rate_limiter,
-            retry_strategy=self.retry_strategy,
-            circuit_breaker=self.circuit_breaker,
+            rate_limiter=rate_limiter,
+            retry_strategy=retry_strategy or RetryStrategy(),
+            circuit_breaker=circuit_breaker or CircuitBreaker(),
             respect_robots=respect_robots,
             timeout=timeout,
             timeout_growth=timeout_growth,
             max_retry_after=max_retry_after,
             user_agent=user_agent,
         )
-        self.robots = self._fetcher.robots
-        self.sitemaps = self._fetcher.sitemaps
+        # Set on a subclass, they apply to its requests.
+        for layer in (transport, self._fetcher):
+            for name in layer.SETTINGS:
+                setattr(layer, name, getattr(self, name))
         # Links marked rel="nofollow" are left out of the pages, as robots.txt is followed;
         # a robots meta tag may name the crawler ("asyncwebcrawler"), as X-Robots-Tag may.
         self._parser = parser or HTMLParser(skip_nofollow=respect_robots, robots_name=robots_name)
         self.storage = storage
-        self.keep_pages = keep_pages
+        self._keep_pages = keep_pages
         self.stats = CrawlerStats()
         # The latest crawl() call; an empty one before the first.
         self._run = self._new_run()
@@ -277,6 +283,55 @@ class AsyncCrawler:
     @property
     def closed(self) -> bool:
         return self._fetcher.closed
+
+    @property
+    def max_concurrent(self) -> int:
+        return self._max_concurrent
+
+    @property
+    def max_depth(self) -> int:
+        return self._max_depth
+
+    @property
+    def keep_pages(self) -> bool:
+        return self._keep_pages
+
+    @property
+    def max_page_size(self) -> int | None:
+        return self._max_page_size
+
+    @property
+    def max_parsing(self) -> int:
+        return self._max_parsing
+
+    @property
+    def timeout_growth(self) -> float:
+        return self._fetcher.timeout_growth
+
+    @property
+    def max_retry_after(self) -> float:
+        return self._fetcher.max_retry_after
+
+    @property
+    def rate_limiter(self) -> RateLimiter:
+        return self._fetcher.rate_limiter
+
+    @property
+    def retry_strategy(self) -> RetryStrategy:
+        return self._fetcher.retry_strategy
+
+    @property
+    def circuit_breaker(self) -> CircuitBreaker:
+        return self._fetcher.circuit_breaker
+
+    @property
+    def robots(self) -> RobotsParser | None:
+        """robots.txt of the sites, downloaded and cached; None without `respect_robots`."""
+        return self._fetcher.robots
+
+    @property
+    def sitemaps(self) -> SitemapParser:
+        return self._fetcher.sitemaps
 
     @property
     def processed_urls(self) -> dict[str, ParsedPage]:

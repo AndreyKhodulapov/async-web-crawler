@@ -75,9 +75,10 @@ listed in the [API reference](api.md#internals).
   silently stops working: the test still passes but no longer tests what
   it says.
 - Shared components are passed to the layers once. Reassigning
-  `crawler.circuit_breaker` after construction no longer reaches requests
-  already wired to the old one. Either document this, or keep such
-  attributes read-only.
+  `crawler.circuit_breaker` after construction would no longer reach
+  requests already wired to the old one, so the settings of the facade
+  are read-only properties: a new value fails loudly with
+  `AttributeError` instead of doing nothing.
 - **Logger names are an interface**: log filters, alerts and tests depend
   on them. A layer moved to a new module logs under a new name. Tests
   should listen to the package logger (`crawler`), not to a module's.

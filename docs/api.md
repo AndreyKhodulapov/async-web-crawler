@@ -862,7 +862,10 @@ Who owns what:
 - `AsyncCrawler` creates the shared objects — `SemaphoreManager`,
   `RateLimiter`, `RetryStrategy`, `CircuitBreaker`, `HttpTransport`,
   `Fetcher`, `HTMLParser`, `CrawlerStats` — and exposes some of them as
-  its attributes (`rate_limiter`, `circuit_breaker`, `stats` ...).
+  its attributes (`rate_limiter`, `circuit_breaker`, `stats` ...). The
+  settings and the components of a crawler are read-only, as the layers
+  got them when it was made; only `storage` may be replaced between
+  crawls.
 - `Fetcher` creates `RobotsParser` and `SitemapParser`, which download
   through it, so robots.txt and sitemaps get the same politeness as pages;
   `AsyncCrawler.robots` and `.sitemaps` are the same objects.
@@ -874,4 +877,8 @@ Who owns what:
 - The crawl constants (`ROBOTS_POLL`, `MAX_ROBOTS_RETRIES`,
   `FRONTIER_FACTOR` ...) are defined by `CrawlRun` and read from the
   crawler when a run is made, so one set on an `AsyncCrawler` or on a
-  subclass applies to its crawls.
+  subclass applies to its crawls. The request constants
+  (`MAX_REDIRECTS`, `MAX_TIMEOUT_GROWTH`, `REDIRECT_STATUSES`) are
+  defined by `Fetcher` and `HttpTransport` and read from the crawler when
+  it is made: one set on a subclass applies, one set on a crawler later
+  does not. `sitemaps.MAX_SIZE` is read on every download of a sitemap.

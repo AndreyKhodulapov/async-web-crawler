@@ -31,10 +31,12 @@ from crawler import (
     ParseError,
     PermanentError,
     ProgressTracker,
+    RateLimiter,
     RetryStrategy,
     RobotsDisallowedError,
     RobotsUnreachableError,
     StorageError,
+    TooManyRedirectsError,
     TransientError,
     UnexpectedError,
 )
@@ -220,6 +222,65 @@ class TestInit:
     def test_rate_options_configure_the_limiter(self):
         limiter = AsyncCrawler(requests_per_second=4, per_domain_rate=False, min_delay=0.5, jitter=0.1).rate_limiter
         assert (limiter.interval, limiter.per_domain, limiter.jitter) == (0.5, False, 0.1)
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("max_concurrent", 1),
+            ("max_depth", 0),
+            ("keep_pages", False),
+            ("max_page_size", 100),
+            ("max_parsing", 1),
+            ("timeout_growth", 1.0),
+            ("max_retry_after", 1.0),
+            ("rate_limiter", RateLimiter(None)),
+            ("retry_strategy", RetryStrategy()),
+            ("circuit_breaker", CircuitBreaker()),
+            ("robots", None),
+            ("sitemaps", None),
+        ],
+    )
+    def test_settings_are_read_only(self, name, value):
+        # Handed to the layers when the crawler is made: a new value would not reach them.
+        crawler = AsyncCrawler()
+        with pytest.raises(AttributeError):
+            setattr(crawler, name, value)
+
+
+class TestConstantsOfASubclass:
+    async def test_max_redirects(self, monkeypatch, fake_session):
+        class ShortChains(AsyncCrawler):
+            MAX_REDIRECTS = 1
+
+        crawler = ShortChains(**UNTHROTTLED)
+        monkeypatch.setattr(crawler._fetcher._transport, "_create_session", lambda: fake_session)
+        TestRedirectLimit.chain(fake_session, 2)
+
+        result = await crawler.fetch_result("http://a/0")
+
+        assert isinstance(result.error, TooManyRedirectsError)
+        assert result.error.message == "too many redirects (more than 1)"
+        assert fake_session.requested == ["http://a/0", "http://a/1"]
+
+    async def test_redirect_statuses(self, monkeypatch, fake_session):
+        class PermanentOnly(AsyncCrawler):
+            REDIRECT_STATUSES = frozenset({301, 308})
+
+        crawler = PermanentOnly(**UNTHROTTLED)
+        monkeypatch.setattr(crawler._fetcher._transport, "_create_session", lambda: fake_session)
+        fake_session.routes["http://a/"] = FakeResponse(b"moved", status=302, location="http://a/new")
+
+        result = await crawler.fetch_result("http://a/")
+
+        assert (result.status, result.content, result.redirected) == (302, "moved", False)
+        assert fake_session.requested == ["http://a/"]
+
+    def test_max_timeout_growth(self):
+        class ShortTimeouts(AsyncCrawler):
+            MAX_TIMEOUT_GROWTH = 2.0
+
+        crawler = ShortTimeouts(timeout_growth=3, read_timeout=1)
+        assert crawler._fetcher._timeout_for(retries=1).sock_read == 2.0
 
 
 class TestLifecycle:
