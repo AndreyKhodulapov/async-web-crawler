@@ -3,6 +3,7 @@
 import posixpath
 import re
 from collections.abc import Iterable
+from collections.abc import Set as AbstractSet
 from urllib.parse import unquote, urlsplit
 
 from crawler.urls import get_host
@@ -41,22 +42,31 @@ class UrlFilter:
     ) -> None:
         if max_url_length is not None and max_url_length < 1:
             raise ValueError(f"max_url_length must be >= 1 or None, got {max_url_length}")
-        self.allowed_hosts = None if allowed_hosts is None else set(allowed_hosts)
+        # Hosts in the order given; their sites, for a lookup per link that
+        # does not grow with the number of hosts.
+        self._hosts = None if allowed_hosts is None else dict.fromkeys(allowed_hosts)
+        self._sites = None if self._hosts is None else set(map(_site, self._hosts))
         self._include = _compile(include_patterns)
         self._exclude = _compile(exclude_patterns)
         self._extensions = _extensions(exclude_extensions)
         self.max_url_length = max_url_length
 
+    @property
+    def allowed_hosts(self) -> AbstractSet[str] | None:
+        """The hosts whose URLs pass, None if any host does; read-only, see `allow_host_of`."""
+        return None if self._hosts is None else self._hosts.keys()
+
     def allow_host_of(self, url: str) -> None:
         """Add the host of `url` to `allowed_hosts`; does nothing when hosts are not restricted."""
         host = get_host(url)
-        if self.allowed_hosts is not None and host is not None:
-            self.allowed_hosts.add(host)
+        if self._hosts is not None and self._sites is not None and host is not None:
+            self._hosts[host] = None
+            self._sites.add(_site(host))
 
     def allows(self, url: str) -> bool:
         if self.max_url_length is not None and len(url) > self.max_url_length:
             return False
-        if self.allowed_hosts is not None and not self._host_allowed(get_host(url)):
+        if self._sites is not None and not self._host_allowed(get_host(url)):
             return False
         if self._extensions and _file_extension(url) in self._extensions:
             return False
@@ -66,11 +76,18 @@ class UrlFilter:
         return not self._include or _matches(self._include, forms)
 
     def _host_allowed(self, host: str | None) -> bool:
-        assert self.allowed_hosts is not None  # called only when hosts are restricted
+        """Whether the site of `host`, or a site it is a subdomain of, is allowed."""
+        assert self._sites is not None  # called only when hosts are restricted
         if host is None:
             return False
+        # "a.b.example.com" is looked up as itself, then "b.example.com",
+        # "example.com" and "com": a few lookups, however many sites there are.
         site = _site(host)
-        return any(site == allowed or site.endswith(f".{allowed}") for allowed in map(_site, self.allowed_hosts))
+        while site not in self._sites:
+            _, dot, site = site.partition(".")
+            if not dot:
+                return False
+        return True
 
 
 def _site(host: str) -> str:
