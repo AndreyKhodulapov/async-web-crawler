@@ -15,8 +15,9 @@ from crawler.crawl_run import CrawlRun
 from crawler.exceptions import ParseError, StorageError
 from crawler.fetching import Fetcher
 from crawler.filters import UrlFilter
-from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage
+from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage, ProxyStats
 from crawler.parser import HTMLParser
+from crawler.proxy import ProxyPool
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryStrategy
 from crawler.robots import RobotsParser, product_token
@@ -128,6 +129,21 @@ class AsyncCrawler:
     a session of the crawler. aiohttp keeps no cookies of IP addresses, so
     a site reached by one gets none.
 
+    With `proxies`, every request goes through a proxy of the pool: pages,
+    robots.txt and sitemaps alike (see `ProxyPool` for the rotation and
+    the proxies taken out of it). Politeness stays with the sites: the
+    rate limit, robots.txt and `max_per_domain` are those of the host of
+    the URL, whatever proxy the request goes through. A proxy that fails
+    a request fails it with `ProxyNetworkError`, a network error that is
+    retried, through another proxy at once; when every proxy is out of
+    rotation, requests fail with `NoProxyError` without being sent, and
+    are not retried. The circuit breaker counts neither: a dead proxy
+    must not block the sites behind it. robots.txt that cannot be
+    downloaded for this reason is not cached as unreachable: the page
+    fails with the error of the proxy. `proxy_stats()` counts the
+    requests and failures of every proxy; the proxies out of rotation
+    stay out from one `crawl()` to the next.
+
     `error_stats()` counts the errors of page requests and their retries
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
     counted there, and neither are the requests the circuit breaker refused
@@ -212,6 +228,7 @@ class AsyncCrawler:
         headers: Mapping[str, str] | None = None,
         cookies: Iterable[Cookie] = (),
         keep_cookies: bool = True,
+        proxies: ProxyPool | None = None,
         parser: HTMLParser | None = None,
         storage: DataStorage | None = None,
         keep_pages: bool = True,
@@ -281,6 +298,7 @@ class AsyncCrawler:
             headers=headers,
             cookies=cookies,
             keep_cookies=keep_cookies,
+            proxies=proxies,
         )
         self._transport = transport
         self._fetcher = Fetcher(
@@ -364,6 +382,10 @@ class AsyncCrawler:
     @property
     def circuit_breaker(self) -> CircuitBreaker:
         return self._fetcher.circuit_breaker
+
+    @property
+    def proxies(self) -> ProxyPool | None:
+        return self._transport.proxies
 
     @property
     def robots(self) -> RobotsParser | None:
@@ -607,9 +629,10 @@ class AsyncCrawler:
         counted in `crawl_stats()`.
         The state of the crawl (`processed_urls`, `visited_urls`,
         `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `failed_sitemaps`, `url_depths`,
-        `stats`, `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()`) is reset
-        on every call and stays available after it returns. The rate limits, the robots.txt
-        cache and the states of the circuit breaker carry over; a site whose
+        `stats`, `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()` and
+        `proxy_stats()`) is reset on every call and stays available after it returns. The rate limits,
+        the robots.txt cache, the states of the circuit breaker and the proxies out of rotation carry
+        over; a site whose
         robots.txt the previous crawl gave up on is downloaded again.
 
         Raises:
@@ -694,6 +717,10 @@ class AsyncCrawler:
         They stay available after `close()`.
         """
         return self._transport.cookies()
+
+    def proxy_stats(self) -> dict[str, ProxyStats]:
+        """The proxies by label (their URLs with the password hidden); empty without `proxies`."""
+        return {} if self.proxies is None else self.proxies.get_stats()
 
     def error_stats(self) -> ErrorStats:
         """Errors of page requests since the latest crawl() started, or since the crawler was created."""

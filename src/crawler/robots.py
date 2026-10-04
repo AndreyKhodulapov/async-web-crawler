@@ -17,6 +17,7 @@ from crawler.exceptions import (
     DNSError,
     FetchError,
     PermanentError,
+    ProxyError,
     TooManyRedirectsError,
 )
 from crawler.urls import normalize_url, percent_encode
@@ -249,8 +250,8 @@ class RobotsParser:
     caller that has waited enough says so with `give_up`, and the site is
     not downloaded again until `forget_outages`.
     A download the fetcher did not even start (`CrawlerClosedError`,
-    `CircuitOpenError`) is no answer from the site: the error is passed on
-    and nothing is cached.
+    `CircuitOpenError`), and one that failed in a proxy (`ProxyError`), is
+    no answer from the site: the error is passed on and nothing is cached.
     Files over 500 KiB are cut to that size, the minimum the RFC requires
     crawlers to read.
     """
@@ -288,6 +289,7 @@ class RobotsParser:
             ValueError: `base_url` is not a valid http(s) URL.
             CrawlerClosedError: the fetcher is closed; nothing is cached.
             CircuitOpenError: the fetcher refused to request the site; nothing is cached.
+            ProxyError: the request failed in a proxy, or no proxy was left for it; nothing is cached.
         """
         return (await self._rules_for(base_url)).to_dict()
 
@@ -425,7 +427,7 @@ class RobotsParser:
         url = f"{origin}/robots.txt"
         try:
             status, text = await self._fetch(url)
-        except (CrawlerClosedError, CircuitOpenError):
+        except (CrawlerClosedError, CircuitOpenError, ProxyError):
             raise  # not an answer from the site: nothing to cache
         except TooManyRedirectsError as error:
             logger.info("robots.txt of %s: %s, everything is allowed", origin, error.message)

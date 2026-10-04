@@ -244,7 +244,7 @@ class ProxyPool:
             state.out_until = now + self.cooldown
             state.times_removed += 1
             logger.warning(
-                "Proxy %s is out of rotation for %gs: %d failures in a row, the last %s",
+                "Proxy %s is out of rotation for %gs, failures in a row: %d, the last: %s",
                 proxy.label,
                 self.cooldown,
                 state.failures_in_a_row,

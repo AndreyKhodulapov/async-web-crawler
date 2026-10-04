@@ -13,6 +13,8 @@ from crawler import (
     DNSError,
     FetchTimeoutError,
     NetworkError,
+    NoProxyError,
+    ProxyNetworkError,
     RobotsParser,
     RobotsRules,
     TooManyRedirectsError,
@@ -443,6 +445,9 @@ class TestRobotsParser:
         [
             CrawlerClosedError("https://site/robots.txt", "crawler is closed"),
             CircuitOpenError("https://site/robots.txt", "circuit breaker of site is open"),
+            # Failed in a proxy, or sent through none: no answer of the site either.
+            ProxyNetworkError("https://site/robots.txt", "proxy http://proxy:3128 refused the request: HTTP 407"),
+            NoProxyError("https://site/robots.txt", "no proxy available"),
         ],
     )
     async def test_request_not_sent_is_reported_and_not_cached(self, error):

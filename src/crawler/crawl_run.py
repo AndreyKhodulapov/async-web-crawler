@@ -16,6 +16,7 @@ from crawler.exceptions import (
     HTTPStatusError,
     ParseError,
     PermanentError,
+    ProxyError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     StorageError,
@@ -296,7 +297,7 @@ class CrawlRun:
                     break
                 logger.info("Sitemaps of %s wait %.1fs: %s", url, delay, reason)
                 await asyncio.sleep(delay)
-        except (CrawlerClosedError, CircuitOpenError) as error:
+        except (CrawlerClosedError, CircuitOpenError, ProxyError) as error:
             reason = f"{type(error).__name__}: {error.message}"
         logger.warning("No sitemaps from robots.txt of %s: %s", url, reason)
         return []

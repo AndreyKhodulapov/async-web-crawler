@@ -19,6 +19,7 @@ from crawler.exceptions import (
     FetchTimeoutError,
     HTTPStatusError,
     InvalidURLError,
+    ProxyError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     TooManyRedirectsError,
@@ -88,9 +89,10 @@ class Fetcher:
         return self._closed
 
     def reset_stats(self) -> None:
-        """Count errors and retries anew."""
+        """Count errors and retries anew, and the requests of the transport."""
         self.errors = ErrorTracker()
         self.retries = 0
+        self._transport.reset_stats()
 
     async def close(self) -> None:
         """Refuse further requests and close the transport. Safe to call more than once."""
@@ -309,7 +311,7 @@ class Fetcher:
             return None  # an invalid URL fails in the transport with InvalidURLError
         try:
             allowed = await self.robots.is_allowed(url, self._user_agent, wait=wait)
-        except (CrawlerClosedError, CircuitOpenError) as error:
+        except (CrawlerClosedError, CircuitOpenError, ProxyError) as error:
             # Raised for the robots.txt URL; the page fails for the same reason under its own.
             return type(error)(url, error.message)
         except TimeoutError:

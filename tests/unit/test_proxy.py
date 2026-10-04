@@ -104,7 +104,10 @@ class TestOutOfRotation:
         with caplog.at_level(logging.WARNING, logger="crawler.proxy"):
             fail(pool, proxy, 1)
         assert pool.get_stats()[proxy.label] == ProxyStats(state="out", requests=2, failures=2, times_removed=1)
-        assert "Proxy http://proxy-0:3128 is out of rotation for 60s: 2 failures in a row" in caplog.text
+        assert (
+            "Proxy http://proxy-0:3128 is out of rotation for 60s, failures in a row: 2, the last: cannot connect"
+            in caplog.text
+        )
 
     def test_a_response_clears_the_count(self, pool):
         proxy = pool.proxies[0]

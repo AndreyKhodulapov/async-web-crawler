@@ -2,12 +2,16 @@ import asyncio
 import contextlib
 import gzip
 import logging
+import ssl
 import time
 from collections import Counter
 
+import certifi
 import pytest
+import trustme
 from aiohttp import web
 from pages import ENCODING_PAGES, SITE_HEADERS, SITE_PAGES, fixture_html
+from proxy_server import ProxyServer
 
 from crawler.logging_setup import reset_logging
 from demo_site import free_port
@@ -286,9 +290,8 @@ def restore_logging():
     logging.getLogger().setLevel(level)
 
 
-@pytest.fixture
-async def server(aiohttp_server):
-    """Local HTTP server with predictable endpoints; no internet required."""
+def make_app() -> web.Application:
+    """The application of the test site, with a `SiteState` of its own."""
     app = web.Application()
     app[SITE_STATE] = SiteState()
     app.router.add_get("/ok", ok)
@@ -313,7 +316,50 @@ async def server(aiohttp_server):
     app.router.add_get("/wide/{n}", wide_page)
     app.router.add_get("/cookies/set", set_cookies)
     app.router.add_get("/cookies/echo", echo_cookies)
-    return await aiohttp_server(app)
+    return app
+
+
+@pytest.fixture
+async def server(aiohttp_server):
+    """Local HTTP server with predictable endpoints; no internet required."""
+    return await aiohttp_server(make_app())
+
+
+@pytest.fixture
+async def https_server(aiohttp_server, tmp_path, monkeypatch):
+    """The test site over https, by the name localhost or 127.0.0.1, with a state of its own.
+
+    Its certificate is issued by a test CA that the crawler trusts for the
+    test: certifi gives the file of that CA in place of its bundle.
+    """
+    authority = trustme.CA()
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    authority.issue_cert("localhost", "127.0.0.1").configure_cert(context)
+    ca_file = tmp_path / "test-ca.pem"
+    authority.cert_pem.write_to_path(str(ca_file))
+    monkeypatch.setattr(certifi, "where", lambda: str(ca_file))
+    return await aiohttp_server(make_app(), ssl=context)
+
+
+@pytest.fixture
+def https_site(https_server) -> SiteState:
+    return https_server.app[SITE_STATE]
+
+
+@pytest.fixture
+async def make_proxy():
+    """Starts local proxies, as `make_proxy(**options)` (see `ProxyServer`); they are closed after the test."""
+    proxies: list[ProxyServer] = []
+
+    async def make(**options) -> ProxyServer:
+        proxy = ProxyServer(**options)
+        await proxy.start()
+        proxies.append(proxy)
+        return proxy
+
+    yield make
+    for proxy in proxies:
+        await proxy.close()
 
 
 @pytest.fixture
