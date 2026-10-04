@@ -951,6 +951,21 @@ class TestCrawlBlockedHost:
         assert stats["errors"] == {"NetworkError": 2, "CircuitOpenError": 2}
         assert stats["top_domains"] == {"a": 4, "b": 1}
 
+    async def test_a_page_with_an_error_never_retried_is_not_put_off(self, make_crawler, fake_session):
+        # Its 501 opens the circuit, but the breaker took no retry from it:
+        # a probe would only get the same 501.
+        crawler = make_crawler(
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+        fake_session.routes["http://a/1"] = FakeResponse(status=501)
+
+        await crawler.crawl(["http://a/1"])
+
+        assert fake_session.requested == ["http://a/1"]
+        assert crawler.failed_urls["http://a/1"].startswith("PermanentHTTPError: HTTP 501")
+        assert crawler.circuit_breaker.times_opened("a") == 1
+
     async def test_no_probe_after_the_last_opening(self, make_crawler, fake_session):
         crawler = make_crawler(
             max_concurrent=2,
@@ -1247,6 +1262,28 @@ class TestCrawlStorage:
         crawler.storage = MemoryStorage()
         await crawler.crawl(["http://a/1"])
         assert fake_session.requested == ["http://a/1"]
+
+    async def test_a_second_crawl_is_refused_while_the_storage_of_the_first_opens(self, make_crawler, fake_session):
+        opening, opened = asyncio.Event(), asyncio.Event()
+
+        class Slow(MemoryStorage):
+            async def _open_storage(self) -> None:
+                opening.set()
+                await opened.wait()
+
+        crawler = make_crawler(storage=Slow(), max_depth=0)
+        first = asyncio.create_task(crawler.crawl(["http://a/1"]))
+        await opening.wait()
+
+        # Let in, the second crawl would wait for the same storage.
+        async with asyncio.timeout(1):
+            with pytest.raises(RuntimeError, match="a crawl is already running on this crawler"):
+                await crawler.crawl(["http://a/2"])
+
+        opened.set()
+        await first
+        assert fake_session.requested == ["http://a/1"]
+        assert crawler.processed_urls.keys() == {"http://a/1"}
 
 
 class TestCrawlScope:
@@ -1558,6 +1595,21 @@ class TestRobots:
         assert crawler.unreachable_urls == {"http://a/1": reason}
         assert crawler.failed_sitemaps == {"http://a/sitemap.xml": f"RobotsUnreachableError: {reason}"}
         assert f"No sitemaps from robots.txt of http://a/1: {reason}" in [r.getMessage() for r in caplog.records]
+
+    async def test_a_site_given_up_on_is_tried_again_after_the_crawl(self, make_crawler, fake_session):
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        downloads = 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
+        fake_session.routes["http://a/robots.txt"] = [FakeResponse(status=503)] * downloads + [FakeResponse(status=404)]
+
+        await crawler.crawl(["http://a/1"])
+        assert crawler.unreachable_urls == {"http://a/1": "robots.txt is unreachable (HTTP 503)"}
+
+        # The crawl gave up on the site, the crawler did not.
+        await crawler.fetch_url("http://a/1")
+
+        assert fake_session.requested == ["http://a/robots.txt"] * (downloads + 1) + ["http://a/1"]
+        assert crawler.unreachable_urls == {"http://a/1": "robots.txt is unreachable (HTTP 503)"}
 
     async def test_crawl_waits_for_the_robots_txt_of_the_host_a_page_redirects_to(
         self, make_crawler, fake_session, caplog

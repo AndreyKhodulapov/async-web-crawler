@@ -115,7 +115,7 @@ sites it visits and follows their rules.
   one site ends empty after a 503 of a few seconds. The same goes for every
   way into the site: a start URL that redirects there and a sitemap of it,
   or the fix covers the direct links only. Budget the waiting per site
-  (here three downloads in a row), not per page or per sitemap, or a dead
+  (here three repeat downloads), not per page or per sitemap, or a dead
   site is waited for once by its sitemaps and again by its pages; and do
   not wait at all for a failure that does not pass by itself: a host name
   that does not exist is a typo, and three minutes change nothing about

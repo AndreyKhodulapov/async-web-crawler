@@ -174,6 +174,10 @@ class CrawlRun:
         finally:
             self._crawl_finished = time.perf_counter()
             self.stats.finish()
+            # A site given up on is given up for this crawl only: a
+            # fetch_url() after it downloads robots.txt again.
+            if self.robots is not None:
+                self.robots.forget_outages()
         stats = self.crawl_stats()
         logger.info(
             "Crawl finished: %d processed, %d failed, %d skipped, %d blocked, %d unreachable, %d left in queue, %.2fs",
@@ -688,8 +692,8 @@ class CrawlRun:
 
         A 5xx or a timeout on robots.txt is often a hiccup of a few seconds;
         failing every page of the site at once would end a crawl of that
-        site with nothing. The site is given up once `MAX_ROBOTS_RETRIES`
-        downloads in a row have failed, whoever waited for them (its pages,
+        site with nothing. The site is given up once the `MAX_ROBOTS_RETRIES`
+        downloads after the first have failed too, whoever waited for them (its pages,
         the pages that redirect to it, its sitemaps), and at once when the
         failure does not pass by itself (a bad certificate, a host name that
         does not resolve): three minutes change nothing about a typo. The
@@ -790,12 +794,19 @@ class CrawlRun:
         would have had, and its failure says no more about the page than
         about the host. The probe of the host, though, is the retry the
         breaker gave the page: a page whose probe failed fails with its error.
+        So does a page with a `PermanentError`, such as HTTP 501: it would
+        have had no retries.
         """
         error = result.error
         if isinstance(error, CircuitOpenError):
             return error
         breaker = self.circuit_breaker
-        if error is None or not breaker.is_failure(error) or breaker.opened_by_probe(error.url):
+        if (
+            error is None
+            or isinstance(error, PermanentError)
+            or not breaker.is_failure(error)
+            or breaker.opened_by_probe(error.url)
+        ):
             return None
         message = breaker.refusal(error.url)
         return None if message is None else CircuitOpenError(error.url, message)

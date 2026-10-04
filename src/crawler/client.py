@@ -55,13 +55,14 @@ class AsyncCrawler:
       its URLs are not requested either and fail with
       `RobotsUnreachableError` (see `RobotsParser`); in `crawl()`, they
       wait for it to be downloaded again, and so do the pages that
-      redirect to them and the sitemaps of the site: at most
-      `MAX_ROBOTS_RETRIES` downloads per site and outage, each after the
-      first a single attempt, and none after a failure that does not pass
-      by itself, such as a host name that does not resolve. No page waits
-      for a download of robots.txt longer than `ROBOTS_POLL` seconds: the
-      download goes on, and the page comes back every that long until it
-      is over, so a site that is slow to fail holds no worker back.
+      redirect to them and the sitemaps of the site: it is downloaded
+      again at most `MAX_ROBOTS_RETRIES` times per site and outage, each
+      time a single attempt, and not at all after a failure that does not
+      pass by itself, such as a host name that does not resolve. No page
+      waits for a download of robots.txt longer than `ROBOTS_POLL`
+      seconds: the download goes on, and the page comes back every that
+      long until it is over, so a site that is slow to fail holds no
+      worker back.
     - Redirects are followed one request at a time, up to
       `MAX_REDIRECTS`: the target of each goes through robots.txt, the
       rate limit, the retries and the circuit breaker of its own host.
@@ -268,6 +269,8 @@ class AsyncCrawler:
         self.stats = CrawlerStats()
         # The latest crawl() call; an empty one before the first.
         self._run = self._new_run()
+        # A crawl() that is opening the storage, before its run has started.
+        self._starting = False
 
     async def __aenter__(self) -> Self:
         return self
@@ -465,9 +468,10 @@ class AsyncCrawler:
         `blocked_urls` and do not count toward `max_pages`. Neither do pages
         of sites whose robots.txt cannot be read: they are put off until it
         is downloaded again (see `RobotsParser.UNREACHABLE_TTL`), then
-        listed in `unreachable_urls` once it has failed `MAX_ROBOTS_RETRIES`
-        downloads in a row, or at once after a failure that does not pass by
-        itself (a bad certificate, a host name that does not resolve); a
+        listed in `unreachable_urls` once it has also failed the
+        `MAX_ROBOTS_RETRIES` downloads after the first, or at once after a
+        failure that does not pass by itself (a bad certificate, a host
+        name that does not resolve); a
         site whose robots.txt failed for a moment is crawled once it is
         back. So does a page that redirects to such a site: it is requested
         again when it comes back, uncounted meanwhile. Each download after
@@ -482,7 +486,8 @@ class AsyncCrawler:
         flight: the breaker refused the retries it would have had, so it
         is requested again when the host may be probed, uncounted
         meanwhile, rather than failed. The probe itself is such a retry: a
-        page whose probe failed fails with its error. Once
+        page whose probe failed fails with its error, and so does one with
+        an error never retried, such as HTTP 501. Once
         the circuit of a host has opened `MAX_CIRCUIT_OPENINGS` times in
         the crawl, its refused pages go to `failed_urls` with
         `CircuitOpenError`, so a host that stays down holds the crawl for
@@ -551,8 +556,8 @@ class AsyncCrawler:
         that cannot be read does not stop the crawl: it is logged and listed
         in `failed_sitemaps`. A sitemap of a site whose robots.txt cannot
         be read waits for it as a page does, within the `MAX_ROBOTS_RETRIES`
-        downloads of the site, before the first page is fetched; so do the
-        sitemaps named in such a robots.txt.
+        repeat downloads of the site, before the first page is fetched; so
+        do the sitemaps named in such a robots.txt.
 
         Failed pages do not stop the crawl: they are listed in `failed_urls`.
         Every processed page is saved to the `storage` of the crawler, if it
@@ -595,12 +600,18 @@ class AsyncCrawler:
             raise ValueError(f"invalid sitemap URLs: {', '.join(map(repr, invalid))}")
         if robots_sitemaps and self.robots is None:
             raise ValueError("robots_sitemaps needs a crawler that reads robots.txt (respect_robots=True)")
-        if self._run.running:
+        if self._run.running or self._starting:
             raise RuntimeError("a crawl is already running on this crawler")
         if self.storage is not None:
             # Before anything is requested: a storage that cannot be
             # written to is found out now, not a batch of pages later.
-            await self.storage.open()
+            # The crawler is taken while it opens: another crawl() may
+            # start meanwhile, and the run starts only after it.
+            self._starting = True
+            try:
+                await self.storage.open()
+            finally:
+                self._starting = False
 
         url_filter = UrlFilter(
             allowed_hosts={get_host(url) for url in start_urls + sitemap_urls} if same_domain_only else None,

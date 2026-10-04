@@ -101,8 +101,9 @@ errors, after the retries) disallows the whole site for 60 seconds, then it
 is fetched again. Such pages are counted as unreachable, not as blocked:
 the site did not forbid them. In a crawl they are put off until robots.txt
 is fetched again, so a site whose robots.txt failed for a moment is crawled
-once it is back; only after `AsyncCrawler.MAX_ROBOTS_RETRIES` (3) failed
-downloads in a row, about three minutes, do its pages go to
+once it is back; only after the `AsyncCrawler.MAX_ROBOTS_RETRIES` (3)
+downloads after the first have failed too, about three minutes, do its
+pages go to
 `unreachable_urls`. A failure that does not pass by itself, a bad
 certificate or a host name that does not exist (`DNSError`), is not
 waited for at all: the pages go there at once. A resolver that fails for
@@ -115,8 +116,9 @@ waits for a download longer than `AsyncCrawler.ROBOTS_POLL` (2) seconds:
 the download goes on, and the page is put off for that long at a time
 until it is over, so a site that is slow to fail holds no worker back
 (outside a crawl, `fetch_url` and the others wait for the download). A
-site given up on is not downloaded again for the rest of the crawl; the
-next `crawl()` on the same crawler tries it again.
+site given up on is not downloaded again for the rest of the crawl; once
+it is over, `fetch_url` and the next `crawl()` on the same crawler try it
+again.
 Redirects are followed by
 the crawler, one request at a time: the target of each is checked against
 robots.txt of its own site and waits for the rate limit of its own host, as
@@ -236,7 +238,8 @@ the retries it would have had, so it is requested again when the host may
 be probed, instead of being the page lost to the outage. The probe is
 such a retry: a page whose probe failed is failed with its own error and
 not put off again, so that one broken page does not probe a healthy host
-until it is given up. So the pages of
+until it is given up. A page with an error that is never retried, such as
+HTTP 501, fails at once too: the breaker took nothing from it. So the pages of
 a host that went down for a moment are fetched once it is back, even when
 the page refused was the last one `max_pages` allowed. A page refused
 before its request does not count toward `max_pages`, and neither does one
@@ -431,7 +434,7 @@ as those of the start URLs; when a start URL redirects to another host
 crawled too. A sitemap that cannot be downloaded or read is logged and
 listed in `failed_sitemaps`, and the crawl goes on. A sitemap of a site
 whose robots.txt cannot be read waits for it to be downloaded again, within
-the `AsyncCrawler.MAX_ROBOTS_RETRIES` (3) downloads of the site, as a page
+the `AsyncCrawler.MAX_ROBOTS_RETRIES` (3) repeat downloads of the site, as a page
 does, and so do the sitemaps that such a robots.txt names under `robots_sitemaps`: the first
 page is fetched after that wait, so that a crawl fed by sitemaps alone does
 not end empty after a 503 of a few seconds.
