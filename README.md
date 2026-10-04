@@ -38,6 +38,11 @@ configuration file, by command-line options, or from Python.
   `NO_PROXY` of the environment; a proxy that keeps failing is taken out
   of rotation for a while without blocking the sites behind it; requests
   and failures per proxy in the summary and the reports, passwords hidden
+- **JavaScript rendering** in a headless Chromium (Playwright, optional):
+  every HTML page or those matching patterns, waiting for an event or a
+  CSS selector; the page itself downloaded as without a browser, images
+  and fonts not loaded, navigations of a page checked against robots.txt
+  and the filters like redirects
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that
   grow with every retry
@@ -80,6 +85,14 @@ pip install -e .                       # the crawler and its dependencies
 pip install -r requirements-dev.txt    # test and lint tools, for development
 ```
 
+Rendering JavaScript pages needs Playwright and its Chromium (about
+600 MB on disk), which the crawler does without otherwise:
+
+```bash
+pip install -e ".[js]"
+playwright install chromium
+```
+
 ## Quick start
 
 ```bash
@@ -116,6 +129,7 @@ python src/main.py --urls https://example.com --max-pages 100 --output results.j
 python src/main.py --config config.yaml --max-pages 500 --report report.html
 python src/main.py --config config.yaml --urls-file urls.txt
 some_tool | python src/main.py --config config.yaml --urls-file -
+python src/main.py --urls https://quotes.toscrape.com/js/ --render --output quotes.jsonl
 ```
 
 A crawl is set up by a configuration file, by options, or by both. An
@@ -143,6 +157,7 @@ when the configuration has sitemaps to crawl.
 | `--cookies-file PATH` | `session.cookies_file` | send the cookies of a Netscape `cookies.txt` file, as a browser extension or `curl -c` exports it |
 | `--save-cookies PATH` | `session.save_cookies` | write the cookies to a `cookies.txt` file after the crawl, readable by its owner only |
 | `--proxy URL` | `proxy.urls` | send the requests through a proxy, `http://[user:password@]host:port`; repeat for several, in place of those of the file (`proxy.from_env` is turned off) |
+| `--render` | `rendering.mode` | render every HTML page in a headless Chromium, so that links and text JavaScript makes are found; sets `mode: always` and clears `rendering.include` of the file. Without Chromium, exit code 2 with the command to install it |
 | `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, `nofollow` and `noindex`, or do not |
 | `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
@@ -153,7 +168,7 @@ when the configuration has sitemaps to crawl.
 | `--no-progress` | | do not show the progress line |
 
 Everything else (sitemaps, the other filters, retries, the circuit breaker, timeouts,
-the rotation of proxies) is set in the file. The command line never keeps the pages in memory
+the rotation of proxies, what and how to render) is set in the file. The command line never keeps the pages in memory
 (`crawler.keep_pages` is off whatever the file says): they go to `--output`.
 The log and the progress line go to stderr, the summary to stdout:
 
@@ -298,6 +313,24 @@ storages. All of it is described in the [API reference](docs/api.md).
 - **`https://` proxies are not tested end to end.** The tests run an
   http proxy, with CONNECT for https sites; a proxy reached over TLS is
   left to aiohttp.
+- **A rendered page is fetched by two clients.** The document is
+  downloaded by aiohttp, its scripts, styles and data by Chromium: a site
+  that compares the fingerprints of TLS and headers sees two clients.
+  The browser's own requests go directly, without the proxies, the
+  cookies and the headers of `session`, and the cookies a script sets do
+  not reach `save_cookies`.
+- **The browser's own requests are not checked against robots.txt**, as
+  no browser checks them: scripts, styles, data, the requests of a page
+  after it loaded. They are not counted against the rate limit either; a
+  rendered page costs the site its scripts and data too. Images, fonts
+  and media are not loaded by default.
+- **What a page does after the wait is not seen.** A page is read once
+  `wait_until` and `wait_for` are met: content loaded later, and a
+  navigation started later, are missed. A page that changes its URL with
+  `history.pushState` keeps the URL it was downloaded from. In the
+  browser the User-Agent is `user_agent`; `user_agents` are not rotated
+  there. The rendering `timeout` does not grow with retries, as the
+  timeouts of requests do.
 - **Not for URLs from strangers.** Links to private addresses
   (`127.0.0.1`, `10.0.0.0/8`, the cloud metadata address) are followed
   like any other. The crawler is a command-line tool for sites you choose,
@@ -322,7 +355,7 @@ storages. All of it is described in the [API reference](docs/api.md).
 
 | Document | Content |
 |----------|---------|
-| [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, cookies and headers, proxies, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page, the internal layers |
+| [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, cookies and headers, proxies, rendering, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page, the internal layers |
 | [docs/configuration.md](docs/configuration.md) | configuration guide: every key with its type and default, validation, overrides, recipes |
 | [docs/demo.md](docs/demo.md) | the demo commands and their output |
 | [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler, memory, bottlenecks found and fixed |
@@ -364,6 +397,7 @@ pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, 
 pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker, saving, AdvancedCrawler, the command line, the example and the scale demo against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
 pytest -m postgres          # the database tests and the save demo against PostgreSQL
+pytest -m browser           # rendering in a headless Chromium; skipped without Playwright or Chromium
 ```
 
 The database tests run on SQLite by default. With the marker `postgres` the
@@ -376,7 +410,7 @@ found by the same variable that moved it:
 ```bash
 export CRAWLER_POSTGRES_PORT=55432          # port 5432 is taken
 docker compose up -d --wait
-pytest -m ""                                # every test: the default ones, network and postgres
+pytest -m ""                                # every test: the default ones, network, postgres and browser
 ```
 
 ```bash
@@ -388,7 +422,7 @@ The [Makefile](Makefile) keeps these commands short, with the tools of `.venv`:
 
 ```bash
 make test                   # the default tests
-make test-all               # every test, network and postgres too
+make test-all               # every test, network, postgres and browser too
 make lint                   # ruff check and a format check
 make db                     # start the PostgreSQL of docker-compose.yml
 make check                  # lint and every test: what a change must pass
@@ -411,6 +445,9 @@ src/
     ├── crawl_run.py        # CrawlRun: one crawl — queue, filters, limits, deferred pages, counters, saving
     ├── fetching.py         # Fetcher: one URL with robots.txt, circuit breaker, rate limit, retries and redirects
     ├── transport.py        # Transport contract; HttpTransport: single GET requests over an aiohttp session, decoding, size limits
+    ├── rendering.py        # Rendering, BrowserTransport, Renderer: HTML pages rendered in a headless Chromium (Playwright)
+    ├── session.py          # cookies.txt files, the cookie jar, checks of cookies and headers
+    ├── proxy.py            # ProxyPool, Proxy: rotation, proxies out of rotation, their statistics
     ├── queue.py            # CrawlerQueue: URL priority queue and statuses
     ├── semaphores.py       # SemaphoreManager: global and per-domain limits
     ├── rate_limiter.py     # RateLimiter: requests per second, delays, jitter, rate stats

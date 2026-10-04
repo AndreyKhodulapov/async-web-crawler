@@ -49,6 +49,11 @@ leaves a failing site alone.
   proxy and a slow site look alike. It is put on the site, as without a
   proxy; put on the proxy, one dead site would take every proxy out in
   turn. A proxy that loses packets then looks like slow sites.
+  A browser that cannot start or crashes is a failure of the crawler, not
+  of the site (`RenderError`): it is not retried, since another attempt meets the
+  same browser, and the circuit breaker does not count it. A page the
+  browser takes too long to render is a timeout of the site, as a slow
+  response would be.
 - An unforeseen exception (a bug) must not break the batch: catch it at the
   boundary of one URL, log the traceback and report it as that URL's error.
 

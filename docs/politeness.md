@@ -209,6 +209,21 @@ sites it visits and follows their rules.
   cookies stay on one address. A session that jumps between addresses
   looks stolen, and some sites end it.
 
+## Rendering JavaScript
+
+- A rendered page costs the site more than its HTML: the browser loads
+  its scripts, styles and data, as a visitor's would. The page counts
+  once against the rate limit; its own requests are not limited and not
+  checked against robots.txt, as no browser checks them. Block what the
+  HTML does not need (images, fonts and media by default), and render
+  only the pages that need it.
+- A navigation a page starts on its own (`location`, a meta refresh) is a
+  request the crawler makes, so it goes through robots.txt, the filters
+  and the rate limit like a redirect: a script cannot lead the crawler
+  where robots.txt forbids.
+- The browser sends the crawler's `user_agent`, not the "HeadlessChrome"
+  of Chromium: the crawler keeps its name in the browser too.
+
 ## Measuring politeness
 
 - Current requests per second over a sliding window (the last 5 seconds),

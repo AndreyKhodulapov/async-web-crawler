@@ -278,6 +278,76 @@ Politeness stays with the sites: the rate limit, robots.txt, Crawl-delay,
 whatever proxy a request goes through. Proxies are not a way around the
 limits of a site.
 
+### `rendering`
+
+Pages rendered in a headless Chromium, for sites whose links and text
+JavaScript makes: without it, such a page is an empty shell. Off by
+default. See [Rendering](api.md#rendering).
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `mode` | `off`, `always` or `patterns` | `off` | `always`: every HTML page is rendered; `patterns`: only the pages whose URL matches `include`; write `"off"` in quotes, YAML reads a bare `off` as `false` |
+| `include` | list of regular expressions | `[]` | with `mode: patterns`, the URLs to render, searched anywhere in the URL as in `filters`; required there, an error with another `mode` |
+| `wait_until` | `load`, `domcontentloaded` or `networkidle` | `load` | the event of the page to wait for; `networkidle` is no request for half a second |
+| `wait_for` | CSS selector or `null` | `null` | an element to wait for after that, e.g. `"#content"` |
+| `timeout` | number, > 0 | `30.0` | seconds the browser has for a page, the waits included |
+| `max_open_pages` | whole number, >= 1 | `2` | pages rendered at once; a browser tab takes 50 to 100 MB |
+| `block_resources` | list of resource types | `[image, font, media]` | requests the browser does not make: `image`, `font`, `media`, `stylesheet`, `script`, `xhr`, `fetch`, `websocket`, `eventsource`, `manifest`, `texttrack`, `other` |
+
+```yaml
+rendering:
+  mode: patterns
+  include: ['^https://example\.com/app/']
+  wait_for: "#content"
+```
+
+Rendering needs the extra `js` and the browser of Playwright:
+
+```bash
+pip install -e ".[js]"
+playwright install chromium
+```
+
+Without the package, a `mode` other than `"off"` is a configuration
+error with the command to install it. Without Chromium, the command line
+stops before the crawl with the other command and exit code 2; from
+Python, every page to render fails with `RenderError` that says the same.
+`--render` on the command line sets `mode: always` and clears `include`,
+so it renders every page whatever the file says.
+
+The page itself is downloaded as without a browser: through the proxies,
+with the cookies and the headers of `session`, within `max_page_size`.
+Only an HTML page goes to the browser; robots.txt, sitemaps, redirects
+and other types never do. The browser gets the document as it was
+downloaded, runs its JavaScript and loads its scripts, styles and data
+itself; robots.txt is not asked about them, as no browser asks it. A
+page counts once against `max_pages` and the rate limit, whatever it
+loads, and is rendered within the slot of its request, so
+`max_concurrent` and `max_per_domain` bound the browser too.
+
+A page that goes to another URL on its own (JavaScript setting
+`location`, `<meta http-equiv="refresh">`) is a redirect: the browser is
+stopped, and the crawler checks the target against robots.txt and the
+filters and requests it as it would after an HTTP redirect, within the
+limit of redirects. Frames and pop-up windows get nothing: their content
+is not in the HTML of the page.
+
+The rendered HTML is what is parsed and saved; the status, the headers
+(`X-Robots-Tag`) and the final URL are those of the download. A page
+over `max_page_size` once rendered fails with `PageTooLargeError`, one
+the browser takes longer than `timeout` to render fails with a timeout
+and is retried as one, with the same `timeout` (it does not grow with
+the retries). A browser that cannot start or crashes fails the pages
+with `RenderError`, which is not retried and not held against the site;
+a crashed browser is started again for the next page, once.
+
+`wait_until: load` is enough for a page that builds itself from its own
+scripts; a page that loads its data afterwards needs `networkidle` or,
+better, `wait_for` with an element the data makes. Rendering costs: a
+page takes seconds and tens of megabytes instead of milliseconds, and
+the site serves its scripts and data too. Use `patterns` when only some
+pages need it.
+
 ### `storage`
 
 Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
@@ -327,7 +397,8 @@ written. A problem is reported by the path of its key:
 
 - an unknown key, with the closest known one suggested;
 - a value of the wrong type (`max_pages: yes` is not a number, `"10"` is
-  not one either) or out of its limits;
+  not one either) or out of its limits; `true` or `false` for a string
+  suggests quotes, as YAML reads a bare `off`, `on`, `no` or `yes` so;
 - an invalid URL or regular expression, an unknown log level or encoding;
   a URL with a space or a control character inside, which a client would
   send as `%20` or drop, so it is not the URL that was meant;
@@ -343,11 +414,17 @@ written. A problem is reported by the path of its key:
   path; a SOCKS proxy; the same proxy listed twice, its host in any case;
   the URL is not shown,
   a repeated one with its password hidden;
+- an unknown `rendering.mode`, `wait_until` or resource type, an empty
+  `wait_for`;
 - a key written twice in YAML (plain YAML would keep the last one silently);
 - keys that do not go together: `sitemaps.from_robots` without
   `crawler.respect_robots`, a `user_agents` entry with another bot name,
   `session.cookies`, `cookies_file` or `save_cookies` with
-  `session.keep_cookies: false`, `proxy.from_env` with `proxy.urls`;
+  `session.keep_cookies: false`, `proxy.from_env` with `proxy.urls`,
+  `rendering.mode: patterns` without `rendering.include`, `include` with
+  another `mode`;
+- rendering on, without the package of Playwright, with the command to
+  install it;
 - with `proxy.from_env`, a variable that is not the URL of a proxy, or
   `HTTP_PROXY` and `HTTPS_PROXY` naming one proxy with different
   passwords, when the crawler is made, reported by the names of the

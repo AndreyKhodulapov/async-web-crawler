@@ -24,7 +24,12 @@ listed in the [API reference](api.md#internals).
     proxy of every request and tells the pool how it went, and the
     request layer sees only the class of the error (`ProxyNetworkError`
     is retried, `NoProxyError` is not), never a proxy;
-  - rendering JavaScript in a headless browser is a second transport with the same contract;
+  - rendering JavaScript in a headless browser is a second transport with
+    the same contract (`BrowserTransport`), a wrapper of the first: the
+    page is downloaded as before and only then handed to the browser. A
+    page that goes to another URL on its own comes back as a redirect, so
+    the request layer checks robots.txt, the filters and the redirect
+    limit for it as for any redirect; the transport never calls up to ask;
   - a crawl shared by several machines replaces the queue and the set of seen URLs of the crawl layer.
 
 ## Contracts between layers

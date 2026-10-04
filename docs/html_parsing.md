@@ -89,7 +89,8 @@ BeautifulSoup is a tree API on top of a pluggable parser:
 
 - **JavaScript-rendered pages (SPA)**: the HTML is a shell and the content
   arrives later via JS and API calls. Options: call the site's JSON API
-  directly, or render with a headless browser (Playwright).
+  directly, or render with a headless browser (Playwright; the crawler's
+  `rendering` section, see the [configuration guide](configuration.md#rendering)).
 - **Anti-bot protection**: a challenge page or HTTP 403 instead of content.
   Respect it; do not try to bypass it.
 - **Rate limits**: HTTP 429 with `Retry-After` means "slow down". A polite

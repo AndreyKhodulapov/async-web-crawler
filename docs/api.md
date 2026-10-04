@@ -15,6 +15,7 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Timeouts](#timeouts) | connect, read and total timeouts |
 | [Cookies and headers](#cookies-and-headers) | the session of the crawler, `cookies.txt` files |
 | [Proxies](#proxies) | `ProxyPool`: rotation, proxies taken out of it, their errors |
+| [Rendering](#rendering) | `Rendering`: pages rendered in a headless Chromium, their errors |
 | [Crawling](#crawling) | `crawl()`: depth, filters, sitemaps, state of a crawl |
 | [Page statistics](#page-statistics) | `CrawlerStats`, export to JSON and HTML |
 | [AdvancedCrawler](#advancedcrawler) | the crawler set up by a configuration |
@@ -80,7 +81,8 @@ without being requested, and a URL of a site whose robots.txt cannot be read
 fails with `RobotsUnreachableError`. A request to a host blocked by the
 circuit breaker fails with `CircuitOpenError` without being sent, and one
 for which every proxy is out of rotation with `NoProxyError` (see
-[Proxies](#proxies)).
+[Proxies](#proxies)). With `rendering`, an HTML page is rendered in a
+headless browser before it is returned (see [Rendering](#rendering)).
 
 ## Politeness
 
@@ -464,6 +466,81 @@ HTTP to SOCKS, does instead.
 `AdvancedCrawler` makes the pool of the `proxy` section (see the
 [configuration guide](configuration.md#proxy)).
 
+## Rendering
+
+With `Rendering`, HTML pages are rendered in a headless Chromium before
+they are parsed, so the links and the text that JavaScript makes are
+found. It needs `pip install -e ".[js]"` and `playwright install
+chromium`; Playwright is imported when the first page is rendered, so the
+crawler works without it until then.
+
+```python
+from crawler import AsyncCrawler, Rendering
+
+rendering = Rendering(wait_until="load", wait_for=".quote", timeout=20.0)
+async with AsyncCrawler(rendering=rendering) as crawler:
+    page = await crawler.fetch_and_parse("https://quotes.toscrape.com/js/")
+    print(len(page["text"]))  # about 1500 characters of quotes; without rendering, 74 of the header and footer
+```
+
+| Name | What it does |
+|------|--------------|
+| `Rendering(include=, wait_until=, wait_for=, timeout=, max_open_pages=, block_resources=)` | which pages are rendered and how long they are waited for; `ValueError` for a value out of its range or a pattern that is not a regular expression, `TypeError` for a string in place of a list |
+| `include` | regular expressions searched in the URL, as in `UrlFilter`; given, only the pages that match one are rendered; empty (the default), every HTML page |
+| `wait_until` | `"load"` (the default), `"domcontentloaded"` or `"networkidle"` (no request for half a second) |
+| `wait_for` | a CSS selector to wait for after that; `None` by default |
+| `timeout` | seconds the browser has for a page, the waits included; `30.0` |
+| `max_open_pages` | pages rendered at once, each a browser tab of 50 to 100 MB; `2` |
+| `block_resources` | types of requests the browser does not make (`RESOURCE_TYPES` of `crawler.rendering`: `"image"`, `"script"`, `"xhr"` ...); images, fonts and media by default |
+| `renders(url)` | whether the page at `url` is rendered, if it is HTML |
+| `AsyncCrawler(rendering=)` | render pages as it says; `None`, the default, renders none |
+| `crawler.rendering` | the settings, `None` without rendering |
+| `browser_problem()`, `playwright_problem()` of `crawler.rendering` | why pages cannot be rendered here (Playwright or Chromium is not installed), with the command to install it; `None` if they can. `browser_problem()` is a coroutine that starts the driver of Playwright for a moment |
+
+Every request is made as without a browser first: the page is downloaded
+by aiohttp, through the proxies, with the cookies and the headers, within
+`max_page_size`. Only a response that is HTML, for a URL that
+`renders()`, goes to the browser: robots.txt, sitemaps, redirects and
+other types never do. The browser gets the document as downloaded, not
+again from the site, runs its JavaScript and loads what it asks for
+itself, but `block_resources`. The page counts once against `max_pages`
+and the rate limit, and is rendered within the concurrency slot of its
+request; its response time includes the rendering. `fetch_url()` and the
+other methods render an HTML page too.
+
+A page that goes to another URL on its own (JavaScript setting
+`location`, `<meta http-equiv="refresh">`, a form sent) comes back as a
+redirect to that URL, with the status of the download: the browser is
+stopped, and the crawler checks the target against robots.txt and the
+filters, waits for the rate limit of its host and requests it, within
+`MAX_REDIRECTS`, as it does after an HTTP redirect. A disallowed target
+fails with `RobotsDisallowedError` before it is requested. Navigations of
+frames and pop-up windows are refused: what they show is not in the HTML
+of the page. Service workers are blocked.
+
+The rendered page keeps the status, the headers and the final URL of its
+download; its text is the HTML of the page once rendered (the DOM, as
+`page.content()` serializes it), and its size the bytes of that HTML in
+UTF-8. The browser has one context for the crawler, with its
+`user_agent`; a tab is opened for every page and closed after it.
+
+| Error | When | Retried | Circuit breaker |
+|-------|------|---------|-----------------|
+| `FetchTimeoutError` | the page took the browser longer than `timeout`: `rendering timeout (30.0s)` | yes, with the same `timeout` | counts, as any timeout |
+| `PageTooLargeError` | the rendered HTML is over `max_page_size` bytes | no | does not count, as without a browser |
+| `RenderError` | Playwright or Chromium is not installed (the message has the command to install it), the browser could not start, crashed, or the page crashed in it | no | does not count: the browser failed, not the site |
+| `CrawlerClosedError` | the crawler was closed while the page was rendered | no | does not count |
+
+The browser is started for the first page to render, so a crawl without
+such a page never starts it, and closed by `close()`. A browser that
+crashes fails the pages it was rendering and is started again for the
+next one, once (`Renderer.MAX_LAUNCHES`, 2 launches in all); after that,
+or after a browser that could not start, every page to render fails with
+`RenderError` at once. `error_stats()` counts `RenderError` as `other`.
+
+`AdvancedCrawler` makes the settings of the `rendering` section (see the
+[configuration guide](configuration.md#rendering)).
+
 ## Crawling
 
 `crawl()` runs `max_concurrent` workers over a priority queue of URLs. A link
@@ -697,7 +774,7 @@ asyncio.run(main())
 | `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
-| `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats` |
+| `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats`; `crawler.proxies` and `crawler.rendering` are the pool and the settings of rendering, `None` without them |
 | `reports` | the report files the latest `write_reports()` wrote |
 | `save_cookies()`, `cookie_file` | writes the cookies to `session.save_cookies` and returns the file, `None` without one or when it cannot be written (logged); `crawl()` calls it, call it yourself after a crawl that was cancelled. `cookie_file` is the file it wrote |
 
@@ -991,11 +1068,13 @@ and may change. A layer calls only the one below it.
 | Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
 | HTTP | `transport.py` | `Transport`, `HttpTransport` | `Transport` is the contract the request layer sends through; `HttpTransport` makes a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
+| HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash | robots.txt, filters, retries, limits |
 
 Who owns what:
 
 - `AsyncCrawler` creates the shared objects — `SemaphoreManager`,
-  `RateLimiter`, `RetryStrategy`, `CircuitBreaker`, `HttpTransport`,
+  `RateLimiter`, `RetryStrategy`, `CircuitBreaker`, `HttpTransport`
+  (wrapped in a `BrowserTransport` with `rendering`),
   `Fetcher`, `HTMLParser`, `CrawlerStats` — and exposes some of them as
   its attributes (`rate_limiter`, `circuit_breaker`, `stats` ...). The
   settings and the components of a crawler are read-only, as the layers

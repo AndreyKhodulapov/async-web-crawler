@@ -8,7 +8,7 @@ PYTHON ?= .venv/bin/python
 test:  # the default tests: unit and integration, no internet or database needed
 	$(PYTHON) -m pytest -q
 
-test-all:  # every test, the network and postgres ones too
+test-all:  # every test, the network, postgres and browser ones too
 	$(PYTHON) -m pytest -q -m ""
 
 lint:
