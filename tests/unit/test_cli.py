@@ -122,6 +122,18 @@ def test_invalid_options_are_usage_errors(argv, capsys):
     assert "usage:" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "url", ["https://a.example/my page", "https://a.example/ # the home page", "https://a.example/a\tb"]
+)
+def test_a_url_with_a_space_is_an_error_of_the_option(url, capsys):
+    # Not of `urls` in the configuration, which the user never wrote.
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["--urls", url])
+
+    assert exit_info.value.code == 2
+    assert "argument --urls: a URL cannot contain spaces or control characters" in capsys.readouterr().err
+
+
 def test_options_alone_make_a_configuration():
     config = build_config(parse_args(["--urls", "https://example.com/", "--max-pages", "5"]))
 

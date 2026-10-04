@@ -53,7 +53,9 @@ class DNSError(NetworkError):
     """The resolver says the host name has no address: mostly a name that does not exist.
 
     A lookup that failed for now, such as a resolver that cannot be
-    reached, is a plain `NetworkError`.
+    reached, is a plain `NetworkError`. That takes the codes of the system
+    resolver: with aiodns installed, aiohttp uses it instead, and every
+    failed lookup is a `DNSError`.
     """
 
 

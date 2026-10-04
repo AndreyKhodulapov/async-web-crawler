@@ -8,6 +8,7 @@ from collections.abc import Callable
 from urllib.parse import urlsplit
 
 from crawler import is_valid_http_url, storage_from_url
+from crawler.config import http_url_problem
 
 
 def number(raw: str, number_type: type[int] | type[float] = float) -> int | float:
@@ -46,6 +47,9 @@ def share(raw: str) -> float:
 def http_url(raw: str) -> str:
     if not is_valid_http_url(raw):
         raise argparse.ArgumentTypeError(f"not an absolute http(s) URL: {raw!r}")
+    # Here rather than in the check of the configuration, which would name `urls`.
+    if (problem := http_url_problem(raw)) is not None:
+        raise argparse.ArgumentTypeError(f"{problem}, got {raw!r}")
     return raw
 
 

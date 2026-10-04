@@ -65,7 +65,12 @@ def _option(
 _SPACE_OR_CONTROL = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
 
 
-def _http_url(value: str) -> str | None:
+def http_url_problem(value: str) -> str | None:
+    """What is wrong with `value` as a URL to crawl, None if nothing.
+
+    One check for `urls` and `sitemaps.urls` of the configuration, the
+    lines of a URL list and the URLs of the command line.
+    """
     if not is_valid_http_url(value):
         return "expected an http:// or https:// URL"
     # Valid all the same: a space would be sent as %20, a tab or a line break dropped.
@@ -141,7 +146,7 @@ class CrawlOptions:
 class SitemapOptions:
     """Section `sitemaps`: sitemaps whose pages are crawled along with the start URLs."""
 
-    urls: tuple[str, ...] = _option((), check=_http_url)
+    urls: tuple[str, ...] = _option((), check=http_url_problem)
     from_robots: bool = False  # also the sitemaps that robots.txt of the start URLs' sites names
     max_urls: int = _option(50_000, minimum=1)  # pages taken from one sitemap, its index included
 
@@ -242,7 +247,7 @@ class CrawlerConfig:
     change a value, make another one with `overrides`.
     """
 
-    urls: tuple[str, ...] = _option((), check=_http_url)
+    urls: tuple[str, ...] = _option((), check=http_url_problem)
     sitemaps: SitemapOptions = field(default_factory=SitemapOptions)
     crawler: CrawlOptions = field(default_factory=CrawlOptions)
     retry: RetryOptions = field(default_factory=RetryOptions)
@@ -325,7 +330,7 @@ def load_urls(path: str | Path) -> list[str]:
         url = line.strip()
         if not url or url.startswith("#"):
             continue
-        problem = _http_url(url)
+        problem = http_url_problem(url)
         if problem is None:
             urls.append(url)
         else:

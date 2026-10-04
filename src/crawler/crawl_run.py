@@ -692,13 +692,14 @@ class CrawlRun:
 
         A 5xx or a timeout on robots.txt is often a hiccup of a few seconds;
         failing every page of the site at once would end a crawl of that
-        site with nothing. The site is given up once the `MAX_ROBOTS_RETRIES`
-        downloads after the first have failed too, whoever waited for them (its pages,
-        the pages that redirect to it, its sitemaps), and at once when the
-        failure does not pass by itself (a bad certificate, a host name that
-        does not resolve): three minutes change nothing about a typo. The
-        wait is `ROBOTS_POLL` when the download is due already: another
-        task is making it, or is about to, and nobody else waits for it.
+        site with nothing. The site is given up once the
+        `MAX_ROBOTS_RETRIES` downloads after the first have failed too,
+        whoever waited for them (its pages, the pages that redirect to it,
+        its sitemaps), and at once when the failure does not pass by itself
+        (a bad certificate, a host name that does not resolve): three
+        minutes change nothing about a typo. The wait is `ROBOTS_POLL`
+        when the download is due already: another task is making it, or
+        is about to, and nobody else waits for it.
         """
         assert self.robots is not None  # asked after it refused a URL
         if not self.robots.may_recover(url) or self.robots.failed_downloads(url) > self.MAX_ROBOTS_RETRIES:

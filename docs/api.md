@@ -103,12 +103,13 @@ the site did not forbid them. In a crawl they are put off until robots.txt
 is fetched again, so a site whose robots.txt failed for a moment is crawled
 once it is back; only after the `AsyncCrawler.MAX_ROBOTS_RETRIES` (3)
 downloads after the first have failed too, about three minutes, do its
-pages go to
-`unreachable_urls`. A failure that does not pass by itself, a bad
-certificate or a host name that does not exist (`DNSError`), is not
+pages go to `unreachable_urls`. A failure that does not pass by itself, a
+bad certificate or a host name that does not exist (`DNSError`), is not
 waited for at all: the pages go there at once. A resolver that fails for
-now (`EAI_AGAIN`) is an outage, not `DNSError`, and is waited for. A page that redirects to
-such a site waits the same way and is requested again, and so does a
+now (`EAI_AGAIN`) is an outage, not `DNSError`, and is waited for; with
+aiodns installed, which aiohttp then uses and which gives no such code,
+every DNS failure is `DNSError`. A page that redirects to such a site
+waits the same way and is requested again, and so does a
 sitemap of the site (see [Crawling](#crawling)); they all share the
 downloads of the site. Each download after the first is a single attempt,
 without the retries and their growing timeouts, and no page of a crawl

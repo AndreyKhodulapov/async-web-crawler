@@ -31,7 +31,10 @@ leaves a failing site alone.
     (`EAI_AGAIN`) a plain `NetworkError`. A retry costs little for both.
     Waiting minutes does not: once the retries are spent, `DNSError` is
     taken for good, and a crawl does not wait for the robots.txt of such a
-    host; it waits out the other one like any outage.
+    host; it waits out the other one like any outage. This needs the codes
+    of the system resolver: aiohttp switches to aiodns when it is
+    installed, which gives no code, and then every DNS failure is
+    `DNSError`.
 - Some failures are not about the request at all: the crawler is closed, the
   host's circuit is open, robots.txt is unreachable. Retrying the request
   cannot fix them.
