@@ -170,7 +170,7 @@ def fake_session() -> FakeSession:
 def make_crawler(monkeypatch, fake_session):
     def make(**options) -> AsyncCrawler:
         crawler = AsyncCrawler(**{"max_concurrent": 3, **UNTHROTTLED, **options})
-        monkeypatch.setattr(crawler, "_create_session", lambda: fake_session)
+        monkeypatch.setattr(crawler._transport, "_create_session", lambda: fake_session)
         return crawler
 
     return make
@@ -214,7 +214,7 @@ class TestInit:
 
     def test_does_not_create_session_eagerly(self):
         crawler = AsyncCrawler()
-        assert crawler._session is None
+        assert crawler._transport._session is None
 
     def test_rate_options_configure_the_limiter(self):
         limiter = AsyncCrawler(requests_per_second=4, per_domain_rate=False, min_delay=0.5, jitter=0.1).rate_limiter
@@ -225,7 +225,7 @@ class TestLifecycle:
     async def test_session_is_created_once_and_reused(self, crawler, fake_session):
         await crawler.fetch_url("http://a")
         await crawler.fetch_url("http://b")
-        assert crawler._session is fake_session
+        assert crawler._transport._session is fake_session
         assert fake_session.requested == ["http://a", "http://b"]
 
     async def test_close_is_idempotent(self, crawler, fake_session):
