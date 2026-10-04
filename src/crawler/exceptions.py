@@ -19,8 +19,8 @@ Most errors fall into one of four kinds that decide whether a retry can help:
 - `ParseError`: the page was downloaded but is not an HTML document.
 
 `CrawlerClosedError`, `RobotsUnreachableError`, `CircuitOpenError`,
-`NoProxyError` and `UnexpectedError` belong to none of them: they are not
-about the request itself, and none is retried.
+`NoProxyError`, `RenderError` and `UnexpectedError` belong to none of them:
+they are not about the request itself, and none is retried.
 
 `ProxyError` is the base of the errors of proxies, `ProxyNetworkError` and
 `NoProxyError`: they say nothing about the site.
@@ -146,6 +146,13 @@ class ProxyNetworkError(ProxyError, NetworkError):
 
 class NoProxyError(ProxyError):
     """Every proxy for the URL is out of rotation: the request was not sent."""
+
+
+class RenderError(FetchError):
+    """The headless browser failed to render the page: it is not installed, could not start or crashed.
+
+    The site is not to blame: the circuit breaker of its host does not count it.
+    """
 
 
 class PageTooLargeError(PermanentError):

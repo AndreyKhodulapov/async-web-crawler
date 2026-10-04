@@ -19,6 +19,7 @@ from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage, Prox
 from crawler.parser import HTMLParser
 from crawler.proxy import ProxyPool
 from crawler.rate_limiter import RateLimiter
+from crawler.rendering import BrowserTransport, Rendering
 from crawler.retry import RetryStrategy
 from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
@@ -144,6 +145,23 @@ class AsyncCrawler:
     requests and failures of every proxy; the proxies out of rotation
     stay out from one `crawl()` to the next.
 
+    With `rendering`, HTML pages are rendered in a headless Chromium
+    (Playwright, an optional dependency), so that the links and the text
+    that JavaScript makes are found: every page, or those the patterns of
+    `rendering` name (see `Rendering`). A page is downloaded as without a
+    browser, through the limits, the proxies and the cookies of the
+    crawler; the browser gets the document as downloaded and loads its
+    scripts, styles and data itself, without asking robots.txt, as a
+    browser does. A page that goes to another URL on its own (a
+    JavaScript or `<meta>` redirect) is followed as a redirect: robots.txt,
+    the filters of `crawl()` and `MAX_REDIRECTS` apply to it. A page the
+    browser takes longer than `rendering.timeout` to render fails with
+    `FetchTimeoutError`; one it cannot render (not installed, crashed)
+    with `RenderError`, which is not retried and which the circuit
+    breaker does not count. robots.txt and sitemaps are never rendered.
+    The browser starts with the first page to render and is closed by
+    `close()`.
+
     `error_stats()` counts the errors of page requests and their retries
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
     counted there, and neither are the requests the circuit breaker refused
@@ -229,6 +247,7 @@ class AsyncCrawler:
         cookies: Iterable[Cookie] = (),
         keep_cookies: bool = True,
         proxies: ProxyPool | None = None,
+        rendering: Rendering | None = None,
         parser: HTMLParser | None = None,
         storage: DataStorage | None = None,
         keep_pages: bool = True,
@@ -301,9 +320,12 @@ class AsyncCrawler:
             proxies=proxies,
         )
         self._transport: Transport = transport
+        if rendering is not None:
+            self._transport = BrowserTransport(transport, rendering, user_agent=user_agent, max_page_size=max_page_size)
         self._proxies = proxies
+        self._rendering = rendering
         self._fetcher = Fetcher(
-            transport,
+            self._transport,
             limits=self._limits,
             rate_limiter=rate_limiter,
             retry_strategy=retry_strategy or RetryStrategy(),
@@ -387,6 +409,10 @@ class AsyncCrawler:
     @property
     def proxies(self) -> ProxyPool | None:
         return self._proxies
+
+    @property
+    def rendering(self) -> Rendering | None:
+        return self._rendering
 
     @property
     def robots(self) -> RobotsParser | None:
@@ -728,7 +754,7 @@ class AsyncCrawler:
         return self._fetcher.errors.get_stats()
 
     async def close(self) -> None:
-        """Close the HTTP session and the storage. Safe to call more than once.
+        """Close the HTTP session, the browser and the storage. Safe to call more than once.
 
         A storage that cannot write its last pages is closed all the same;
         the failure is logged.

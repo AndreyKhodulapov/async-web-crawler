@@ -22,6 +22,7 @@ from crawler.exceptions import (
     PermanentHTTPError,
     ProxyError,
     ProxyNetworkError,
+    RenderError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     SitemapError,
@@ -50,6 +51,7 @@ from crawler.progress import Progress, ProgressTracker, format_progress, show_pr
 from crawler.proxy import Proxy, ProxyPool
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
+from crawler.rendering import Rendering
 from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
@@ -120,6 +122,8 @@ __all__ = [
     "ProxyStats",
     "RateLimiter",
     "RateStats",
+    "RenderError",
+    "Rendering",
     "RetryRule",
     "RetryStrategy",
     "RobotsDisallowedError",

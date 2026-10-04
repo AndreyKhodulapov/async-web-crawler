@@ -15,6 +15,7 @@ from crawler import (
     PermanentHTTPError,
     ProxyError,
     ProxyNetworkError,
+    RenderError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     TooManyRedirectsError,
@@ -68,6 +69,7 @@ def test_http_error_subclass_keeps_its_own_kind():
         (UnexpectedError(URL, "KeyError: 'x'"), None),
         (ProxyNetworkError(URL, "cannot connect to the proxy"), NetworkError),
         (NoProxyError(URL, "no proxy available"), None),
+        (RenderError(URL, "the browser crashed"), None),
     ],
 )
 def test_errors_have_one_kind_at_most(error, kind):
@@ -87,6 +89,7 @@ def test_errors_have_one_kind_at_most(error, kind):
         (CrawlerClosedError(URL, "crawler is closed"), "other"),
         (ProxyNetworkError(URL, "cannot connect to the proxy"), "NetworkError"),
         (NoProxyError(URL, "no proxy available"), "other"),
+        (RenderError(URL, "the browser crashed"), "other"),
         (KeyError("x"), "other"),
     ],
 )

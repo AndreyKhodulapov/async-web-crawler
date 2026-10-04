@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import gzip
 import logging
+import os
 import ssl
 import time
 from collections import Counter
@@ -10,7 +11,7 @@ import certifi
 import pytest
 import trustme
 from aiohttp import web
-from pages import ENCODING_PAGES, SITE_HEADERS, SITE_PAGES, fixture_html
+from pages import ENCODING_PAGES, JS_PAGES, JS_SCRIPT, SITE_HEADERS, SITE_PAGES, fixture_html
 from proxy_server import ProxyServer
 
 from crawler.logging_setup import reset_logging
@@ -21,7 +22,7 @@ class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
-    /busy/, /shop/, sitemaps and robots.txt, in the order they arrived. `robots` is the
+    /busy/, /shop/, /js/, sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404; the
     first `robots_failures` requests for it answer 503 whatever it is, or
     the first `robots_failures_by_host[host]` requests from the hosts named
@@ -281,6 +282,32 @@ async def site_page(request: web.Request) -> web.Response:
     return web.Response(text=html, content_type="text/html", headers=SITE_HEADERS.get(request.path))
 
 
+async def js_page(request: web.Request) -> web.Response:
+    """The pages of JS_PAGES, their script and image; any other path under /js/ is a plain page."""
+    request.app[SITE_STATE].record(request)
+    if request.path == "/js/app.js":
+        return web.Response(text=JS_SCRIPT, content_type="application/javascript")
+    if request.path == "/js/image.png":
+        return web.Response(body=b"\x89PNG\r\n\x1a\n", content_type="image/png")
+    if request.path == "/js/to-private":
+        raise web.HTTPFound("/js/private/page")
+    html = JS_PAGES.get(request.path, f"<html><body><p>{request.path}</p></body></html>")
+    return web.Response(text=html, content_type="text/html")
+
+
+@pytest.fixture(scope="session")
+def chromium() -> None:
+    """Skips the test unless Playwright and its Chromium are installed (see the js extra)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pytest.skip('Playwright is not installed: pip install -e ".[js]"')
+    with sync_playwright() as playwright:
+        executable = playwright.chromium.executable_path
+    if not os.path.exists(executable):
+        pytest.skip("Chromium of Playwright is not installed: playwright install chromium")
+
+
 @pytest.fixture
 def restore_logging():
     """Undoes `configure_logging` after the test: its handlers are removed and closed, the level is put back."""
@@ -316,6 +343,7 @@ def make_app() -> web.Application:
     app.router.add_get("/wide/{n}", wide_page)
     app.router.add_get("/cookies/set", set_cookies)
     app.router.add_get("/cookies/echo", echo_cookies)
+    app.router.add_get("/js/{path:.*}", js_page)
     return app
 
 
