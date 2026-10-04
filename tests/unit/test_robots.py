@@ -7,8 +7,11 @@ import pytest
 from helpers import BOT, FakeClock
 
 from crawler import (
+    CertificateError,
     CircuitOpenError,
     CrawlerClosedError,
+    DNSError,
+    FetchTimeoutError,
     NetworkError,
     RobotsParser,
     RobotsRules,
@@ -372,6 +375,41 @@ class TestRobotsParser:
         fetch.answer = (200, "")
         await robots.fetch_robots("https://site/")
         assert robots.unreachable_for("https://site/page") == 0
+
+    async def test_failed_downloads_counts_an_outage(self):
+        fetch = FakeFetcher((503, ""))
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        assert robots.failed_downloads("https://site/page") == 0
+        await robots.fetch_robots("https://site/")
+        assert robots.failed_downloads("https://site/page") == 1
+        assert robots.failed_downloads("https://other/page") == 0
+
+        clock.now += RobotsParser.UNREACHABLE_TTL
+        await robots.fetch_robots("https://site/")
+        assert robots.failed_downloads("https://site/page") == 2
+
+        clock.now += RobotsParser.UNREACHABLE_TTL
+        fetch.answer = (200, "")
+        await robots.fetch_robots("https://site/")
+        assert robots.failed_downloads("https://site/page") == 0
+
+    @pytest.mark.parametrize(
+        ("answer", "recoverable"),
+        [
+            ((503, ""), True),
+            ((429, ""), True),
+            (FetchTimeoutError("https://site/robots.txt", "read timeout (20.0s)"), True),
+            (NetworkError("https://site/robots.txt", "connection refused"), True),
+            (DNSError("https://site/robots.txt", "ClientConnectorDNSError: Cannot connect to host site:443"), False),
+            (CertificateError("https://site/robots.txt", "certificate verify failed"), False),
+            ((200, ""), True),
+        ],
+    )
+    async def test_may_recover_tells_an_outage_from_a_failure_for_good(self, answer, recoverable):
+        robots = RobotsParser(FakeFetcher(answer))
+        await robots.fetch_robots("https://site/")
+        assert robots.may_recover("https://site/page") is recoverable
 
     async def test_robots_txt_that_was_read_is_kept(self):
         fetch = FakeFetcher((200, "User-agent: *\nDisallow: /private/"))

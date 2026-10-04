@@ -20,6 +20,7 @@ from crawler import (
     CircuitOpenError,
     CircuitState,
     CrawlerClosedError,
+    DNSError,
     FetchResult,
     FetchTimeoutError,
     HTMLParser,
@@ -276,6 +277,7 @@ class TestErrorMapping:
             (TimeoutError(), TransientError),
             (aiohttp.ClientConnectorError(MagicMock(), ConnectionRefusedError("connection refused")), NetworkError),
             (aiohttp.ClientConnectorError(MagicMock(), socket.gaierror("Name or service not known")), NetworkError),
+            (aiohttp.ClientConnectorDNSError(MagicMock(), socket.gaierror("Name or service not known")), DNSError),
             (aiohttp.TooManyRedirects(MagicMock(), ()), PermanentError),
         ],
     )
@@ -1175,11 +1177,50 @@ class TestRobots:
         await crawler.crawl(["http://a/1", "http://a/2"])
 
         # Downloaded once more after each wait; the pages wait together.
-        assert fake_session.requested == ["http://a/robots.txt"] * (1 + AsyncCrawler.MAX_WAITS_PER_PAGE)
+        assert fake_session.requested == ["http://a/robots.txt"] * (1 + AsyncCrawler.MAX_ROBOTS_RETRIES)
         reason = "robots.txt is unreachable (NetworkError: ClientConnectionError: refused)"
         assert crawler.unreachable_urls == {"http://a/1": reason, "http://a/2": reason}
         assert crawler.crawl_stats().unreachable == 2
         assert f"Gave up on http://a/1: {reason}" in [r.getMessage() for r in caplog.records]
+
+    async def test_crawl_does_not_wait_for_a_robots_txt_whose_host_does_not_resolve(
+        self, make_crawler, fake_session, caplog
+    ):
+        # A name that does not resolve is a typo, not an outage: waiting
+        # three minutes for it would change nothing.
+        caplog.set_level(logging.INFO, logger="crawler.client")
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = aiohttp.ClientConnectorDNSError(
+            MagicMock(), socket.gaierror("Name or service not known")
+        )
+
+        await crawler.crawl(["http://a/1", "http://a/2"])
+
+        assert fake_session.requested == ["http://a/robots.txt"]
+        reason = "robots.txt is unreachable (DNSError: ClientConnectorDNSError: Cannot connect to host"
+        assert all(why.startswith(reason) for why in crawler.unreachable_urls.values())
+        assert set(crawler.unreachable_urls) == {"http://a/1", "http://a/2"}
+        assert not [r for r in caplog.records if r.getMessage().startswith("Deferred ")]
+
+    async def test_sitemaps_and_pages_share_the_downloads_of_an_unreachable_robots_txt(
+        self, make_crawler, fake_session, caplog
+    ):
+        # The sitemaps named in robots.txt, the sitemap given and the start
+        # URL all wait for the same site: it is downloaded again three
+        # times in all, not three times for each of them.
+        caplog.set_level(logging.WARNING, logger="crawler.client")
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        crawler.robots.UNREACHABLE_TTL = 0.1
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=503)
+
+        await crawler.crawl(["http://a/1"], sitemap_urls=["http://a/sitemap.xml"], robots_sitemaps=True)
+
+        assert fake_session.requested == ["http://a/robots.txt"] * (1 + AsyncCrawler.MAX_ROBOTS_RETRIES)
+        reason = "robots.txt is unreachable (HTTP 503)"
+        assert crawler.unreachable_urls == {"http://a/1": reason}
+        assert crawler.failed_sitemaps == {"http://a/sitemap.xml": f"RobotsUnreachableError: {reason}"}
+        assert f"No sitemaps from robots.txt of http://a/1: {reason}" in [r.getMessage() for r in caplog.records]
 
     async def test_crawl_waits_for_the_robots_txt_of_the_host_a_page_redirects_to(
         self, make_crawler, fake_session, caplog
@@ -1222,8 +1263,8 @@ class TestRobots:
         await crawler.crawl(["http://a/1"])
 
         reason = "redirects to http://b/1, robots.txt is unreachable (HTTP 503)"
-        assert fake_session.requested.count("http://a/1") == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
-        assert fake_session.requested.count("http://b/robots.txt") == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+        assert fake_session.requested.count("http://a/1") == 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
+        assert fake_session.requested.count("http://b/robots.txt") == 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
         assert crawler.unreachable_urls == {"http://a/1": reason}
         assert crawler.crawl_stats().unreachable == 1
         assert f"Gave up on http://a/1: {reason}" in [r.getMessage() for r in caplog.records]

@@ -194,12 +194,12 @@ DEPTH  RESULT                                LINKS  URL
     ...
     1  NetworkError:...                             http://localhost:50865/page/7
     1  CircuitOpenError: circuit breaker...         http://localhost:50865/page/8
-    1  NetworkError:...                             http://unreachable.invalid/
+    1  DNSError:...                                 http://unreachable.invalid/
 Crawled: 12 pages, failed: 13, skipped: 1, blocked: 0, unreachable: 0, left in queue: 0, speed: 7.4 pages/s
 
 === Errors (24 failed attempts) ===
 By kind:  TransientError 6, PermanentError 2, NetworkError 15, ParseError 1, other 0
-By class: NetworkError 15, TransientHTTPError 5, PermanentHTTPError 2, ParseError 1, FetchTimeoutError 1
+By class: NetworkError 11, TransientHTTPError 5, DNSError 4, PermanentHTTPError 2, ParseError 1, FetchTimeoutError 1
 Retries: 12, pages recovered by a retry: 3, average time per retry: 0.58s
 Permanent errors (2):
   http://127.0.0.1:50864/missing  PermanentHTTPError: HTTP 404 Not Found

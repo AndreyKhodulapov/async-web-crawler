@@ -11,7 +11,14 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from crawler.exceptions import CircuitOpenError, CrawlerClosedError, FetchError, TooManyRedirectsError
+from crawler.exceptions import (
+    CircuitOpenError,
+    CrawlerClosedError,
+    DNSError,
+    FetchError,
+    PermanentError,
+    TooManyRedirectsError,
+)
 from crawler.urls import normalize_url, percent_encode
 
 logger = logging.getLogger(__name__)
@@ -105,13 +112,23 @@ class RobotsRules:
     group: they are meant for every crawler.
 
     `unreachable` tells why robots.txt could not be read, e.g. "HTTP 503";
-    everything is disallowed then.
+    everything is disallowed then. `recoverable` says whether a later
+    download may read it: False after a failure that does not pass by
+    itself, such as a bad certificate or a host name that does not resolve.
     """
 
-    def __init__(self, groups: list[_Group], *, sitemaps: Sequence[str] = (), unreachable: str | None = None) -> None:
+    def __init__(
+        self,
+        groups: list[_Group],
+        *,
+        sitemaps: Sequence[str] = (),
+        unreachable: str | None = None,
+        recoverable: bool = True,
+    ) -> None:
         self._groups = groups
         self.sitemaps = list(sitemaps)
         self.unreachable = unreachable
+        self.recoverable = recoverable
 
     @classmethod
     def parse(cls, text: str) -> "RobotsRules":
@@ -149,8 +166,8 @@ class RobotsRules:
         return cls([])
 
     @classmethod
-    def forbid_all(cls, reason: str) -> "RobotsRules":
-        return cls([], unreachable=reason)
+    def forbid_all(cls, reason: str, *, recoverable: bool = True) -> "RobotsRules":
+        return cls([], unreachable=reason, recoverable=recoverable)
 
     def can_fetch(self, url: str, user_agent: str = "*") -> bool:
         """Whether a crawler with this User-Agent may fetch `url`; False for an invalid URL."""
@@ -222,7 +239,10 @@ class RobotsParser:
     error, as major search engines do: the site is asking crawlers to back off.
     Unlike the rules of a file that was read, which are kept for good, an
     unreachable robots.txt is fetched again after `UNREACHABLE_TTL`
-    seconds, so one timeout does not close the site for the whole crawl.
+    seconds, so one timeout does not close the site for the whole crawl;
+    `failed_downloads` counts the downloads of an outage, and `may_recover`
+    tells a failure that passes by itself (a 5xx, a timeout) from one that
+    does not (a bad certificate, a host name that does not resolve).
     A download the fetcher did not even start (`CrawlerClosedError`,
     `CircuitOpenError`) is no answer from the site: the error is passed on
     and nothing is cached.
@@ -244,6 +264,7 @@ class RobotsParser:
         self._clock = clock
         self._rules: dict[str, RobotsRules] = {}
         self._expires: dict[str, float] = {}  # origin -> when its unreachable robots.txt is fetched again
+        self._failed: dict[str, int] = {}  # origin -> downloads of its robots.txt failed in a row
         self._downloads: dict[str, asyncio.Task[RobotsRules]] = {}
 
     async def fetch_robots(self, base_url: str) -> dict[str, Any]:
@@ -296,6 +317,19 @@ class RobotsParser:
         """Seconds until the unreachable robots.txt of the site of `url` is downloaded again; 0 if it is not unreachable."""
         return max(0.0, self._expires.get(_origin(url), 0.0) - self._clock())
 
+    def failed_downloads(self, url: str) -> int:
+        """How many downloads in a row of robots.txt of the site of `url` have failed; 0 once it has been read."""
+        return self._failed.get(_origin(url), 0)
+
+    def may_recover(self, url: str) -> bool:
+        """Whether robots.txt of the site of `url`, unreachable now, may be read by a later download.
+
+        False after a failure that does not pass by itself: a bad
+        certificate, a host name that does not resolve. True while it is
+        not unreachable. The rules must have been fetched.
+        """
+        return self._cached(url).recoverable
+
     def _cached(self, url: str) -> RobotsRules:
         origin = _origin(url)
         if origin not in self._rules:
@@ -334,7 +368,9 @@ class RobotsParser:
             logger.info("robots.txt of %s: %s, everything is allowed", origin, error.message)
             rules = RobotsRules.allow_all()
         except FetchError as error:
-            rules = RobotsRules.forbid_all(f"{type(error).__name__}: {error.message}")
+            # A bad certificate or a host name that does not resolve is not an outage.
+            recoverable = not isinstance(error, PermanentError | DNSError)
+            rules = RobotsRules.forbid_all(f"{type(error).__name__}: {error.message}", recoverable=recoverable)
         else:
             if 200 <= status < 300:
                 rules = RobotsRules.parse(text[: self.MAX_SIZE])
@@ -345,6 +381,7 @@ class RobotsParser:
                 rules = RobotsRules.allow_all()
         if rules.unreachable is None:
             self._expires.pop(origin, None)
+            self._failed.pop(origin, None)
         else:
             logger.warning(
                 "robots.txt of %s is unreachable, the site is disallowed for %gs: %s",
@@ -353,6 +390,7 @@ class RobotsParser:
                 rules.unreachable,
             )
             self._expires[origin] = self._clock() + self.UNREACHABLE_TTL
+            self._failed[origin] = self._failed.get(origin, 0) + 1
         self._rules[origin] = rules
         return rules
 

@@ -8,7 +8,8 @@ Most errors fall into one of four kinds that decide whether a retry can help:
 - `TransientError`: the server or the path to it is overloaded for now
   (a timeout, HTTP 429, 503); the same request may succeed later.
 - `NetworkError`: the request did not reach the server (DNS, a refused or
-  reset connection); worth retrying too.
+  reset connection); worth retrying too. `DNSError` is the one of them
+  that is mostly for good: a host name that does not resolve.
 - `PermanentError`: the request is wrong or forbidden (HTTP 404, 403, a bad
   certificate, a page over the size limit, a sitemap that is not one); every
   attempt would fail the same way.
@@ -45,6 +46,10 @@ class PermanentError(FetchError):
 
 class NetworkError(FetchError):
     """The request failed at the network level (DNS, connection, payload)."""
+
+
+class DNSError(NetworkError):
+    """The host name could not be resolved: mostly a name that does not exist."""
 
 
 class ParseError(FetchError):

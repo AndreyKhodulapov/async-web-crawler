@@ -26,6 +26,7 @@ from crawler.exceptions import (
     CertificateError,
     CircuitOpenError,
     CrawlerClosedError,
+    DNSError,
     FetchError,
     FetchTimeoutError,
     HTTPStatusError,
@@ -93,7 +94,10 @@ class AsyncCrawler:
       its URLs are not requested either and fail with
       `RobotsUnreachableError` (see `RobotsParser`); in `crawl()`, they
       wait for it to be downloaded again, and so do the pages that
-      redirect to them and the sitemaps of the site.
+      redirect to them and the sitemaps of the site: at most
+      `MAX_ROBOTS_RETRIES` downloads per site and outage, and none after
+      a failure that does not pass by itself, such as a host name that
+      does not resolve.
     - Redirects are followed one request at a time, up to
       `MAX_REDIRECTS`: the target of each goes through robots.txt, the
       rate limit, the retries and the circuit breaker of its own host.
@@ -179,10 +183,13 @@ class AsyncCrawler:
     DEFAULT_MAX_RETRY_AFTER = 600.0
     # In crawl(), a page whose host is held back longer than this is put off.
     MIN_PENALTY_TO_DEFER = 1.0
-    # In crawl(), a page waits at most this many times for the robots.txt of
-    # its site to be downloaded again, or for a Retry-After too long to retry
-    # it, before it is given up.
+    # In crawl(), a page waits at most this many times for a Retry-After
+    # too long to retry it, before it is given up.
     MAX_WAITS_PER_PAGE = 3
+    # In crawl(), the unreachable robots.txt of a site is downloaded again at
+    # most this many times in a row before its pages, and the pages that
+    # redirect to them, are given up; so are its sitemaps.
+    MAX_ROBOTS_RETRIES = 3
     # In crawl(), longer links are not followed: they are mostly generated ones.
     MAX_URL_LENGTH = 2048
     # In crawl(), new links are not queued once the pages queued, in progress
@@ -279,7 +286,7 @@ class AsyncCrawler:
         self._host_pages: Counter[str] = Counter()  # pages requested by host
         self._over_host_limit = 0  # pages skipped without a request over max_pages_per_host
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
-        self._page_waits: Counter[str] = Counter()  # times a page waited for robots.txt or a long Retry-After
+        self._page_waits: Counter[str] = Counter()  # times a page waited for a Retry-After too long to retry
         self._max_frontier = 0  # pages queued, in progress and requested that crawl() allows
         self._links_dropped = 0
         self._host_queued: Counter[str] = Counter()  # pages ever queued by host
@@ -768,8 +775,10 @@ class AsyncCrawler:
         robots.txt disallows are not requested: they are listed in
         `blocked_urls` and do not count toward `max_pages`. Neither do pages
         of sites whose robots.txt cannot be read: they are put off until it
-        is downloaded again (see `RobotsParser.UNREACHABLE_TTL`), at most
-        `MAX_WAITS_PER_PAGE` times, then listed in `unreachable_urls`; a
+        is downloaded again (see `RobotsParser.UNREACHABLE_TTL`), then
+        listed in `unreachable_urls` once it has failed `MAX_ROBOTS_RETRIES`
+        downloads in a row, or at once after a failure that does not pass by
+        itself (a bad certificate, a host name that does not resolve); a
         site whose robots.txt failed for a moment is crawled once it is
         back. So does a page that redirects to such a site: it is requested
         again when it comes back, uncounted meanwhile. Pages that the circuit breaker refuses do not
@@ -841,9 +850,9 @@ class AsyncCrawler:
         those of the start URLs and of the pages they redirect to. A sitemap
         that cannot be read does not stop the crawl: it is logged and listed
         in `failed_sitemaps`. A sitemap of a site whose robots.txt cannot
-        be read waits for it as a page does, up to `MAX_WAITS_PER_PAGE`
-        times, before the first page is fetched; so do the sitemaps named
-        in such a robots.txt.
+        be read waits for it as a page does, within the `MAX_ROBOTS_RETRIES`
+        downloads of the site, before the first page is fetched; so do the
+        sitemaps named in such a robots.txt.
 
         Failed pages do not stop the crawl: they are listed in `failed_urls`.
         Every processed page is saved to the `storage` of the crawler, if it
@@ -1036,21 +1045,18 @@ class AsyncCrawler:
     async def _sitemaps_in_robots(self, url: str) -> list[str]:
         """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read.
 
-        While it is unreachable, it is waited for and downloaded again, up
-        to `MAX_WAITS_PER_PAGE` times, as the pages of the site wait for it.
+        While it is unreachable, it is waited for and downloaded again, as
+        the pages of the site wait for it (see `_robots_wait`).
         """
         assert self.robots is not None
-        waits = 0
         try:
             while True:
                 rules = await self.robots.fetch_robots(url)
                 if rules["unreachable"] is None:
                     return rules["sitemaps"]
                 reason = f"robots.txt is unreachable ({rules['unreachable']})"
-                if waits >= self.MAX_WAITS_PER_PAGE:
+                if (delay := self._robots_wait(url)) is None:
                     break
-                waits += 1
-                delay = self._robots_back_in(url)
                 logger.info("Sitemaps of %s wait %.1fs: %s", url, delay, reason)
                 await asyncio.sleep(delay)
         except (CrawlerClosedError, CircuitOpenError) as error:
@@ -1062,22 +1068,20 @@ class AsyncCrawler:
         """The pages a sitemap lists; a sitemap that cannot be read is logged and lists none.
 
         While robots.txt of its site is unreachable, the sitemap waits for
-        it to be downloaded again, up to `MAX_WAITS_PER_PAGE` times, as a
-        page of the crawl does: a crawl fed by sitemaps alone would
-        otherwise end empty after a 503 of a few seconds.
+        it to be downloaded again, as a page of the crawl does (see
+        `_robots_wait`): a crawl fed by sitemaps alone would otherwise end
+        empty after a 503 of a few seconds.
         """
-        waits = 0
         while True:
             try:
                 return await self.sitemaps.fetch_sitemap(url)
             except FetchError as error:
-                if not isinstance(error, RobotsUnreachableError) or waits >= self.MAX_WAITS_PER_PAGE:
+                delay = self._robots_wait(error.url) if isinstance(error, RobotsUnreachableError) else None
+                if delay is None:
                     reason = f"{type(error).__name__}: {error.message}"
                     logger.warning("Sitemap %s is left out: %s", url, reason)
                     self._failed_sitemaps[url] = reason
                     return []
-                waits += 1
-                delay = self._robots_back_in(error.url)
                 logger.info("Sitemap %s waits %.1fs: %s", url, delay, error.message)
                 await asyncio.sleep(delay)
 
@@ -1435,48 +1439,52 @@ class AsyncCrawler:
             # or the page that takes its place, even if the others have stopped.
             queue.reopen()
 
-    def _robots_back_in(self, url: str) -> float:
-        """Seconds until the unreachable robots.txt of the site of `url` is downloaded again.
+    def _robots_wait(self, url: str) -> float | None:
+        """Seconds the crawl waits for the unreachable robots.txt of the site of `url` to be downloaded again; None to give up.
 
-        A second when it is due already: another task may be downloading it.
+        A 5xx or a timeout on robots.txt is often a hiccup of a few seconds;
+        failing every page of the site at once would end a crawl of that
+        site with nothing. The site is given up once `MAX_ROBOTS_RETRIES`
+        downloads in a row have failed, whoever waited for them (its pages,
+        the pages that redirect to it, its sitemaps), and at once when the
+        failure does not pass by itself (a bad certificate, a host name that
+        does not resolve): three minutes change nothing about a typo. The
+        wait is a second when the download is due already: another task
+        may be making it.
         """
         assert self.robots is not None  # asked after it refused a URL
+        if not self.robots.may_recover(url) or self.robots.failed_downloads(url) > self.MAX_ROBOTS_RETRIES:
+            return None
         return self.robots.unreachable_for(url) or 1.0
 
     def _wait_for_robots(
         self, url: str, queue: CrawlerQueue, refusal: RobotsUnreachableError, *, requested: bool
     ) -> bool:
-        """Put off a page of the crawl until the robots.txt that refused it is downloaded again.
+        """Put off a page of the crawl until the robots.txt that refused it is downloaded again, if it is worth waiting for.
 
-        A 5xx or a timeout on robots.txt is often a hiccup of a few seconds;
-        failing every page of the site at once would end a crawl of that
-        site with nothing. The refusal is for the page itself or for the
-        target of its redirect; `requested` says whether the page was
-        requested (it redirected): it is then uncounted, as the request was
-        not answered with the page, and made again when it comes back. The
-        page waits out `RobotsParser.UNREACHABLE_TTL` at most
-        `MAX_WAITS_PER_PAGE` times: returns False once they are used up,
-        and the caller marks the page unreachable.
+        The refusal is for the page itself or for the target of its
+        redirect; `requested` says whether the page was requested (it
+        redirected): it is then uncounted, as the request was not answered
+        with the page, and made again when it comes back. Returns False
+        when the site is given up (see `_robots_wait`), and the caller
+        marks the page unreachable.
         """
-        delay = self._robots_back_in(refusal.url)
-        return self._put_off_page(url, queue, delay, refusal.message, requested=requested)
+        delay = self._robots_wait(refusal.url)
+        if delay is None:
+            return False
+        self._put_off_page(url, queue, delay, refusal.message, requested=requested)
+        return True
 
-    def _put_off_page(self, url: str, queue: CrawlerQueue, delay: float, reason: str, *, requested: bool) -> bool:
-        """Put a page of the crawl back into the queue for `delay` seconds, unless it has waited `MAX_WAITS_PER_PAGE` times.
+    def _put_off_page(self, url: str, queue: CrawlerQueue, delay: float, reason: str, *, requested: bool) -> None:
+        """Put a page of the crawl back into the queue for `delay` seconds.
 
         With `requested`, the page is uncounted from the limits first: it
-        is counted again when it is taken again. Returns whether the page
-        was put off.
+        is counted again when it is taken again.
         """
-        if self._page_waits[url] >= self.MAX_WAITS_PER_PAGE:
-            del self._page_waits[url]
-            return False
-        self._page_waits[url] += 1
         if requested:
             self._uncount_page(url, queue)
         logger.info("Deferred %s for %.1fs: %s", url, delay, reason)
         queue.defer(url, delay, priority=queue.depth(url))
-        return True
 
     def _outwaits_retries(self, error: FetchError | None) -> bool:
         """Whether `error` carries a Retry-After too long for the retry strategy, so the request was not retried."""
@@ -1496,10 +1504,13 @@ class AsyncCrawler:
         to another one. Returns False once the page has waited
         `MAX_WAITS_PER_PAGE` times: the caller fails it then.
         """
+        if self._page_waits[url] >= self.MAX_WAITS_PER_PAGE:
+            del self._page_waits[url]
+            return False
+        self._page_waits[url] += 1
         delay = self._penalty_left(error.url) or 1.0
         # The request was answered, but not with the page: it is not a page requested.
-        if not self._put_off_page(url, queue, delay, error.message, requested=True):
-            return False
+        self._put_off_page(url, queue, delay, error.message, requested=True)
         self._warn_once_held_back(error.url, delay)
         return True
 
@@ -1640,6 +1651,8 @@ class AsyncCrawler:
             raise InvalidURLError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientConnectorCertificateError as exc:
             raise CertificateError(url, f"{type(exc).__name__}: {exc}") from exc
+        except aiohttp.ClientConnectorDNSError as exc:
+            raise DNSError(url, f"{type(exc).__name__}: {exc}") from exc
         except aiohttp.ClientError as exc:
             raise NetworkError(url, f"{type(exc).__name__}: {exc}") from exc
 

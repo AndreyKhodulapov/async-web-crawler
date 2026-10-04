@@ -245,9 +245,10 @@ storages. All of it is described in the [API reference](docs/api.md).
   crawl of many hosts without one is parsing-bound.
 - **Some guards are constants, not options.** The URL length limit (2048),
   the redirect limit (10), the queue size (3 times the page limit), the
-  wait at which a host's pages are put off (1 second) and the times a page
-  waits for a robots.txt that cannot be read or for a Retry-After too long
-  to retry (3) are class attributes of `AsyncCrawler`.
+  wait at which a host's pages are put off (1 second), the times a
+  robots.txt that cannot be read is downloaded again (3) and the times a
+  page waits for a Retry-After too long to retry (3) are class attributes
+  of `AsyncCrawler`.
 
 ## Documentation
 

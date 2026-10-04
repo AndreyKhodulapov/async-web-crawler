@@ -218,7 +218,7 @@ class TestRobots:
             await crawler.crawl([url("/site/")])
 
         # Downloaded once more after each of the three waits.
-        assert site.hits["/robots.txt"] == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+        assert site.hits["/robots.txt"] == 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
         assert crawler.unreachable_urls == {url("/site/"): "robots.txt is unreachable (HTTP 503)"}
         assert site.hits["/site/"] == 0
         assert f"Gave up on {url('/site/')}: robots.txt is unreachable (HTTP 503)" in [
@@ -260,8 +260,8 @@ class TestRobots:
         assert pages == {}
         assert crawler.unreachable_urls == {start: reason}
         # Requested once more after each of the three waits.
-        assert site.hits["/site/to-other-host"] == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
-        assert site.robots_hits["localhost"] == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+        assert site.hits["/site/to-other-host"] == 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
+        assert site.robots_hits["localhost"] == 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
         assert f"Gave up on {start}: {reason}" in [r.getMessage() for r in caplog.records]
 
     async def test_unreachable_pages_are_not_blocked_and_do_not_count_toward_max_pages(
@@ -270,7 +270,7 @@ class TestRobots:
         # One worker takes the page of the unreachable site first; the crawl
         # does not wait for its robots.txt here, the test is about the limits.
         async with polite(respect_robots=True, max_concurrent=1) as crawler:
-            crawler.MAX_WAITS_PER_PAGE = 0
+            crawler.MAX_ROBOTS_RETRIES = 0
             pages = await crawler.crawl([f"{closed_port_url}page", url("/site/")], max_pages=1)
         stats = crawler.crawl_stats()
 

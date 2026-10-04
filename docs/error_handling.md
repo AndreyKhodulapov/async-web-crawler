@@ -9,7 +9,7 @@ leaves a failing site alone.
 | Kind | Examples | Retry? |
 |------|----------|--------|
 | Transient | timeouts, HTTP 408, 429, 500, 502, 503, 504, Cloudflare's 520-524 | yes, with backoff |
-| Network | DNS failure, connection refused or reset | yes |
+| Network | DNS failure (`DNSError`), connection refused or reset | yes |
 | Permanent | HTTP 401, 403, 404, 410, 501, a redirect loop, a bad certificate, an invalid URL, a page over the size limit | no |
 | Parse | the body is not an HTML document | no: the same bytes come back |
 
@@ -26,7 +26,9 @@ leaves a failing site alone.
   - 429 means "too fast": retry, but with longer pauses (here 4x).
   - 501 and 505 are server errors that never pass.
   - A DNS failure is permanent for a mistyped domain, but a resolver timeout
-    looks the same to the client; a retry costs little.
+    looks the same to the client; a retry costs little. Waiting minutes for
+    it does not: once the retries are spent, `DNSError` is taken for good,
+    and a crawl does not wait for the robots.txt of such a host.
 - Some failures are not about the request at all: the crawler is closed, the
   host's circuit is open, robots.txt is unreachable. Retrying the request
   cannot fix them.

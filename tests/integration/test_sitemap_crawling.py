@@ -222,7 +222,7 @@ async def test_sitemap_of_a_site_whose_robots_txt_stays_down_is_left_out(url, si
 
     assert pages == {}
     # Downloaded once more after each of the three waits.
-    assert site.hits["/robots.txt"] == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+    assert site.hits["/robots.txt"] == 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
     assert crawler.failed_sitemaps == {url(SITEMAP): "RobotsUnreachableError: robots.txt is unreachable (HTTP 503)"}
     assert f"Sitemap {url(SITEMAP)} is left out" in caplog.text
 

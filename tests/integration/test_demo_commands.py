@@ -63,7 +63,7 @@ async def test_errors_demo_meets_every_kind_of_error(url, tmp_path, capsys):
     # 503 twice, 429 once and a read timeout, each made good by a retry.
     assert fetched == {"/", *articles, "/flaky", "/rate-limited", "/slow", "/ok"}
     failed = {page["url"]: page["error"] for page in saved["failed"]}
-    assert failed.pop("http://unreachable.invalid/").startswith("NetworkError: ClientConnectorDNSError")
+    assert failed.pop("http://unreachable.invalid/").startswith("DNSError: ClientConnectorDNSError")
     down = {page: error for page, error in failed.items() if urlsplit(page).hostname == "localhost"}
     # The pages refused by its breaker wait for the probes, then fail with the others.
     assert len(down) == 8
