@@ -65,7 +65,7 @@ async def test_crawl_by_a_configuration_file(url, site, tmp_path):
     assert len((out / "data" / "pages.csv").read_text(encoding="utf-8").splitlines()) == 5  # with the header
 
     log = [json.loads(line) for line in (out / "logs" / "crawler.log").read_text(encoding="utf-8").splitlines()]
-    assert {"crawler.client", "crawler.advanced"} <= {entry["logger"] for entry in log}
+    assert {"crawler.crawl_run", "crawler.advanced"} <= {entry["logger"] for entry in log}
     assert any(entry["level"] == "DEBUG" for entry in log)
     assert any(url("/site/missing.html") in entry["message"] for entry in log if entry["level"] == "WARNING")
 

@@ -38,6 +38,7 @@ from crawler import (
     TransientError,
     UnexpectedError,
 )
+from crawler.crawl_run import CrawlRun
 
 
 class FakeResponse:
@@ -1290,14 +1291,15 @@ class TestCrawlDuplicates:
 class TestCrawlPageStats:
     async def test_bug_while_crawling_a_page_fails_that_page_only(self, make_crawler, fake_session, monkeypatch):
         crawler = make_crawler(max_concurrent=1, max_depth=0)
-        crawl_page = crawler._crawl_page
+        crawl_page = CrawlRun._crawl_page
 
-        async def broken(url, queue, url_filter):
+        async def broken(self, url, queue, url_filter):
             if url == "http://a/1":
                 raise KeyError("x")
-            await crawl_page(url, queue, url_filter)
+            await crawl_page(self, url, queue, url_filter)
 
-        monkeypatch.setattr(crawler, "_crawl_page", broken)
+        # The run of a crawl is made inside crawl().
+        monkeypatch.setattr(CrawlRun, "_crawl_page", broken)
         await crawler.crawl(["http://a/1", "http://a/2"])
 
         assert crawler.failed_urls == {"http://a/1": "UnexpectedError: KeyError: 'x'"}

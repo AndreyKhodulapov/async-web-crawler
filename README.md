@@ -364,7 +364,8 @@ src/
 ├── demo_scale.py           # ScaleSite, SyncCrawler and the measurements of the `scale` command
 └── crawler/
     ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
-    ├── client.py           # AsyncCrawler: fetching, parsing, crawl()
+    ├── client.py           # AsyncCrawler: the public API — fetch_*, crawl(), statistics, close()
+    ├── crawl_run.py        # CrawlRun: one crawl — queue, filters, limits, deferred pages, counters, saving
     ├── fetching.py         # Fetcher: one URL with robots.txt, circuit breaker, rate limit, retries and redirects
     ├── transport.py        # HttpTransport: single GET requests over an aiohttp session, decoding, size limits
     ├── queue.py            # CrawlerQueue: URL priority queue and statuses
