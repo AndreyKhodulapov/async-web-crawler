@@ -21,6 +21,7 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Logging](#logging) | `configure_logging` |
 | [Saving pages](#saving-pages) | the storages, `PageRecord`, databases by URL |
 | [Parsed page](#parsed-page) | `ParsedPage`, `HTMLParser` |
+| [Internals](#internals) | the layers behind `AsyncCrawler` and what each is responsible for |
 
 ## Fetching and crawling
 
@@ -634,8 +635,8 @@ and the overrides are described in the [configuration guide](configuration.md).
 
 ## Logging
 
-Every module logs to a logger named after it (`crawler.fetching`,
-`crawler.retry`, ...). `configure_logging` sends the records to the console
+Every module logs to a logger named after it (`crawler.fetching` for
+requests, `crawler.crawl_run` for the pages of a crawl, `crawler.retry`, ...). `configure_logging` sends the records to the console
 and, given a file, to that file as well:
 
 ```python
@@ -842,3 +843,35 @@ when `respect_robots` is on, a parser passed in decides for itself.
 `HTMLParser(robots_name="mybot")` adds the directives of
 `<meta name="mybot">` to those of `<meta name="robots">`; the crawler's own
 parser takes the robots.txt name of its `user_agent`.
+
+## Internals
+
+`AsyncCrawler` is a facade over three layers, each in a module of its own.
+They are not part of the public API: they are not exported from `crawler`
+and may change. A layer calls only the one below it.
+
+| Layer | Module | Class | Responsible for | Knows nothing of |
+|-------|--------|-------|-----------------|------------------|
+| Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
+| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
+| Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
+| HTTP | `transport.py` | `HttpTransport` | a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
+
+Who owns what:
+
+- `AsyncCrawler` creates the shared objects — `SemaphoreManager`,
+  `RateLimiter`, `RetryStrategy`, `CircuitBreaker`, `HttpTransport`,
+  `Fetcher`, `HTMLParser`, `CrawlerStats` — and exposes some of them as
+  its attributes (`rate_limiter`, `circuit_breaker`, `stats` ...).
+- `Fetcher` creates `RobotsParser` and `SitemapParser`, which download
+  through it, so robots.txt and sitemaps get the same politeness as pages;
+  `AsyncCrawler.robots` and `.sitemaps` are the same objects.
+- Every `crawl()` makes a new `CrawlRun`, so the state of a crawl is never
+  reset field by field: the previous run stays readable until the next one
+  starts. Before the first crawl the properties read an empty run. The
+  rate limits, the robots.txt cache and the states of the circuit breaker
+  live in the shared objects and carry over between crawls.
+- The crawl constants (`ROBOTS_POLL`, `MAX_ROBOTS_RETRIES`,
+  `FRONTIER_FACTOR` ...) are defined by `CrawlRun` and read from the
+  crawler when a run is made, so one set on an `AsyncCrawler` or on a
+  subclass applies to its crawls.

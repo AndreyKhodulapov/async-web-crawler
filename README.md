@@ -280,7 +280,7 @@ storages. All of it is described in the [API reference](docs/api.md).
 
 | Document | Content |
 |----------|---------|
-| [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page |
+| [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page, the internal layers |
 | [docs/configuration.md](docs/configuration.md) | configuration guide: every key with its type and default, validation, overrides, recipes |
 | [docs/demo.md](docs/demo.md) | the demo commands and their output |
 | [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler, memory, bottlenecks found and fixed |
@@ -294,7 +294,8 @@ Notes on the concepts behind the crawler:
 [politeness](docs/politeness.md),
 [error handling](docs/error_handling.md),
 [data storage](docs/data_storage.md),
-[advanced features](docs/advanced_features.md).
+[advanced features](docs/advanced_features.md),
+[architecture](docs/architecture.md).
 
 ## Demo
 
@@ -413,6 +414,7 @@ docs/
 ├── configuration.md        # configuration guide: every key, validation, recipes
 ├── demo.md                 # the demo commands and their output
 ├── advanced_features.md    # notes on sitemaps, configuration, logging, monitoring and integration
+├── architecture.md         # notes on the layers of the crawler and refactoring without changing behaviour
 ├── asyncio_concepts.md     # notes on async concepts used here
 ├── concurrency_control.md  # notes on queues, limits and crawl order
 ├── data_storage.md         # notes on saving data: files, databases, batching, failed writes
