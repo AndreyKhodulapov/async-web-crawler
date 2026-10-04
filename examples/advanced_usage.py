@@ -15,7 +15,7 @@ import asyncio
 import sys
 from pathlib import Path
 
-from crawler import AdvancedCrawler, ConfigError, show_progress
+from crawler import AdvancedCrawler, ConfigError, StorageError, show_progress
 
 CONFIG = Path(__file__).with_name("config.yaml")
 
@@ -53,7 +53,8 @@ async def main(config_path: str | Path = CONFIG) -> None:
 if __name__ == "__main__":
     try:
         asyncio.run(main(*sys.argv[1:2]))
-    except ConfigError as error:
+    except (ConfigError, StorageError) as error:
+        # The configuration is invalid, or an output cannot be opened: nothing was crawled.
         sys.exit(f"error: {error}")
     except KeyboardInterrupt:
         sys.exit(130)

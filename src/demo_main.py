@@ -831,7 +831,12 @@ async def run_save(args: argparse.Namespace) -> None:
         print(f"Crawling {site.url} and saving its pages to JSON, CSV and a database\n", file=sys.stderr)
         # As in `errors`: the start page and its links.
         async with make_crawler(args, max_depth=1, max_per_domain=2, storage=storage) as crawler:
-            await crawler.crawl([site.url], max_pages=len(site.links()) + 1)
+            try:
+                await crawler.crawl([site.url], max_pages=len(site.links()) + 1)
+            except StorageError as error:
+                # Found out before the first request: nothing was crawled, so there is nothing to report.
+                print(f"error: {error}", file=sys.stderr)
+                return
 
     print_crawl_report(crawler)
     # The crawler has closed its storages: the pages are read from new ones.

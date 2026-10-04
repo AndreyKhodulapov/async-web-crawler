@@ -80,6 +80,8 @@ class AdvancedCrawler:
             read_timeout=options.read_timeout,
             timeout_growth=options.timeout_growth,
             max_page_size=options.max_page_size,
+            max_parsing=options.max_parsing,
+            max_retry_after=options.max_retry_after,
             user_agent=options.user_agent,
             user_agents=options.user_agents,
             storage=self.storage,
@@ -154,6 +156,9 @@ class AdvancedCrawler:
 
         Raises:
             ConfigError: the configuration has neither start URLs nor sitemaps.
+            StorageError: the storage cannot be opened (the output file is
+                of another layout, the database cannot be reached); nothing
+                is requested.
         """
         config = self.config
         if not config.urls and not config.sitemaps.urls:

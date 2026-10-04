@@ -3,12 +3,13 @@
 from crawler.advanced import AdvancedCrawler
 from crawler.circuit_breaker import BreakerCall, CircuitBreaker, CircuitState
 from crawler.client import AsyncCrawler
-from crawler.config import CrawlerConfig, load_config
+from crawler.config import CrawlerConfig, load_config, load_urls
 from crawler.exceptions import (
     CertificateError,
     CircuitOpenError,
     ConfigError,
     CrawlerClosedError,
+    DNSError,
     FetchError,
     FetchTimeoutError,
     HTTPStatusError,
@@ -82,6 +83,7 @@ __all__ = [
     "CrawlerConfig",
     "CrawlerQueue",
     "CrawlerStats",
+    "DNSError",
     "DataStorage",
     "DatabaseDriver",
     "DatabaseStorage",
@@ -129,6 +131,7 @@ __all__ = [
     "is_same_host",
     "is_valid_http_url",
     "load_config",
+    "load_urls",
     "product_token",
     "register_database",
     "show_progress",

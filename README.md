@@ -14,7 +14,8 @@ configuration file, by command-line options, or from Python.
 - **Crawling**: a priority queue of URLs and a pool of workers, depth and
   page limits, deduplication of normalized URLs, filters by domain, by
   regular expressions and by file extension (by default the crawl stays on
-  the start hosts, and documents, images and archives are not followed);
+  the start hosts and their subdomains, and documents, images and archives
+  are not followed);
   guards against endless URL spaces: tracking parameters dropped, a URL
   length limit, `<link rel="canonical">` for variants of a page, a page
   limit per host; a queue bounded by the page limit, so memory does not
@@ -45,7 +46,8 @@ configuration file, by command-line options, or from Python.
 - **Configuration file** in YAML or JSON, checked on load with every
   problem reported by the path of its key
 - **Command line** with live progress, a summary, exit codes for scripts
-  and a clean stop on Ctrl-C that keeps the pages fetched so far
+  and a clean stop on Ctrl-C that keeps the pages fetched so far; start
+  URLs from a list file or stdin
 - **Statistics and reports**: pages by outcome, status code, error and
   domain, speed and response time; export to JSON and to a self-contained
   HTML report with charts
@@ -103,16 +105,28 @@ the [configuration guide](docs/configuration.md) explains them.
 python src/main.py --config config.yaml
 python src/main.py --urls https://example.com --max-pages 100 --output results.json
 python src/main.py --config config.yaml --max-pages 500 --report report.html
+python src/main.py --config config.yaml --urls-file urls.txt
+some_tool | python src/main.py --config config.yaml --urls-file -
 ```
 
 A crawl is set up by a configuration file, by options, or by both. An
 option wins over the file; an option left out keeps the value of the file,
 or the default without a file.
 
+A long list of start URLs can be kept in a text file, one URL per line
+([examples/urls.txt](examples/urls.txt)): `#` starts a comment line, blank
+lines are skipped, a URL given twice is crawled once. One file of settings
+then serves many lists. A line that is not an http(s) URL, or has a space
+inside (a comment after the URL), stops the run before anything is
+requested; the error counts the valid and the invalid lines and lists the
+first 20 of the invalid ones by number. A list without URLs is no error
+when the configuration has sitemaps to crawl.
+
 | Option | Configuration key | Effect |
 |--------|-------------------|--------|
 | `--config PATH` | | configuration file, YAML or JSON |
 | `--urls URL [URL ...]` | `urls` | start URLs, in place of those of the file |
+| `--urls-file PATH` | `urls` | start URLs from a text file, one per line; `-` reads them from stdin. With `--urls`, both are crawled, those of `--urls` first; together they replace the `urls` of the file and keep its `sitemaps.urls` |
 | `--max-pages N` | `crawler.max_pages` | pages to request, failed ones included |
 | `--max-depth N` | `crawler.max_depth` | links followed from a start URL; 0 crawls the start URLs only |
 | `--output PATH` | `storage.outputs` | where to save the pages: a `.jsonl`, `.json`, `.csv` or `.db` file, or a database URL; repeat for several, in place of those of the file |
@@ -149,8 +163,8 @@ URL is shown as `***`.
 
 | Exit code | Meaning |
 |-----------|---------|
-| 0 | the crawl ran and fetched at least one page |
-| 1 | no page was fetched, or a directory or the log file could not be opened |
+| 0 | the crawl ran, fetched at least one page and saved every page it should |
+| 1 | no page was fetched, some could not be saved, or a directory, the log file, an output file or the database could not be opened; an output that cannot be opened is reported before anything is requested |
 | 2 | wrong options or configuration; nothing was requested or written |
 | 130 | interrupted with Ctrl-C |
 
@@ -211,11 +225,64 @@ The parts work on their own too: `RateLimiter`, `RobotsParser`,
 `SitemapParser`, `RetryStrategy`, `CircuitBreaker`, `HTMLParser`, the
 storages. All of it is described in the [API reference](docs/api.md).
 
+## Limitations
+
+- **`max_pages` counts requests, not saved pages.** Every page requested
+  counts: one that failed, one that turned out not to be HTML, one marked
+  `noindex`, one that is a variant of another page by its canonical URL.
+  So `--max-pages 100` may save fewer than 100 pages; the summary shows how
+  many were skipped and why. Pages that robots.txt disallows are not
+  requested and do not count.
+- **A site is a host name.** `same_domain_only` keeps the crawl on the
+  start hosts and their subdomains, `www.example.com` and `example.com`
+  being one host. There is no public suffix list: a start URL on
+  `docs.example.com` does not bring in `example.com`, and a site spread over
+  unrelated domains needs `same_domain_only: false` with an `include`
+  pattern for each of them. The limits go by the exact host name: the rate
+  limit, the circuit breaker and `max_pages_per_host` are kept per host, so
+  a site that spreads its links over `example.com`, `www.example.com` and
+  `docs.example.com` is asked at up to three times the rate, as one server.
+- **A crawl cannot be resumed.** Ctrl-C keeps the pages fetched so far,
+  but the queue is lost: the next run starts from the start URLs again,
+  adding to the output files or starting them anew with `--overwrite`.
+- **A storage that keeps failing fills memory.** Pages that could not be
+  written stay buffered and are retried; a database that is down for long
+  holds every page since the outage in memory.
+- **One host at a time under a rate limit.** The workers take pages from
+  one queue in the order of depth and wait for the turn of their host in
+  the rate limiter; while the pages of the first host last, those of the
+  other hosts wait in the queue. A crawl of several hosts with a rate limit
+  takes about the sum of their times, not the longest of them (two hosts
+  of 30 pages at 2 requests per second: 25 s instead of 15), and the time
+  left on the progress line does not know it. One site never notices; for
+  the sitemaps of several hosts, a list of start URLs on several hosts,
+  `same_domain_only: false` or a site on many subdomains, set `rate_limit`
+  higher or to `null` and rely on `max_per_domain`. See [docs/concurrency_control.md](docs/concurrency_control.md).
+- **Not for URLs from strangers.** Links to private addresses
+  (`127.0.0.1`, `10.0.0.0/8`, the cloud metadata address) are followed
+  like any other. The crawler is a command-line tool for sites you choose,
+  not a service that takes URLs from users.
+- **Parsing is bound by one CPU.** HTML is parsed in a worker thread of
+  one process; a few heavy pages per second is the ceiling whatever
+  `max_concurrent` says. With a rate limit per host it never matters; a
+  crawl of many hosts without one is parsing-bound. A page costs about
+  forty times its size in memory and a couple of seconds per megabyte to
+  parse, so pages over `max_page_size` (3 MiB) are not read and at most
+  `max_parsing` (2) are parsed at once; raising both for a site of huge
+  pages costs memory accordingly.
+- **Some guards are constants, not options.** The URL length limit (2048),
+  the redirect limit (10), the queue size (3 times the page limit), the
+  wait at which a host's pages are put off (1 second), the times a
+  robots.txt that cannot be read is downloaded again (3), how often its
+  pages look in on that download (2 seconds) and the times a page waits
+  for a Retry-After too long to retry (3) are class attributes of
+  `AsyncCrawler`.
+
 ## Documentation
 
 | Document | Content |
 |----------|---------|
-| [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page |
+| [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page, the internal layers |
 | [docs/configuration.md](docs/configuration.md) | configuration guide: every key with its type and default, validation, overrides, recipes |
 | [docs/demo.md](docs/demo.md) | the demo commands and their output |
 | [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler, memory, bottlenecks found and fixed |
@@ -229,7 +296,8 @@ Notes on the concepts behind the crawler:
 [politeness](docs/politeness.md),
 [error handling](docs/error_handling.md),
 [data storage](docs/data_storage.md),
-[advanced features](docs/advanced_features.md).
+[advanced features](docs/advanced_features.md),
+[architecture](docs/architecture.md).
 
 ## Demo
 
@@ -262,11 +330,29 @@ The database tests run on SQLite by default. With the marker `postgres` the
 same checks run on a PostgreSQL server: start it with `docker compose up -d
 --wait`, or point `CRAWLER_TEST_DATABASE_URL` at another one (the default is
 `postgresql://crawler:crawler@localhost:5432/crawler`). The tests drop and
-create the `pages` table.
+create the `pages` table. A server of the compose file on another port is
+found by the same variable that moved it:
+
+```bash
+export CRAWLER_POSTGRES_PORT=55432          # port 5432 is taken
+docker compose up -d --wait
+pytest -m ""                                # every test: the default ones, network and postgres
+```
 
 ```bash
 ruff format src tests       # format
 ruff check src tests        # lint
+```
+
+The [Makefile](Makefile) keeps these commands short, with the tools of `.venv`:
+
+```bash
+make test                   # the default tests
+make test-all               # every test, network and postgres too
+make lint                   # ruff check and a format check
+make db                     # start the PostgreSQL of docker-compose.yml
+make check                  # lint and every test: what a change must pass
+make db check CRAWLER_POSTGRES_PORT=55432   # the same with the server on another port
 ```
 
 ## Project structure
@@ -281,7 +367,10 @@ src/
 ├── demo_scale.py           # ScaleSite, SyncCrawler and the measurements of the `scale` command
 └── crawler/
     ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
-    ├── client.py           # AsyncCrawler: fetching, parsing, crawl()
+    ├── client.py           # AsyncCrawler: the public API — fetch_*, crawl(), statistics, close()
+    ├── crawl_run.py        # CrawlRun: one crawl — queue, filters, limits, deferred pages, counters, saving
+    ├── fetching.py         # Fetcher: one URL with robots.txt, circuit breaker, rate limit, retries and redirects
+    ├── transport.py        # HttpTransport: single GET requests over an aiohttp session, decoding, size limits
     ├── queue.py            # CrawlerQueue: URL priority queue and statuses
     ├── semaphores.py       # SemaphoreManager: global and per-domain limits
     ├── rate_limiter.py     # RateLimiter: requests per second, delays, jitter, rate stats
@@ -292,7 +381,7 @@ src/
     ├── error_stats.py      # ErrorTracker: counts errors, retries and their outcomes
     ├── stats.py            # CrawlerStats: pages by outcome, status code and domain, speed, running time
     ├── report.py           # the statistics as JSON and as an HTML report with charts
-    ├── config.py           # CrawlerConfig, load_config: YAML or JSON file, defaults, validation
+    ├── config.py           # CrawlerConfig, load_config, load_urls: YAML or JSON file, defaults, validation, URL lists
     ├── logging_setup.py    # configure_logging: text on the console, JSON Lines in a rotated file
     ├── progress.py         # ProgressTracker, show_progress: percent, speed, time left, active tasks
     ├── filters.py          # UrlFilter: host, pattern and file extension rules
@@ -311,9 +400,11 @@ src/
         └── factory.py      # storage_from_output, storage_from_url, storage_from_env, register_database
 examples/
 ├── advanced_usage.py       # a crawl by a configuration file: progress, statistics, report
-└── config.yaml             # the configuration of the example
+├── config.yaml             # the configuration of the example
+└── urls.txt                # a list of start URLs for --urls-file
 config.example.yaml         # every configuration key with its default
 docker-compose.yml          # PostgreSQL for the crawler and its tests
+Makefile                    # test, lint and database commands
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
@@ -325,6 +416,7 @@ docs/
 ├── configuration.md        # configuration guide: every key, validation, recipes
 ├── demo.md                 # the demo commands and their output
 ├── advanced_features.md    # notes on sitemaps, configuration, logging, monitoring and integration
+├── architecture.md         # notes on the layers of the crawler and refactoring without changing behaviour
 ├── asyncio_concepts.md     # notes on async concepts used here
 ├── concurrency_control.md  # notes on queues, limits and crawl order
 ├── data_storage.md         # notes on saving data: files, databases, batching, failed writes

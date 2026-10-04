@@ -148,6 +148,48 @@ class TestClosing:
         assert storage.pending == 0
 
 
+class TestOpening:
+    async def test_open_writes_nothing(self):
+        storage = MemoryStorage(batch_size=1)
+
+        await storage.open()
+        await storage.open()
+
+        assert (storage.batches, storage.written, storage.released) == ([], 0, 0)
+        await save_pages(storage, "a")
+        assert storage.urls == [["a"]]
+
+    async def test_open_after_close_fails(self):
+        storage = MemoryStorage()
+        await storage.close()
+
+        with pytest.raises(StorageError, match="MemoryStorage is closed"):
+            await storage.open()
+
+    @pytest.mark.parametrize(
+        "error", [OSError("read-only file system"), TypeError("not a path")], ids=["write error", "other"]
+    )
+    async def test_a_storage_that_cannot_be_opened_is_a_storage_error(self, error):
+        class Unopenable(MemoryStorage):
+            async def _open_storage(self) -> None:
+                raise error
+
+        storage = Unopenable()
+
+        with pytest.raises(StorageError, match=f"Unopenable cannot be opened: {error}") as raised:
+            await storage.open()
+
+        assert raised.value.__cause__ is error
+
+    async def test_a_storage_error_of_opening_is_passed_on(self):
+        class Unopenable(MemoryStorage):
+            async def _open_storage(self) -> None:
+                raise StorageError("pages.jsonl is not JSON Lines")
+
+        with pytest.raises(StorageError, match="^pages.jsonl is not JSON Lines$"):
+            await Unopenable().open()
+
+
 class TestWriteErrors:
     async def test_failed_write_is_retried(self, caplog):
         storage = MemoryStorage(batch_size=2, failures=[OSError("disk busy")])

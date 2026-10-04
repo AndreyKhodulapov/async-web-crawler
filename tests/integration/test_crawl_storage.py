@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from helpers import UNTHROTTLED, MemoryStorage
 
-from crawler import AsyncCrawler, CSVStorage, DataStorage, JSONStorage, PageRecord, SQLiteStorage
+from crawler import AsyncCrawler, CSVStorage, DataStorage, JSONStorage, PageRecord, SQLiteStorage, StorageError
 
 DISK_FULL = OSError("disk full")
 # More failures than any test has writes: the storage never recovers.
@@ -183,7 +183,7 @@ class TestSaveErrors:
     async def test_storage_that_always_fails_does_not_stop_the_crawl(self, url, caplog):
         storage = MemoryStorage(batch_size=2, failures=[DISK_FULL] * ALWAYS)
 
-        with caplog.at_level(logging.ERROR, logger="crawler.client"):
+        with caplog.at_level(logging.ERROR, logger="crawler"):
             crawler = await crawl(storage, url("/site/"))
 
         assert len(crawler.processed_urls) == 5
@@ -217,7 +217,7 @@ class TestSaveErrors:
     async def test_unexpected_error_of_the_storage_does_not_stop_the_crawl(self, url, caplog):
         storage = MemoryStorage(batch_size=1, failures=[TypeError("not serializable")] * ALWAYS)
 
-        with caplog.at_level(logging.ERROR, logger="crawler.client"):
+        with caplog.at_level(logging.ERROR, logger="crawler"):
             crawler = await crawl(storage, url("/site/"))
 
         stats = crawler.crawl_stats()
@@ -225,16 +225,14 @@ class TestSaveErrors:
         assert "Unexpected error while saving " in caplog.text
         assert "TypeError: not serializable" in caplog.text
 
-    async def test_closed_storage_does_not_stop_the_crawl(self, url, caplog):
+    async def test_closed_storage_fails_the_crawl_before_it_requests_anything(self, url, site):
         storage = MemoryStorage()
         await storage.close()
 
-        with caplog.at_level(logging.ERROR, logger="crawler.client"):
-            crawler = await crawl(storage, url("/site/"))
+        with pytest.raises(StorageError, match="MemoryStorage is closed"):
+            await crawl(storage, url("/site/"))
 
-        stats = crawler.crawl_stats()
-        assert (stats.processed, stats.saved, stats.save_failed) == (5, 0, 5)
-        assert "MemoryStorage is closed" in caplog.text
+        assert site.hits == {}
 
     async def test_buffered_pages_are_not_failures_while_the_crawl_runs(self, url):
         seen = []

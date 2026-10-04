@@ -103,6 +103,60 @@ class TestClosed:
         assert breaker.state("b.test") is CircuitState.CLOSED
 
 
+class TestRetries:
+    """The retries of a request record their outcomes on the call of its first attempt."""
+
+    @staticmethod
+    def attempts(breaker: CircuitBreaker, *outcomes: FetchError | None) -> None:
+        call = breaker.call(URL)
+        for outcome in outcomes:
+            with call:
+                call.record(outcome)
+
+    def test_a_retry_that_succeeds_makes_the_request_a_success(self, breaker):
+        self.attempts(breaker, TIMEOUT, None)
+        assert breaker.get_stats()["a.test"] == CircuitStats(state="closed", requests=1, failures=0)
+
+    def test_failed_retries_count_once(self, breaker):
+        # Three requests failing four times each: fewer than min_requests, 4 of them.
+        for _ in range(3):
+            self.attempts(breaker, TIMEOUT, TIMEOUT, TIMEOUT, TIMEOUT)
+        assert breaker.state("a.test") is CircuitState.CLOSED
+        assert breaker.get_stats()["a.test"] == CircuitStats(state="closed", requests=3, failures=3)
+
+    def test_the_first_failure_counts_at_once(self, breaker):
+        # Four requests failing on their first attempt open the circuit before any retry.
+        calls = [breaker.call(URL) for _ in range(4)]
+        for call in calls:
+            with call:
+                call.record(REFUSED)
+        assert breaker.state("a.test") is CircuitState.OPEN
+        with pytest.raises(CircuitOpenError), calls[0]:
+            pass
+
+    def test_a_retry_after_the_window_counts_anew(self, breaker, clock):
+        call = breaker.call(URL)
+        with call:
+            call.record(TIMEOUT)
+        clock.now += 60
+        with call:
+            call.record(None)
+        assert breaker.get_stats()["a.test"] == CircuitStats(state="closed", requests=1, failures=0)
+
+    def test_a_retry_after_the_circuit_closed_counts_anew(self, breaker, clock):
+        # The failure left the window when the circuit opened; the probe closed it.
+        call = breaker.call(URL)
+        with call:
+            call.record(TIMEOUT)
+        request(breaker, TIMEOUT, TIMEOUT, TIMEOUT)  # 4 of 4 with the call's failure
+        assert breaker.state("a.test") is CircuitState.OPEN
+        clock.now += breaker.cooldown
+        request(breaker, None)
+        with call:
+            call.record(TIMEOUT)
+        assert breaker.get_stats()["a.test"] == CircuitStats(state="closed", requests=1, failures=1, times_opened=1)
+
+
 class TestOpen:
     def test_requests_are_refused(self, breaker, clock):
         open_circuit(breaker)
@@ -175,6 +229,21 @@ class TestHalfOpen:
         clock.now += half_open.cooldown
         assert half_open.state("a.test") is CircuitState.HALF_OPEN
         assert half_open.get_stats()["a.test"].times_opened == 2
+
+    def test_a_failed_probe_is_remembered(self, half_open, clock):
+        # Not while the circuit is closed, and not for another URL.
+        assert half_open.opened_by_probe(URL) is False
+        request(half_open, REFUSED)
+        assert half_open.opened_by_probe(URL) is True
+        assert half_open.opened_by_probe("http://a.test/other") is False
+        clock.now += half_open.cooldown
+        assert half_open.opened_by_probe(URL) is True  # half-open: still open on that failure
+        request(half_open, None)
+        assert half_open.opened_by_probe(URL) is False
+
+    def test_a_circuit_opened_on_its_window_was_not_opened_by_a_probe(self, breaker):
+        open_circuit(breaker)
+        assert breaker.opened_by_probe(URL) is False
 
     def test_probe_without_an_outcome_lets_another_request_probe(self, half_open):
         with half_open.call(URL):
@@ -292,3 +361,17 @@ def test_transitions_are_logged(breaker, clock, caplog):
 def test_rejects_invalid_arguments(options, message):
     with pytest.raises(ValueError, match=message):
         CircuitBreaker(**options)
+
+
+@pytest.mark.parametrize(
+    ("error", "failure"),
+    [(TIMEOUT, True), (REFUSED, True), (HTTPStatusError(URL, 501, "Not Implemented"), True), (NOT_FOUND, False)],
+    ids=["timeout", "refused", "501", "404"],
+)
+def test_is_failure_says_what_counts_against_a_host(error, failure):
+    assert CircuitBreaker.is_failure(error) is failure
+
+
+@pytest.mark.parametrize("outcome", [None, BAD_CERTIFICATE], ids=["success", "certificate"])
+def test_what_counts_neither_way_is_not_a_failure(outcome):
+    assert CircuitBreaker.is_failure(outcome) is False

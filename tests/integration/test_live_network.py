@@ -2,7 +2,7 @@
 
 import pytest
 
-from crawler import AsyncCrawler, NetworkError, RetryStrategy, RobotsUnreachableError
+from crawler import AsyncCrawler, DNSError, RetryStrategy, RobotsUnreachableError
 
 pytestmark = pytest.mark.network
 
@@ -16,10 +16,10 @@ async def test_fetch_real_https_page():
 async def test_nonexistent_domain():
     # Its robots.txt cannot be fetched either, so the site is not touched.
     async with AsyncCrawler(retry_strategy=RetryStrategy(max_retries=0)) as crawler:
-        with pytest.raises(RobotsUnreachableError, match="robots.txt is unreachable \\(NetworkError"):
+        with pytest.raises(RobotsUnreachableError, match="robots.txt is unreachable \\(DNSError"):
             await crawler.fetch_url("https://nonexistent-domain.invalid")
     async with AsyncCrawler(retry_strategy=RetryStrategy(max_retries=0), respect_robots=False) as crawler:
-        with pytest.raises(NetworkError):
+        with pytest.raises(DNSError):
             await crawler.fetch_url("https://nonexistent-domain.invalid")
 
 

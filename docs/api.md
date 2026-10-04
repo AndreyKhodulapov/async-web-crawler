@@ -17,10 +17,11 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Page statistics](#page-statistics) | `CrawlerStats`, export to JSON and HTML |
 | [AdvancedCrawler](#advancedcrawler) | the crawler set up by a configuration |
 | [Live progress](#live-progress) | `show_progress`, `ProgressTracker` |
-| [Configuration](#configuration) | `load_config`, `CrawlerConfig` |
+| [Configuration](#configuration) | `load_config`, `load_urls`, `CrawlerConfig` |
 | [Logging](#logging) | `configure_logging` |
 | [Saving pages](#saving-pages) | the storages, `PageRecord`, databases by URL |
 | [Parsed page](#parsed-page) | `ParsedPage`, `HTMLParser` |
+| [Internals](#internals) | the layers behind `AsyncCrawler` and what each is responsible for |
 
 ## Fetching and crawling
 
@@ -68,7 +69,7 @@ asyncio.run(main())
 | `fetch_urls(urls)` | `{url: text}` for successful pages | failed URLs are logged and skipped |
 | `fetch_many(urls)` | `list[FetchResult]` in input order | error stored per result |
 | `fetch_and_parse(url)` | `ParsedPage` dict | download errors raise a `FetchError` subclass, a response that is not an HTML document raises `ParseError`; problems in parts of the page go to `page["errors"]` |
-| `crawl(start_urls, max_pages)` | `{url: ParsedPage}` for fetched pages | failed URLs go to `failed_urls` |
+| `crawl(start_urls, max_pages)` | `{url: ParsedPage}` for fetched pages | failed URLs go to `failed_urls`; a storage that cannot be opened raises `StorageError` before anything is requested |
 | `close()` | - | safe to call twice; called by `async with`; closes the storage too |
 
 Every method checks robots.txt, waits for the rate limit and retries transient
@@ -98,20 +99,43 @@ host and port) and cached for the crawler's lifetime. A missing robots.txt
 (HTTP 4xx, or a redirect loop) allows everything; an unreachable one (HTTP 5xx, 429, network
 errors, after the retries) disallows the whole site for 60 seconds, then it
 is fetched again. Such pages are counted as unreachable, not as blocked:
-the site did not forbid them. A crawl does not queue them again, so only
-the pages found after the 60 seconds are fetched. Redirects are followed by
+the site did not forbid them. In a crawl they are put off until robots.txt
+is fetched again, so a site whose robots.txt failed for a moment is crawled
+once it is back; only after the `AsyncCrawler.MAX_ROBOTS_RETRIES` (3)
+downloads after the first have failed too, about three minutes, do its
+pages go to `unreachable_urls`. A failure that does not pass by itself, a
+bad certificate or a host name that does not exist (`DNSError`), is not
+waited for at all: the pages go there at once. A resolver that fails for
+now (`EAI_AGAIN`) is an outage, not `DNSError`, and is waited for; with
+aiodns installed, which aiohttp then uses and which gives no such code,
+every DNS failure is `DNSError`. A page that redirects to such a site
+waits the same way and is requested again, and so does a
+sitemap of the site (see [Crawling](#crawling)); they all share the
+downloads of the site. Each download after the first is a single attempt,
+without the retries and their growing timeouts, and no page of a crawl
+waits for a download longer than `AsyncCrawler.ROBOTS_POLL` (2) seconds:
+the download goes on, and the page is put off for that long at a time
+until it is over, so a site that is slow to fail holds no worker back
+(outside a crawl, `fetch_url` and the others wait for the download). A
+site given up on is not downloaded again for the rest of the crawl; once
+it is over, `fetch_url` and the next `crawl()` on the same crawler try it
+again.
+Redirects are followed by
 the crawler, one request at a time: the target of each is checked against
 robots.txt of its own site and waits for the rate limit of its own host, as
 a link to it would. Up to `AsyncCrawler.MAX_REDIRECTS` (10) redirects in a
 row are followed; one more fails with `TooManyRedirectsError`, its target
 not requested. A disallowed target fails the request with
 `RobotsDisallowedError` before it is sent. Crawl-delay is capped at 30 seconds. While
-a retry waits, the whole host waits with it, since a timeout or a 429 usually
-means the site is overloaded. A Retry-After header holds back the host for
-as long as it asks, up to `AsyncCrawler.MAX_RETRY_AFTER` (10 minutes), even
-when the request is not retried; a request whose Retry-After is longer than
-`max_delay` of the retry strategy is not retried. Later `fetch_url()` calls
-to the host wait for that time too.
+a request that got HTTP 429, a Retry-After header or a timeout waits for
+its retry, the whole host waits with it: such a failure usually means the
+site is overloaded. After any other failure (HTTP 500, a reset connection)
+only that request waits, and the other pages of the host are fetched
+meanwhile. A Retry-After header holds back the host for
+as long as it asks, up to `AsyncCrawler(max_retry_after=600.0)` seconds
+(10 minutes), even when the request is not retried; a request whose
+Retry-After is longer than `max_delay` of the retry strategy is not
+retried. Later `fetch_url()` calls to the host wait for that time too.
 
 ## Retries
 
@@ -182,8 +206,17 @@ counted in `error_stats()`. After that one request goes through as a probe
 
 Failures are timeouts, network errors, HTTP 408, 429 and any 5xx, even
 one that is not retried, such as 501; any other response, a 404 too, is a
-success, so broken links do not block a site. Every attempt counts,
-retries and robots.txt downloads included. Each request of a redirect
+success, so broken links do not block a site. A request counts once,
+however many attempts it takes, robots.txt downloads included: its first
+failure counts at once, so a host that goes down is spotted after its
+first failed requests; a failed retry adds nothing; a retry that
+succeeds turns the failure into a success. So one broken URL retried
+three times does not open the circuit, and neither does a slow host whose
+pages come through on the second attempt, as long as the retries land
+before `min_requests` first attempts have failed: with that many requests
+to the host in flight at once, their timeouts open the circuit before any
+retry, and the probe after the cooldown, a first attempt with the base
+timeout, may open it again. Each request of a redirect
 chain counts for its own host: a link that redirects to a failing host
 counts against that host, not the host of the link.
 The circuit is checked before a request waits for the rate limit, where a
@@ -199,21 +232,41 @@ under its own URL, and robots.txt is not cached as unreachable.
 
 In a crawl, a page the breaker refuses is not failed: it is put off until
 the circuit may let a probe through, or for a second while the probe is in
-flight, and the workers go on with other pages meanwhile. So the pages of
+flight, and the workers go on with other pages meanwhile. So is a page
+whose request was sent and failed while the circuit opened, on its own
+failure or on those of the other requests in flight: the breaker refused
+the retries it would have had, so it is requested again when the host may
+be probed, instead of being the page lost to the outage. The probe is
+such a retry: a page whose probe failed is failed with its own error and
+not put off again, so that one broken page does not probe a healthy host
+until it is given up. A page with an error that is never retried, such as
+HTTP 501, fails at once too: the breaker took nothing from it. So the pages of
 a host that went down for a moment are fetched once it is back, even when
 the page refused was the last one `max_pages` allowed. A page refused
-before its request does not count toward `max_pages`; one whose redirect
+before its request does not count toward `max_pages`, and neither does one
+put off after its request failed, until it is taken again; one whose redirect
 target is refused has sent its request, so it counts, and counts again
 when it is taken again. After the circuit of a host has opened
 `AsyncCrawler.MAX_CIRCUIT_OPENINGS` (3) times in the crawl, no more probes
-are sent: its remaining pages go to `failed_urls` with `CircuitOpenError`,
-and a host that stays down holds the crawl for about two cooldowns.
+are sent: its remaining pages go to `failed_urls`, with `CircuitOpenError`
+if they were never requested and with the error of their request if they
+were, and a host that stays down holds the crawl for about two cooldowns.
 
 The same goes for a host held back longer than
 `AsyncCrawler.MIN_PENALTY_TO_DEFER` (1 second), by a Retry-After or the
-pause before a retry: its pages are put off until the host may be asked
+pause before the retry of a request that found it overloaded (HTTP 429, a
+timeout): its pages are put off until the host may be asked
 again, instead of holding workers in the rate limiter, and count toward
-`max_pages` only when they are taken again.
+`max_pages` only when they are taken again. A Retry-After longer than
+`max_delay` of the retry strategy is logged as a warning once per host
+(`example.com asked to wait 300s (Retry-After); its pages are put off until
+then`): with one host in the crawl, nothing is requested until it ends.
+The page that got such a Retry-After is not retried by its request, as
+`RetryStrategy` says, but it comes back with the host, up to
+`AsyncCrawler.MAX_WAITS_PER_PAGE` (3) times; then it goes to `failed_urls`.
+A page that got it with a permanent error (HTTP 403 with a Retry-After)
+goes there at once: the host is held back all the same, but the page would
+fail the same way when it came back.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
@@ -260,7 +313,8 @@ are not counted.
 | `read_timeout` | `20.0` | the longest pause between two chunks of the response |
 | `total_timeout` | `30.0` | the whole request, body included |
 | `timeout_growth` | `1.5` | each retry multiplies all three by this, up to 4 times the initial values; `1` keeps them fixed |
-| `max_page_size` | `10485760` | bytes of a page body; a larger one fails with `PageTooLargeError` (a permanent error) and the rest is not downloaded; `None` lifts the limit |
+| `max_page_size` | `3145728` | bytes of a page body (3 MiB); a larger one fails with `PageTooLargeError` (a permanent error) and the rest is not downloaded; `None` lifts the limit |
+| `max_parsing` | `2` | pages parsed at once, whatever `max_concurrent` says |
 
 With the defaults the read timeout is 20 s on the first attempt and 30, 45
 and 67.5 s on the three retries: a page that is only slow gets through, a
@@ -273,6 +327,13 @@ The body is read in chunks and given up once it is over its limit:
 unpacked from gzip or deflate, so a gzip bomb fails too, and a
 Content-Length over the limit fails the request before the body is read.
 robots.txt is cut at 500 KiB, the size RFC 9309 asks crawlers to read.
+
+The size limit bounds the download, `max_parsing` the parsing: a page
+takes about forty times its size in memory and a couple of seconds per
+megabyte to parse (a 10 MiB page full of links measured 20 s and 400 MB),
+and the GIL runs the parses one at a time anyway. With the defaults no
+more than two pages of 3 MiB are parsed at once, about 250 MB; a site of
+larger pages needs a larger `max_page_size`, and the memory grows with it.
 
 ## Crawling
 
@@ -334,7 +395,7 @@ after the crawler: the robots.txt name of its `user_agent`,
 | `AsyncCrawler(max_depth=2)` | how far from the start pages to go; 0 fetches the start pages only |
 | `AsyncCrawler(max_per_domain=None)` | parallel requests to one host; `None` means only `max_concurrent` applies |
 | `max_pages_per_host=None` | pages requested from one host; `None` means only `max_pages` applies |
-| `same_domain_only=False` | follow links on the start hosts only (and on the hosts their redirects end on, not those they pass through); the configuration turns it on by default |
+| `same_domain_only=False` | follow links on the start hosts only (and on the hosts their redirects end on, not those they pass through) and on their subdomains: `docs.example.com` for a start URL on `example.com`, not the other way round; `www.example.com` and `example.com` are one host. The configuration turns it on by default |
 | `include_patterns=()` | regular expressions; a link must match at least one |
 | `exclude_patterns=()` | regular expressions; a matching link is skipped, even if included |
 | `exclude_extensions=()` | file extensions such as `"pdf"`; a link to such a file is skipped. Only the last extension of the URL path counts, in any case, the query does not. The configuration sets a list of documents, images, archives and media by default |
@@ -370,9 +431,14 @@ a start URL, so its links are followed up to `max_depth`; unlike a start
 URL, it must pass the filters, and a redirect does not bring another host
 into the crawl. `same_domain_only` keeps the hosts of `sitemap_urls` as well
 as those of the start URLs; when a start URL redirects to another host
-("example.com" to "www.example.com"), the sitemap pages on that host are
+("example.org" to "example.com"), the sitemap pages on that host are
 crawled too. A sitemap that cannot be downloaded or read is logged and
-listed in `failed_sitemaps`, and the crawl goes on.
+listed in `failed_sitemaps`, and the crawl goes on. A sitemap of a site
+whose robots.txt cannot be read waits for it to be downloaded again, within
+the `AsyncCrawler.MAX_ROBOTS_RETRIES` (3) repeat downloads of the site, as a page
+does, and so do the sitemaps that such a robots.txt names under `robots_sitemaps`: the first
+page is fetched after that wait, so that a crawl fed by sitemaps alone does
+not end empty after a 503 of a few seconds.
 
 `crawl()` returns every parsed page, so it holds them all in memory until
 it ends. A large crawl that saves its pages to a storage does not need
@@ -567,13 +633,15 @@ line of it.
 
 `load_config(path, overrides)` reads a YAML or a JSON file into a
 `CrawlerConfig`, checked as it is loaded; `CrawlerConfig.from_dict(mapping)`
-does the same for a mapping. The keys, their limits, the errors and the
-overrides are described in the [configuration guide](configuration.md).
+does the same for a mapping. `load_urls(path)` reads start URLs from a
+text file, one per line (`"-"` is stdin), and raises `ConfigError` listing
+every line that is not an http(s) URL or has a space inside. The keys, their limits, the errors
+and the overrides are described in the [configuration guide](configuration.md).
 
 ## Logging
 
-Every module logs to a logger named after it (`crawler.client`,
-`crawler.retry`, ...). `configure_logging` sends the records to the console
+Every module logs to a logger named after it (`crawler.fetching` for
+requests, `crawler.crawl_run` for the pages of a crawl, `crawler.retry`, ...). `configure_logging` sends the records to the console
 and, given a file, to that file as well:
 
 ```python
@@ -585,14 +653,14 @@ configure_logging("INFO", "crawler.log", max_bytes=10 * 1024 * 1024, backup_coun
 The console (stderr) gets a line of text per record:
 
 ```
-19:41:40 | INFO    | crawler.client | Fetched https://example.com/: status=200 size=1256B elapsed=0.10s
+19:41:40 | INFO    | crawler.fetching | Fetched https://example.com/: status=200 size=1256B elapsed=0.10s
 ```
 
 The file gets JSON Lines, an object per record, so it can be read by
 `jq` or loaded by a log collector as it is:
 
 ```json
-{"time": "2026-10-02T16:41:40.438+00:00", "level": "INFO", "logger": "crawler.client", "message": "Fetched https://example.com/: status=200 size=1256B elapsed=0.10s"}
+{"time": "2026-10-02T16:41:40.438+00:00", "level": "INFO", "logger": "crawler.fetching", "message": "Fetched https://example.com/: status=200 size=1256B elapsed=0.10s"}
 ```
 
 `time` is UTC in ISO 8601; a record logged with an exception has its
@@ -659,6 +727,12 @@ the same types:
 
 All of them share the behavior of `DataStorage`:
 
+- `open()` opens the file or the connection ahead of the first write and
+  checks that it can be written to: a file of another layout, a path that
+  cannot be written, a database that cannot be reached raise `StorageError`
+  at once, before a crawl has anything to save. Nothing is written by it.
+  `crawl()` calls it before its first request and lets the error through;
+  without it, the first write opens the storage the same way.
 - `save(record)` puts the record into a buffer; the buffer is written once
   it holds `batch_size` records (100 by default), on `flush()` and on
   `close()`. Several workers may save at once.
@@ -676,7 +750,7 @@ All of them share the behavior of `DataStorage`:
   them all; `pending` and `written` count the records in the buffer and those
   written out.
 
-A database storage creates its table on the first use (`init_db()`), with
+A database storage creates its table on `open()` or the first use (`init_db()`), with
 `url` unique and indexes on `crawled_at` and `status_code`. A batch is one
 transaction: all of its pages are saved or none. Saving a URL again replaces
 its row. `count()`, `status_counts()` and `get(url)` query the table.
@@ -685,9 +759,9 @@ A file storage adds to the file if it exists, so a second crawl with the
 same file keeps the pages of the first one, and a page fetched by both is
 in the file twice; adding to a file that is not empty is logged as a
 warning. With `overwrite=True` the file is started anew: what it held is
-dropped on the first write (a crawl that saves nothing leaves it as it
-was), and a file that could not be added to, such as one of the other JSON
-layout, is replaced too.
+dropped on the first write, not on `open()` (a crawl that saves nothing
+leaves it as it was), and a file that could not be added to, such as one
+of the other JSON layout, is replaced too.
 
 In a crawl, a failed save never stops the crawler: it is logged, the page
 stays in the results, and `crawl_stats()` counts `saved` and `save_failed`.
@@ -722,7 +796,7 @@ PostgreSQL server for the crawler, use the compose file of the repository:
 docker compose up -d --wait                  # PostgreSQL 17 on localhost:5432
 export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
 python src/demo_main.py save
-CRAWLER_POSTGRES_PORT=55432 docker compose up -d --wait   # if port 5432 is taken
+CRAWLER_POSTGRES_PORT=55432 docker compose up -d --wait   # if port 5432 is taken; the URL then has :55432
 ```
 
 Another database needs a driver and a few lines of storage: `DatabaseStorage`
@@ -774,3 +848,42 @@ when `respect_robots` is on, a parser passed in decides for itself.
 `HTMLParser(robots_name="mybot")` adds the directives of
 `<meta name="mybot">` to those of `<meta name="robots">`; the crawler's own
 parser takes the robots.txt name of its `user_agent`.
+
+## Internals
+
+`AsyncCrawler` is a facade over three layers, each in a module of its own.
+They are not part of the public API: they are not exported from `crawler`
+and may change. A layer calls only the one below it.
+
+| Layer | Module | Class | Responsible for | Knows nothing of |
+|-------|--------|-------|-----------------|------------------|
+| Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
+| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
+| Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
+| HTTP | `transport.py` | `HttpTransport` | a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
+
+Who owns what:
+
+- `AsyncCrawler` creates the shared objects — `SemaphoreManager`,
+  `RateLimiter`, `RetryStrategy`, `CircuitBreaker`, `HttpTransport`,
+  `Fetcher`, `HTMLParser`, `CrawlerStats` — and exposes some of them as
+  its attributes (`rate_limiter`, `circuit_breaker`, `stats` ...). The
+  settings and the components of a crawler are read-only, as the layers
+  got them when it was made; only `storage` may be replaced between
+  crawls.
+- `Fetcher` creates `RobotsParser` and `SitemapParser`, which download
+  through it, so robots.txt and sitemaps get the same politeness as pages;
+  `AsyncCrawler.robots` and `.sitemaps` are the same objects.
+- Every `crawl()` makes a new `CrawlRun`, so the state of a crawl is never
+  reset field by field: the previous run stays readable until the next one
+  starts. Before the first crawl the properties read an empty run. The
+  rate limits, the robots.txt cache and the states of the circuit breaker
+  live in the shared objects and carry over between crawls.
+- The crawl constants (`ROBOTS_POLL`, `MAX_ROBOTS_RETRIES`,
+  `FRONTIER_FACTOR` ...) are defined by `CrawlRun` and read from the
+  crawler when a run is made, so one set on an `AsyncCrawler` or on a
+  subclass applies to its crawls. The request constants
+  (`MAX_REDIRECTS`, `MAX_TIMEOUT_GROWTH`, `REDIRECT_STATUSES`) are
+  defined by `Fetcher` and `HttpTransport` and read from the crawler when
+  it is made: one set on a subclass applies, one set on a crawler later
+  does not. `sitemaps.MAX_SIZE` is read on every download of a sitemap.

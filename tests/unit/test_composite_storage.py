@@ -105,6 +105,28 @@ class TestFailures:
         assert "MemoryStorage: failed to write 1 records: disk full" in message
         assert "OtherStorage: not serializable" in message
 
+    async def test_open_opens_every_storage_and_names_the_one_that_cannot_be(self):
+        class Unopenable(MemoryStorage):
+            async def _open_storage(self) -> None:
+                raise OSError("read-only file system")
+
+        opened = []
+
+        class Openable(MemoryStorage):
+            async def _open_storage(self) -> None:
+                opened.append(self)
+
+        working = Openable()
+        storage = CompositeStorage(Unopenable(), working)
+
+        with pytest.raises(StorageError) as raised:
+            await storage.open()
+
+        assert opened == [working]
+        assert str(raised.value).startswith(
+            "failed to open 1 of 2 storages: Unopenable: Unopenable cannot be opened: read-only file system"
+        )
+
     async def test_close_closes_the_others_when_one_fails(self):
         broken = MemoryStorage(failures=[DISK_FULL] * ALWAYS)
         working = MemoryStorage()

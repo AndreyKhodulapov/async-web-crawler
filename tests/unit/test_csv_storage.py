@@ -293,6 +293,49 @@ class TestBrokenFiles:
         assert path.read_bytes() == written
 
 
+class TestOpening:
+    async def test_open_makes_the_file_and_writes_nothing(self, tmp_path):
+        path = tmp_path / "pages.csv"
+
+        async with CSVStorage(path) as storage:
+            await storage.open()
+            assert path.read_bytes() == b""
+            assert storage.written == 0
+            await storage.save(make_record())
+
+        assert await read_all(CSVStorage(path)) == [make_record()]
+
+    async def test_open_leaves_a_file_of_this_storage_as_it_is(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        async with CSVStorage(path) as storage:
+            await storage.save(make_record())
+        before = path.read_bytes()
+
+        async with CSVStorage(path) as storage:
+            await storage.open()
+            assert path.read_bytes() == before
+            await storage.save(make_record("https://site/b"))
+
+        assert [record["url"] for record in await read_all(CSVStorage(path))] == ["https://site/page", "https://site/b"]
+        assert parse_csv(path)[0] == FIELDS
+
+    async def test_open_refuses_a_file_that_is_not_of_this_storage(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        path.write_bytes(b"\r\nurl,title\r\nhttps://site/a,A\r\n")
+
+        async with CSVStorage(path) as storage:
+            with pytest.raises(StorageError, match="starts with an empty line"):
+                await storage.open()
+
+        assert path.read_bytes() == b"\r\nurl,title\r\nhttps://site/a,A\r\n"
+
+    async def test_open_refuses_a_path_that_cannot_be_written(self, tmp_path):
+        storage = CSVStorage(tmp_path / "missing" / "pages.csv")
+
+        with pytest.raises(StorageError, match="CSVStorage cannot be opened: .*missing"):
+            await storage.open()
+
+
 class TestOverwrite:
     async def test_file_of_an_earlier_run_is_replaced_with_its_header(self, tmp_path):
         path = tmp_path / "pages.csv"
@@ -331,9 +374,23 @@ class TestOverwrite:
         path.write_bytes(b"url\r\nhttps://site/kept\r\n")
 
         async with CSVStorage(path, overwrite=True) as storage:
+            await storage.open()
             await storage.flush()
 
         assert path.read_bytes() == b"url\r\nhttps://site/kept\r\n"
+
+    async def test_a_longer_file_of_an_earlier_run_is_cut(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        async with CSVStorage(path) as storage:
+            await save_all(storage, make_records(20))
+        record = make_record("https://site/new", title="New")
+
+        async with CSVStorage(path, overwrite=True) as storage:
+            await storage.open()
+            await storage.save(record)
+
+        assert await read_all(CSVStorage(path)) == [record]
+        assert len(parse_csv(path)) == 2
 
     async def test_adding_to_a_file_is_logged(self, tmp_path, caplog):
         caplog.set_level(logging.WARNING, logger="crawler.storage")

@@ -1,0 +1,8 @@
+# Start URLs for `python src/main.py --urls-file examples/urls.txt`:
+# one per line; blank lines and lines starting with "#" are skipped.
+
+# Sandboxes made for crawling practice.
+https://books.toscrape.com/index.html
+https://quotes.toscrape.com/
+
+https://web-scraping.dev/products

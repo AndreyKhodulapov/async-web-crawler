@@ -2,13 +2,14 @@
 
 import csv
 import json
-import os
 import sqlite3
 from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
+from helpers import POSTGRES_DSN
 
+from crawler import CSVStorage
 from demo_main import parse_args, run_crawl, run_errors, run_save
 
 # Start page, 8 articles and the three pages a retry makes good.
@@ -36,8 +37,9 @@ async def test_crawl_reports_errors_and_circuit_breaker(url, tmp_path, capsys):
     assert (errors["total"], errors["retries"], errors["successful_retries"]) == (2, 1, 1)
     assert errors["by_class"] == {"TransientHTTPError": 1, "PermanentHTTPError": 1}
     assert errors["permanent_errors"] == {url("/status/404"): "PermanentHTTPError: HTTP 404 Not Found"}
+    # The page made good by its retry counts once, as a success.
     assert saved["circuit_breaker"] == {
-        "127.0.0.1": {"state": "closed", "requests": 3, "failures": 1, "times_opened": 0, "rejected": 0}
+        "127.0.0.1": {"state": "closed", "requests": 2, "failures": 0, "times_opened": 0, "rejected": 0}
     }
 
 
@@ -62,7 +64,7 @@ async def test_errors_demo_meets_every_kind_of_error(url, tmp_path, capsys):
     # 503 twice, 429 once and a read timeout, each made good by a retry.
     assert fetched == {"/", *articles, "/flaky", "/rate-limited", "/slow", "/ok"}
     failed = {page["url"]: page["error"] for page in saved["failed"]}
-    assert failed.pop("http://unreachable.invalid/").startswith("NetworkError: ClientConnectorDNSError")
+    assert failed.pop("http://unreachable.invalid/").startswith("DNSError: ClientConnectorDNSError")
     down = {page: error for page, error in failed.items() if urlsplit(page).hostname == "localhost"}
     # The pages refused by its breaker wait for the probes, then fail with the others.
     assert len(down) == 8
@@ -164,11 +166,28 @@ async def test_save_demo_replaces_the_files_unless_told_to_append(tmp_path, caps
     connection.close()
 
 
-async def test_save_demo_goes_on_when_a_storage_cannot_be_written(tmp_path, capsys):
+async def test_save_demo_stops_before_the_crawl_when_a_storage_cannot_be_opened(tmp_path, capsys):
     options = save_options(tmp_path, "--batch-size", "100")
     options[options.index("--csv") + 1] = str(tmp_path / "missing" / "pages.csv")
 
     await run_save(parse_args([*options, "--log-level", "ERROR"]))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines()[-1].startswith(
+        "error: failed to open 1 of 3 storages: CSVStorage: CSVStorage cannot be opened: "
+    )
+    assert (tmp_path / "pages.jsonl").read_text(encoding="utf-8") == ""
+
+
+async def test_save_demo_goes_on_when_a_storage_cannot_be_written(tmp_path, capsys, monkeypatch):
+    async def write_batch(self, records):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(CSVStorage, "_write_batch", write_batch)
+    monkeypatch.setattr(CSVStorage, "WRITE_ERRORS", ())  # not retried: the run would take seconds
+
+    await run_save(parse_args([*save_options(tmp_path, "--batch-size", "100"), "--log-level", "ERROR"]))
 
     assert len((tmp_path / "pages.jsonl").read_text(encoding="utf-8").splitlines()) == 12
     output = capsys.readouterr().out
@@ -190,10 +209,9 @@ async def test_save_demo_writes_an_indented_array_in_another_encoding(tmp_path):
 
 @pytest.mark.postgres
 async def test_save_demo_with_postgres(tmp_path, capsys, monkeypatch):
-    dsn = os.environ.get("CRAWLER_TEST_DATABASE_URL", "postgresql://crawler:crawler@localhost:5432/crawler")
-    connection = await asyncpg.connect(dsn)
+    connection = await asyncpg.connect(POSTGRES_DSN)
     await connection.execute("DROP TABLE IF EXISTS pages")
-    monkeypatch.setenv("CRAWLER_DATABASE_URL", dsn)
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", POSTGRES_DSN)
     files = ["--json", str(tmp_path / "pages.jsonl"), "--csv", str(tmp_path / "pages.csv")]
 
     try:
@@ -207,6 +225,6 @@ async def test_save_demo_with_postgres(tmp_path, capsys, monkeypatch):
     assert "=== Saved pages (this crawl: 12 saved, 0 not saved) ===" in output
     row = next(line.split() for line in output.splitlines() if line.startswith("PostgresStorage "))
     assert row[1:3] == ["12", "-"]
-    assert f":{urlsplit(dsn).password}@" not in row[-1]
+    assert f":{urlsplit(POSTGRES_DSN).password}@" not in row[-1]
     assert ":***@" in row[-1]
     assert "Pages found by URL in postgresql://" in output

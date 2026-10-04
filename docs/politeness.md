@@ -110,10 +110,25 @@ sites it visits and follows their rules.
   everything is disallowed. 429 is best treated like 5xx: the site asks crawlers to back off.
 - An **unreachable** robots.txt is an outage, not a rule: cache it briefly
   (here 60 seconds) and fetch it again, or one timeout closes the site for
-  the whole crawl. The TTL helps the URLs that come later: pages refused
-  during the outage are not queued again, so a crawl of that one site
-  still ends empty. Count such pages apart from the disallowed ones, so the
-  report does not blame robots.txt for a network failure.
+  the whole crawl. The TTL alone helps only the URLs that come later; the
+  pages refused during the outage must wait for it too, or a crawl of that
+  one site ends empty after a 503 of a few seconds. The same goes for every
+  way into the site: a start URL that redirects there and a sitemap of it,
+  or the fix covers the direct links only. Budget the waiting per site
+  (here three repeat downloads), not per page or per sitemap, or a dead
+  site is waited for once by its sitemaps and again by its pages; and do
+  not wait at all for a failure that does not pass by itself: a host name
+  that does not exist is a typo, and three minutes change nothing about
+  it (but a resolver that answers "try again" is an outage). Mind the
+  cost of each try, too: a host that accepts the connection and never
+  answers fails only by timeout, and a download with retries
+  and growing timeouts takes minutes, so download again with a single
+  attempt, and let no page wait for a download for long (here two
+  seconds; the download goes on by itself and the page comes back
+  later), or every worker that takes a page of that site stands still
+  with it. Count such pages apart from the
+  disallowed ones, so the report does not blame robots.txt for a network
+  failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
   origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB,
   and stop downloading there: a huge or endless file must not fill the memory.
@@ -157,8 +172,16 @@ sites it visits and follows their rules.
   crawler: it holds back the host for as long as it asks, even when the
   failed URL is not retried and the wait is longer than any retry pause.
   Coming back after 30 seconds when asked for 2 minutes is what gets a bot
-  blocked. Cap it all the same (here 10 minutes): a misconfigured server
-  must not stop the crawl for a day.
+  blocked. Cap it all the same (here 10 minutes by default,
+  `max_retry_after`): a misconfigured server must not stop the crawl for a
+  day. And say so in the log: a crawl that makes no requests for minutes
+  looks stuck to the user.
+- A 500 or 502 on one URL, or a reset connection, more often means **one
+  page** or one backend is broken. Let only that request wait for its
+  retry: holding the host for every retry lets a few broken pages stall
+  the whole site for minutes (two pages answering 503 among 40 took a
+  crawl from 0.2 s to 10 s). A host that fails everywhere is caught by the
+  circuit breaker instead.
 - While a host is held back for long, put its pages aside rather than let
   workers wait for it: otherwise one host blocks the crawl of all the
   others (head-of-line blocking).

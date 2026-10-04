@@ -10,7 +10,7 @@ import yaml
 from helpers import FAST_CONFIG
 
 import main
-from crawler import AdvancedCrawler
+from crawler import AdvancedCrawler, JSONStorage, StorageError
 from main import build_config, parse_args, run
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
@@ -127,6 +127,39 @@ async def test_no_page_fetched_is_exit_code_1(url, config_file, capsys):
     assert "Pages: 1 (0 successful, 1 failed, 0 skipped)" in capsys.readouterr().out
 
 
+async def test_output_file_that_cannot_be_written_fails_the_run_before_anything_is_requested(
+    url, site, config_file, tmp_path, capsys
+):
+    pages = tmp_path / "pages.jsonl"
+    pages.write_text('[{"url": "https://site/a"}]\n', encoding="utf-8")  # a JSON array, not JSON Lines
+    argv = ["--config", config_file(), "--output", str(pages), "--stats-json", str(tmp_path / "stats.json")]
+
+    # main() prints the error and exits with 1, see the unit tests of the command line.
+    with pytest.raises(StorageError, match="is not JSON Lines of this storage: it was not written without indent"):
+        await run(build_config(parse_args(argv)), progress=False)
+
+    assert capsys.readouterr().out == ""
+    assert site.hits == {}
+    assert pages.read_text(encoding="utf-8") == '[{"url": "https://site/a"}]\n'
+    assert not (tmp_path / "stats.json").exists()  # no report of a crawl that did not run
+
+
+async def test_pages_that_could_not_be_saved_are_exit_code_1(url, config_file, tmp_path, capsys, monkeypatch):
+    async def write_batch(self, records):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(JSONStorage, "_write_batch", write_batch)
+    monkeypatch.setattr(JSONStorage, "WRITE_ERRORS", ())  # not retried: the run would take seconds
+    argv = ["--config", config_file(), "--output", str(tmp_path / "pages.jsonl"), "--max-depth", "0"]
+
+    assert await run(build_config(parse_args(argv)), progress=False) == 1
+
+    summary = capsys.readouterr().out
+    assert "Pages: 1 (1 successful, 0 failed, 0 skipped)" in summary
+    assert "Saved: 0 pages to" in summary
+    assert "1 not saved" in summary
+
+
 async def test_log_file_that_cannot_be_opened_is_an_os_error(url, config_file, tmp_path):
     (tmp_path / "taken").write_text("a file, not a directory")
     argv = ["--config", config_file(), "--log-file", str(tmp_path / "taken" / "crawler.log")]
@@ -200,6 +233,35 @@ async def test_crawl_is_stopped_when_the_progress_cannot_be_shown(url, site, con
     stats = json.loads(stats_file.read_text(encoding="utf-8"))
     # The page in flight was dropped with the crawl, not failed by a crawler closed under it.
     assert (stats["total_pages"], stats["successful"], stats["errors"]) == (1, 1, {})
+
+
+async def test_crawl_by_a_list_of_urls(url, site, config_file, tmp_path, capsys):
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text(f"# pages to crawl\n{url('/site/a.html')}\n\n{url('/site/b.html')}\n", encoding="utf-8")
+    out = tmp_path / "pages.jsonl"
+    argv = ["--config", config_file(), "--urls-file", str(urls_file), "--max-depth", "0", "--output", str(out)]
+
+    code = await run(build_config(parse_args(argv)), progress=False)
+
+    assert code == 0
+    # The list replaces the start URL of the configuration.
+    assert set(site.hits) == {"/site/a.html", "/site/b.html"}
+    assert saved_urls(out) == {url("/site/a.html"), url("/site/b.html")}
+    assert "Pages: 2 (2 successful" in capsys.readouterr().out
+
+
+async def test_command_reads_the_list_of_urls_from_stdin(url, site, config_file, tmp_path):
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, str(Path(main.__file__)), "--config", config_file(), "--urls-file", "-",
+        "--max-depth", "0", "--output", str(tmp_path / "pages.jsonl"), "--no-progress",
+        cwd=tmp_path, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )  # fmt: skip
+    urls = f"{url('/site/a.html')}\r\n{url('/site/a.html')}\r\n{url('/site/b.html')}\r\n".encode()
+    output, errors = await asyncio.wait_for(process.communicate(urls), timeout=30)
+
+    assert process.returncode == 0, errors.decode()
+    assert "Pages: 2 (2 successful, 0 failed, 0 skipped)" in output.decode()
+    assert saved_urls(tmp_path / "pages.jsonl") == {url("/site/a.html"), url("/site/b.html")}
 
 
 async def test_command_runs_as_a_script(url, config_file, tmp_path):

@@ -142,6 +142,13 @@ the small pages, and from 7.6 to 10.5 on the large ones.
   a BeautifulSoup tree), for a gain that only shows where the rate limit
   does not: wide crawls of many hosts. Processes help there as well, and
   keep the parser as it is.
+- **The size of a page is the size of its parse.** A 10 MiB page full of
+  links takes 20 s and about 400 MB to parse, and four such parses at once
+  took 120 s and 1.5 GB: the GIL ran them one at a time, and the trees sat
+  in memory meanwhile. Hence the body limit of 3 MiB by default and
+  `max_parsing`, two parses at once whatever `max_concurrent` says: the
+  memory of parsing is bounded by their product, and the download limit
+  alone would not bound it.
 - **Logging.** At the `INFO` level the crawler writes four records a page,
   each formatted and flushed to stderr on the event loop: about 10% of the
   time of a small page, and as much again with a log file. Against a real

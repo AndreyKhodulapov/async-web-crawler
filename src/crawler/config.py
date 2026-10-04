@@ -5,6 +5,7 @@ import difflib
 import json
 import math
 import re
+import sys
 import types
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -59,8 +60,23 @@ def _option(
     return field(default=default, metadata={name: limit for name, limit in limits.items() if limit is not None})
 
 
-def _http_url(value: str) -> str | None:
-    return None if is_valid_http_url(value) else "expected an http:// or https:// URL"
+# Whitespace, C0 and C1 controls. Inside a URL they are a mistake rather than
+# a part of it, e.g. a comment after the URL on its line.
+_SPACE_OR_CONTROL = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
+
+
+def http_url_problem(value: str) -> str | None:
+    """What is wrong with `value` as a URL to crawl, None if nothing.
+
+    One check for `urls` and `sitemaps.urls` of the configuration, the
+    lines of a URL list and the URLs of the command line.
+    """
+    if not is_valid_http_url(value):
+        return "expected an http:// or https:// URL"
+    # Valid all the same: a space would be sent as %20, a tab or a line break dropped.
+    if _SPACE_OR_CONTROL.search(value.strip()):
+        return "a URL cannot contain spaces or control characters (a space is written %20)"
+    return None
 
 
 def _pattern(value: str) -> str | None:
@@ -119,6 +135,10 @@ class CrawlOptions:
     read_timeout: float = _option(20.0, above=0)
     timeout_growth: float = _option(1.5, minimum=1)
     max_page_size: int | None = _option(AsyncCrawler.DEFAULT_MAX_PAGE_SIZE, minimum=1)  # bytes; null lifts the limit
+    max_parsing: int = _option(
+        2, minimum=1
+    )  # pages parsed at once; parsing costs about 40 times the page size in memory
+    max_retry_after: float = _option(AsyncCrawler.DEFAULT_MAX_RETRY_AFTER, above=0)  # the longest Retry-After obeyed
     keep_pages: bool = True  # false lets a page go once it is saved: the memory of a large crawl stays flat
 
 
@@ -126,7 +146,7 @@ class CrawlOptions:
 class SitemapOptions:
     """Section `sitemaps`: sitemaps whose pages are crawled along with the start URLs."""
 
-    urls: tuple[str, ...] = _option((), check=_http_url)
+    urls: tuple[str, ...] = _option((), check=http_url_problem)
     from_robots: bool = False  # also the sitemaps that robots.txt of the start URLs' sites names
     max_urls: int = _option(50_000, minimum=1)  # pages taken from one sitemap, its index included
 
@@ -227,7 +247,7 @@ class CrawlerConfig:
     change a value, make another one with `overrides`.
     """
 
-    urls: tuple[str, ...] = _option((), check=_http_url)
+    urls: tuple[str, ...] = _option((), check=http_url_problem)
     sitemaps: SitemapOptions = field(default_factory=SitemapOptions)
     crawler: CrawlOptions = field(default_factory=CrawlOptions)
     retry: RetryOptions = field(default_factory=RetryOptions)
@@ -277,6 +297,50 @@ def load_config(path: str | Path, overrides: Mapping[str, Any] | None = None) ->
     if overrides and isinstance(mapping, Mapping):
         mapping = _merge(mapping, overrides)
     return CrawlerConfig.from_dict(mapping, source=str(path))
+
+
+def load_urls(path: str | Path) -> list[str]:
+    """Read start URLs from a text file, one per line; "-" reads them from stdin.
+
+    The file is UTF-8, with or without a BOM, and its lines may end in
+    "\n", "\r\n" or "\r". Blank lines and lines that start with "#" are
+    skipped, spaces around a URL are dropped, and a URL given again is
+    dropped too: the first one keeps its place. A comment takes a line of
+    its own: spaces inside a URL are an error.
+
+    Raises:
+        ConfigError: the file cannot be read or is not UTF-8, there is no
+            stdin to read, or lines of it are not http(s) URLs; every such
+            line is listed by its number.
+    """
+    name = "<stdin>" if path == "-" else str(path)
+    if path == "-" and sys.stdin is None:
+        # Started with stdin closed, e.g. `<&-` in a shell.
+        raise ConfigError(["there is no standard input to read URLs from"], name)
+    try:
+        content = sys.stdin.buffer.read() if path == "-" else Path(path).read_bytes()
+        text = content.decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ConfigError([f"cannot read the file: {error}"], name) from error
+    urls: list[str] = []
+    problems: list[str] = []
+    # Not splitlines(): it also breaks at form feeds and Unicode separators,
+    # and the line numbers would not be those an editor shows.
+    for number, line in enumerate(re.split(r"\r\n|\r|\n", text), start=1):
+        url = line.strip()
+        if not url or url.startswith("#"):
+            continue
+        problem = http_url_problem(url)
+        if problem is None:
+            urls.append(url)
+        else:
+            shown = url if len(url) <= 100 else f"{url[:100]}..."
+            problems.append(f"{name}:{number}: {problem}, got {_show(shown)}")
+    if problems:
+        valid = f"{len(urls)} URL is valid" if len(urls) == 1 else f"{len(urls)} URLs are valid"
+        invalid = "1 line is not" if len(problems) == 1 else f"{len(problems)} lines are not"
+        raise ConfigError(problems, name, summary=f"{valid}, {invalid}")
+    return list(dict.fromkeys(urls))
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):

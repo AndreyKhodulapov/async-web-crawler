@@ -23,7 +23,8 @@ class CSVStorage(DataStorage):
     """Keeps pages in a CSV file, a row per page, adding to the file if it exists.
 
     With `overwrite` the file is started anew instead: what it held,
-    header included, is dropped on the first write. Adding to a file that
+    header included, is dropped on the first write, not on `open`, so a
+    crawl that saves nothing leaves it as it was. Adding to a file that
     is not empty is logged as a warning, since a second run with the same
     file keeps the pages of the first one too.
 
@@ -32,7 +33,7 @@ class CSVStorage(DataStorage):
     record with a field the header lacks is refused with `ValueError`.
 
     A file that is not what this storage writes is reported with
-    `StorageError`: on the first write (and left alone), unless
+    `StorageError`: on `open` or the first write (and left alone), unless
     `overwrite`, if it starts with an empty line or does not end with a
     line break (a write that was cut short); on `read`, if a row does not
     fit the header or the file is not in `encoding`.
@@ -70,6 +71,11 @@ class CSVStorage(DataStorage):
         self._file: AsyncBufferedReader | None = None
         self._header: list[str] | None = None
         self._end = 0  # where the next row goes
+        self._stale = False  # the file holds an earlier run that the first write drops
+
+    async def _open_storage(self) -> None:
+        if self._file is None:
+            await self._open()
 
     async def _write_batch(self, records: Sequence[PageRecord]) -> None:
         file = self._file or await self._open()
@@ -86,12 +92,16 @@ class CSVStorage(DataStorage):
         # A retry starts where the failed write did, so nothing is written twice.
         await file.seek(self._end)
         await file.write(encoded)
+        if self._stale:
+            await file.truncate()  # the rest of the earlier run
+            self._stale = False
         await file.flush()
         self._end += len(encoded)
         self._header = list(writer.fieldnames)
 
     async def _open(self) -> AsyncBufferedReader:
-        if not self.overwrite and await aiofiles.os.path.exists(self.path):
+        exists = await aiofiles.os.path.exists(self.path)
+        if not self.overwrite and exists:
             try:
                 async with aiofiles.open(self.path, encoding=self.encoding, newline="") as file:
                     first_line = await file.readline()
@@ -102,9 +112,14 @@ class CSVStorage(DataStorage):
             if first_line and self._header is None:
                 # Not a file to start anew: there may be rows below.
                 raise StorageError(f"{self.path} starts with an empty line, not with a header")
-        file = await aiofiles.open(self.path, "w+b" if self._header is None else "r+b")
+        file = await aiofiles.open(self.path, "r+b" if exists else "w+b")
         self._end = await file.seek(0, os.SEEK_END)
-        if self._header is not None:
+        if self.overwrite:
+            # Kept until the first write, which starts at the beginning.
+            self._stale = self._end > 0
+            self._end = 0
+            await file.seek(0)
+        elif self._header is not None:
             line_break = "\n".encode(self.encoding)[len("".encode(self.encoding)) :]
             await file.seek(self._end - len(line_break))
             if await file.read() != line_break:

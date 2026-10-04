@@ -9,7 +9,7 @@ leaves a failing site alone.
 | Kind | Examples | Retry? |
 |------|----------|--------|
 | Transient | timeouts, HTTP 408, 429, 500, 502, 503, 504, Cloudflare's 520-524 | yes, with backoff |
-| Network | DNS failure, connection refused or reset | yes |
+| Network | DNS failure (`DNSError`), connection refused or reset | yes |
 | Permanent | HTTP 401, 403, 404, 410, 501, a redirect loop, a bad certificate, an invalid URL, a page over the size limit | no |
 | Parse | the body is not an HTML document | no: the same bytes come back |
 
@@ -25,8 +25,16 @@ leaves a failing site alone.
   - 500 often comes from a bug, not from load: retry it once, not three times.
   - 429 means "too fast": retry, but with longer pauses (here 4x).
   - 501 and 505 are server errors that never pass.
-  - A DNS failure is permanent for a mistyped domain, but a resolver timeout
-    looks the same to the client; a retry costs little.
+  - A DNS failure is permanent for a mistyped domain, but not when the
+    resolver itself is down for a moment. The resolver tells them apart:
+    "no such name" (`EAI_NONAME`, `EAI_NODATA`) is `DNSError`, "try again"
+    (`EAI_AGAIN`) a plain `NetworkError`. A retry costs little for both.
+    Waiting minutes does not: once the retries are spent, `DNSError` is
+    taken for good, and a crawl does not wait for the robots.txt of such a
+    host; it waits out the other one like any outage. This needs the codes
+    of the system resolver: aiohttp switches to aiodns when it is
+    installed, which gives no code, and then every DNS failure is
+    `DNSError`.
 - Some failures are not about the request at all: the crawler is closed, the
   host's circuit is open, robots.txt is unreachable. Retrying the request
   cannot fix them.
@@ -65,11 +73,13 @@ leaves a failing site alone.
 - **Retry-After** (seconds or an HTTP date, with 429 or 503) tells when to
   come back: wait `max(backoff, Retry-After)`. When it asks for longer than
   the cap, do not retry: coming back early earns another refusal. The rest of
-  the crawler still honors it in full, up to a cap of its own (10 minutes),
+  the crawler still honors it in full, up to a cap of its own (`max_retry_after`, 10 minutes by default),
   see [politeness.md](politeness.md#backing-off-a-struggling-site).
 - **Make the wait injectable**. `RetryStrategy(wait=...)` sleeps by default;
-  the crawler instead holds back the whole host in the rate limiter, and
-  tests pass a wait that only records the delays.
+  the crawler instead holds back the whole host in the rate limiter after a
+  429, a Retry-After or a timeout (see
+  [politeness.md](politeness.md#backing-off-a-struggling-site)), and tests
+  pass a wait that only records the delays.
 
 ## Timeouts
 
@@ -117,10 +127,26 @@ leaves a failing site alone.
   site for its broken links.
 - **Per host**: one dead site must not stop the crawl of the others, and a
   host that is down fails all of its pages, so a circuit per URL learns too late.
-- **Retries under a breaker**: every attempt counts, retries included, so a
-  dead host opens its circuit after a few pages. A retry the breaker would
-  refuse is not made, and the page fails with the error of its last attempt,
-  not with `CircuitOpenError`.
+- **Retries under a breaker**: a request counts once, however many attempts
+  it takes. Its first failure counts at once, so a dead host opens its
+  circuit after a few pages, not after their retries; a failed retry adds
+  nothing, and a retry that succeeds turns the failure into a success, so one
+  broken URL retried three times does not open the circuit, and neither does a
+  slow host whose pages come through on the second attempt, as long as the
+  retries land before `min_requests` first attempts have failed: with that
+  many requests in flight at once, their timeouts open the circuit before
+  any retry. A retry the
+  breaker would refuse is not made, and the page fails with the error of its
+  last attempt, not with `CircuitOpenError`.
+- **Pages in flight when the circuit opens** are the ones the breaker
+  costs: their failures land on an open circuit, and the retries that would
+  have saved them are refused. Outside a crawl they fail with their error;
+  in a crawl they are put off with the pages refused before being sent and
+  requested again when the host may be probed, as the page that lost its
+  retries to the breaker is no more broken than the host. Except the probe:
+  it is the retry the breaker gives, so a page whose probe fails fails for
+  good. Otherwise one page that answers 500 every time would probe the
+  host again and again, and the host would be given up for it.
 - Check the circuit before a request waits for the rate limit (no point in
   queueing for a blocked host) and once more when its turn comes (the circuit
   may have opened meanwhile).

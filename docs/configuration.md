@@ -29,7 +29,18 @@ python src/main.py --config config.yaml
 
 The options and the keys they stand for are listed in the
 [README](../README.md#command-line). An option that takes a list (`--urls`,
-`--output`) replaces the whole list of the file. Sitemaps, filters, retries,
+`--output`) replaces the whole list of the file.
+
+The start URLs come from `urls` of the file, or from the command line:
+`--urls` and `--urls-file` (a text file with a URL per line, or `-` for
+stdin; see [examples/urls.txt](../examples/urls.txt)). A comment takes a
+line of its own, as a space inside a URL is an error, and lines may end in
+`\n`, `\r\n` or a lone `\r`. Given together, both
+are crawled, those of `--urls` first, and a URL given twice is crawled
+once; either of them replaces `urls` of the file, and `sitemaps.urls` stay.
+A list file is an option of the command line only: the configuration has
+no key for it, so one file of settings serves many lists. In code,
+`load_urls(path)` reads such a file. Sitemaps, filters, retries,
 the circuit breaker and timeouts have no options: they are set in the file.
 The command line always turns `crawler.keep_pages` off, whatever the file
 says: it saves the pages and does not need them in memory.
@@ -80,7 +91,9 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `connect_timeout` | number, > 0 | `10.0` | DNS, TCP and TLS |
 | `read_timeout` | number, > 0 | `20.0` | the longest pause between two chunks of the response |
 | `timeout_growth` | number, >= 1 | `1.5` | the timeouts grow by this factor on every retry |
-| `max_page_size` | whole number, >= 1, or `null` | `10485760` | bytes of a page body (10 MiB); a larger page fails unread; `null` lifts the limit |
+| `max_page_size` | whole number, >= 1, or `null` | `3145728` | bytes of a page body (3 MiB); a larger page fails unread; `null` lifts the limit |
+| `max_parsing` | whole number, >= 1 | `2` | pages parsed at once; parsing takes about 40 times the size of a page in memory and a couple of seconds per megabyte, so this times `max_page_size` bounds the memory of parsing |
+| `max_retry_after` | number, > 0 | `600.0` | the longest wait a `Retry-After` header is obeyed for (10 minutes); a host that asks for more is asked again after this long |
 | `keep_pages` | true or false | `true` | `false` drops a page from memory once it is saved, for large crawls |
 
 ### `retry`
@@ -114,7 +127,7 @@ not to the start URLs.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `same_domain_only` | true or false | `true` | follow links on the hosts of the start URLs and of `sitemaps.urls` only; `false` follows links to any host |
+| `same_domain_only` | true or false | `true` | follow links on the hosts of the start URLs and of `sitemaps.urls` only, and on their subdomains; `false` follows links to any host |
 | `include` | list of regular expressions | `[]` | a link must match at least one; empty means any link |
 | `exclude` | list of regular expressions | `[]` | a matching link is skipped, even if included |
 | `exclude_extensions` | list of file extensions | documents, images, archives, media, programs, `css`, `js` (see `config.example.yaml`) | a link to a file with one of them is not followed; `[]` follows every link |
@@ -128,6 +141,18 @@ and `/report.pdf?v=2`, but not `/view?file=report.pdf`. Write `gz`, not
 `tar.gz`. A page that turns out not to be HTML anyway, such as a PDF behind
 a link without an extension, is requested but not downloaded: it is listed
 as skipped and counts toward `max_pages`.
+
+A site is its host name: with a start URL on `example.com`, links to
+`www.example.com` (the same host) and to `docs.example.com` (a subdomain)
+are followed, links to `example.org` are not. A start URL on
+`docs.example.com` keeps the crawl there: `example.com` and `blog.example.com`
+are outside. A site spread over unrelated domains needs
+`same_domain_only: false` with an `include` pattern for each of them.
+The limits are per exact host name, not per site: `rate_limit`,
+the circuit breaker and `max_pages_per_host` count `example.com`,
+`www.example.com` and `docs.example.com` apart, so a site that links to
+all three is asked at up to three times `rate_limit`. Most sites redirect
+the apex to `www.` (or back) and are not affected.
 
 The library itself, `AsyncCrawler.crawl()`, follows links to any host and
 to files unless given `same_domain_only=True` and `exclude_extensions`; the
@@ -185,13 +210,18 @@ written. A problem is reported by the path of its key:
 - a value of the wrong type (`max_pages: yes` is not a number, `"10"` is
   not one either) or out of its limits;
 - an invalid URL or regular expression, an unknown log level or encoding;
+  a URL with a space or a control character inside, which a client would
+  send as `%20` or drop, so it is not the URL that was meant;
 - an output with an unknown extension, or a URL of an unknown database;
 - a User-Agent with a line break or another control character in it, a path
   with a null character or in the home directory of an unknown user;
 - a key written twice in YAML (plain YAML would keep the last one silently);
 - keys that do not go together: `sitemaps.from_robots` without
   `crawler.respect_robots`, a `user_agents` entry with another bot name;
-- a file that cannot be read, has another extension or is not valid YAML or JSON.
+- a file that cannot be read, has another extension or is not valid YAML or JSON;
+- in the file of `--urls-file`, a line that is not an http(s) URL, reported
+  by its number, or a file that cannot be read or is not UTF-8; `-` with
+  stdin closed.
 
 All the problems are listed at once:
 
@@ -201,7 +231,17 @@ Invalid configuration: config.yaml: 2 problems
   - filters.exclude[0]: not a regular expression: missing ), unterminated subpattern at position 0, got "("
 ```
 
-The command line prints the list and exits with code 2. In code it is a
+A list of start URLs is checked the same way; its error counts the lines:
+
+```
+Invalid configuration: urls.txt: 9870 URLs are valid, 130 lines are not
+  - urls.txt:12: expected an http:// or https:// URL, got "example.com"
+  ...
+  - ... and 110 more
+```
+
+The message shows the first 20 problems; `error.problems` holds all of
+them. The command line prints the message and exits with code 2. In code it is a
 `ConfigError` (a `ValueError`) with the list in `error.problems` and the
 file in `error.source`.
 

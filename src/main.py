@@ -4,14 +4,17 @@ Usage:
     python src/main.py --config config.yaml
     python src/main.py --urls https://example.com --max-pages 100 --output results.json
     python src/main.py --config config.yaml --max-pages 500 --report report.html
+    python src/main.py --config config.yaml --urls-file urls.txt
+    cat urls.txt | python src/main.py --config config.yaml --urls-file -
 
 A crawl is set up by a configuration file (see config.example.yaml), by
 options, or by both: an option wins over the file. Logs and progress go to
 stderr, the summary to stdout.
 
-Exit codes: 0 - the crawl ran and fetched pages, 1 - no page was fetched or
-a file could not be opened, 2 - wrong options or configuration,
-130 - interrupted (Ctrl-C); the pages fetched by then are saved and reported.
+Exit codes: 0 - the crawl ran, fetched pages and saved every page it should,
+1 - no page was fetched, some could not be saved, or a file or the database
+could not be opened, 2 - wrong options or configuration, 130 - interrupted
+(Ctrl-C); the pages fetched by then are saved and reported.
 """
 
 import argparse
@@ -20,7 +23,7 @@ import sys
 from typing import Any
 
 from cli_options import hide_password, http_url, positive
-from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, load_config, show_progress
+from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, StorageError, load_config, load_urls, show_progress
 from crawler.config import LOG_LEVELS
 
 
@@ -32,6 +35,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", metavar="PATH", help="configuration file, YAML or JSON; see config.example.yaml")
     parser.add_argument(
         "--urls", nargs="+", type=http_url, metavar="URL", help="start URLs, in place of those of the configuration"
+    )
+    parser.add_argument(
+        "--urls-file",
+        metavar="PATH",
+        help='start URLs from a text file, one per line, "#" for comments; "-" reads them from stdin. '
+        "With --urls, both are crawled",
     )
     parser.add_argument("--max-pages", type=positive(int), metavar="N", help="pages to request, failed ones included")
     parser.add_argument(
@@ -77,11 +86,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def start_urls(args: argparse.Namespace) -> list[str] | None:
+    """The URLs of --urls, then those of --urls-file, each once; None if neither is given.
+
+    Raises:
+        ConfigError: the file cannot be read, or lines of it are not URLs.
+    """
+    if args.urls_file is None:
+        return args.urls
+    return list(dict.fromkeys([*(args.urls or ()), *load_urls(args.urls_file)]))
+
+
 def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    """The options that were given, shaped like the configuration file."""
+    """The options that were given, shaped like the configuration file.
+
+    Raises:
+        ConfigError: the file of --urls-file cannot be read, or lines of it are not URLs.
+    """
     # (section, key, value); a value of None is an option that was not given.
     options = [
-        (None, "urls", args.urls),
+        (None, "urls", start_urls(args)),
         ("crawler", "max_pages", args.max_pages),
         ("crawler", "max_depth", args.max_depth),
         ("crawler", "respect_robots", args.respect_robots),
@@ -116,7 +140,16 @@ def build_config(args: argparse.Namespace) -> CrawlerConfig:
     overrides.setdefault("crawler", {})["keep_pages"] = False
     config = CrawlerConfig.from_dict(overrides) if args.config is None else load_config(args.config, overrides)
     if not config.urls and not config.sitemaps.urls:
-        where = "--urls" if args.config is None else "--urls, or `urls` or `sitemaps.urls` in the configuration"
+        if args.urls_file is not None:
+            # An empty list is not an error by itself: sitemaps may give the pages.
+            name = "the standard input" if args.urls_file == "-" else args.urls_file
+            replaced = "" if args.config is None else ", and it replaces `urls` of the configuration"
+            raise ConfigError([f"nothing to crawl: {name} lists no URLs{replaced}"])
+        where = (
+            "--urls or --urls-file"
+            if args.config is None
+            else "--urls, --urls-file, or `urls` or `sitemaps.urls` in the configuration"
+        )
         raise ConfigError([f"nothing to crawl: give {where}"])
     return config
 
@@ -158,6 +191,7 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
 
     Raises:
         OSError: a directory cannot be created, or the log file cannot be opened.
+        StorageError: an output file or the database cannot be opened; nothing is requested.
     """
     async with AdvancedCrawler(config) as crawler:
         crawl = asyncio.create_task(crawler.crawl())
@@ -169,13 +203,17 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
             # The crawl must stop before the crawler is closed under it.
             crawl.cancel()
             await asyncio.gather(crawl, return_exceptions=True)
-            crawler.write_reports()
+            if not isinstance(error, StorageError):
+                # A storage that could not be opened stopped the crawl before
+                # it requested anything: there is nothing to report.
+                crawler.write_reports()
             if isinstance(error, asyncio.CancelledError):
                 await crawler.close()  # writes the pages the storage still holds, so the summary counts them
                 print_summary(crawler, interrupted=True)
             raise
         print_summary(crawler)
-        return 0 if crawler.get_stats()["successful"] else 1
+        # A page that could not be saved is a failure of the run too.
+        return 0 if crawler.get_stats()["successful"] and not crawler.crawler.crawl_stats().save_failed else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -185,9 +223,11 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2  # as argparse exits for a wrong flag
+    except KeyboardInterrupt:  # while the URLs are typed into stdin
+        return 130
     try:
         return asyncio.run(run(config, progress=not args.no_progress))
-    except OSError as error:
+    except (OSError, StorageError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

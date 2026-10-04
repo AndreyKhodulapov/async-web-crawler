@@ -8,7 +8,9 @@ Most errors fall into one of four kinds that decide whether a retry can help:
 - `TransientError`: the server or the path to it is overloaded for now
   (a timeout, HTTP 429, 503); the same request may succeed later.
 - `NetworkError`: the request did not reach the server (DNS, a refused or
-  reset connection); worth retrying too.
+  reset connection); worth retrying too. `DNSError` is the one of them
+  that is mostly for good: a host name that does not exist. A resolver
+  that fails for now (EAI_AGAIN) gives a plain `NetworkError`.
 - `PermanentError`: the request is wrong or forbidden (HTTP 404, 403, a bad
   certificate, a page over the size limit, a sitemap that is not one); every
   attempt would fail the same way.
@@ -45,6 +47,16 @@ class PermanentError(FetchError):
 
 class NetworkError(FetchError):
     """The request failed at the network level (DNS, connection, payload)."""
+
+
+class DNSError(NetworkError):
+    """The resolver says the host name has no address: mostly a name that does not exist.
+
+    A lookup that failed for now, such as a resolver that cannot be
+    reached, is a plain `NetworkError`. That takes the codes of the system
+    resolver: with aiodns installed, aiohttp uses it instead, and every
+    failed lookup is a `DNSError`.
+    """
 
 
 class ParseError(FetchError):
@@ -139,18 +151,24 @@ class ConfigError(ValueError):
     """A configuration cannot be read, or has unknown keys or invalid values.
 
     `problems` lists them all, each starting with the path of its key, such
-    as "crawler.max_pages"; the message is the same list.
+    as "crawler.max_pages", or with the file and line of a list of URLs.
+    The message lists the first `shown` of them under `summary`, "N problems"
+    if no summary is given.
     """
 
-    def __init__(self, problems: Sequence[str], source: str | None = None) -> None:
+    shown = 20  # a file of the wrong kind can have thousands of problems
+
+    def __init__(self, problems: Sequence[str], source: str | None = None, *, summary: str | None = None) -> None:
         self.problems = list(problems)
         self.source = source
         prefix = f"{source}: " if source else ""
-        if len(self.problems) == 1:
+        if len(self.problems) == 1 and summary is None:
             super().__init__(f"Invalid configuration: {prefix}{self.problems[0]}")
-        else:
-            lines = "".join(f"\n  - {problem}" for problem in self.problems)
-            super().__init__(f"Invalid configuration: {prefix}{len(self.problems)} problems{lines}")
+            return
+        lines = "".join(f"\n  - {problem}" for problem in self.problems[: self.shown])
+        if len(self.problems) > self.shown:
+            lines += f"\n  - ... and {len(self.problems) - self.shown} more"
+        super().__init__(f"Invalid configuration: {prefix}{summary or f'{len(self.problems)} problems'}{lines}")
 
 
 ERROR_KINDS = (TransientError, PermanentError, NetworkError, ParseError)

@@ -1,5 +1,8 @@
 """Unit tests for UrlFilter."""
 
+import itertools
+import time
+
 import pytest
 
 from crawler import UrlFilter
@@ -13,9 +16,29 @@ def test_allowed_hosts():
     url_filter = UrlFilter(allowed_hosts={"example.com"})
     assert url_filter.allows("https://example.com/page")
     assert url_filter.allows("http://EXAMPLE.com:8080/page")  # ports are ignored
-    assert not url_filter.allows("https://www.example.com/page")
     assert not url_filter.allows("https://other.org/")
+    assert not url_filter.allows("https://example.com.other.org/")
+    assert not url_filter.allows("https://notexample.com/")
     assert not url_filter.allows("not a url")
+
+
+def test_www_and_the_apex_are_one_host():
+    assert UrlFilter(allowed_hosts={"example.com"}).allows("https://www.example.com/page")
+    assert UrlFilter(allowed_hosts={"www.example.com"}).allows("https://example.com/page")
+    # "www" is a host of its own only when nothing follows it.
+    assert not UrlFilter(allowed_hosts={"www.com"}).allows("https://example.com/")
+    assert not UrlFilter(allowed_hosts={"example.com"}).allows("https://www.com/")
+
+
+def test_subdomains_of_an_allowed_host_pass():
+    url_filter = UrlFilter(allowed_hosts={"example.com"})
+    assert url_filter.allows("https://docs.example.com/")
+    assert url_filter.allows("https://www.docs.example.com/")
+    assert url_filter.allows("https://api.v2.example.com/")
+    # Not the other way round: the site is docs.example.com, not everything under example.com.
+    assert not UrlFilter(allowed_hosts={"docs.example.com"}).allows("https://example.com/")
+    assert not UrlFilter(allowed_hosts={"docs.example.com"}).allows("https://blog.example.com/")
+    assert UrlFilter(allowed_hosts={"www.example.com"}).allows("https://docs.example.com/")
 
 
 def test_allow_host_of_extends_the_set():
@@ -23,6 +46,55 @@ def test_allow_host_of_extends_the_set():
     url_filter.allow_host_of("https://WWW.example.com:8443/landing")
     url_filter.allow_host_of("not a url")
     assert url_filter.allowed_hosts == {"example.com", "www.example.com"}
+
+
+def test_allowed_hosts_are_read_only():
+    url_filter = UrlFilter(allowed_hosts={"example.com"})
+    # A host added past allow_host_of() would not reach the lookup.
+    with pytest.raises(AttributeError):
+        url_filter.allowed_hosts.add("other.org")  # type: ignore[union-attr]
+    with pytest.raises(AttributeError):
+        url_filter.allowed_hosts = {"other.org"}  # type: ignore[misc]
+
+
+HOSTS = ["example.com", "www.example.com", "docs.example.com", "www.com", "com", "127.0.0.1", "0.1", "a.b.c.d"]
+LINK_HOSTS = [
+    *HOSTS,
+    "www.docs.example.com",
+    "api.v2.example.com",
+    "blog.example.com",
+    "example.com.other.org",
+    "notexample.com",
+    "www.www.com",
+    "10.127.0.0.1",
+    "x.a.b.c.d",
+    "b.c.d",
+]
+
+
+@pytest.mark.parametrize("allowed", [set(hosts) for size in (1, 2) for hosts in itertools.combinations(HOSTS, size)])
+def test_hosts_pass_as_the_site_or_a_subdomain_of_an_allowed_one(allowed):
+    def site(host):
+        return host[4:] if host.startswith("www.") and "." in host[4:] else host
+
+    url_filter = UrlFilter(allowed_hosts=allowed)
+    for host in LINK_HOSTS:
+        expected = any(site(host) == site(a) or site(host).endswith(f".{site(a)}") for a in allowed)
+        assert url_filter.allows(f"https://{host}/") == expected, host
+
+
+def test_many_allowed_hosts_do_not_slow_down_a_link():
+    # Start URLs from a file may name tens of thousands of sites; every link is checked against them.
+    url_filter = UrlFilter(allowed_hosts={f"site{number}.example.org" for number in range(100_000)})
+    links = [f"https://docs.site{number}.example.org/" for number in range(500)]
+    links += [f"https://other{number}.com/" for number in range(500)]
+
+    started = time.perf_counter()
+    allowed = [url_filter.allows(link) for link in links]
+    elapsed = time.perf_counter() - started
+
+    assert allowed == [True] * 500 + [False] * 500
+    assert elapsed < 0.5  # a scan of the hosts per link takes about 40 s
 
 
 def test_allow_host_of_keeps_hosts_unrestricted():

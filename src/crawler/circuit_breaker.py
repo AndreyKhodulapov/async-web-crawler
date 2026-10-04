@@ -24,14 +24,24 @@ class CircuitState(StrEnum):
 
 
 @dataclass(slots=True)
+class _Outcome:
+    """The outcome of one call, as counted in the window of its circuit."""
+
+    time: float
+    failed: bool
+    counted: bool = True  # False once it has left the window
+
+
+@dataclass(slots=True)
 class _Circuit:
     state: CircuitState = CircuitState.CLOSED
-    # (time, failed) of the outcomes counted while closed, oldest first.
-    outcomes: deque[tuple[float, bool]] = field(default_factory=deque)
+    # The outcomes counted while closed, oldest first.
+    outcomes: deque[_Outcome] = field(default_factory=deque)
     failures: int = 0  # the failed ones among `outcomes`
     opened_at: float = 0.0
     reason: str = ""
     probe: "BreakerCall | None" = None
+    failed_probe: str | None = None  # the URL of the probe whose failure opened the circuit, if one did
     times_opened: int = 0
     rejected: int = 0
 
@@ -66,8 +76,19 @@ class CircuitBreaker:
     HTTP 5xx, even one not worth a retry, such as 501. Any other response
     of the server, HTTP 404 included, is a success: the host is up, and a
     site with broken links must not be blocked for them. Other errors, such
-    as a bad certificate, count neither way. Every attempt counts, retries
-    included.
+    as a bad certificate, count neither way.
+
+    A call counts once, however many attempts it takes: the retries of a
+    request reuse its `BreakerCall`, and each `record` replaces the outcome
+    of the one before. The first failure counts at once, so a host that
+    goes down is spotted after its first failed requests, not after their
+    retries; a failed retry adds nothing; a retry that succeeds turns the
+    failure into a success, so one broken page retried three times does
+    not open the circuit, and neither does a slow host whose pages come
+    through on the second attempt, as long as the retries land before
+    `min_requests` first attempts have failed: with that many requests to
+    the host in flight at once, their timeouts open the circuit before any
+    retry. Separate calls to the same URL count separately.
 
     `failure_threshold=None` turns the breaker off: every request goes through.
     """
@@ -134,6 +155,22 @@ class CircuitBreaker:
         """How many times the circuit of `host` has opened since `reset_stats`."""
         circuit = self._circuits.get(host)
         return 0 if circuit is None else circuit.times_opened
+
+    def opened_by_probe(self, url: str) -> bool:
+        """Whether the circuit of the host of `url` is open because the probe of `url` itself failed.
+
+        False while the circuit is closed, and when it opened on the
+        failures counted in its window, or on the probe of another URL.
+        """
+        if (found := self._lookup(url)) is None:
+            return False
+        _, circuit = found
+        return self._state(circuit) is not CircuitState.CLOSED and circuit.failed_probe == url
+
+    @staticmethod
+    def is_failure(error: FetchError | None) -> bool:
+        """Whether an outcome counts as a failure of the host: a transient or network error, or an HTTP 5xx."""
+        return _is_failure(error) is True
 
     def call(self, url: str) -> "BreakerCall":
         """A request to `url`: entering it raises `CircuitOpenError` if the request is refused."""
@@ -218,7 +255,7 @@ class CircuitBreaker:
         if probe:
             if failed:
                 assert error is not None
-                self._open(host, circuit, f"probe {url} failed: {type(error).__name__}: {error.message}")
+                self._open(host, circuit, f"probe {url} failed: {type(error).__name__}: {error.message}", probe=url)
             else:
                 circuit.state = CircuitState.CLOSED
                 self._clear(circuit)
@@ -227,9 +264,16 @@ class CircuitBreaker:
         if self._state(circuit) is not CircuitState.CLOSED:
             return  # a request sent before the circuit opened: the probe decides
         now = self._clock()
-        circuit.outcomes.append((now, failed))
-        circuit.failures += failed
         self._forget(circuit, now)
+        outcome = call._outcome
+        if outcome is not None and outcome.counted:
+            # A retry of the call: its outcome stands for the call now.
+            circuit.failures += failed - outcome.failed
+            outcome.failed = failed
+        else:
+            outcome = call._outcome = _Outcome(now, failed)
+            circuit.outcomes.append(outcome)
+            circuit.failures += failed
         if not failed:
             return
         assert self.failure_threshold is not None  # the breaker is on
@@ -243,21 +287,25 @@ class CircuitBreaker:
         if circuit is not None and circuit.probe is call:
             circuit.probe = None
 
-    def _open(self, host: str, circuit: _Circuit, reason: str) -> None:
+    def _open(self, host: str, circuit: _Circuit, reason: str, *, probe: str | None = None) -> None:
         circuit.state = CircuitState.OPEN
         circuit.opened_at = self._clock()
         circuit.reason = reason
+        circuit.failed_probe = probe
         self._clear(circuit)
         circuit.times_opened += 1
         logger.warning("Circuit breaker of %s opened: %s; requests to it fail for %gs", host, reason, self.cooldown)
 
     def _forget(self, circuit: _Circuit, now: float) -> None:
-        while circuit.outcomes and circuit.outcomes[0][0] <= now - self.window:
-            _, failed = circuit.outcomes.popleft()
-            circuit.failures -= failed
+        while circuit.outcomes and circuit.outcomes[0].time <= now - self.window:
+            outcome = circuit.outcomes.popleft()
+            outcome.counted = False
+            circuit.failures -= outcome.failed
 
     @staticmethod
     def _clear(circuit: _Circuit) -> None:
+        for outcome in circuit.outcomes:
+            outcome.counted = False
         circuit.outcomes.clear()
         circuit.failures = 0
 
@@ -270,13 +318,16 @@ class BreakerCall:
     after a wait for the rate limit, in case the circuit has opened
     meanwhile; it changes nothing for a request already let through as the
     probe. Inside, `record` tells how the request went. Exiting frees a
-    probe that recorded nothing.
+    probe that recorded nothing. A retry of the request enters the same
+    call again: its outcome replaces the one recorded before (see
+    `CircuitBreaker`).
     """
 
     def __init__(self, breaker: CircuitBreaker, url: str, host: str | None) -> None:
         self._breaker = breaker
         self.url = url
         self.host = host
+        self._outcome: _Outcome | None = None  # the outcome of the call in the window of its circuit
 
     def __enter__(self) -> Self:
         self.admit()
@@ -295,7 +346,7 @@ class BreakerCall:
         self._breaker._admit(self)
 
     def record(self, error: FetchError | None) -> None:
-        """The outcome of the request: the error it failed with, None on success."""
+        """The outcome of the request: the error it failed with, None on success; a retry's replaces it."""
         self._breaker._record(self, error)
 
 

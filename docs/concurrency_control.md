@@ -79,7 +79,14 @@ load under control.
   host, URLs for other hosts wait in the queue. Fixes include more workers than
   slots, putting off the URLs of a host that cannot be asked now (here: an
   open circuit breaker, a Retry-After), or one queue per host (as in large
-  crawlers).
+  crawlers). The rate limiter is such a busy host: with one queue ordered
+  by depth, the workers wait for the turn of the first host while the
+  second host's pages sit in the queue. Measured with two hosts of 30
+  pages, 2 requests per second each and 10 workers: 25 s, against the 15 s
+  of fetching them side by side, and the first page of the second host
+  after 10 s. A queue per host, taken in the order in which the hosts are
+  ready, would fix it; this crawler documents it instead, as a crawl of
+  one site never sees it.
 
 ## Traversal order and depth
 
@@ -118,8 +125,11 @@ load under control.
 
 ## URL filters
 
-- Host filter: stay on the start hosts. A start URL that redirects
-  (`example.com` -> `www.example.com`) adds its final host too.
+- Host filter: stay on the start hosts and their subdomains, `www` and
+  the apex being one host. A start URL that redirects (`example.org` ->
+  `example.com`) adds its final host too. A public suffix list would tell
+  `example.co.uk` from `co.uk`; without one, only subdomains of a start
+  host are let in, never its parent domain.
 - Include/exclude regular expressions, compiled once up front so that a
   bad pattern fails fast. Exclude wins over include.
 - Filters apply to discovered links only: the start URLs are an explicit choice.

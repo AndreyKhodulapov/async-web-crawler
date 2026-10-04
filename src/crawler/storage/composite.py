@@ -16,8 +16,9 @@ class CompositeStorage(DataStorage):
 
     Each storage keeps its own buffer, batch size and retries; this one
     only passes the calls on, to all of them at once. A storage that fails
-    does not keep the others from saving: `save`, `flush` and `close` reach
-    every storage and then raise one `StorageError` naming those that failed.
+    does not keep the others from saving: `open`, `save`, `flush` and
+    `close` reach every storage and then raise one `StorageError` naming
+    those that failed.
 
     A page counts as `written` once every storage has written it, and as
     `pending` while any of them still buffers it. `read` gives the records
@@ -37,6 +38,9 @@ class CompositeStorage(DataStorage):
     @property
     def written(self) -> int:
         return min(storage.written for storage in self.storages)
+
+    async def open(self) -> None:
+        await self._for_each(lambda storage: storage.open(), "open")
 
     async def save(self, record: PageRecord) -> None:
         await self._for_each(lambda storage: storage.save(record), "save the page to")

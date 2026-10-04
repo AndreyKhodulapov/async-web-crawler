@@ -53,6 +53,8 @@ FULL = {
         "read_timeout": 15.0,
         "timeout_growth": 2.0,
         "max_page_size": 1_000_000,
+        "max_parsing": 4,
+        "max_retry_after": 120.0,
         "keep_pages": False,
     },
     "retry": {"max_retries": 5, "backoff_factor": 3.0, "base_delay": 0.5, "max_delay": 10.0},
@@ -135,6 +137,8 @@ class TestDefaults:
             "read_timeout",
             "timeout_growth",
             "max_page_size",
+            "max_parsing",
+            "max_retry_after",
             "keep_pages",
         ):
             assert getattr(options, name) == crawler[name], name
@@ -297,6 +301,7 @@ class TestInvalid:
             ({"crawler": {"jitter": -0.5}}, "crawler.jitter: must be >= 0, got -0.5"),
             ({"crawler": {"read_timeout": 0}}, "crawler.read_timeout: must be > 0, got 0.0"),
             ({"crawler": {"timeout_growth": 0.5}}, "crawler.timeout_growth: must be >= 1, got 0.5"),
+            ({"crawler": {"max_retry_after": 0}}, "crawler.max_retry_after: must be > 0, got 0.0"),
             ({"crawler": {"user_agent": "  "}}, 'crawler.user_agent: must not be empty, got ""'),
             ({"sitemaps": {"max_urls": 0}}, "sitemaps.max_urls: must be >= 1, got 0"),
             ({"retry": {"max_retries": -1}}, "retry.max_retries: must be >= 0, got -1"),
@@ -326,6 +331,15 @@ class TestInvalid:
         ]
         assert problems({"sitemaps": {"urls": ["sitemap.xml"]}}) == [
             'sitemaps.urls[0]: expected an http:// or https:// URL, got "sitemap.xml"'
+        ]
+
+    def test_urls_with_spaces_inside_are_invalid(self):
+        # Valid for a client, which sends the space as %20, but not what was meant.
+        assert problems({"urls": ["https://a.example/ # home", " https://b.example/ "]}) == [
+            'urls[0]: a URL cannot contain spaces or control characters (a space is written %20), got "https://a.example/ # home"'
+        ]
+        assert problems({"sitemaps": {"urls": ["https://a.example/site\tmap.xml"]}}) == [
+            'sitemaps.urls[0]: a URL cannot contain spaces or control characters (a space is written %20), got "https://a.example/site\\tmap.xml"'
         ]
 
     def test_invalid_pattern(self):
@@ -446,6 +460,16 @@ class TestInvalid:
             CrawlerConfig.from_dict({"crawler": {"max_pages": 0}})
 
         assert str(error.value) == "Invalid configuration: crawler.max_pages: must be >= 1, got 0"
+
+    def test_message_shows_the_first_twenty_problems(self):
+        with pytest.raises(ConfigError) as error:
+            CrawlerConfig.from_dict({"urls": [f"bad{index}" for index in range(25)]})
+
+        assert len(error.value.problems) == 25
+        lines = str(error.value).splitlines()
+        assert lines[0] == "Invalid configuration: 25 problems"
+        assert lines[1:21] == [f"  - {problem}" for problem in error.value.problems[:20]]
+        assert lines[21:] == ["  - ... and 5 more"]
 
     @pytest.mark.parametrize("data", [None, [], "urls", 5])
     def test_top_level_must_be_a_mapping(self, data):

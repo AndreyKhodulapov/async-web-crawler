@@ -114,8 +114,9 @@ example.com  closed            2         0       0         0
 ```
 
 `REQUESTS` and `FAILURES` are counted over the breaker's window of the last
-minute and include robots.txt; `OPENED` and `REJECTED` count since the crawl
-started. With `--json`, the parsed pages (with their depth), the failed,
+minute and include robots.txt; a request made good by a retry is one success,
+one that failed after its retries one failure. `OPENED` and `REJECTED` count
+since the crawl started. With `--json`, the parsed pages (with their depth), the failed,
 skipped, blocked and unreachable URLs with the reasons, the statistics, the
 per-host table, the error statistics and the circuit breakers are saved to a file.
 
@@ -162,15 +163,15 @@ Every attempt is logged (excerpt):
 ```
 WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:50864/flaky failed: TransientHTTPError: HTTP 503 Service Unavailable; retrying in 0.1s
 WARNING | crawler.circuit_breaker | Circuit breaker of localhost opened: 5 of 5 requests failed in 60s; requests to it fail for 1s
-INFO    | crawler.client | Deferred http://localhost:50865/page/6 for 1.0s: circuit breaker of localhost is open (5 of 5 requests failed in 60s), next probe in 1.0s
+INFO    | crawler.crawl_run | Deferred http://localhost:50865/page/6 for 1.0s: circuit breaker of localhost is open (5 of 5 requests failed in 60s), next probe in 1.0s
 WARNING | crawler.retry | Failed http://127.0.0.1:50864/server-error on attempt 2/4 after 0.62s, no retries left for HTTP 500: TransientHTTPError: HTTP 500 Internal Server Error
 WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:50864/rate-limited failed: TransientHTTPError: HTTP 429 Too Many Requests; retrying in 1.0s
 WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:50864/slow failed: FetchTimeoutError: read timeout (1.0s); retrying in 0.2s
 INFO    | crawler.circuit_breaker | Circuit breaker of localhost is half-open: probing it with http://localhost:50865/page/6
-INFO    | crawler.client | Deferred http://localhost:50865/page/7 for 1.0s: circuit breaker of localhost is half-open, waiting for the probe request
+INFO    | crawler.crawl_run | Deferred http://localhost:50865/page/7 for 1.0s: circuit breaker of localhost is half-open, waiting for the probe request
 INFO    | crawler.retry | Succeeded http://127.0.0.1:50864/flaky on attempt 3/4 after 1.63s
 INFO    | crawler.retry | Succeeded http://127.0.0.1:50864/slow on attempt 2/4 after 2.82s
-INFO    | crawler.client | Gave up on http://localhost:50865/page/8: circuit breaker of localhost opened 3 times
+INFO    | crawler.crawl_run | Gave up on http://localhost:50865/page/8: circuit breaker of localhost opened 3 times
 ```
 
 Then come the pages, the error statistics and the circuit breakers:
@@ -193,12 +194,12 @@ DEPTH  RESULT                                LINKS  URL
     ...
     1  NetworkError:...                             http://localhost:50865/page/7
     1  CircuitOpenError: circuit breaker...         http://localhost:50865/page/8
-    1  NetworkError:...                             http://unreachable.invalid/
+    1  DNSError:...                                 http://unreachable.invalid/
 Crawled: 12 pages, failed: 13, skipped: 1, blocked: 0, unreachable: 0, left in queue: 0, speed: 7.4 pages/s
 
 === Errors (24 failed attempts) ===
 By kind:  TransientError 6, PermanentError 2, NetworkError 15, ParseError 1, other 0
-By class: NetworkError 15, TransientHTTPError 5, PermanentHTTPError 2, ParseError 1, FetchTimeoutError 1
+By class: NetworkError 11, TransientHTTPError 5, DNSError 4, PermanentHTTPError 2, ParseError 1, FetchTimeoutError 1
 Retries: 12, pages recovered by a retry: 3, average time per retry: 0.58s
 Permanent errors (2):
   http://127.0.0.1:50864/missing  PermanentHTTPError: HTTP 404 Not Found
@@ -206,9 +207,9 @@ Permanent errors (2):
 
 === Circuit breaker (3 hosts: 0 open, 1 half-open) ===
 HOST                 STATE      REQUESTS  FAILURES  OPENED  REJECTED
-127.0.0.1            closed           21         6       0         0
+127.0.0.1            closed           17         1       0         0
 localhost            half-open         0         0       3         8
-unreachable.invalid  closed            4         4       0         0
+unreachable.invalid  closed            1         1       0         0
 
 Error report saved to error_report.json
 ```
@@ -271,7 +272,10 @@ CRAWLED AT (UTC)     STATUS  TYPE         TEXT  LINKS  DEPTH  URL  TITLE
 ```
 
 A page counts as saved once every storage has written it; when one of them
-cannot be written, the table shows which storages have the pages. The files
+cannot be written, the table shows which storages have the pages. A storage
+that cannot be opened at all (a file in a directory that does not exist, a
+database that cannot be reached) stops the command before the crawl, with
+an error on stderr. The files
 are read from their start, and the database finds the pages of this crawl by
 URL. The files are replaced on every run, unless `--append` is given. The
 database is never emptied: saving a URL again replaces its row, but the local

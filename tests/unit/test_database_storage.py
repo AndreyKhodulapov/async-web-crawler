@@ -111,6 +111,31 @@ class TestInitDb:
         assert len(driver.batches) == 1
 
 
+class TestOpening:
+    async def test_open_connects_and_makes_the_table(self):
+        driver = RecordingDriver()
+        storage = make_storage(driver, batch_size=1)
+
+        await storage.open()
+
+        assert driver.connections == 1
+        assert len(driver.statements) == 3  # the table and two indexes
+        assert driver.batches == []
+        await storage.save(make_record())
+        assert len(driver.statements) == 3  # not initialized again
+        assert len(driver.batches) == 1
+
+    async def test_a_database_that_cannot_be_reached_is_a_storage_error(self):
+        class Unreachable(RecordingDriver):
+            async def connect(self) -> None:
+                raise ConnectionError("connection refused")
+
+        storage = make_storage(Unreachable())
+
+        with pytest.raises(StorageError, match="Storage cannot be opened: connection refused"):
+            await storage.open()
+
+
 class TestWriting:
     async def test_batch_is_one_call_with_a_row_per_record(self):
         driver = RecordingDriver()
