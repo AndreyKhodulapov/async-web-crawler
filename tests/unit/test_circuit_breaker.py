@@ -230,6 +230,21 @@ class TestHalfOpen:
         assert half_open.state("a.test") is CircuitState.HALF_OPEN
         assert half_open.get_stats()["a.test"].times_opened == 2
 
+    def test_a_failed_probe_is_remembered(self, half_open, clock):
+        # Not while the circuit is closed, and not for another URL.
+        assert half_open.opened_by_probe(URL) is False
+        request(half_open, REFUSED)
+        assert half_open.opened_by_probe(URL) is True
+        assert half_open.opened_by_probe("http://a.test/other") is False
+        clock.now += half_open.cooldown
+        assert half_open.opened_by_probe(URL) is True  # half-open: still open on that failure
+        request(half_open, None)
+        assert half_open.opened_by_probe(URL) is False
+
+    def test_a_circuit_opened_on_its_window_was_not_opened_by_a_probe(self, breaker):
+        open_circuit(breaker)
+        assert breaker.opened_by_probe(URL) is False
+
     def test_probe_without_an_outcome_lets_another_request_probe(self, half_open):
         with half_open.call(URL):
             pass
@@ -346,3 +361,17 @@ def test_transitions_are_logged(breaker, clock, caplog):
 def test_rejects_invalid_arguments(options, message):
     with pytest.raises(ValueError, match=message):
         CircuitBreaker(**options)
+
+
+@pytest.mark.parametrize(
+    ("error", "failure"),
+    [(TIMEOUT, True), (REFUSED, True), (HTTPStatusError(URL, 501, "Not Implemented"), True), (NOT_FOUND, False)],
+    ids=["timeout", "refused", "501", "404"],
+)
+def test_is_failure_says_what_counts_against_a_host(error, failure):
+    assert CircuitBreaker.is_failure(error) is failure
+
+
+@pytest.mark.parametrize("outcome", [None, BAD_CERTIFICATE], ids=["success", "certificate"])
+def test_what_counts_neither_way_is_not_a_failure(outcome):
+    assert CircuitBreaker.is_failure(outcome) is False

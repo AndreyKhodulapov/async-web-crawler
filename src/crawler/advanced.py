@@ -156,6 +156,9 @@ class AdvancedCrawler:
 
         Raises:
             ConfigError: the configuration has neither start URLs nor sitemaps.
+            StorageError: the storage cannot be opened (the output file is
+                of another layout, the database cannot be reached); nothing
+                is requested.
         """
         config = self.config
         if not config.urls and not config.sitemaps.urls:

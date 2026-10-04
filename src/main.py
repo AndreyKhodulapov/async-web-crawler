@@ -9,9 +9,10 @@ A crawl is set up by a configuration file (see config.example.yaml), by
 options, or by both: an option wins over the file. Logs and progress go to
 stderr, the summary to stdout.
 
-Exit codes: 0 - the crawl ran and fetched pages, 1 - no page was fetched or
-a file could not be opened, 2 - wrong options or configuration,
-130 - interrupted (Ctrl-C); the pages fetched by then are saved and reported.
+Exit codes: 0 - the crawl ran, fetched pages and saved every page it should,
+1 - no page was fetched, some could not be saved, or a file or the database
+could not be opened, 2 - wrong options or configuration, 130 - interrupted
+(Ctrl-C); the pages fetched by then are saved and reported.
 """
 
 import argparse
@@ -20,7 +21,7 @@ import sys
 from typing import Any
 
 from cli_options import hide_password, http_url, positive
-from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, load_config, show_progress
+from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, StorageError, load_config, show_progress
 from crawler.config import LOG_LEVELS
 
 
@@ -158,6 +159,7 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
 
     Raises:
         OSError: a directory cannot be created, or the log file cannot be opened.
+        StorageError: an output file or the database cannot be opened; nothing is requested.
     """
     async with AdvancedCrawler(config) as crawler:
         crawl = asyncio.create_task(crawler.crawl())
@@ -169,13 +171,17 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
             # The crawl must stop before the crawler is closed under it.
             crawl.cancel()
             await asyncio.gather(crawl, return_exceptions=True)
-            crawler.write_reports()
+            if not isinstance(error, StorageError):
+                # A storage that could not be opened stopped the crawl before
+                # it requested anything: there is nothing to report.
+                crawler.write_reports()
             if isinstance(error, asyncio.CancelledError):
                 await crawler.close()  # writes the pages the storage still holds, so the summary counts them
                 print_summary(crawler, interrupted=True)
             raise
         print_summary(crawler)
-        return 0 if crawler.get_stats()["successful"] else 1
+        # A page that could not be saved is a failure of the run too.
+        return 0 if crawler.get_stats()["successful"] and not crawler.crawler.crawl_stats().save_failed else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -187,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2  # as argparse exits for a wrong flag
     try:
         return asyncio.run(run(config, progress=not args.no_progress))
-    except OSError as error:
+    except (OSError, StorageError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

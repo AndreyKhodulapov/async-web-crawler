@@ -68,7 +68,7 @@ asyncio.run(main())
 | `fetch_urls(urls)` | `{url: text}` for successful pages | failed URLs are logged and skipped |
 | `fetch_many(urls)` | `list[FetchResult]` in input order | error stored per result |
 | `fetch_and_parse(url)` | `ParsedPage` dict | download errors raise a `FetchError` subclass, a response that is not an HTML document raises `ParseError`; problems in parts of the page go to `page["errors"]` |
-| `crawl(start_urls, max_pages)` | `{url: ParsedPage}` for fetched pages | failed URLs go to `failed_urls` |
+| `crawl(start_urls, max_pages)` | `{url: ParsedPage}` for fetched pages | failed URLs go to `failed_urls`; a storage that cannot be opened raises `StorageError` before anything is requested |
 | `close()` | - | safe to call twice; called by `async with`; closes the storage too |
 
 Every method checks robots.txt, waits for the rate limit and retries transient
@@ -227,15 +227,24 @@ under its own URL, and robots.txt is not cached as unreachable.
 
 In a crawl, a page the breaker refuses is not failed: it is put off until
 the circuit may let a probe through, or for a second while the probe is in
-flight, and the workers go on with other pages meanwhile. So the pages of
+flight, and the workers go on with other pages meanwhile. So is a page
+whose request was sent and failed while the circuit opened, on its own
+failure or on those of the other requests in flight: the breaker refused
+the retries it would have had, so it is requested again when the host may
+be probed, instead of being the page lost to the outage. The probe is
+such a retry: a page whose probe failed is failed with its own error and
+not put off again, so that one broken page does not probe a healthy host
+until it is given up. So the pages of
 a host that went down for a moment are fetched once it is back, even when
 the page refused was the last one `max_pages` allowed. A page refused
-before its request does not count toward `max_pages`; one whose redirect
+before its request does not count toward `max_pages`, and neither does one
+put off after its request failed, until it is taken again; one whose redirect
 target is refused has sent its request, so it counts, and counts again
 when it is taken again. After the circuit of a host has opened
 `AsyncCrawler.MAX_CIRCUIT_OPENINGS` (3) times in the crawl, no more probes
-are sent: its remaining pages go to `failed_urls` with `CircuitOpenError`,
-and a host that stays down holds the crawl for about two cooldowns.
+are sent: its remaining pages go to `failed_urls`, with `CircuitOpenError`
+if they were never requested and with the error of their request if they
+were, and a host that stays down holds the crawl for about two cooldowns.
 
 The same goes for a host held back longer than
 `AsyncCrawler.MIN_PENALTY_TO_DEFER` (1 second), by a Retry-After or the
@@ -710,6 +719,12 @@ the same types:
 
 All of them share the behavior of `DataStorage`:
 
+- `open()` opens the file or the connection ahead of the first write and
+  checks that it can be written to: a file of another layout, a path that
+  cannot be written, a database that cannot be reached raise `StorageError`
+  at once, before a crawl has anything to save. Nothing is written by it.
+  `crawl()` calls it before its first request and lets the error through;
+  without it, the first write opens the storage the same way.
 - `save(record)` puts the record into a buffer; the buffer is written once
   it holds `batch_size` records (100 by default), on `flush()` and on
   `close()`. Several workers may save at once.
@@ -727,7 +742,7 @@ All of them share the behavior of `DataStorage`:
   them all; `pending` and `written` count the records in the buffer and those
   written out.
 
-A database storage creates its table on the first use (`init_db()`), with
+A database storage creates its table on `open()` or the first use (`init_db()`), with
 `url` unique and indexes on `crawled_at` and `status_code`. A batch is one
 transaction: all of its pages are saved or none. Saving a URL again replaces
 its row. `count()`, `status_counts()` and `get(url)` query the table.
@@ -736,9 +751,9 @@ A file storage adds to the file if it exists, so a second crawl with the
 same file keeps the pages of the first one, and a page fetched by both is
 in the file twice; adding to a file that is not empty is logged as a
 warning. With `overwrite=True` the file is started anew: what it held is
-dropped on the first write (a crawl that saves nothing leaves it as it
-was), and a file that could not be added to, such as one of the other JSON
-layout, is replaced too.
+dropped on the first write, not on `open()` (a crawl that saves nothing
+leaves it as it was), and a file that could not be added to, such as one
+of the other JSON layout, is replaced too.
 
 In a crawl, a failed save never stops the crawler: it is logged, the page
 stays in the results, and `crawl_stats()` counts `saved` and `save_failed`.

@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 import asyncpg
 import pytest
 
+from crawler import CSVStorage
 from demo_main import parse_args, run_crawl, run_errors, run_save
 
 # Start page, 8 articles and the three pages a retry makes good.
@@ -165,11 +166,28 @@ async def test_save_demo_replaces_the_files_unless_told_to_append(tmp_path, caps
     connection.close()
 
 
-async def test_save_demo_goes_on_when_a_storage_cannot_be_written(tmp_path, capsys):
+async def test_save_demo_stops_before_the_crawl_when_a_storage_cannot_be_opened(tmp_path, capsys):
     options = save_options(tmp_path, "--batch-size", "100")
     options[options.index("--csv") + 1] = str(tmp_path / "missing" / "pages.csv")
 
     await run_save(parse_args([*options, "--log-level", "ERROR"]))
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines()[-1].startswith(
+        "error: failed to open 1 of 3 storages: CSVStorage: CSVStorage cannot be opened: "
+    )
+    assert (tmp_path / "pages.jsonl").read_text(encoding="utf-8") == ""
+
+
+async def test_save_demo_goes_on_when_a_storage_cannot_be_written(tmp_path, capsys, monkeypatch):
+    async def write_batch(self, records):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(CSVStorage, "_write_batch", write_batch)
+    monkeypatch.setattr(CSVStorage, "WRITE_ERRORS", ())  # not retried: the run would take seconds
+
+    await run_save(parse_args([*save_options(tmp_path, "--batch-size", "100"), "--log-level", "ERROR"]))
 
     assert len((tmp_path / "pages.jsonl").read_text(encoding="utf-8").splitlines()) == 12
     output = capsys.readouterr().out

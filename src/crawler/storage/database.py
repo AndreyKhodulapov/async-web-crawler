@@ -67,8 +67,8 @@ class DatabaseStorage(DataStorage):
     another database passes its driver and lists in `WRITE_ERRORS` the
     errors of the driver that a retry may cure.
 
-    `init_db` creates the table; it is called on the first use if it was
-    not called before. A batch is written in one transaction: all of its
+    `init_db` creates the table; it is called by `open` and on the first
+    use if it was not called before. A batch is written in one transaction: all of its
     pages are saved or none. Saving a URL again replaces its row. `links`
     and `metadata` are stored as JSON. `crawled_at` and `status_code` are
     indexed, and so is `url`, being unique.
@@ -132,6 +132,10 @@ class DatabaseStorage(DataStorage):
             f"SELECT {', '.join(self.COLUMNS)} FROM {self.TABLE} WHERE url = {self._driver.placeholder(1)}", url
         )
         return None if row is None else self._to_record(row)
+
+    async def _open_storage(self) -> None:
+        if not self._initialized:
+            await self.init_db()
 
     async def _write_batch(self, records: Sequence[PageRecord]) -> None:
         if not self._initialized:

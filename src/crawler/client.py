@@ -125,7 +125,9 @@ class AsyncCrawler:
       retry is a success of the host. A retry the breaker would refuse is
       not made: the request fails with the error of its last attempt.
       robots.txt that cannot be downloaded for this reason is not cached
-      as unreachable. In `crawl()`, the pages of such a host wait for it.
+      as unreachable. In `crawl()`, the pages of such a host wait for it:
+      a page refused before it was sent, and one whose request failed
+      while the circuit opened, is put off until the host may be probed.
 
     Every request has a `connect_timeout` (DNS, TCP and TLS, waiting for a
     pooled connection), a `read_timeout` (for each chunk of the response)
@@ -831,7 +833,13 @@ class AsyncCrawler:
         long at a time while the download goes on, and the workers go on
         with other sites meanwhile. Pages that the circuit breaker refuses do not
         count either: they are put off until their host may be probed and
-        tried again, and the crawl goes on with other pages meanwhile. Once
+        tried again, and the crawl goes on with other pages meanwhile. So
+        is a page whose request failed while the circuit of its host
+        opened, on its own failure or on those of other requests in
+        flight: the breaker refused the retries it would have had, so it
+        is requested again when the host may be probed, uncounted
+        meanwhile, rather than failed. The probe itself is such a retry: a
+        page whose probe failed fails with its error. Once
         the circuit of a host has opened `MAX_CIRCUIT_OPENINGS` times in
         the crawl, its refused pages go to `failed_urls` with
         `CircuitOpenError`, so a host that stays down holds the crawl for
@@ -905,7 +913,10 @@ class AsyncCrawler:
 
         Failed pages do not stop the crawl: they are listed in `failed_urls`.
         Every processed page is saved to the `storage` of the crawler, if it
-        has one, and the storage is flushed before the crawl returns. A page
+        has one, and the storage is flushed before the crawl returns. The
+        storage is opened before the first request (see `DataStorage.open`):
+        one that cannot be written to fails the crawl before anything is
+        requested, instead of a batch of pages later. A page
         that cannot be saved is still returned: the failure is logged and
         counted in `crawl_stats()`.
         The state of the crawl (`processed_urls`, `visited_urls`,
@@ -921,6 +932,7 @@ class AsyncCrawler:
                 a pattern or an extension is invalid, `robots_sitemaps` is asked of a crawler that does not
                 read robots.txt.
             RuntimeError: another crawl is running on this crawler.
+            StorageError: the storage cannot be opened; nothing is requested.
         """
         if isinstance(start_urls, str):
             raise TypeError(f"expected a list of start URLs, got a string: {start_urls!r}")
@@ -942,6 +954,10 @@ class AsyncCrawler:
             raise ValueError("robots_sitemaps needs a crawler that reads robots.txt (respect_robots=True)")
         if self._crawl_started is not None and self._crawl_finished is None:
             raise RuntimeError("a crawl is already running on this crawler")
+        if self.storage is not None:
+            # Before anything is requested: a storage that cannot be
+            # written to is found out now, not a batch of pages later.
+            await self.storage.open()
 
         url_filter = UrlFilter(
             allowed_hosts={get_host(url) for url in start_urls + sitemap_urls} if same_domain_only else None,
@@ -1204,8 +1220,9 @@ class AsyncCrawler:
                         queue.mark_blocked(url, refusal.message)
                     elif isinstance(refusal, RobotsUnreachableError):
                         if not self._wait_for_robots(url, queue, refusal, requested=False):
-                            logger.info("Gave up on %s: %s", url, refusal.message)
-                            queue.mark_unreachable(url, refusal.message)
+                            reason = self._unreachable_reason(refusal)
+                            logger.info("Gave up on %s: %s", url, reason)
+                            queue.mark_unreachable(url, reason)
                     elif isinstance(refusal, CircuitOpenError):
                         self._defer_or_fail(url, queue, refusal)
                     else:
@@ -1251,13 +1268,16 @@ class AsyncCrawler:
             return skip_reason is None
 
         result = await self._fetch(url, html_only=True, check_robots=False, follow=follow, robots_wait=self.ROBOTS_POLL)
-        if isinstance(result.error, CircuitOpenError):
+        if (refusal := self._circuit_refusal(result)) is not None:
             # The circuit of the host, or of the host a redirect leads to,
-            # opened while the request waited for its turn.
-            if not sent:
+            # opened while the request waited for its turn or was in flight.
+            if refusal is not result.error:
+                # The request was answered, but not with the page: it is not a page requested.
+                self._uncount_page(url, queue)
+            elif not sent:
                 # Nothing was sent: the page costs nothing of the limits.
                 self._uncount_page(url, queue)
-            if not self._defer_or_fail(url, queue, result.error):
+            if not self._defer_or_fail(url, queue, refusal, result):
                 self._forget_redirects(url, targets, queue)
             return
         if self._outwaits_retries(result.error) and self._wait_for_host(url, queue, result.error):
@@ -1275,7 +1295,7 @@ class AsyncCrawler:
             queue.mark_blocked(url, f"redirects to {result.error.url}, {result.error.message}")
             return
         if isinstance(result.error, RobotsUnreachableError):
-            reason = f"redirects to {result.error.url}, {result.error.message}"
+            reason = f"redirects to {result.error.url}, {self._unreachable_reason(result.error)}"
             logger.info("Gave up on %s: %s", url, reason)
             queue.mark_unreachable(url, reason)
             return
@@ -1539,6 +1559,20 @@ class AsyncCrawler:
         self._put_off_page(url, queue, delay, refusal.message, requested=requested)
         return True
 
+    def _unreachable_reason(self, refusal: RobotsUnreachableError) -> str:
+        """Why the site of `refusal` is given up: the failure of its robots.txt as cached, whatever the refusal said.
+
+        A refusal may say only that robots.txt is being downloaded, when
+        the page looked in on a download that was over by then; the site
+        is given up for the failure of its downloads, which the cache knows.
+        """
+        assert self.robots is not None  # it refused the URL
+        try:
+            unreachable = self.robots.unreachable_reason(refusal.url)
+        except LookupError:
+            unreachable = None
+        return refusal.message if unreachable is None else f"robots.txt is unreachable ({unreachable})"
+
     def _put_off_page(self, url: str, queue: CrawlerQueue, delay: float, reason: str, *, requested: bool) -> None:
         """Put a page of the crawl back into the queue for `delay` seconds.
 
@@ -1584,18 +1618,45 @@ class AsyncCrawler:
         self._warn_once_held_back(error.url, delay)
         return True
 
-    def _defer_or_fail(self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError) -> bool:
+    def _circuit_refusal(self, result: FetchResult) -> CircuitOpenError | None:
+        """The refusal of the circuit breaker that a page of the crawl waits out; None if the breaker has no say in its outcome.
+
+        Either the request was refused, or it was sent and failed while
+        the circuit of its host opened, on its failure or on those of
+        other requests: the breaker then refused the retries the page
+        would have had, and its failure says no more about the page than
+        about the host. The probe of the host, though, is the retry the
+        breaker gave the page: a page whose probe failed fails with its error.
+        """
+        error = result.error
+        if isinstance(error, CircuitOpenError):
+            return error
+        breaker = self.circuit_breaker
+        if error is None or not breaker.is_failure(error) or breaker.opened_by_probe(error.url):
+            return None
+        message = breaker.refusal(error.url)
+        return None if message is None else CircuitOpenError(error.url, message)
+
+    def _defer_or_fail(
+        self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError, result: FetchResult | None = None
+    ) -> bool:
         """Put off a page the circuit breaker refused until its host may be probed, or give up on it.
 
-        The host is that of the refusal: the page may redirect to another one.
-        Returns whether the page was put off rather than failed.
+        The host is that of the refusal: the page may redirect to another
+        one. `result` is that of the page's request, if one was made: a
+        page given up on fails with the error of its request, if it got
+        one, else with the refusal. Returns whether the page was put off
+        rather than failed.
         """
         host = get_host(refusal.url)
         assert host is not None  # a URL without a host has no circuit
         opened = self.circuit_breaker.times_opened(host)
         if opened >= self.MAX_CIRCUIT_OPENINGS:
             logger.info("Gave up on %s: circuit breaker of %s opened %d times", url, host, opened)
-            self._fail_page(url, queue, refusal)
+            if result is not None and result.error is not None and result.error is not refusal:
+                self._fail_page(url, queue, result.error, result)
+            else:
+                self._fail_page(url, queue, refusal)
             return False
         # Back when the probe may go; a page refused while the probe is in
         # flight comes back a second later.

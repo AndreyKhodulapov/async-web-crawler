@@ -10,7 +10,7 @@ import yaml
 from helpers import FAST_CONFIG
 
 import main
-from crawler import AdvancedCrawler
+from crawler import AdvancedCrawler, JSONStorage, StorageError
 from main import build_config, parse_args, run
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
@@ -125,6 +125,39 @@ async def test_no_page_fetched_is_exit_code_1(url, config_file, capsys):
 
     assert await run(build_config(parse_args(argv)), progress=False) == 1
     assert "Pages: 1 (0 successful, 1 failed, 0 skipped)" in capsys.readouterr().out
+
+
+async def test_output_file_that_cannot_be_written_fails_the_run_before_anything_is_requested(
+    url, site, config_file, tmp_path, capsys
+):
+    pages = tmp_path / "pages.jsonl"
+    pages.write_text('[{"url": "https://site/a"}]\n', encoding="utf-8")  # a JSON array, not JSON Lines
+    argv = ["--config", config_file(), "--output", str(pages), "--stats-json", str(tmp_path / "stats.json")]
+
+    # main() prints the error and exits with 1, see the unit tests of the command line.
+    with pytest.raises(StorageError, match="is not JSON Lines of this storage: it was not written without indent"):
+        await run(build_config(parse_args(argv)), progress=False)
+
+    assert capsys.readouterr().out == ""
+    assert site.hits == {}
+    assert pages.read_text(encoding="utf-8") == '[{"url": "https://site/a"}]\n'
+    assert not (tmp_path / "stats.json").exists()  # no report of a crawl that did not run
+
+
+async def test_pages_that_could_not_be_saved_are_exit_code_1(url, config_file, tmp_path, capsys, monkeypatch):
+    async def write_batch(self, records):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(JSONStorage, "_write_batch", write_batch)
+    monkeypatch.setattr(JSONStorage, "WRITE_ERRORS", ())  # not retried: the run would take seconds
+    argv = ["--config", config_file(), "--output", str(tmp_path / "pages.jsonl"), "--max-depth", "0"]
+
+    assert await run(build_config(parse_args(argv)), progress=False) == 1
+
+    summary = capsys.readouterr().out
+    assert "Pages: 1 (1 successful, 0 failed, 0 skipped)" in summary
+    assert "Saved: 0 pages to" in summary
+    assert "1 not saved" in summary
 
 
 async def test_log_file_that_cannot_be_opened_is_an_os_error(url, config_file, tmp_path):

@@ -22,7 +22,8 @@ class JSONStorage(DataStorage):
     """Keeps pages in a JSON file, adding to the file if it exists.
 
     With `overwrite` the file is started anew instead: what it held is
-    dropped on the first write. Adding to a file that is not empty is
+    dropped on the first write, not on `open`, so a crawl that saves
+    nothing leaves it as it was. Adding to a file that is not empty is
     logged as a warning, since a second run with the same file keeps the
     pages of the first one too.
 
@@ -35,7 +36,7 @@ class JSONStorage(DataStorage):
     through it in pieces, so the file may be larger than the memory. The
     file is UTF-8, `crawled_at` is written in ISO 8601.
 
-    Raises (on the first write, unless `overwrite`):
+    Raises (on `open` or the first write, unless `overwrite`):
         StorageError: the file exists in the other layout, is an array
             that some other program wrote, or is JSON Lines whose last
             line is not complete.
@@ -64,6 +65,11 @@ class JSONStorage(DataStorage):
         self._tail = b"" if indent is None else b"\n]\n"
         self._file: AsyncBufferedReader | None = None
         self._end = 0  # where the next record goes
+        self._stale = False  # the file holds an earlier run that the first write drops
+
+    async def _open_storage(self) -> None:
+        if self._file is None:
+            await self._open()
 
     async def _write_batch(self, records: Sequence[PageRecord]) -> None:
         file = self._file or await self._open()
@@ -76,14 +82,21 @@ class JSONStorage(DataStorage):
         # A retry starts where the failed write did, so nothing is written twice.
         await file.seek(self._end)
         await file.write(encoded + self._tail)
+        if self._stale:
+            await file.truncate()  # the rest of the earlier run
+            self._stale = False
         await file.flush()
         self._end += len(encoded)
 
     async def _open(self) -> AsyncBufferedReader:
         exists = await aiofiles.os.path.exists(self.path)
-        file = await aiofiles.open(self.path, "r+b" if exists and not self.overwrite else "w+b")
+        file = await aiofiles.open(self.path, "r+b" if exists else "w+b")
         size = await file.seek(0, os.SEEK_END)
-        if size:
+        if self.overwrite:
+            # Kept until the first write, which starts at the beginning.
+            self._stale = size > 0
+            await file.seek(0)
+        elif size:
             self._end = max(size - len(self._tail), 0)
             await file.seek(0)
             first = await file.read(1)

@@ -132,6 +132,15 @@ leaves a failing site alone.
   any retry. A retry the
   breaker would refuse is not made, and the page fails with the error of its
   last attempt, not with `CircuitOpenError`.
+- **Pages in flight when the circuit opens** are the ones the breaker
+  costs: their failures land on an open circuit, and the retries that would
+  have saved them are refused. Outside a crawl they fail with their error;
+  in a crawl they are put off with the pages refused before being sent and
+  requested again when the host may be probed, as the page that lost its
+  retries to the breaker is no more broken than the host. Except the probe:
+  it is the retry the breaker gives, so a page whose probe fails fails for
+  good. Otherwise one page that answers 500 every time would probe the
+  host again and again, and the host would be given up for it.
 - Check the circuit before a request waits for the rate limit (no point in
   queueing for a blocked host) and once more when its turn comes (the circuit
   may have opened meanwhile).

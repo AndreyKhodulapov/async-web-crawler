@@ -41,6 +41,7 @@ class _Circuit:
     opened_at: float = 0.0
     reason: str = ""
     probe: "BreakerCall | None" = None
+    failed_probe: str | None = None  # the URL of the probe whose failure opened the circuit, if one did
     times_opened: int = 0
     rejected: int = 0
 
@@ -155,6 +156,22 @@ class CircuitBreaker:
         circuit = self._circuits.get(host)
         return 0 if circuit is None else circuit.times_opened
 
+    def opened_by_probe(self, url: str) -> bool:
+        """Whether the circuit of the host of `url` is open because the probe of `url` itself failed.
+
+        False while the circuit is closed, and when it opened on the
+        failures counted in its window, or on the probe of another URL.
+        """
+        if (found := self._lookup(url)) is None:
+            return False
+        _, circuit = found
+        return self._state(circuit) is not CircuitState.CLOSED and circuit.failed_probe == url
+
+    @staticmethod
+    def is_failure(error: FetchError | None) -> bool:
+        """Whether an outcome counts as a failure of the host: a transient or network error, or an HTTP 5xx."""
+        return _is_failure(error) is True
+
     def call(self, url: str) -> "BreakerCall":
         """A request to `url`: entering it raises `CircuitOpenError` if the request is refused."""
         return BreakerCall(self, url, get_host(url))
@@ -238,7 +255,7 @@ class CircuitBreaker:
         if probe:
             if failed:
                 assert error is not None
-                self._open(host, circuit, f"probe {url} failed: {type(error).__name__}: {error.message}")
+                self._open(host, circuit, f"probe {url} failed: {type(error).__name__}: {error.message}", probe=url)
             else:
                 circuit.state = CircuitState.CLOSED
                 self._clear(circuit)
@@ -270,10 +287,11 @@ class CircuitBreaker:
         if circuit is not None and circuit.probe is call:
             circuit.probe = None
 
-    def _open(self, host: str, circuit: _Circuit, reason: str) -> None:
+    def _open(self, host: str, circuit: _Circuit, reason: str, *, probe: str | None = None) -> None:
         circuit.state = CircuitState.OPEN
         circuit.opened_at = self._clock()
         circuit.reason = reason
+        circuit.failed_probe = probe
         self._clear(circuit)
         circuit.times_opened += 1
         logger.warning("Circuit breaker of %s opened: %s; requests to it fail for %gs", host, reason, self.cooldown)

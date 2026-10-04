@@ -224,6 +224,55 @@ class TestBothLayouts:
 
 
 @LAYOUTS
+class TestOpening:
+    async def test_open_makes_the_file_and_writes_nothing(self, tmp_path, indent):
+        path = tmp_path / "pages"
+
+        async with JSONStorage(path, indent=indent) as storage:
+            await storage.open()
+            assert path.read_bytes() == b""
+            assert storage.written == 0
+            await storage.save(make_record())
+
+        assert await read_all(JSONStorage(path, indent=indent)) == [make_record()]
+
+    async def test_open_leaves_a_file_of_this_storage_as_it_is(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        async with JSONStorage(path, indent=indent) as storage:
+            await storage.save(make_record())
+        before = path.read_bytes()
+
+        async with JSONStorage(path, indent=indent) as storage:
+            await storage.open()
+            assert path.read_bytes() == before
+            await storage.save(make_record("https://site/b"))
+
+        assert [record["url"] for record in await read_all(JSONStorage(path, indent=indent))] == [
+            "https://site/page",
+            "https://site/b",
+        ]
+
+    async def test_open_refuses_a_file_of_the_other_layout(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        other = JSONStorage(path, indent=None if indent is not None else 2)
+        async with other as storage:
+            await storage.save(make_record())
+        before = path.read_bytes()
+
+        async with JSONStorage(path, indent=indent) as storage:
+            with pytest.raises(StorageError, match="is not"):
+                await storage.open()
+
+        assert path.read_bytes() == before
+
+    async def test_open_refuses_a_path_that_cannot_be_written(self, tmp_path, indent):
+        storage = JSONStorage(tmp_path / "missing" / "pages", indent=indent)
+
+        with pytest.raises(StorageError, match="JSONStorage cannot be opened: .*missing"):
+            await storage.open()
+
+
+@LAYOUTS
 class TestOverwrite:
     async def test_file_of_an_earlier_run_is_replaced(self, tmp_path, indent):
         path = tmp_path / "pages"
@@ -255,9 +304,27 @@ class TestOverwrite:
         path.write_text("kept")
 
         async with JSONStorage(path, indent=indent, overwrite=True) as storage:
+            await storage.open()
             await storage.flush()
 
         assert path.read_text() == "kept"
+
+    async def test_a_longer_file_of_an_earlier_run_is_cut(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        async with JSONStorage(path, indent=indent) as storage:
+            for record in make_records(20):
+                await storage.save(record)
+        record = make_record("https://site/new", title="New")
+
+        async with JSONStorage(path, indent=indent, overwrite=True) as storage:
+            await storage.open()
+            await storage.save(record)
+
+        assert await read_all(JSONStorage(path, indent=indent)) == [record]
+        if indent is None:
+            assert path.read_text(encoding="utf-8").count("\n") == 1
+        else:
+            assert json.loads(path.read_text(encoding="utf-8")) == [as_json(record)]
 
     async def test_adding_to_a_file_is_logged(self, tmp_path, indent, caplog):
         caplog.set_level(logging.WARNING, logger="crawler.storage")

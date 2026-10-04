@@ -40,8 +40,14 @@ class DataStorage(ABC):
     other error is raised as it is and its batch is dropped: no retry cures
     it, and kept in the buffer the batch would fail every later write.
 
+    `open` opens the file or the connection ahead of the first write and
+    checks that it can be written to: a storage that cannot be is found
+    out before anything is crawled, not a batch of pages later. Without
+    it, the first write does the same.
+
     A subclass implements `_write_batch`, `_read` and `_close`, and lists in
-    `WRITE_ERRORS` the exceptions its writes fail with.
+    `WRITE_ERRORS` the exceptions its writes fail with; `_open_storage`
+    does what the first write would otherwise do to open the storage.
     """
 
     WRITE_ERRORS: ClassVar[tuple[type[Exception], ...]] = (OSError,)
@@ -89,6 +95,28 @@ class DataStorage(ABC):
         traceback: TracebackType | None,
     ) -> None:
         await self.close()
+
+    async def open(self) -> None:
+        """Open the file or the connection and check that it can be written to.
+
+        Does up front what the first write would do otherwise: the file is
+        opened and checked, the database connected and its table created.
+        Nothing is written. Safe to call more than once.
+
+        Raises:
+            StorageError: the storage cannot be opened (the file is of
+                another layout or cannot be written, the database cannot
+                be reached), or it is closed.
+        """
+        async with self._lock:
+            if self._closed:
+                raise StorageError(f"{type(self).__name__} is closed")
+            try:
+                await self._open_storage()
+            except StorageError:
+                raise
+            except Exception as error:
+                raise StorageError(f"{type(self).__name__} cannot be opened: {error}") from error
 
     async def save(self, record: PageRecord) -> None:
         """Add a page to the storage; it is written with the rest of its batch.
@@ -167,6 +195,9 @@ class DataStorage(ABC):
         self._paused_until = 0.0
         self._written += len(batch)
         logger.debug("Wrote %d records to %s", len(batch), type(self).__name__)
+
+    async def _open_storage(self) -> None:
+        """Open the file or the connection, unless it is open; what the first write does otherwise. Nothing by default."""
 
     @abstractmethod
     async def _write_batch(self, records: Sequence[PageRecord]) -> None:

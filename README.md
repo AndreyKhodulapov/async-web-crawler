@@ -150,8 +150,8 @@ URL is shown as `***`.
 
 | Exit code | Meaning |
 |-----------|---------|
-| 0 | the crawl ran and fetched at least one page |
-| 1 | no page was fetched, or a directory or the log file could not be opened |
+| 0 | the crawl ran, fetched at least one page and saved every page it should |
+| 1 | no page was fetched, some could not be saved, or a directory, the log file, an output file or the database could not be opened; an output that cannot be opened is reported before anything is requested |
 | 2 | wrong options or configuration; nothing was requested or written |
 | 130 | interrupted with Ctrl-C |
 
@@ -235,6 +235,16 @@ storages. All of it is described in the [API reference](docs/api.md).
 - **A storage that keeps failing fills memory.** Pages that could not be
   written stay buffered and are retried; a database that is down for long
   holds every page since the outage in memory.
+- **One host at a time under a rate limit.** The workers take pages from
+  one queue in the order of depth and wait for the turn of their host in
+  the rate limiter; while the pages of the first host last, those of the
+  other hosts wait in the queue. A crawl of several hosts with a rate limit
+  takes about the sum of their times, not the longest of them (two hosts
+  of 30 pages at 2 requests per second: 25 s instead of 15), and the time
+  left on the progress line does not know it. One site never notices; for
+  the sitemaps of several hosts, `same_domain_only: false` or a site on
+  many subdomains, set `rate_limit` higher or to `null` and rely on
+  `max_per_domain`. See [docs/concurrency_control.md](docs/concurrency_control.md).
 - **Not for URLs from strangers.** Links to private addresses
   (`127.0.0.1`, `10.0.0.0/8`, the cloud metadata address) are followed
   like any other. The crawler is a command-line tool for sites you choose,

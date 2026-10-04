@@ -272,7 +272,10 @@ CRAWLED AT (UTC)     STATUS  TYPE         TEXT  LINKS  DEPTH  URL  TITLE
 ```
 
 A page counts as saved once every storage has written it; when one of them
-cannot be written, the table shows which storages have the pages. The files
+cannot be written, the table shows which storages have the pages. A storage
+that cannot be opened at all (a file in a directory that does not exist, a
+database that cannot be reached) stops the command before the crawl, with
+an error on stderr. The files
 are read from their start, and the database finds the pages of this crawl by
 URL. The files are replaced on every run, unless `--append` is given. The
 database is never emptied: saving a URL again replaces its row, but the local

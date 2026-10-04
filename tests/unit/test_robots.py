@@ -542,6 +542,35 @@ class TestWaitingForDownloads:
         assert await robots.is_allowed("https://other/y", BOT) is True
         assert fetch.requested == ["https://site/robots.txt", "https://other/robots.txt"]
 
+    async def test_a_download_that_finished_as_the_wait_ran_out_answers(self, monkeypatch):
+        # The timer of the wait may fire in the iteration of the event loop
+        # in which the download finished: asyncio then reports a timeout
+        # for a future that is done, and the rules are in the cache.
+        wait_for = asyncio.wait_for
+
+        async def wait_for_and_time_out(awaitable, timeout):
+            result = await wait_for(awaitable, timeout)
+            assert result is not None
+            raise TimeoutError
+
+        monkeypatch.setattr(asyncio, "wait_for", wait_for_and_time_out)
+        requested: list[str] = []
+
+        async def fetch(url: str) -> tuple[int, str]:
+            requested.append(url)
+            await asyncio.sleep(0)
+            return (200, "User-agent: *\nDisallow: /x") if len(requested) == 1 else (503, "")
+
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+
+        assert await robots.is_allowed("https://site/x", BOT, wait=1) is False
+        assert await robots.is_allowed("https://site/y", BOT, wait=1) is True
+        # The same for a download that found the site unreachable: it is cached for a while.
+        assert await robots.is_allowed("https://other/y", BOT, wait=1) is False
+        assert robots.unreachable_reason("https://other/y") == "HTTP 503"
+        assert requested == ["https://site/robots.txt", "https://other/robots.txt"]
+
     async def test_a_caller_may_wait_for_a_download_only_so_long(self):
         # The download goes on for the cache: the next caller finds it there.
         answered = asyncio.Event()

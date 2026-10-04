@@ -297,7 +297,9 @@ class RobotsParser:
         With `wait`, a download that takes longer than that many seconds
         from its start is not waited for: `TimeoutError` is raised, at
         once if that long has passed already, and the download goes on
-        for the callers that do wait for it, into the cache.
+        for the callers that do wait for it, into the cache. A download
+        that finished in time answers even when the wait ran out at the
+        same moment.
         """
         return (await self._rules_for(url, wait)).can_fetch(url, user_agent)
 
@@ -400,7 +402,16 @@ class RobotsParser:
         if left <= 0:
             waiting.cancel()
             raise TimeoutError(f"robots.txt of {origin} has been downloading for over {wait:g}s")
-        return await asyncio.wait_for(waiting, left)
+        try:
+            return await asyncio.wait_for(waiting, left)
+        except TimeoutError:
+            # The download may have finished in the very iteration of the
+            # event loop in which the wait ran out: the task is cancelled
+            # with its future done. Then the rules are in the cache.
+            rules = self._rules.get(origin)
+            if rules is not None and self._clock() < self._expires.get(origin, math.inf):
+                return rules
+            raise
 
     def _forget_download(self, origin: str, download: asyncio.Task[RobotsRules]) -> None:
         del self._downloads[origin]

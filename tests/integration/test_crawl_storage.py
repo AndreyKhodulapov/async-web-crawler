@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from helpers import UNTHROTTLED, MemoryStorage
 
-from crawler import AsyncCrawler, CSVStorage, DataStorage, JSONStorage, PageRecord, SQLiteStorage
+from crawler import AsyncCrawler, CSVStorage, DataStorage, JSONStorage, PageRecord, SQLiteStorage, StorageError
 
 DISK_FULL = OSError("disk full")
 # More failures than any test has writes: the storage never recovers.
@@ -225,16 +225,14 @@ class TestSaveErrors:
         assert "Unexpected error while saving " in caplog.text
         assert "TypeError: not serializable" in caplog.text
 
-    async def test_closed_storage_does_not_stop_the_crawl(self, url, caplog):
+    async def test_closed_storage_fails_the_crawl_before_it_requests_anything(self, url, site):
         storage = MemoryStorage()
         await storage.close()
 
-        with caplog.at_level(logging.ERROR, logger="crawler.client"):
-            crawler = await crawl(storage, url("/site/"))
+        with pytest.raises(StorageError, match="MemoryStorage is closed"):
+            await crawl(storage, url("/site/"))
 
-        stats = crawler.crawl_stats()
-        assert (stats.processed, stats.saved, stats.save_failed) == (5, 0, 5)
-        assert "MemoryStorage is closed" in caplog.text
+        assert site.hits == {}
 
     async def test_buffered_pages_are_not_failures_while_the_crawl_runs(self, url):
         seen = []

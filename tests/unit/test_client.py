@@ -5,12 +5,13 @@ import logging
 import socket
 import ssl
 import time
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable
 from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
-from helpers import UNTHROTTLED, FakeClock
+from helpers import UNTHROTTLED, FakeClock, MemoryStorage
 from multidict import CIMultiDict
 
 from crawler import (
@@ -33,6 +34,7 @@ from crawler import (
     RetryStrategy,
     RobotsDisallowedError,
     RobotsUnreachableError,
+    StorageError,
     TransientError,
     UnexpectedError,
 )
@@ -849,20 +851,23 @@ class TestCrawlBlockedHost:
 
         await crawler.crawl([*pages, "http://b/"])
 
-        # Opened by a/0, then by the failed probes a/1 and a/2.
-        assert fake_session.requested == ["http://a/0", "http://b/", "http://a/1", "http://a/2"]
+        # Opened by a/0, which lost its retries to that and is put off like
+        # the others, then by the failed probes a/0 and a/1: a page whose
+        # probe failed is not put off again, so a/2 and a/3 are never requested.
+        assert fake_session.requested == ["http://a/0", "http://b/", "http://a/0", "http://a/1"]
         assert list(crawler.processed_urls) == ["http://b/"]
-        assert [crawler.failed_urls[page].split(":")[0] for page in pages] == ["NetworkError"] * 3 + [
+        assert [crawler.failed_urls[page].split(":")[0] for page in pages] == ["NetworkError"] * 2 + [
             "CircuitOpenError"
-        ]
+        ] * 2
         assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
         messages = [record.getMessage() for record in caplog.records]
+        assert any(message.startswith("Deferred http://a/0 for 0.") for message in messages)
         assert any(message.startswith("Deferred http://a/1 for 0.") for message in messages)
         assert "Gave up on http://a/3: circuit breaker of a opened 3 times" in messages
-        # Deferred pages are counted once, when they are done; a/3 was never requested.
+        # Deferred pages are counted once, when they are done; a/2 and a/3 were never requested.
         stats = crawler.stats.get_stats()
         assert (stats["total_pages"], stats["successful"], stats["failed"]) == (5, 1, 4)
-        assert stats["errors"] == {"NetworkError": 3, "CircuitOpenError": 1}
+        assert stats["errors"] == {"NetworkError": 2, "CircuitOpenError": 2}
         assert stats["top_domains"] == {"a": 4, "b": 1}
 
     async def test_no_probe_after_the_last_opening(self, make_crawler, fake_session):
@@ -877,12 +882,21 @@ class TestCrawlBlockedHost:
         # A probe is still in flight when the pages deferred along with it come back.
         fake_session.latency = 0.01
 
-        # a/0 and a/1 are sent together, a/2 and a/3 are probes. A page
-        # refused while a probe is in flight comes back a second later, when
-        # the circuit is half-open again: a/4 after the third opening.
+        # a/0 and a/1 are sent together and put off when a/0 opens the
+        # circuit, a/1 last, as its failure lands after a/2 to a/4 were
+        # refused; a/0 and a/2 are the probes. A page refused while a probe
+        # is in flight comes back a second later, when the circuit is
+        # half-open again: a/1, a/3 and a/4 after the third opening.
         await crawler.crawl(pages)
 
-        assert fake_session.requested == pages[:4]
+        assert fake_session.requested == ["http://a/0", "http://a/1", "http://a/0", "http://a/2"]
+        assert [crawler.failed_urls[page].split(":")[0] for page in pages] == [
+            "NetworkError",
+            "CircuitOpenError",
+            "NetworkError",
+            "CircuitOpenError",
+            "CircuitOpenError",
+        ]
         assert crawler.failed_urls[pages[4]] == (
             "CircuitOpenError: circuit breaker of a opened 3 times, no more probes in this crawl"
         )
@@ -937,13 +951,90 @@ class TestCrawlBlockedHost:
         fake_session.routes["http://a/1"] = aiohttp.ClientConnectionError("refused")
 
         # a/2 reaches max_pages and closes the queue, then waits for its turn
-        # while a/1 opens the circuit: it is refused, deferred and probes the host later.
+        # while a/1 opens the circuit: both are deferred, a/1 probes the
+        # host and fails, a/2 probes it next and is crawled.
         await crawler.crawl(["http://a/1", "http://a/2"], max_pages=2)
 
-        assert fake_session.requested == ["http://a/1", "http://a/2"]
+        assert fake_session.requested == ["http://a/1", "http://a/1", "http://a/2"]
         assert crawler.failed_urls.keys() == {"http://a/1"}
         assert crawler.processed_urls.keys() == {"http://a/2"}
         assert crawler.crawl_stats().queued == 0
+
+    async def test_pages_in_flight_when_the_circuit_opens_are_put_off_and_crawled_later(
+        self, make_crawler, fake_session, caplog
+    ):
+        # The review's probe: a host answers 503 for a moment. Every page
+        # in flight fails, the first ones open the circuit, and none is
+        # retried, as the breaker refuses the retries; without the crawl
+        # putting them off, they would be the pages lost to the outage.
+        caplog.set_level(logging.INFO, logger="crawler.client")
+        crawler = make_crawler(
+            max_concurrent=4,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=0.05),
+        )
+        pages = [f"http://a/{page}" for page in range(8)]
+        for page in pages[:4]:
+            fake_session.routes[page] = [FakeResponse(status=503), FakeResponse()]
+        fake_session.latency = 0.01
+
+        await crawler.crawl(pages)
+
+        assert crawler.failed_urls == {}
+        assert set(crawler.processed_urls) == set(pages)
+        # The four in flight were requested twice, the others once, after the cooldown.
+        assert sorted(fake_session.requested) == sorted(pages[:4] * 2 + pages[4:])
+        assert crawler.circuit_breaker.times_opened("a") == 1
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred ")]
+        reason = "circuit breaker of a is open (2 of 2 requests failed in 60s)"
+        assert {message.split()[1] for message in deferred if reason in message} == set(pages)
+        stats = crawler.stats.get_stats()
+        assert (stats["total_pages"], stats["successful"], stats["failed"]) == (8, 8, 0)
+
+    async def test_pages_in_flight_when_the_circuit_opens_fail_once_the_host_is_given_up(
+        self, make_crawler, fake_session
+    ):
+        crawler = make_crawler(
+            max_concurrent=4,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=0.05),
+        )
+        pages = [f"http://a/{page}" for page in range(8)]
+        for page in pages:
+            fake_session.routes[page] = FakeResponse(status=503)
+        fake_session.latency = 0.01
+
+        await crawler.crawl(pages)
+
+        # The two probes fail with their own error; the rest were refused.
+        assert set(crawler.failed_urls) == set(pages)
+        failures = Counter(error.split(":")[0] for error in crawler.failed_urls.values())
+        assert failures == {"TransientHTTPError": 2, "CircuitOpenError": 6}
+        assert crawler.processed_urls == {}
+        assert len(fake_session.requested) == 6
+        assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
+
+    async def test_page_whose_probe_fails_is_not_put_off_again(self, make_crawler, fake_session):
+        # One page of a healthy host answers 500 every time, and opens the
+        # circuit. Put off again after its probe failed, it would probe the
+        # host again and again, and the host would be given up for one
+        # broken page.
+        crawler = make_crawler(
+            max_concurrent=1,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+        fake_session.routes["http://a/broken"] = FakeResponse(status=500)
+
+        await crawler.crawl(["http://a/broken", "http://a/1", "http://a/2"])
+
+        assert fake_session.requested == ["http://a/broken", "http://a/broken", "http://a/1", "http://a/2"]
+        assert crawler.failed_urls == {"http://a/broken": "TransientHTTPError: HTTP 500 Error"}
+        assert set(crawler.processed_urls) == {"http://a/1", "http://a/2"}
+        assert crawler.circuit_breaker.times_opened("a") == 2
+        assert crawler.circuit_breaker.state("a") is CircuitState.CLOSED
 
 
 class TestCrawlHeldBackHost:
@@ -1041,6 +1132,40 @@ class TestCrawlHeldBackHost:
         assert set(crawler.processed_urls) == {"http://a/1", "http://a/2"}
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert not [message for message in warnings if "put off" in message]
+
+
+class TestCrawlStorage:
+    async def test_the_storage_is_opened_before_the_first_request(self, make_crawler, fake_session):
+        opened = []
+
+        class Opening(MemoryStorage):
+            async def _open_storage(self) -> None:
+                opened.append(list(fake_session.requested))
+
+        crawler = make_crawler(storage=Opening(), max_depth=0)
+        await crawler.crawl(["http://a/1"])
+
+        assert opened == [[]]
+        assert fake_session.requested == ["http://a/1"]
+
+    async def test_a_storage_that_cannot_be_opened_fails_the_crawl_before_it_requests_anything(
+        self, make_crawler, fake_session
+    ):
+        class Unopenable(MemoryStorage):
+            async def _open_storage(self) -> None:
+                raise OSError("read-only file system")
+
+        crawler = make_crawler(storage=Unopenable(), max_depth=0)
+
+        with pytest.raises(StorageError, match="Unopenable cannot be opened: read-only file system"):
+            await crawler.crawl(["http://a/1"])
+
+        assert fake_session.requested == []
+        assert crawler.crawl_stats().processed == 0
+        # The crawler is free for another crawl.
+        crawler.storage = MemoryStorage()
+        await crawler.crawl(["http://a/1"])
+        assert fake_session.requested == ["http://a/1"]
 
 
 class TestCrawlScope:
@@ -1266,6 +1391,34 @@ class TestRobots:
         assert crawler.unreachable_urls == {"http://a/1": reason, "http://a/2": reason}
         assert crawler.crawl_stats().unreachable == 2
         assert f"Gave up on http://a/1: {reason}" in [r.getMessage() for r in caplog.records]
+
+    async def test_a_site_is_given_up_for_the_failure_of_its_robots_txt_not_for_a_wait_that_ran_out(
+        self, make_crawler, fake_session, monkeypatch
+    ):
+        # The wait for the last download may run out in the very moment the
+        # download fails: the page is told only that robots.txt is being
+        # downloaded, but the site is given up for what the download found.
+        crawler = make_crawler(respect_robots=True, max_depth=0, max_concurrent=1)
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        crawler.ROBOTS_POLL = 0.01
+        fake_session.routes["http://a/robots.txt"] = aiohttp.ClientConnectionError("refused")
+        robots, is_allowed, raced = crawler.robots, crawler.robots.is_allowed, []
+
+        async def is_allowed_as_the_wait_runs_out(url, user_agent="*", *, wait=None):
+            allowed = await is_allowed(url, user_agent, wait=wait)
+            if robots.failed_downloads(url) > AsyncCrawler.MAX_ROBOTS_RETRIES and not raced:
+                raced.append(url)
+                raise TimeoutError
+            return allowed
+
+        monkeypatch.setattr(robots, "is_allowed", is_allowed_as_the_wait_runs_out)
+
+        await crawler.crawl(["http://a/1"])
+
+        assert raced == ["http://a/1"]
+        assert crawler.unreachable_urls == {
+            "http://a/1": "robots.txt is unreachable (NetworkError: ClientConnectionError: refused)"
+        }
 
     async def test_crawl_does_not_wait_for_a_robots_txt_whose_host_does_not_resolve(
         self, make_crawler, fake_session, caplog

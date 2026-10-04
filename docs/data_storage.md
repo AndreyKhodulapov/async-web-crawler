@@ -119,6 +119,14 @@ blocking the event loop, losing pages or writing them twice.
 - **Saving must not kill the crawl**: catch at the boundary of one page, log,
   count, go on. Fetched pages are expensive, a failed save is not a reason to
   throw away the rest.
+- **But open the storage before the crawl.** A storage opened lazily, by
+  its first write, reports a file of the wrong layout or a database that
+  cannot be reached one batch of pages into the crawl, as an error in the
+  log, and the crawl goes on saving nothing. Open it before the first
+  request and let the error fail the crawl: nothing has been fetched yet,
+  and the user gets a message and an exit code instead of an empty file.
+  Keep the overwrite for the first write all the same, so that a crawl
+  that saves nothing leaves the old file alone.
 - **Count honestly**. With batches, "save() did not raise" does not mean
   "written": the record may sit in the buffer, and one failed flush is many
   pages. Count what the storage has actually written out and derive the

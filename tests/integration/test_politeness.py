@@ -471,16 +471,18 @@ class TestCircuitBreaker:
         async with polite(**options) as crawler:
             await crawler.crawl([*blocked, other_host], max_pages=7)
 
-        # The third page opens the circuit; the others wait, and the crawl
-        # goes on to the other host.
+        # The third page opens the circuit and is put off with the others,
+        # having lost its retries to the breaker; the crawl goes on to the
+        # other host.
         assert [path for path, _ in site.log[:4]] == ["/flaky/4"] * 3 + ["/site/b.html"]
-        # The first probe fails and opens the circuit again; the second one succeeds.
-        assert list(crawler.failed_urls) == blocked[:4]
+        # The first probe, the third page again, fails and opens the circuit
+        # again; the second one succeeds.
+        assert list(crawler.failed_urls) == blocked[:3]
         assert set(crawler.failed_urls.values()) == {"TransientHTTPError: HTTP 503 Service Unavailable"}
-        assert list(crawler.processed_urls) == [other_host, *blocked[4:]]
-        assert site.hits["/flaky/4"] == 6
+        assert list(crawler.processed_urls) == [other_host, *blocked[3:]]
+        assert site.hits["/flaky/4"] == 7
         assert crawler.circuit_breaker.get_stats()["127.0.0.1"].times_opened == 2
-        assert crawler.crawl_stats().requests == 7
+        assert crawler.crawl_stats().requests == 8
 
     async def test_one_broken_page_does_not_open_the_circuit(self, url, site):
         # The review's probe: one page answers 503 every time and is retried

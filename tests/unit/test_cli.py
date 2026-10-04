@@ -6,7 +6,7 @@ import pytest
 import yaml
 
 import main
-from crawler import ConfigError, CrawlerConfig
+from crawler import ConfigError, CrawlerConfig, StorageError
 from main import build_config, config_overrides, parse_args
 
 
@@ -206,7 +206,13 @@ def test_problems_of_the_file_are_all_reported(tmp_path, capsys):
 
 @pytest.mark.parametrize(
     ("outcome", "code"),
-    [(0, 0), (1, 1), (OSError("cannot open the log"), 1), (KeyboardInterrupt(), 130)],
+    [
+        (0, 0),
+        (1, 1),
+        (OSError("cannot open the log"), 1),
+        (StorageError("pages.jsonl is not JSON Lines of this storage"), 1),
+        (KeyboardInterrupt(), 130),
+    ],
 )
 def test_exit_code_follows_the_run(outcome, code, monkeypatch, capsys):
     seen = {}
@@ -221,4 +227,4 @@ def test_exit_code_follows_the_run(outcome, code, monkeypatch, capsys):
 
     assert main.main(["--urls", "https://example.com/", "--no-progress"]) == code
     assert seen == {"urls": ("https://example.com/",), "progress": False}
-    assert capsys.readouterr().err == ("error: cannot open the log\n" if isinstance(outcome, OSError) else "")
+    assert capsys.readouterr().err == (f"error: {outcome}\n" if isinstance(outcome, OSError | StorageError) else "")
