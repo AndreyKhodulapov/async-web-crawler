@@ -82,9 +82,12 @@ class CircuitBreaker:
     of the one before. The first failure counts at once, so a host that
     goes down is spotted after its first failed requests, not after their
     retries; a failed retry adds nothing; a retry that succeeds turns the
-    failure into a success, so one broken page retried three times, or a
-    slow host whose pages come through on the second attempt, does not open
-    the circuit. Separate calls to the same URL count separately.
+    failure into a success, so one broken page retried three times does
+    not open the circuit, and neither does a slow host whose pages come
+    through on the second attempt, as long as the retries land before
+    `min_requests` first attempts have failed: with that many requests to
+    the host in flight at once, their timeouts open the circuit before any
+    retry. Separate calls to the same URL count separately.
 
     `failure_threshold=None` turns the breaker off: every request goes through.
     """

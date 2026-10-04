@@ -847,6 +847,29 @@ class TestCrawlBlockedHost:
         )
         assert crawler.circuit_breaker.times_opened("a") == 3
 
+    async def test_no_robots_txt_download_for_a_host_given_up_on(self, make_crawler, fake_session, caplog):
+        # robots.txt of the host fails, each download a probe of its
+        # circuit: after the third opening the page is given up without a
+        # fourth download, as any page of the host is.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(
+            max_concurrent=1,
+            max_depth=0,
+            respect_robots=True,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.02),
+        )
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = aiohttp.ClientConnectionError("refused")
+
+        await crawler.crawl(["http://a/1"])
+
+        assert fake_session.requested == ["http://a/robots.txt"] * AsyncCrawler.MAX_CIRCUIT_OPENINGS
+        assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
+        assert crawler.unreachable_urls == {}
+        assert crawler.failed_urls == {
+            "http://a/1": "CircuitOpenError: circuit breaker of a opened 3 times, no more probes in this crawl"
+        }
+
     async def test_page_refused_after_its_wait_costs_nothing_of_max_pages(self, make_crawler, fake_session):
         crawler = make_crawler(
             max_concurrent=2,
@@ -907,6 +930,25 @@ class TestCrawlHeldBackHost:
         assert warnings.count("a asked to wait 1s (Retry-After); its pages are put off until then") == 1
         deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/")]
         assert len(deferred) == 3
+
+    async def test_page_forbidden_with_a_long_retry_after_fails_at_once(self, make_crawler, fake_session, caplog):
+        # HTTP 403 with a Retry-After: the host is held back as it asked,
+        # but the page is not requested again, it would be forbidden again.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(
+            max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=1, max_delay=0.05)
+        )
+        crawler.MIN_PENALTY_TO_DEFER = 0.05
+        fake_session.routes["http://a/1"] = FakeResponse(status=403, retry_after="1")
+        fake_session.routes["http://a/2"] = FakeResponse(b"ok")
+
+        await crawler.crawl(["http://a/1", "http://a/2"])
+
+        assert fake_session.requested == ["http://a/1", "http://a/2"]
+        assert crawler.failed_urls == {"http://a/1": "PermanentHTTPError: HTTP 403 Error"}
+        assert set(crawler.processed_urls) == {"http://a/2"}
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred ")]
+        assert deferred == ["Deferred http://a/2 for 1.0s: its host is held back"]
 
     async def test_page_asked_to_wait_is_the_last_one_of_max_pages(self, make_crawler, fake_session):
         # The page reached max_pages and closed the queue; put off, it is

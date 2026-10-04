@@ -126,7 +126,10 @@ leaves a failing site alone.
   circuit after a few pages, not after their retries; a failed retry adds
   nothing, and a retry that succeeds turns the failure into a success, so one
   broken URL retried three times does not open the circuit, and neither does a
-  slow host whose pages come through on the second attempt. A retry the
+  slow host whose pages come through on the second attempt, as long as the
+  retries land before `min_requests` first attempts have failed: with that
+  many requests in flight at once, their timeouts open the circuit before
+  any retry. A retry the
   breaker would refuse is not made, and the page fails with the error of its
   last attempt, not with `CircuitOpenError`.
 - Check the circuit before a request waits for the rate limit (no point in

@@ -34,6 +34,7 @@ from crawler.exceptions import (
     NetworkError,
     PageTooLargeError,
     ParseError,
+    PermanentError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     SitemapError,
@@ -796,7 +797,8 @@ class AsyncCrawler:
         logged as a warning once per host, as the crawl may be quiet for
         that long; the page that got it, which the request did not retry,
         comes back with the host too, at most `MAX_WAITS_PER_PAGE` times,
-        then goes to `failed_urls`.
+        then goes to `failed_urls`; a page that got it with a permanent
+        error (HTTP 403) goes there at once.
 
         With `respect_robots`, the links of a page whose <meta name="robots">
         (or <meta> with the robots.txt name of the crawler, "asyncwebcrawler")
@@ -1140,7 +1142,9 @@ class AsyncCrawler:
                     continue
                 # robots.txt and the circuit breaker are checked before the
                 # page counts toward max_pages: a refused page costs no request.
-                refusal = await self._check_robots(url) or self._check_circuit(url) or self._check_probes_left(url)
+                # A host given up on comes first: its robots.txt is not
+                # downloaded either, which would probe its circuit once more.
+                refusal = self._check_probes_left(url) or await self._check_robots(url) or self._check_circuit(url)
                 if refusal is not None:
                     if isinstance(refusal, RobotsDisallowedError):
                         queue.mark_blocked(url, refusal.message)
@@ -1400,7 +1404,10 @@ class AsyncCrawler:
             logger.exception("Unexpected error while saving the last pages of the crawl")
 
     def _check_probes_left(self, url: str) -> CircuitOpenError | None:
-        """In a crawl, a host whose circuit has opened `MAX_CIRCUIT_OPENINGS` times gets no more probes."""
+        """In a crawl, a host whose circuit has opened `MAX_CIRCUIT_OPENINGS` times gets no more probes.
+
+        Checked before robots.txt, whose download would be a probe too.
+        """
         host = get_host(url)
         if host is None or self.circuit_breaker.state(host) is CircuitState.CLOSED:
             return None
@@ -1487,9 +1494,15 @@ class AsyncCrawler:
         queue.defer(url, delay, priority=queue.depth(url))
 
     def _outwaits_retries(self, error: FetchError | None) -> bool:
-        """Whether `error` carries a Retry-After too long for the retry strategy, so the request was not retried."""
+        """Whether `error` carries a Retry-After too long for the retry strategy, so the request was not retried.
+
+        Not for a permanent error, such as HTTP 403 with a Retry-After: the
+        host is held back for as long as it asked, but the page would fail
+        the same way when it comes back.
+        """
         return (
             isinstance(error, HTTPStatusError)
+            and not isinstance(error, PermanentError)
             and error.retry_after is not None
             and error.retry_after > self.retry_strategy.max_delay
         )

@@ -199,8 +199,12 @@ however many attempts it takes, robots.txt downloads included: its first
 failure counts at once, so a host that goes down is spotted after its
 first failed requests; a failed retry adds nothing; a retry that
 succeeds turns the failure into a success. So one broken URL retried
-three times, or a slow host whose pages come through on the second
-attempt, does not open the circuit. Each request of a redirect
+three times does not open the circuit, and neither does a slow host whose
+pages come through on the second attempt, as long as the retries land
+before `min_requests` first attempts have failed: with that many requests
+to the host in flight at once, their timeouts open the circuit before any
+retry, and the probe after the cooldown, a first attempt with the base
+timeout, may open it again. Each request of a redirect
 chain counts for its own host: a link that redirects to a failing host
 counts against that host, not the host of the link.
 The circuit is checked before a request waits for the rate limit, where a
@@ -238,6 +242,9 @@ then`): with one host in the crawl, nothing is requested until it ends.
 The page that got such a Retry-After is not retried by its request, as
 `RetryStrategy` says, but it comes back with the host, up to
 `AsyncCrawler.MAX_WAITS_PER_PAGE` (3) times; then it goes to `failed_urls`.
+A page that got it with a permanent error (HTTP 403 with a Retry-After)
+goes there at once: the host is held back all the same, but the page would
+fail the same way when it came back.
 
 | Parameter | Default | Meaning |
 |-----------|---------|---------|
