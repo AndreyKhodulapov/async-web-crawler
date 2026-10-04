@@ -283,7 +283,10 @@ async def site_page(request: web.Request) -> web.Response:
 
 
 async def js_page(request: web.Request) -> web.Response:
-    """The pages of JS_PAGES, their script and image; any other path under /js/ is a plain page."""
+    """The pages of JS_PAGES, their script and image; any other path under /js/ is a plain page.
+
+    /js/cookie-read sets a cookie for every parameter of its query, as /cookies/set does.
+    """
     request.app[SITE_STATE].record(request)
     if request.path == "/js/app.js":
         return web.Response(text=JS_SCRIPT, content_type="application/javascript")
@@ -292,7 +295,11 @@ async def js_page(request: web.Request) -> web.Response:
     if request.path == "/js/to-private":
         raise web.HTTPFound("/js/private/page")
     html = JS_PAGES.get(request.path, f"<html><body><p>{request.path}</p></body></html>")
-    return web.Response(text=html, content_type="text/html")
+    response = web.Response(text=html, content_type="text/html")
+    if request.path == "/js/cookie-read":
+        for name, value in request.query.items():
+            response.headers.add("Set-Cookie", f"{name}={value}")
+    return response
 
 
 @pytest.fixture(scope="session")

@@ -1,5 +1,6 @@
 """Tests for the contract between the request layer and its transport."""
 
+from collections.abc import Iterable
 from http.cookiejar import Cookie
 
 import aiohttp
@@ -23,6 +24,7 @@ class ScriptedTransport:
         self.requests: list[str] = []
         self.closed = False
         self.resets = 0
+        self.updates: list[tuple[list[Cookie], list[Cookie]]] = []
 
     async def get(
         self,
@@ -48,6 +50,9 @@ class ScriptedTransport:
     def cookies(self) -> list[Cookie]:
         return []
 
+    def update_cookies(self, changed: Iterable[Cookie], removed: Iterable[Cookie]) -> None:
+        self.updates.append((list(changed), list(removed)))
+
 
 def make_fetcher(transport: Transport) -> Fetcher:
     return Fetcher(
@@ -72,6 +77,7 @@ class TestTransportContract:
     def test_the_http_transport_is_a_transport(self) -> None:
         transport = HttpTransport(max_concurrent=1, timeout=TIMEOUT, user_agent="TestBot/1.0", max_page_size=None)
         assert isinstance(transport, Transport)
+        assert isinstance(ScriptedTransport({}), Transport)  # the stand-in keeps up with the contract
 
     async def test_the_fetcher_follows_a_redirect_any_transport_reports(self) -> None:
         transport = ScriptedTransport(

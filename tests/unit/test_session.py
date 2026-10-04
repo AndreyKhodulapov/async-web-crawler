@@ -5,11 +5,13 @@ import stat
 import time
 from http.cookies import SimpleCookie
 
+import aiohttp
 import pytest
 from yarl import URL
 
 from crawler import AsyncCrawler, load_cookies_file, make_cookie, save_cookies_file
 from crawler.session import CookieJar
+from crawler.transport import HttpTransport
 
 HEADER = "# Netscape HTTP Cookie File\n"
 
@@ -209,6 +211,61 @@ class TestCookieJar:
 
         assert summary(exported) == summary(cookies)
         assert [cookie.expires for cookie in sorted(exported, key=lambda cookie: cookie.name)] == [later, None]
+
+    async def test_removed_cookies_go_by_domain_path_and_name(self):
+        jar = CookieJar()
+        jar.add(
+            [
+                make_cookie("sid", "1", "example.com"),
+                make_cookie("sid", "2", "example.com", path="/app"),
+                make_cookie("wide", "3", ".example.org"),
+                make_cookie("other", "4", "example.com"),
+            ]
+        )
+
+        jar.remove([make_cookie("sid", "any value", "example.com"), make_cookie("wide", "", ".example.org")])
+
+        assert summary(jar.export()) == [
+            ("example.com", "/", "other", "4", False),
+            ("example.com", "/app", "sid", "2", False),
+        ]
+
+
+def make_transport(**options) -> HttpTransport:
+    timeout = aiohttp.ClientTimeout(total=5)
+    return HttpTransport(max_concurrent=1, timeout=timeout, user_agent="TestBot/1.0", max_page_size=None, **options)
+
+
+class TestTransportCookies:
+    async def test_cookies_are_updated_in_the_jar(self):
+        transport = make_transport(cookies=[make_cookie("sid", "1", "example.com"), make_cookie("old", "2", "a.test")])
+        transport._get_session()  # the jar is made with the session
+        try:
+            transport.update_cookies(
+                [make_cookie("sid", "new", "example.com"), make_cookie("js", "3", ".example.com")],
+                [make_cookie("old", "", "a.test")],
+            )
+
+            assert summary(transport.cookies()) == [
+                (".example.com", "/", "js", "3", False),
+                ("example.com", "/", "sid", "new", False),
+            ]
+        finally:
+            await transport.close()
+
+    def test_before_the_first_request_the_starting_cookies_are_updated(self):
+        transport = make_transport(cookies=[make_cookie("sid", "1", "example.com"), make_cookie("old", "2", "a.test")])
+
+        transport.update_cookies([make_cookie("sid", "new", "example.com")], [make_cookie("old", "", "a.test")])
+
+        assert summary(transport.cookies()) == [("example.com", "/", "sid", "new", False)]
+
+    def test_without_keep_cookies_none_are_kept(self):
+        transport = make_transport(keep_cookies=False)
+
+        transport.update_cookies([make_cookie("sid", "1", "example.com")], [])
+
+        assert transport.cookies() == []
 
 
 class TestCrawlerArguments:

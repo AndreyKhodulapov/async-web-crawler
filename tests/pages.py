@@ -140,6 +140,17 @@ JS_PAGES = {
         </script></body></html>
     """,
     "/js/big": '<html><body><script>document.body.innerHTML = "<p>" + "x".repeat(20000) + "</p>";</script></body></html>',
+    "/js/cookie-read": """
+        <html><body><p id="out"></p>
+        <script>document.getElementById("out").textContent = "seen:" + document.cookie;</script></body></html>
+    """,
+    "/js/cookie-set": """
+        <html><body><script>
+            document.cookie = "from_js=1; path=/";
+            fetch("/cookies/set?from_fetch=2").then(() => { document.body.innerHTML += '<p id="done">done</p>'; });
+        </script></body></html>
+    """,
+    "/js/cookie-delete": '<html><body><script>document.cookie = "sid=; path=/; max-age=0";</script></body></html>',
     "/js/popup": """
         <html><body><iframe src="/js/framed"></iframe>
         <script>window.open("/js/opened");</script><p>popup</p></body></html>

@@ -237,6 +237,15 @@ class CookieJar(aiohttp.CookieJar):
                 [(cookie.name, morsel)], URL.build(scheme="https", host=cookie.domain.removeprefix("."))
             )
 
+    def remove(self, cookies: Iterable[Cookie]) -> None:
+        """Remove the cookies of the domains, paths and names of `cookies`; the values do not matter."""
+        for cookie in cookies:
+            host, path, name = cookie.domain.removeprefix("."), cookie.path, cookie.name
+            self.clear(lambda morsel: (morsel["domain"], morsel["path"], morsel.key) == (host, path, name))  # noqa: B023, called at once
+            # The mark is by host and name: a cookie of another path may still have it.
+            if not any((morsel["domain"], morsel.key) == (host, name) for morsel in self):
+                self._for_host_only.discard((host, name))
+
     def export(self) -> list[Cookie]:
         """The cookies kept, expired ones left out, as `http.cookiejar` cookies."""
         cookies = []

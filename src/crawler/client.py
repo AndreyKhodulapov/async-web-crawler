@@ -152,7 +152,10 @@ class AsyncCrawler:
     browser, through the limits, the proxies and the cookies of the
     crawler; the browser gets the document as downloaded and loads its
     scripts, styles and data itself, without asking robots.txt, as a
-    browser does. A page that goes to another URL on its own (a
+    browser does. The browser shares the cookies of the crawler both
+    ways, those JavaScript sets included, and its requests carry the
+    `user_agent` and the `headers`; with `keep_cookies=False` every page
+    has a browser of its own, without cookies. A page that goes to another URL on its own (a
     JavaScript or `<meta>` redirect) is followed as a redirect: robots.txt,
     the filters of `crawl()` and `MAX_REDIRECTS` apply to it. A page the
     browser takes longer than `rendering.timeout` to render fails with
@@ -321,7 +324,14 @@ class AsyncCrawler:
         )
         self._transport: Transport = transport
         if rendering is not None:
-            self._transport = BrowserTransport(transport, rendering, user_agent=user_agent, max_page_size=max_page_size)
+            self._transport = BrowserTransport(
+                transport,
+                rendering,
+                user_agent=user_agent,
+                max_page_size=max_page_size,
+                headers=headers,
+                keep_cookies=keep_cookies,
+            )
         self._proxies = proxies
         self._rendering = rendering
         self._fetcher = Fetcher(

@@ -97,6 +97,10 @@ class Transport(Protocol):
         """The cookies the transport keeps, those sites have set included."""
         ...
 
+    def update_cookies(self, changed: Iterable[Cookie], removed: Iterable[Cookie]) -> None:
+        """Keep the `changed` cookies, in place of those of their domain, path and name, and drop the `removed` ones."""
+        ...
+
 
 class HttpTransport:
     """Sends GET requests over one aiohttp session, without following redirects: a `Transport`.
@@ -200,6 +204,21 @@ class HttpTransport:
         if not self._keep_cookies:
             return []
         return list(self._initial_cookies) if self._cookie_jar is None else self._cookie_jar.export()
+
+    def update_cookies(self, changed: Iterable[Cookie], removed: Iterable[Cookie]) -> None:
+        """Keep the `changed` cookies and drop the `removed` ones, as `Transport.update_cookies` says; none without `keep_cookies`."""
+        if not self._keep_cookies:
+            return
+        changed, removed = list(changed), list(removed)
+        if self._cookie_jar is not None:
+            self._cookie_jar.remove(removed)
+            self._cookie_jar.add(changed)
+            return
+        # Before the first request: the session takes the starting cookies when it is made.
+        replaced = {(cookie.domain, cookie.path, cookie.name) for cookie in [*changed, *removed]}
+        self._initial_cookies = [
+            cookie for cookie in self._initial_cookies if (cookie.domain, cookie.path, cookie.name) not in replaced
+        ] + changed
 
     async def get(
         self,

@@ -11,15 +11,17 @@ import importlib.util
 import logging
 import os
 import time
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from http.cookiejar import Cookie
-from typing import TYPE_CHECKING, NamedTuple
+from http.cookiejar import HTTPONLY_ATTR, Cookie
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import aiohttp
 
 from crawler.exceptions import CrawlerClosedError, FetchTimeoutError, PageTooLargeError, RenderError
 from crawler.filters import UrlFilter
 from crawler.parser import is_html_content_type
+from crawler.session import cookie_domain_problem, cookie_name_problem, cookie_value_problem, make_cookie
 from crawler.transport import Response, Transport
 
 if TYPE_CHECKING:
@@ -137,6 +139,123 @@ async def browser_problem() -> str | None:
     return None if os.path.exists(executable) else _NO_CHROMIUM
 
 
+_Key = tuple[str, str, str]  # the domain, path and name of a cookie
+
+
+class CookieSync:
+    """Keeps the cookies of a browser context in step with those of the jar of the crawler, both ways.
+
+    Before a page, what the jar has changed since the last time goes to
+    the browser (`to_browser`); after it, what the browser has changed
+    goes to the jar (`to_jar`). Each side is compared with how it was the
+    last time, so neither undoes what the other changed meanwhile: a
+    page that opens while another one runs does not overwrite with the
+    jar the cookies the other one's JavaScript set, and the cookies the
+    crawler gets while a page runs are not lost. When both sides change
+    a cookie, the browser wins.
+
+    `sent` and `written` record how a side kept what it was given,
+    which may differ from what it was given (Chromium refuses some
+    cookies and shortens long lives): it is not taken for a change.
+
+    Cookies the crawler would not keep or send stay in the browser:
+    those of IP addresses, and those with a name or a value it cannot
+    send (see `syncable`). One per context; `lock` keeps the steps of
+    two pages apart.
+    """
+
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self._jar: dict[_Key, Cookie] = {}  # how each side was the last time
+        self._browser: dict[_Key, Cookie] = {}
+
+    def to_browser(self, jar: Iterable[Cookie]) -> tuple[list[Cookie], list[Cookie]]:
+        """The cookies the jar has changed and those it has dropped since the last time."""
+        now = _by_key(jar)
+        changes = _changes(self._jar, now)
+        self._jar = now
+        return changes
+
+    def sent(self, cookies: Iterable[Cookie], browser: Iterable[Cookie]) -> None:
+        """How the browser keeps `cookies`, just sent to it: as it has them in `browser`, or not at all."""
+        _record(self._browser, cookies, _by_key(browser))
+
+    def to_jar(self, browser: Iterable[Cookie]) -> tuple[list[Cookie], list[Cookie]]:
+        """The cookies the browser has changed and those it has dropped since the last time."""
+        now = _by_key(browser)
+        changes = _changes(self._browser, now)
+        self._browser = now
+        return changes
+
+    def written(self, cookies: Iterable[Cookie], jar: Iterable[Cookie]) -> None:
+        """How the jar keeps `cookies`, just written to it: as it has them in `jar`, or not at all."""
+        _record(self._jar, cookies, _by_key(jar))
+
+
+def syncable(cookie: Cookie) -> bool:
+    """Whether the crawler keeps and sends `cookie`, so that it goes between the browser and the jar."""
+    return (
+        cookie_domain_problem(cookie.domain) is None
+        and cookie_name_problem(cookie.name) is None
+        and cookie_value_problem(cookie.value or "") is None
+    )
+
+
+def _key(cookie: Cookie) -> _Key:
+    return cookie.domain, cookie.path, cookie.name
+
+
+def _state(cookie: Cookie) -> tuple[object, ...]:
+    return cookie.value, cookie.expires, cookie.secure, cookie.has_nonstandard_attr(HTTPONLY_ATTR)
+
+
+def _by_key(cookies: Iterable[Cookie]) -> dict[_Key, Cookie]:
+    return {_key(cookie): cookie for cookie in cookies if syncable(cookie)}
+
+
+def _changes(before: dict[_Key, Cookie], now: dict[_Key, Cookie]) -> tuple[list[Cookie], list[Cookie]]:
+    changed = [cookie for key, cookie in now.items() if key not in before or _state(before[key]) != _state(cookie)]
+    removed = [cookie for key, cookie in before.items() if key not in now]
+    return changed, removed
+
+
+def _record(side: dict[_Key, Cookie], cookies: Iterable[Cookie], now: dict[_Key, Cookie]) -> None:
+    for key in map(_key, cookies):
+        if key in now:
+            side[key] = now[key]
+        else:
+            side.pop(key, None)
+
+
+def to_playwright(cookie: Cookie) -> dict[str, Any]:
+    """`cookie` as Playwright adds it to a context; a domain without "." in front is for its host only."""
+    result: dict[str, Any] = {
+        "name": cookie.name,
+        "value": cookie.value or "",
+        "domain": cookie.domain,
+        "path": cookie.path,
+        "secure": cookie.secure,
+        "httpOnly": cookie.has_nonstandard_attr(HTTPONLY_ATTR),
+    }
+    if cookie.expires is not None:
+        result["expires"] = cookie.expires
+    return result
+
+
+def from_playwright(cookie: Mapping[str, Any]) -> Cookie:
+    """A cookie of a context, as Playwright gives it, as `http.cookiejar` has it; -1 as the expiry is for the session."""
+    expires = cookie.get("expires", -1)
+    return make_cookie(
+        cookie.get("name", ""),
+        cookie.get("value", ""),
+        cookie.get("domain", ""),
+        path=cookie.get("path", "/"),
+        secure=cookie.get("secure", False),
+        expires=int(expires) if expires > 0 else None,
+        http_only=cookie.get("httpOnly", False),
+    )
+
+
 class Rendered(NamedTuple):
     """What the browser made of a page: its HTML, or the URL it went to on its own instead."""
 
@@ -160,6 +279,13 @@ class BrowserTransport:
     there: the browser is stopped, and the page comes back as a redirect
     to that URL, for the caller to check and follow as any other.
 
+    The browser shares the cookies of `http`: it gets those `http` keeps
+    before every page, and they get those the page set (by JavaScript or
+    in the responses to its requests) after it, see `CookieSync`. With
+    `keep_cookies=False` nothing goes between them, and each page has a
+    browser of its own. The requests of the browser carry `user_agent`
+    and the `headers`.
+
     A rendered page keeps the status, the headers and the final URL of
     its download; its content is the HTML of the page once rendered,
     which fails with `PageTooLargeError` over `max_page_size` bytes. A
@@ -168,10 +294,21 @@ class BrowserTransport:
     start or crashes fails it with `RenderError` (see `Renderer`).
     """
 
-    def __init__(self, http: Transport, rendering: Rendering, *, user_agent: str, max_page_size: int | None) -> None:
+    def __init__(
+        self,
+        http: Transport,
+        rendering: Rendering,
+        *,
+        user_agent: str,
+        max_page_size: int | None,
+        headers: Mapping[str, str] | None = None,
+        keep_cookies: bool = True,
+    ) -> None:
         self.http = http
         self.rendering = rendering
-        self.renderer = Renderer(rendering, user_agent=user_agent)
+        self.renderer = Renderer(
+            rendering, user_agent=user_agent, headers=headers, cookies=http if keep_cookies else None
+        )
         self._max_page_size = max_page_size
 
     async def get(
@@ -221,6 +358,9 @@ class BrowserTransport:
     def cookies(self) -> list[Cookie]:
         return self.http.cookies()
 
+    def update_cookies(self, changed: Iterable[Cookie], removed: Iterable[Cookie]) -> None:
+        self.http.update_cookies(changed, removed)
+
 
 class _LaunchError(Exception):
     """The browser could not start; the message says why, for every page that needed it."""
@@ -240,11 +380,15 @@ class Renderer:
     """Renders pages in one headless Chromium, at most `rendering.max_open_pages` at once.
 
     The browser is started for the first page and closed by `close()`.
-    Its pages share one context (cookies, cache), with the `user_agent`
-    of the crawler. Every request of a page goes through `_route`: the
-    page gets its document as downloaded, its own navigations are
-    stopped and reported, frames and pop-ups get nothing, and the
-    `block_resources` are not requested.
+    Its pages share one context (cookies, cache), whose cookies are kept
+    in step with those of `cookies`, the transport of the crawler, around
+    every page (see `CookieSync`). Without `cookies`, each page has a
+    context of its own, closed after it: nothing goes from one page to
+    the next. The requests of the browser carry the `user_agent` and the
+    `headers` of the crawler. Every request of a page goes through
+    `_route`: the page gets its document as downloaded, its own
+    navigations are stopped and reported, frames and pop-ups get
+    nothing, and the `block_resources` are not requested.
 
     A browser that crashes fails the pages being rendered with
     `RenderError` and is started again for the next one, once: after
@@ -254,14 +398,24 @@ class Renderer:
 
     MAX_LAUNCHES = 2
 
-    def __init__(self, rendering: Rendering, *, user_agent: str) -> None:
+    def __init__(
+        self,
+        rendering: Rendering,
+        *,
+        user_agent: str,
+        headers: Mapping[str, str] | None = None,
+        cookies: Transport | None = None,
+    ) -> None:
         self.rendering = rendering
         self._user_agent = user_agent
+        self._headers = dict(headers or {})
+        self._cookies = cookies
         self._pages = asyncio.Semaphore(rendering.max_open_pages)
         self._lock = asyncio.Lock()  # one launch at a time
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
-        self._context: BrowserContext | None = None
+        self._context: BrowserContext | None = None  # shared by the pages, with cookies
+        self._sync: CookieSync | None = None  # of that context
         self._tabs: dict[Page, _Tab] = {}
         self._launches = 0
         self._failure: str | None = None  # why the browser is not used any more
@@ -281,13 +435,15 @@ class Renderer:
             CrawlerClosedError: the renderer is closed.
         """
         async with self._pages:
-            context = await self._get_context(url)
+            context, sync = await self._get_context(url)
             from playwright.async_api import Error as PlaywrightError
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
             tab = _Tab(document)
             page: Page | None = None
             try:
+                if sync is not None:
+                    await self._send_cookies(context, sync)
                 page = await context.new_page()
                 self._tabs[page] = tab
                 page.on("crash", lambda _: setattr(tab, "crashed", True))
@@ -302,6 +458,35 @@ class Renderer:
                     self._tabs.pop(page, None)
                     with contextlib.suppress(Exception):
                         await page.close()
+                # The cookies a page set before it failed are kept as well. A browser
+                # that crashed meanwhile has failed the page already.
+                with contextlib.suppress(Exception):
+                    await (context.close() if sync is None else self._take_cookies(context, sync))
+
+    async def _send_cookies(self, context: "BrowserContext", sync: CookieSync) -> None:
+        """Give the context the cookies the crawler has changed since the last time."""
+        assert self._cookies is not None
+        async with sync.lock:
+            changed, removed = sync.to_browser(self._cookies.cookies())
+            if not changed and not removed:
+                return
+            if changed:
+                await context.add_cookies([to_playwright(cookie) for cookie in changed])  # type: ignore[arg-type]
+            for cookie in removed:
+                await context.clear_cookies(name=cookie.name, domain=cookie.domain, path=cookie.path)
+            sync.sent([*changed, *removed], map(from_playwright, await context.cookies()))
+            logger.debug("Gave the browser %d cookies, took %d away", len(changed), len(removed))
+
+    async def _take_cookies(self, context: "BrowserContext", sync: CookieSync) -> None:
+        """Give the crawler the cookies the context has changed since the last time."""
+        assert self._cookies is not None
+        async with sync.lock:
+            changed, removed = sync.to_jar(map(from_playwright, await context.cookies()))
+            if not changed and not removed:
+                return
+            self._cookies.update_cookies(changed, removed)
+            sync.written([*changed, *removed], self._cookies.cookies())
+            logger.debug("Took %d cookies from the browser, %d removed", len(changed), len(removed))
 
     async def _load(self, page: "Page", url: str, tab: _Tab) -> Rendered:
         """Load the page and wait for it, unless it goes to another URL meanwhile."""
@@ -374,37 +559,57 @@ class Renderer:
         with contextlib.suppress(Exception):
             await popup.close()
 
-    def _error(self, url: str, tab: _Tab, exc: Exception) -> Exception:
+    def _error(self, url: str, tab: _Tab | None, exc: Exception) -> Exception:
         """The error to fail `url` with after a failure of the browser."""
         if self._closed:
             return CrawlerClosedError(url, "crawler is closed")
-        if tab.crashed:
+        if tab is not None and tab.crashed:
             return RenderError(url, "the page crashed in the browser")
         if not self.running:
             return RenderError(url, "the browser crashed")
         return RenderError(url, f"browser: {_first_line(exc)}")
 
-    async def _get_context(self, url: str) -> "BrowserContext":
-        """The context of the running browser, started now if there is none."""
+    async def _get_context(self, url: str) -> tuple["BrowserContext", CookieSync | None]:
+        """The context to render a page in, and what keeps its cookies in step; the browser is started now if it is not running.
+
+        Without cookies, it is a context of the page's own, with no
+        `CookieSync`, to close after the page.
+        """
         async with self._lock:
             if self._closed:
                 raise CrawlerClosedError(url, "crawler is closed")
-            if self._context is not None and self.running:
-                return self._context
-            if self._failure is None and self._launches == self.MAX_LAUNCHES:
-                self._failure = f"the browser crashed {self._launches} times; pages are not rendered any more"
-            if self._failure is not None:
-                raise RenderError(url, self._failure)
-            await self._shutdown()  # what is left of a crashed browser
-            self._launches += 1
-            try:
-                return await self._launch()
-            except _LaunchError as error:
-                self._failure = str(error)
-                await self._shutdown()
-                raise RenderError(url, self._failure) from error.__cause__
+            if not self.running:
+                await self._start(url)
+            browser = self._browser
+            assert browser is not None
+            from playwright.async_api import Error
 
-    async def _launch(self) -> "BrowserContext":
+            try:
+                if self._cookies is None:
+                    return await self._new_context(browser), None
+                if self._context is None:
+                    self._context, self._sync = await self._new_context(browser), CookieSync()
+                assert self._sync is not None
+                return self._context, self._sync
+            except Error as exc:
+                raise self._error(url, None, exc) from exc
+
+    async def _start(self, url: str) -> None:
+        """Start the browser, for the first time or after it crashed, unless it may not be any more."""
+        if self._failure is None and self._launches == self.MAX_LAUNCHES:
+            self._failure = f"the browser crashed {self._launches} times; pages are not rendered any more"
+        if self._failure is not None:
+            raise RenderError(url, self._failure)
+        await self._shutdown()  # what is left of a crashed browser
+        self._launches += 1
+        try:
+            await self._launch()
+        except _LaunchError as error:
+            self._failure = str(error)
+            await self._shutdown()
+            raise RenderError(url, self._failure) from error.__cause__
+
+    async def _launch(self) -> None:
         try:
             from playwright.async_api import Error, async_playwright
         except ImportError as exc:
@@ -412,16 +617,25 @@ class Renderer:
         try:
             self._playwright = await async_playwright().start()
             self._browser = await self._playwright.chromium.launch()
-            self._browser.on("disconnected", self._on_disconnected)
-            # Service workers would take requests past the routing of the context.
-            context = await self._browser.new_context(user_agent=self._user_agent, service_workers="block")
-            await context.route("**/*", self._route)
         except Error as exc:
             if "Executable doesn't exist" in str(exc):
                 raise _LaunchError(_NO_CHROMIUM) from exc
             raise _LaunchError(f"the browser could not start: {_first_line(exc)}") from exc
-        self._context = context
+        self._browser.on("disconnected", self._on_disconnected)
         logger.info("Started Chromium %s to render pages", self._browser.version)
+
+    async def _new_context(self, browser: "Browser") -> "BrowserContext":
+        """A context of `browser` whose requests are those of the crawler and go through `_route`."""
+        # Service workers would take requests past the routing of the context.
+        context = await browser.new_context(
+            user_agent=self._user_agent, extra_http_headers=self._headers, service_workers="block"
+        )
+        try:
+            await context.route("**/*", self._route)
+        except BaseException:
+            with contextlib.suppress(Exception):
+                await context.close()
+            raise
         return context
 
     def _on_disconnected(self, browser: "Browser") -> None:
@@ -452,6 +666,7 @@ class Renderer:
                 with contextlib.suppress(Exception):
                     await close()
         self._context = self._browser = self._playwright = None
+        self._sync = None
 
 
 def _first_line(exc: BaseException) -> str:

@@ -1,13 +1,23 @@
 """Unit tests for rendering without a browser: its settings, which pages go to the browser, its errors."""
 
 import sys
+import time
 
 import aiohttp
 import pytest
 from test_transport_contract import ScriptedTransport, make_fetcher, page
 
-from crawler import AsyncCrawler, CrawlerClosedError, PageTooLargeError, RenderError, Rendering
-from crawler.rendering import BrowserTransport, Rendered, Renderer, browser_problem, playwright_problem
+from crawler import AsyncCrawler, CrawlerClosedError, PageTooLargeError, RenderError, Rendering, make_cookie
+from crawler.rendering import (
+    BrowserTransport,
+    CookieSync,
+    Rendered,
+    Renderer,
+    browser_problem,
+    from_playwright,
+    playwright_problem,
+    to_playwright,
+)
 from crawler.transport import HttpTransport, Response, Transport
 
 URL = "https://a.test/page"
@@ -187,6 +197,22 @@ class TestBrowserTransport:
         assert transport.cookies() == []
         assert isinstance(transport, Transport)
 
+    def test_cookies_are_updated_in_the_session(self) -> None:
+        transport, http, _ = make_transport({})
+        cookie, gone = make_cookie("sid", "1", "a.test"), make_cookie("old", "", "a.test")
+
+        transport.update_cookies([cookie], [gone])
+
+        assert http.updates == [([cookie], [gone])]
+
+    def test_the_browser_shares_the_cookies_and_headers_of_the_crawler(self) -> None:
+        http = ScriptedTransport({})
+        shared = BrowserTransport(http, DEFAULT, user_agent="TestBot/1.0", max_page_size=None, headers={"X-Key": "1"})
+        alone = BrowserTransport(http, DEFAULT, user_agent="TestBot/1.0", max_page_size=None, keep_cookies=False)
+
+        assert (shared.renderer._cookies, shared.renderer._headers) == (http, {"X-Key": "1"})
+        assert (alone.renderer._cookies, alone.renderer._headers) == (None, {})
+
 
 class TestRenderErrors:
     async def test_without_playwright_pages_fail_with_the_command_to_install_it(self, monkeypatch) -> None:
@@ -240,3 +266,133 @@ class TestInstallation:
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", str(tmp_path))  # where Playwright looks for its browsers
 
         assert await browser_problem() == "Chromium is not installed; run: playwright install chromium"
+
+
+def names(cookies) -> list[tuple[str, str, str]]:
+    return sorted((cookie.domain, cookie.name, cookie.value) for cookie in cookies)
+
+
+SID = make_cookie("sid", "1", "a.test")
+LANG = make_cookie("lang", "en", ".a.test")
+
+
+class TestCookieSync:
+    def test_the_jar_goes_to_the_browser_once(self) -> None:
+        sync = CookieSync()
+
+        assert sync.to_browser([SID, LANG]) == ([SID, LANG], [])
+        assert sync.to_browser([SID, LANG]) == ([], [])
+
+    def test_only_what_the_jar_changed_goes_to_the_browser(self) -> None:
+        sync = CookieSync()
+        sync.to_browser([SID, LANG])
+        changed = make_cookie("sid", "2", "a.test")
+
+        assert sync.to_browser([changed]) == ([changed], [LANG])
+
+    def test_what_the_browser_changed_goes_to_the_jar_and_not_back(self) -> None:
+        sync = CookieSync()
+        sync.sent(sync.to_browser([SID])[0], [SID])
+        made = make_cookie("consent", "yes", "a.test")
+        changed = make_cookie("sid", "2", "a.test")
+
+        assert names(sync.to_jar([changed, made])[0]) == names([changed, made])
+        sync.written([changed, made], [changed, made])
+        assert sync.to_browser([changed, made]) == ([], [])
+
+    def test_a_cookie_the_site_deleted_is_removed_from_the_jar(self) -> None:
+        sync = CookieSync()
+        sync.sent(sync.to_browser([SID, LANG])[0], [SID, LANG])
+
+        assert sync.to_jar([LANG]) == ([], [SID])
+
+    def test_a_cookie_the_browser_refused_is_not_taken_for_deleted(self) -> None:
+        sync = CookieSync()
+        sync.sent(sync.to_browser([SID, LANG])[0], [LANG])  # Chromium did not keep sid
+
+        assert sync.to_jar([LANG]) == ([], [])
+        assert sync.to_browser([SID, LANG]) == ([], [])  # nor sent again and again
+
+    def test_a_page_opened_meanwhile_does_not_overwrite_what_another_page_set(self) -> None:
+        sync = CookieSync()
+        sync.sent(sync.to_browser([SID])[0], [SID])
+        # The script of page A sets a cookie; the crawler gets one for page B meanwhile.
+        by_script = make_cookie("sid", "from-script", "a.test")
+        by_crawler = make_cookie("token", "t", "a.test")
+
+        changed, removed = sync.to_browser([SID, by_crawler])  # page B opens
+        assert (changed, removed) == ([by_crawler], [])
+        sync.sent(changed, [by_script, by_crawler])
+
+        # Page A ends: its cookie goes to the jar, that of the crawler does not come back.
+        assert sync.to_jar([by_script, by_crawler]) == ([by_script], [])
+
+    def test_a_cookie_both_changed_is_that_of_the_browser(self) -> None:
+        sync = CookieSync()
+        sync.sent(sync.to_browser([SID])[0], [SID])
+        in_browser = make_cookie("sid", "browser", "a.test")
+
+        # The crawler got sid=jar meanwhile: the jar takes that of the browser in its place.
+        assert sync.to_jar([in_browser]) == ([in_browser], [])
+        sync.written([in_browser], [in_browser])
+        assert sync.to_browser([in_browser]) == ([], [])
+
+    def test_how_the_jar_keeps_a_cookie_is_not_a_change(self) -> None:
+        sync = CookieSync()
+        sync.sent(sync.to_browser([])[0], [])
+        given = make_cookie("sid", "1", "a.test", expires=int(time.time()) + 10**9)
+        kept = make_cookie("sid", "1", "a.test", expires=int(time.time()) + 3600)
+
+        sync.written(sync.to_jar([given])[0], [kept])
+
+        assert sync.to_browser([kept]) == ([], [])
+
+    @pytest.mark.parametrize(
+        "cookie",
+        [
+            make_cookie("sid", "1", "127.0.0.1"),  # the crawler keeps no cookies of IP addresses
+            make_cookie("note", "two words", "a.test"),  # nor sends a value with a space
+            make_cookie("bad name", "1", "a.test"),
+        ],
+    )
+    def test_cookies_the_crawler_cannot_send_stay_in_the_browser(self, cookie) -> None:
+        sync = CookieSync()
+        sync.sent(sync.to_browser([])[0], [])
+
+        assert sync.to_jar([cookie]) == ([], [])
+        assert sync.to_browser([]) == ([], [])  # and are not taken away from it
+
+
+class TestPlaywrightCookies:
+    def test_a_cookie_goes_to_playwright_with_its_scope(self) -> None:
+        later = int(time.time()) + 3600
+        assert to_playwright(make_cookie("sid", "1", "a.test", secure=True, http_only=True, expires=later)) == {
+            "name": "sid",
+            "value": "1",
+            "domain": "a.test",
+            "path": "/",
+            "secure": True,
+            "httpOnly": True,
+            "expires": later,
+        }
+        assert "expires" not in to_playwright(LANG)  # a session cookie
+
+    def test_a_cookie_of_playwright_comes_back_as_it_was(self) -> None:
+        later = int(time.time()) + 3600
+        for cookie in (make_cookie("sid", "1", "a.test", secure=True, http_only=True, expires=later), LANG):
+            back = from_playwright(to_playwright(cookie) | {"sameSite": "Lax"})
+            assert (back.domain, back.path, back.name, back.value, back.secure, back.expires) == (
+                cookie.domain,
+                cookie.path,
+                cookie.name,
+                cookie.value,
+                cookie.secure,
+                cookie.expires,
+            )
+            assert back.has_nonstandard_attr("HttpOnly") == cookie.has_nonstandard_attr("HttpOnly")
+
+    def test_the_expiry_of_playwright_is_in_whole_seconds_and_minus_one_for_the_session(self) -> None:
+        cookie = {"name": "sid", "value": "1", "domain": "a.test", "path": "/", "secure": False, "httpOnly": False}
+
+        assert from_playwright(cookie | {"expires": 1791140938.75}).expires == 1791140938
+        assert from_playwright(cookie | {"expires": -1}).expires is None

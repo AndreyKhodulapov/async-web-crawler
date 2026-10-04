@@ -10,13 +10,17 @@ from helpers import BOT, FAST_CONFIG, UNTHROTTLED
 
 import main
 from crawler import (
+    AdvancedCrawler,
     AsyncCrawler,
     CircuitBreaker,
+    CrawlerConfig,
     FetchTimeoutError,
     PageTooLargeError,
     RenderError,
     Rendering,
     RobotsDisallowedError,
+    load_cookies_file,
+    make_cookie,
 )
 from crawler.rendering import browser_problem
 
@@ -176,6 +180,80 @@ async def test_the_browser_crashed_is_started_again_once(url, site):
     assert site.hits["/js/target"] == 3
     breaker = crawler.circuit_breaker.get_stats()["127.0.0.1"]
     assert (breaker.state, breaker.failures) == ("closed", 0)
+
+
+# aiohttp keeps no cookies of IP addresses, so the tests of cookies reach the site by its name.
+HOST = "localhost"
+# /js/cookie-set is done once its request has come back.
+COOKIES_SET = Rendering(wait_until="networkidle")
+
+
+async def test_cookies_of_the_crawler_and_of_the_page_itself_are_seen_by_javascript(url):
+    async with make_crawler(cookies=[make_cookie("given", "1", HOST)]) as crawler:
+        # The document sets doc=2 as it is downloaded by the crawler, not by the browser.
+        page = await crawler.fetch_and_parse(url("/js/cookie-read?doc=2", HOST))
+
+    assert "given=1" in page["text"]
+    assert "doc=2" in page["text"]
+
+
+async def test_cookies_javascript_and_its_requests_set_go_with_the_next_page(url):
+    async with make_crawler(COOKIES_SET) as crawler:
+        await crawler.fetch_url(url("/js/cookie-set", HOST))
+        # The document of the next page is downloaded by the crawler.
+        page = await crawler.fetch_url(url("/cookies/echo", HOST))
+        cookies = {cookie.name: cookie.value for cookie in crawler.export_cookies()}
+
+    assert "cookie:from_js=1" in page
+    assert "cookie:from_fetch=2" in page
+    assert cookies == {"from_js": "1", "from_fetch": "2"}
+
+
+async def test_a_cookie_javascript_deletes_is_deleted_for_the_crawler(url):
+    async with make_crawler(cookies=[make_cookie("sid", "1", HOST), make_cookie("lang", "en", HOST)]) as crawler:
+        await crawler.fetch_url(url("/js/cookie-delete", HOST))
+
+        assert [cookie.name for cookie in crawler.export_cookies()] == ["lang"]
+
+
+async def test_without_keep_cookies_a_page_sees_no_cookie_of_another(url):
+    async with make_crawler(COOKIES_SET, keep_cookies=False) as crawler:
+        await crawler.fetch_url(url("/js/cookie-set", HOST))
+        page = await crawler.fetch_and_parse(url("/js/cookie-read?doc=2", HOST))
+
+        assert crawler.export_cookies() == []
+    assert "seen:" in page["text"]
+    assert "from_js" not in page["text"]
+    assert "doc=2" not in page["text"]
+
+
+async def test_headers_of_the_crawler_reach_the_requests_of_the_browser(url, site):
+    async with make_crawler(headers={"X-Key": "1", "Accept-Language": "de"}) as crawler:
+        await crawler.fetch_url(url("/js/links"))
+
+    assert site.headers["/js/app.js"]["X-Key"] == "1"
+    assert site.headers["/js/app.js"]["Accept-Language"] == "de"
+    assert site.headers["/js/app.js"]["User-Agent"] == BOT
+
+
+async def test_saved_cookies_hold_those_javascript_set(url, tmp_path):
+    saved = tmp_path / "cookies.txt"
+    config = CrawlerConfig.from_dict(
+        {
+            **FAST_CONFIG,
+            "urls": [url("/js/cookie-set", HOST)],
+            "rendering": {"mode": "always", "wait_for": "#done"},
+            "session": {"save_cookies": str(saved)},
+        }
+    )
+
+    async with AdvancedCrawler(config) as crawler:
+        await crawler.crawl()
+
+    assert sorted((cookie.domain, cookie.name, cookie.value) for cookie in load_cookies_file(saved)) == [
+        (HOST, "from_fetch", "2"),
+        (HOST, "from_js", "1"),
+    ]
 
 
 async def test_close_ends_the_browser_and_its_processes(url):
