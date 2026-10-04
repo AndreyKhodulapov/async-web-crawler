@@ -62,7 +62,7 @@ def test_timeout_options_configure_the_crawler():
         ["crawl", "--connect-timeout", "1", "--read-timeout", "2", "--total-timeout", "3", "--timeout-growth", "2"]
     )
     crawler = make_crawler(args)
-    timeout = crawler._timeout_for(retries=1)
+    timeout = crawler._fetcher._timeout_for(retries=1)
     assert (timeout.connect, timeout.sock_read, timeout.total) == (2, 4, 6)
 
 

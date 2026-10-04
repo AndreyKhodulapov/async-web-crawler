@@ -634,7 +634,7 @@ and the overrides are described in the [configuration guide](configuration.md).
 
 ## Logging
 
-Every module logs to a logger named after it (`crawler.client`,
+Every module logs to a logger named after it (`crawler.fetching`,
 `crawler.retry`, ...). `configure_logging` sends the records to the console
 and, given a file, to that file as well:
 
@@ -647,14 +647,14 @@ configure_logging("INFO", "crawler.log", max_bytes=10 * 1024 * 1024, backup_coun
 The console (stderr) gets a line of text per record:
 
 ```
-19:41:40 | INFO    | crawler.client | Fetched https://example.com/: status=200 size=1256B elapsed=0.10s
+19:41:40 | INFO    | crawler.fetching | Fetched https://example.com/: status=200 size=1256B elapsed=0.10s
 ```
 
 The file gets JSON Lines, an object per record, so it can be read by
 `jq` or loaded by a log collector as it is:
 
 ```json
-{"time": "2026-10-02T16:41:40.438+00:00", "level": "INFO", "logger": "crawler.client", "message": "Fetched https://example.com/: status=200 size=1256B elapsed=0.10s"}
+{"time": "2026-10-02T16:41:40.438+00:00", "level": "INFO", "logger": "crawler.fetching", "message": "Fetched https://example.com/: status=200 size=1256B elapsed=0.10s"}
 ```
 
 `time` is UTC in ISO 8601; a record logged with an exception has its

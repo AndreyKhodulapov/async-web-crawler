@@ -181,7 +181,7 @@ async def test_site_without_sitemaps_in_robots_txt(url, site):
 async def test_sitemap_waits_for_robots_txt_that_is_down_for_a_moment(url, site, caplog):
     # robots.txt answers 503 to the first download: a crawl fed by the
     # sitemap alone waits for it instead of ending with no pages.
-    caplog.set_level(logging.INFO, logger="crawler.client")
+    caplog.set_level(logging.INFO, logger="crawler")
     site.robots, site.robots_failures = "", 1
     site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"), url("/site/c.html"))}
     async with make_crawler(respect_robots=True) as crawler:
@@ -197,7 +197,7 @@ async def test_sitemap_waits_for_robots_txt_that_is_down_for_a_moment(url, site,
 
 
 async def test_sitemaps_named_in_robots_txt_wait_for_it_too(url, site, caplog):
-    caplog.set_level(logging.INFO, logger="crawler.client")
+    caplog.set_level(logging.INFO, logger="crawler")
     site.robots = f"Sitemap: {url(SITEMAP)}\nUser-agent: *\nDisallow:"
     site.robots_failures = 1
     site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"), url("/site/c.html"))}
@@ -217,7 +217,7 @@ async def test_sitemap_of_a_site_whose_robots_txt_stays_down_is_left_out(url, si
     site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"))}
     async with make_crawler(respect_robots=True) as crawler:
         crawler.robots.UNREACHABLE_TTL = 0.05
-        with caplog.at_level(logging.WARNING, logger="crawler.client"):
+        with caplog.at_level(logging.WARNING, logger="crawler"):
             pages = await crawler.crawl([], sitemap_urls=[url(SITEMAP)])
 
     assert pages == {}
@@ -231,7 +231,7 @@ async def test_no_sitemaps_from_robots_txt_that_stays_down(url, site, caplog):
     site.robots, site.robots_status = "", 503
     async with make_crawler(respect_robots=True) as crawler:
         crawler.robots.UNREACHABLE_TTL = 0.05
-        with caplog.at_level(logging.WARNING, logger="crawler.client"):
+        with caplog.at_level(logging.WARNING, logger="crawler"):
             pages = await crawler.crawl([url("/site/b.html")], robots_sitemaps=True)
 
     assert pages == {}
@@ -252,7 +252,7 @@ async def test_unreadable_sitemaps_do_not_stop_the_crawl(url, site, closed_port_
         url(SITEMAP),
     ]
     async with make_crawler() as crawler:
-        with caplog.at_level(logging.WARNING, logger="crawler.client"):
+        with caplog.at_level(logging.WARNING, logger="crawler"):
             pages = await crawler.crawl([url("/site/b.html")], sitemap_urls=sitemap_urls)
         failed = dict(crawler.failed_sitemaps)
         await crawler.crawl([url("/site/b.html")])
@@ -288,7 +288,7 @@ async def test_oversized_sitemap_is_not_downloaded_whole(url, site, monkeypatch,
     site.sitemaps = {"sitemap.xml": gzip.compress(document) if headers else document}
     site.sitemap_headers = headers
     async with make_crawler() as crawler:
-        with caplog.at_level(logging.INFO, logger="crawler.client"):
+        with caplog.at_level(logging.INFO, logger="crawler"):
             pages = await crawler.crawl([url("/site/c.html")], sitemap_urls=[url(SITEMAP)])
 
     assert list(pages) == [url("/site/c.html")]

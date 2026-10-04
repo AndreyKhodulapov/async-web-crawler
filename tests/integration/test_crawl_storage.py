@@ -183,7 +183,7 @@ class TestSaveErrors:
     async def test_storage_that_always_fails_does_not_stop_the_crawl(self, url, caplog):
         storage = MemoryStorage(batch_size=2, failures=[DISK_FULL] * ALWAYS)
 
-        with caplog.at_level(logging.ERROR, logger="crawler.client"):
+        with caplog.at_level(logging.ERROR, logger="crawler"):
             crawler = await crawl(storage, url("/site/"))
 
         assert len(crawler.processed_urls) == 5
@@ -217,7 +217,7 @@ class TestSaveErrors:
     async def test_unexpected_error_of_the_storage_does_not_stop_the_crawl(self, url, caplog):
         storage = MemoryStorage(batch_size=1, failures=[TypeError("not serializable")] * ALWAYS)
 
-        with caplog.at_level(logging.ERROR, logger="crawler.client"):
+        with caplog.at_level(logging.ERROR, logger="crawler"):
             crawler = await crawl(storage, url("/site/"))
 
         stats = crawler.crawl_stats()

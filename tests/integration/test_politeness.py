@@ -192,7 +192,7 @@ class TestRobots:
         # robots.txt answers 503 to the first download (one attempt and three
         # retries), then it is back: the pages of the site wait out the TTL
         # instead of ending the crawl unreachable, with nothing fetched.
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         site.robots, site.robots_failures = "", 4
         options = {
             "respect_robots": True,
@@ -211,7 +211,7 @@ class TestRobots:
         assert deferred == [f"Deferred {url('/site/')} for 0.1s: robots.txt is unreachable (HTTP 503)"]
 
     async def test_crawl_gives_up_on_a_site_whose_robots_txt_stays_down(self, url, site, caplog):
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         site.robots, site.robots_status = "", 503
         async with polite(respect_robots=True) as crawler:
             crawler.robots.UNREACHABLE_TTL = 0.05
@@ -229,7 +229,7 @@ class TestRobots:
         # /site/to-other-host on 127.0.0.1 redirects to /site/ on localhost,
         # whose robots.txt answers 503 once: the start URL waits for it and
         # is requested again, instead of ending the crawl unreachable.
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         site.robots, site.robots_failures_by_host = "", {"localhost": 1}
         start = url("/site/to-other-host")
         async with polite(respect_robots=True) as crawler:
@@ -249,7 +249,7 @@ class TestRobots:
     async def test_crawl_gives_up_on_a_start_url_redirecting_to_a_site_whose_robots_txt_stays_down(
         self, url, site, caplog
     ):
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         site.robots, site.robots_failures_by_host = "", {"localhost": 100}
         start = url("/site/to-other-host")
         async with polite(respect_robots=True) as crawler:

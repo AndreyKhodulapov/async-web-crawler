@@ -365,6 +365,7 @@ src/
 └── crawler/
     ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
     ├── client.py           # AsyncCrawler: fetching, parsing, crawl()
+    ├── fetching.py         # Fetcher: one URL with robots.txt, circuit breaker, rate limit, retries and redirects
     ├── transport.py        # HttpTransport: single GET requests over an aiohttp session, decoding, size limits
     ├── queue.py            # CrawlerQueue: URL priority queue and statuses
     ├── semaphores.py       # SemaphoreManager: global and per-domain limits

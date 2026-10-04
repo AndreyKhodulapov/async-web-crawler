@@ -137,7 +137,7 @@ class TestBoundedQueue:
     async def test_queue_of_a_wide_site_stays_bounded(self, url, max_concurrent, caplog):
         # Every page links to 50 new ones. Without the bound all of the 1001
         # links found were queued, though 20 pages were to be requested.
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         crawler = await crawl(url("/wide/0"), max_concurrent=max_concurrent, max_depth=10, max_pages=20)
 
         assert len(crawler.processed_urls) == 20

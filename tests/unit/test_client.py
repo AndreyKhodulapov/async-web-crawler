@@ -170,7 +170,7 @@ def fake_session() -> FakeSession:
 def make_crawler(monkeypatch, fake_session):
     def make(**options) -> AsyncCrawler:
         crawler = AsyncCrawler(**{"max_concurrent": 3, **UNTHROTTLED, **options})
-        monkeypatch.setattr(crawler._transport, "_create_session", lambda: fake_session)
+        monkeypatch.setattr(crawler._fetcher._transport, "_create_session", lambda: fake_session)
         return crawler
 
     return make
@@ -214,7 +214,7 @@ class TestInit:
 
     def test_does_not_create_session_eagerly(self):
         crawler = AsyncCrawler()
-        assert crawler._transport._session is None
+        assert crawler._fetcher._transport._session is None
 
     def test_rate_options_configure_the_limiter(self):
         limiter = AsyncCrawler(requests_per_second=4, per_domain_rate=False, min_delay=0.5, jitter=0.1).rate_limiter
@@ -225,7 +225,7 @@ class TestLifecycle:
     async def test_session_is_created_once_and_reused(self, crawler, fake_session):
         await crawler.fetch_url("http://a")
         await crawler.fetch_url("http://b")
-        assert crawler._transport._session is fake_session
+        assert crawler._fetcher._transport._session is fake_session
         assert fake_session.requested == ["http://a", "http://b"]
 
     async def test_close_is_idempotent(self, crawler, fake_session):
@@ -572,7 +572,7 @@ class TestRetries:
 
     async def test_huge_timeout_growth_is_capped(self, make_crawler):
         crawler = make_crawler(timeout_growth=1e300, read_timeout=1)
-        assert crawler._timeout_for(retries=5).sock_read == AsyncCrawler.MAX_TIMEOUT_GROWTH
+        assert crawler._fetcher._timeout_for(retries=5).sock_read == AsyncCrawler.MAX_TIMEOUT_GROWTH
 
     @pytest.mark.parametrize(
         ("failure", "held_back"),
@@ -967,7 +967,7 @@ class TestCrawlBlockedHost:
         # in flight fails, the first ones open the circuit, and none is
         # retried, as the breaker refuses the retries; without the crawl
         # putting them off, they would be the pages lost to the outage.
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         crawler = make_crawler(
             max_concurrent=4,
             max_depth=0,
@@ -1360,7 +1360,7 @@ class TestRobots:
     async def test_crawl_waits_for_an_unreachable_robots_txt_to_be_downloaded_again(
         self, make_crawler, fake_session, caplog
     ):
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         crawler = make_crawler(respect_robots=True, max_depth=0)
         crawler.robots.UNREACHABLE_TTL = 0.1
         fake_session.routes["http://a/robots.txt"] = [FakeResponse(status=503), FakeResponse(status=404)]
@@ -1377,7 +1377,7 @@ class TestRobots:
     async def test_crawl_gives_up_on_a_site_whose_robots_txt_stays_unreachable(
         self, make_crawler, fake_session, caplog
     ):
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         crawler = make_crawler(respect_robots=True, max_depth=0)
         crawler.robots.UNREACHABLE_TTL = 0.05
         crawler.ROBOTS_POLL = 0.01
@@ -1425,7 +1425,7 @@ class TestRobots:
     ):
         # A name that does not resolve is a typo, not an outage: waiting
         # three minutes for it would change nothing.
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         crawler = make_crawler(respect_robots=True, max_depth=0)
         crawler.robots.UNREACHABLE_TTL = 0.05
         fake_session.routes["http://a/robots.txt"] = aiohttp.ClientConnectorDNSError(
@@ -1446,7 +1446,7 @@ class TestRobots:
         # The sitemaps named in robots.txt, the sitemap given and the start
         # URL all wait for the same site: it is downloaded again three
         # times in all, not three times for each of them.
-        caplog.set_level(logging.WARNING, logger="crawler.client")
+        caplog.set_level(logging.WARNING, logger="crawler")
         crawler = make_crawler(respect_robots=True, max_depth=0)
         crawler.robots.UNREACHABLE_TTL = 0.1
         fake_session.routes["http://a/robots.txt"] = FakeResponse(status=503)
@@ -1462,7 +1462,7 @@ class TestRobots:
     async def test_crawl_waits_for_the_robots_txt_of_the_host_a_page_redirects_to(
         self, make_crawler, fake_session, caplog
     ):
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         crawler = make_crawler(respect_robots=True, max_depth=0)
         crawler.robots.UNREACHABLE_TTL = 0.1
         fake_session.routes["http://a/robots.txt"] = FakeResponse(status=404)
@@ -1490,7 +1490,7 @@ class TestRobots:
     async def test_crawl_gives_up_on_a_page_redirecting_to_a_site_whose_robots_txt_stays_unreachable(
         self, make_crawler, fake_session, caplog
     ):
-        caplog.set_level(logging.INFO, logger="crawler.client")
+        caplog.set_level(logging.INFO, logger="crawler")
         crawler = make_crawler(respect_robots=True, max_depth=0)
         crawler.robots.UNREACHABLE_TTL = 0.05
         crawler.ROBOTS_POLL = 0.01
