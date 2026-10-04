@@ -107,7 +107,14 @@ certificate or a host name that does not resolve (`DNSError`), is not
 waited for at all: the pages go there at once. A page that redirects to
 such a site waits the same way and is requested again, and so does a
 sitemap of the site (see [Crawling](#crawling)); they all share the
-downloads of the site.
+downloads of the site. Each download after the first is a single attempt,
+without the retries and their growing timeouts, and no page of a crawl
+waits for a download longer than `AsyncCrawler.ROBOTS_POLL` (2) seconds:
+the download goes on, and the page is put off for that long at a time
+until it is over, so a site that is slow to fail holds no worker back
+(outside a crawl, `fetch_url` and the others wait for the download). A
+site given up on is not downloaded again for the rest of the crawl; the
+next `crawl()` on the same crawler tries it again.
 Redirects are followed by
 the crawler, one request at a time: the target of each is checked against
 robots.txt of its own site and waits for the rate limit of its own host, as
@@ -291,7 +298,8 @@ are not counted.
 | `read_timeout` | `20.0` | the longest pause between two chunks of the response |
 | `total_timeout` | `30.0` | the whole request, body included |
 | `timeout_growth` | `1.5` | each retry multiplies all three by this, up to 4 times the initial values; `1` keeps them fixed |
-| `max_page_size` | `10485760` | bytes of a page body; a larger one fails with `PageTooLargeError` (a permanent error) and the rest is not downloaded; `None` lifts the limit |
+| `max_page_size` | `3145728` | bytes of a page body (3 MiB); a larger one fails with `PageTooLargeError` (a permanent error) and the rest is not downloaded; `None` lifts the limit |
+| `max_parsing` | `2` | pages parsed at once, whatever `max_concurrent` says |
 
 With the defaults the read timeout is 20 s on the first attempt and 30, 45
 and 67.5 s on the three retries: a page that is only slow gets through, a
@@ -304,6 +312,13 @@ The body is read in chunks and given up once it is over its limit:
 unpacked from gzip or deflate, so a gzip bomb fails too, and a
 Content-Length over the limit fails the request before the body is read.
 robots.txt is cut at 500 KiB, the size RFC 9309 asks crawlers to read.
+
+The size limit bounds the download, `max_parsing` the parsing: a page
+takes about forty times its size in memory and a couple of seconds per
+megabyte to parse (a 10 MiB page full of links measured 20 s and 400 MB),
+and the GIL runs the parses one at a time anyway. With the defaults no
+more than two pages of 3 MiB are parsed at once, about 250 MB; a site of
+larger pages needs a larger `max_page_size`, and the memory grows with it.
 
 ## Crawling
 

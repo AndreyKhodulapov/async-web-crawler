@@ -119,6 +119,9 @@ class CrawlOptions:
     read_timeout: float = _option(20.0, above=0)
     timeout_growth: float = _option(1.5, minimum=1)
     max_page_size: int | None = _option(AsyncCrawler.DEFAULT_MAX_PAGE_SIZE, minimum=1)  # bytes; null lifts the limit
+    max_parsing: int = _option(
+        2, minimum=1
+    )  # pages parsed at once; parsing costs about 40 times the page size in memory
     max_retry_after: float = _option(AsyncCrawler.DEFAULT_MAX_RETRY_AFTER, above=0)  # the longest Retry-After obeyed
     keep_pages: bool = True  # false lets a page go once it is saved: the memory of a large crawl stays flat
 

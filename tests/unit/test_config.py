@@ -53,6 +53,7 @@ FULL = {
         "read_timeout": 15.0,
         "timeout_growth": 2.0,
         "max_page_size": 1_000_000,
+        "max_parsing": 4,
         "max_retry_after": 120.0,
         "keep_pages": False,
     },
@@ -136,6 +137,7 @@ class TestDefaults:
             "read_timeout",
             "timeout_growth",
             "max_page_size",
+            "max_parsing",
             "max_retry_after",
             "keep_pages",
         ):

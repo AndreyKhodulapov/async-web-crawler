@@ -80,7 +80,8 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `connect_timeout` | number, > 0 | `10.0` | DNS, TCP and TLS |
 | `read_timeout` | number, > 0 | `20.0` | the longest pause between two chunks of the response |
 | `timeout_growth` | number, >= 1 | `1.5` | the timeouts grow by this factor on every retry |
-| `max_page_size` | whole number, >= 1, or `null` | `10485760` | bytes of a page body (10 MiB); a larger page fails unread; `null` lifts the limit |
+| `max_page_size` | whole number, >= 1, or `null` | `3145728` | bytes of a page body (3 MiB); a larger page fails unread; `null` lifts the limit |
+| `max_parsing` | whole number, >= 1 | `2` | pages parsed at once; parsing takes about 40 times the size of a page in memory and a couple of seconds per megabyte, so this times `max_page_size` bounds the memory of parsing |
 | `max_retry_after` | number, > 0 | `600.0` | the longest wait a `Retry-After` header is obeyed for (10 minutes); a host that asks for more is asked again after this long |
 | `keep_pages` | true or false | `true` | `false` drops a page from memory once it is saved, for large crawls |
 

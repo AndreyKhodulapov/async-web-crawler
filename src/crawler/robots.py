@@ -239,10 +239,15 @@ class RobotsParser:
     error, as major search engines do: the site is asking crawlers to back off.
     Unlike the rules of a file that was read, which are kept for good, an
     unreachable robots.txt is fetched again after `UNREACHABLE_TTL`
-    seconds, so one timeout does not close the site for the whole crawl;
-    `failed_downloads` counts the downloads of an outage, and `may_recover`
+    seconds, so one timeout does not close the site for the whole crawl.
+    Only the caller that starts that download waits for it: the others
+    get the stale rules, which still disallow everything, until it is
+    over, so a site that is slow to fail holds one task back, not every
+    one that asks about it. `failed_downloads` counts the downloads of an outage, and `may_recover`
     tells a failure that passes by itself (a 5xx, a timeout) from one that
-    does not (a bad certificate, a host name that does not resolve).
+    does not (a bad certificate, a host name that does not resolve); a
+    caller that has waited enough says so with `give_up`, and the site is
+    not downloaded again until `forget_outages`.
     A download the fetcher did not even start (`CrawlerClosedError`,
     `CircuitOpenError`) is no answer from the site: the error is passed on
     and nothing is cached.
@@ -266,6 +271,7 @@ class RobotsParser:
         self._expires: dict[str, float] = {}  # origin -> when its unreachable robots.txt is fetched again
         self._failed: dict[str, int] = {}  # origin -> downloads of its robots.txt failed in a row
         self._downloads: dict[str, asyncio.Task[RobotsRules]] = {}
+        self._started: dict[str, float] = {}  # origin -> when its download under way started
 
     async def fetch_robots(self, base_url: str) -> dict[str, Any]:
         """Download (or take from the cache) robots.txt of the site of `base_url`.
@@ -285,9 +291,15 @@ class RobotsParser:
         """
         return (await self._rules_for(base_url)).to_dict()
 
-    async def is_allowed(self, url: str, user_agent: str = "*") -> bool:
-        """`can_fetch`, downloading the site's robots.txt first if needed."""
-        return (await self._rules_for(url)).can_fetch(url, user_agent)
+    async def is_allowed(self, url: str, user_agent: str = "*", *, wait: float | None = None) -> bool:
+        """`can_fetch`, downloading the site's robots.txt first if needed.
+
+        With `wait`, a download that takes longer than that many seconds
+        from its start is not waited for: `TimeoutError` is raised, at
+        once if that long has passed already, and the download goes on
+        for the callers that do wait for it, into the cache.
+        """
+        return (await self._rules_for(url, wait)).can_fetch(url, user_agent)
 
     def can_fetch(self, url: str, user_agent: str = "*") -> bool:
         """Whether `user_agent` may fetch `url`. The site's rules must have been fetched.
@@ -321,14 +333,37 @@ class RobotsParser:
         """How many downloads in a row of robots.txt of the site of `url` have failed; 0 once it has been read."""
         return self._failed.get(_origin(url), 0)
 
+    def give_up(self, url: str) -> None:
+        """Keep the unreachable robots.txt of the site of `url` as it is: it is not downloaded again until `forget_outages`.
+
+        For a caller that has waited for the site enough: every later
+        request for it would otherwise download robots.txt once more. Does
+        nothing for a site whose robots.txt was read, or not fetched yet.
+        """
+        origin = _origin(url)
+        if origin in self._rules and self._rules[origin].unreachable is not None:
+            self._expires.pop(origin, None)
+
+    def forget_outages(self) -> None:
+        """Download the unreachable robots.txt of every site again on the next request, and count its failures from zero.
+
+        For a new crawl: a site given up on an hour ago may be back.
+        """
+        now = self._clock()
+        for origin, rules in self._rules.items():
+            if rules.unreachable is not None:
+                self._expires[origin] = now
+        self._failed.clear()
+
     def may_recover(self, url: str) -> bool:
         """Whether robots.txt of the site of `url`, unreachable now, may be read by a later download.
 
         False after a failure that does not pass by itself: a bad
         certificate, a host name that does not resolve. True while it is
-        not unreachable. The rules must have been fetched.
+        not unreachable, or not fetched yet.
         """
-        return self._cached(url).recoverable
+        rules = self._rules.get(_origin(url))
+        return rules is None or rules.recoverable
 
     def _cached(self, url: str) -> RobotsRules:
         origin = _origin(url)
@@ -336,23 +371,40 @@ class RobotsParser:
             raise LookupError(f"robots.txt of {origin} has not been fetched yet")
         return self._rules[origin]
 
-    async def _rules_for(self, url: str) -> RobotsRules:
+    async def _rules_for(self, url: str, wait: float | None = None) -> RobotsRules:
         origin = _origin(url)
         # The rules of an unreachable robots.txt stay in the cache while it
         # is downloaded again: the synchronous methods keep answering.
-        if origin in self._rules and self._clock() < self._expires.get(origin, math.inf):
-            return self._rules[origin]
+        cached = self._rules.get(origin)
+        if cached is not None and self._clock() < self._expires.get(origin, math.inf):
+            return cached
         download = self._downloads.get(origin)
         if download is None:
             download = asyncio.create_task(self._download(origin))
             self._downloads[origin] = download
+            self._started[origin] = self._clock()
             download.add_done_callback(functools.partial(self._forget_download, origin))
-        # A caller cancelled while waiting must not cancel the download
-        # that other callers are waiting for too.
-        return await asyncio.shield(download)
+        elif cached is not None:
+            # The unreachable robots.txt is being downloaded again: the
+            # stale rules answer at once, so that nobody waits for a site
+            # that may be slow to fail.
+            return cached
+        # A caller cancelled while waiting, or done waiting, must not cancel
+        # the download that other callers are waiting for too.
+        waiting = asyncio.shield(download)
+        if wait is None:
+            return await waiting
+        # The time is given to the download, not to each caller: once it is
+        # up, every caller is turned away at once.
+        left = self._started[origin] + wait - self._clock()
+        if left <= 0:
+            waiting.cancel()
+            raise TimeoutError(f"robots.txt of {origin} has been downloading for over {wait:g}s")
+        return await asyncio.wait_for(waiting, left)
 
     def _forget_download(self, origin: str, download: asyncio.Task[RobotsRules]) -> None:
         del self._downloads[origin]
+        self._started.pop(origin, None)
         if not download.cancelled():
             # Marks the exception as retrieved: when every caller was
             # cancelled, nobody else would, and asyncio would log it.

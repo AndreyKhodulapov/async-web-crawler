@@ -433,8 +433,10 @@ class TestRobotsParser:
         await asyncio.sleep(0)
         assert robots.can_fetch("https://site/a", BOT) is False
 
-        assert await asyncio.gather(*downloads) == [True, True]
-        assert len(fetch.requested) == 2  # the two callers shared one download
+        # The first caller made the download and waited for it; the second
+        # one got the old rules at once instead of waiting too.
+        assert await asyncio.gather(*downloads) == [True, False]
+        assert len(fetch.requested) == 2
 
     @pytest.mark.parametrize(
         "error",
@@ -478,3 +480,92 @@ class TestRobotsParser:
     async def test_invalid_url_is_rejected(self):
         with pytest.raises(ValueError, match="not an absolute"):
             await RobotsParser(FakeFetcher()).fetch_robots("site/page")
+
+
+class TestWaitingForDownloads:
+    async def test_only_the_caller_that_downloads_again_waits_for_it(self):
+        # While an unreachable robots.txt is downloaded again, the others
+        # that ask get the stale rules at once: a site that is slow to fail
+        # holds one task back, not every one that asks about it.
+        clock = FakeClock()
+        answered = asyncio.Event()
+        requested: list[str] = []
+
+        async def fetch(url: str) -> tuple[int, str]:
+            requested.append(url)
+            if len(requested) == 1:
+                return 503, ""
+            await answered.wait()
+            return 200, ""
+
+        robots = RobotsParser(fetch, clock=clock)
+        assert await robots.is_allowed("https://site/a", BOT) is False
+        clock.now += RobotsParser.UNREACHABLE_TTL
+
+        first = asyncio.create_task(robots.is_allowed("https://site/a", BOT))
+        await asyncio.sleep(0)  # the download is under way
+        assert await asyncio.wait_for(robots.is_allowed("https://site/b", BOT), 1) is False
+        assert robots.unreachable_reason("https://site/b") == "HTTP 503"
+        assert not first.done()
+        answered.set()
+
+        assert await first is True
+        assert await robots.is_allowed("https://site/b", BOT) is True
+        assert requested == ["https://site/robots.txt"] * 2
+
+    async def test_a_site_given_up_on_is_not_downloaded_again_until_the_outages_are_forgotten(self):
+        fetch = FakeFetcher((503, ""))
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        await robots.fetch_robots("https://site/")
+        robots.give_up("https://site/page")
+        clock.now += RobotsParser.UNREACHABLE_TTL * 10
+
+        assert robots.unreachable_for("https://site/page") == 0
+        assert await robots.is_allowed("https://site/page", BOT) is False
+        assert len(fetch.requested) == 1
+
+        robots.forget_outages()
+        fetch.answer = (200, "")
+        assert robots.failed_downloads("https://site/page") == 0
+        assert await robots.is_allowed("https://site/page", BOT) is True
+        assert len(fetch.requested) == 2
+
+    async def test_giving_up_leaves_a_robots_txt_that_was_read_alone(self):
+        fetch = FakeFetcher((200, "User-agent: *\nDisallow: /x"))
+        robots = RobotsParser(fetch)
+        await robots.fetch_robots("https://site/")
+        robots.give_up("https://site/page")
+        robots.give_up("https://other/page")  # not fetched yet: nothing to keep
+
+        assert robots.can_fetch("https://site/x", BOT) is False
+        assert await robots.is_allowed("https://other/y", BOT) is True
+        assert fetch.requested == ["https://site/robots.txt", "https://other/robots.txt"]
+
+    async def test_a_caller_may_wait_for_a_download_only_so_long(self):
+        # The download goes on for the cache: the next caller finds it there.
+        answered = asyncio.Event()
+        requested: list[str] = []
+
+        async def fetch(url: str) -> tuple[int, str]:
+            requested.append(url)
+            await answered.wait()
+            return 200, "User-agent: *\nDisallow: /x"
+
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        with pytest.raises(TimeoutError):
+            await robots.is_allowed("https://site/x", BOT, wait=0.01)
+        assert robots.may_recover("https://site/x")  # not fetched yet: nothing says it is down
+        # The time is the download's, not every caller's: once it is up,
+        # the next caller is turned away at once, however long it would wait.
+        clock.now += 1
+        async with asyncio.timeout(1):
+            with pytest.raises(TimeoutError, match="downloading for over 0.5s"):
+                await robots.is_allowed("https://site/x", BOT, wait=0.5)
+        answered.set()
+        await asyncio.sleep(0)
+
+        assert await robots.is_allowed("https://site/x", BOT, wait=0.01) is False
+        assert await robots.is_allowed("https://site/y", BOT) is True
+        assert requested == ["https://site/robots.txt"]

@@ -5,7 +5,7 @@ import logging
 import socket
 import ssl
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from unittest.mock import MagicMock
 
 import aiohttp
@@ -103,14 +103,19 @@ class FakeRequest:
         return None
 
 
+Outcome = FakeResponse | BaseException | Callable[[], Awaitable[FakeResponse | BaseException]]
+
+
 class FakeSession:
     """Serves canned responses or raises canned exceptions per URL.
 
-    A list of outcomes is served one per request; the last one repeats.
+    A list of outcomes is served one per request; the last one repeats. An
+    outcome may be a coroutine function that gives the response, e.g. one
+    that holds the request until the test lets it go.
     """
 
     def __init__(self) -> None:
-        self.routes: dict[str, FakeResponse | BaseException | list[FakeResponse | BaseException]] = {}
+        self.routes: dict[str, Outcome | list[Outcome]] = {}
         self.latency = 0.0
         self.closed = False
         self.in_flight = 0
@@ -140,6 +145,8 @@ class FakeSession:
             outcome = self.routes.get(url, FakeResponse())
             if isinstance(outcome, list):
                 outcome = outcome.pop(0) if len(outcome) > 1 else outcome[0]
+            if callable(outcome):
+                outcome = await outcome()
             if isinstance(outcome, BaseException):
                 raise outcome
             if outcome.url is None:
@@ -197,6 +204,11 @@ class TestInit:
     def test_rejects_non_positive_max_retry_after(self, value):
         with pytest.raises(ValueError, match="max_retry_after"):
             AsyncCrawler(max_retry_after=value)
+
+    @pytest.mark.parametrize("value", [0, -1])
+    def test_rejects_non_positive_max_parsing(self, value):
+        with pytest.raises(ValueError, match="max_parsing"):
+            AsyncCrawler(max_parsing=value)
 
     def test_does_not_create_session_eagerly(self):
         crawler = AsyncCrawler()
@@ -446,6 +458,35 @@ class TestFetchAndParse:
         fake_session.routes["http://a/"] = FakeResponse(b"<a href='/x'>in</a><a href='http://b/'>out</a>")
         page = await crawler.fetch_and_parse("http://a/")
         assert page["links"] == ["http://a/x"]
+
+    async def test_parses_at_most_max_parsing_pages_at_once(self, make_crawler, fake_session):
+        # Parsing takes about forty times the size of a page in memory and
+        # gets no parallelism from the GIL: the trees must not pile up.
+        parser = SlowParser()
+        crawler = make_crawler(max_concurrent=6, max_parsing=2, parser=parser)
+        urls = [f"http://a/{n}" for n in range(6)]
+
+        pages = await asyncio.gather(*(crawler.fetch_and_parse(url) for url in urls))
+
+        assert [page["url"] for page in pages] == urls
+        assert parser.peak == 2
+
+
+class SlowParser(HTMLParser):
+    """Counts the pages being parsed at once; each parse takes a moment."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parsing = self.peak = 0
+
+    async def parse_html(self, html, url, *, final_url=None, content_type=None):
+        self.parsing += 1
+        self.peak = max(self.peak, self.parsing)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().parse_html(html, url, final_url=final_url, content_type=content_type)
+        finally:
+            self.parsing -= 1
 
 
 class TestRetries:
@@ -1214,6 +1255,7 @@ class TestRobots:
         caplog.set_level(logging.INFO, logger="crawler.client")
         crawler = make_crawler(respect_robots=True, max_depth=0)
         crawler.robots.UNREACHABLE_TTL = 0.05
+        crawler.ROBOTS_POLL = 0.01
         fake_session.routes["http://a/robots.txt"] = aiohttp.ClientConnectionError("refused")
 
         await crawler.crawl(["http://a/1", "http://a/2"])
@@ -1298,6 +1340,7 @@ class TestRobots:
         caplog.set_level(logging.INFO, logger="crawler.client")
         crawler = make_crawler(respect_robots=True, max_depth=0)
         crawler.robots.UNREACHABLE_TTL = 0.05
+        crawler.ROBOTS_POLL = 0.01
         fake_session.routes["http://a/robots.txt"] = FakeResponse(status=404)
         fake_session.routes["http://a/1"] = FakeResponse(status=302, location="http://b/1")
         fake_session.routes["http://b/robots.txt"] = FakeResponse(status=503)
@@ -1310,3 +1353,102 @@ class TestRobots:
         assert crawler.unreachable_urls == {"http://a/1": reason}
         assert crawler.crawl_stats().unreachable == 1
         assert f"Gave up on http://a/1: {reason}" in [r.getMessage() for r in caplog.records]
+
+    async def test_a_robots_txt_downloaded_again_is_a_single_attempt(self, make_crawler, fake_session, caplog):
+        # The first download goes through the retries like a page. The site
+        # is then known to be unreachable, and each download after that is
+        # one request: the retries with their growing timeouts would hold
+        # the page that started it for minutes on a host that never answers.
+        caplog.set_level(logging.INFO, logger="crawler.retry")
+        crawler = make_crawler(
+            respect_robots=True, max_depth=0, retry_strategy=RetryStrategy(max_retries=2, base_delay=0.001)
+        )
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=503)
+
+        await crawler.crawl(["http://a/1"])
+
+        assert fake_session.requested == ["http://a/robots.txt"] * (3 + AsyncCrawler.MAX_ROBOTS_RETRIES)
+        assert crawler.unreachable_urls == {"http://a/1": "robots.txt is unreachable (HTTP 503)"}
+        single = [r.getMessage() for r in caplog.records if "a single attempt was asked for" in r.getMessage()]
+        assert len(single) == AsyncCrawler.MAX_ROBOTS_RETRIES
+        assert single[0].startswith("Failed http://a/robots.txt on attempt 1/3 after")
+
+    async def test_pages_of_other_hosts_do_not_wait_for_a_robots_txt_downloaded_again(self, make_crawler, fake_session):
+        # Two workers. The first download of robots.txt of "a" fails at
+        # once; the next one hangs until the test lets it go, as a host
+        # that accepts the connection and never answers would. The worker
+        # that started it waits for it; the other one, taking the other
+        # page of "a", gets the stale rules and goes on with the pages of
+        # "b" found meanwhile, instead of waiting for the download too.
+        crawler = make_crawler(respect_robots=True, max_concurrent=2, max_depth=1)
+        crawler.robots.UNREACHABLE_TTL = 0  # due to be downloaded again at once
+        crawler.ROBOTS_POLL = 0.01
+        answered = asyncio.Event()
+
+        async def hang() -> FakeResponse:
+            await answered.wait()
+            return FakeResponse(status=404)
+
+        fake_session.routes["http://a/robots.txt"] = [FakeResponse(status=503), hang]
+        fake_session.routes["http://b/robots.txt"] = FakeResponse(status=404)
+        fake_session.routes["http://b/1"] = FakeResponse(b"<a href='/2'>2</a><a href='/3'>3</a>")
+
+        crawl = asyncio.create_task(crawler.crawl(["http://a/1", "http://a/2", "http://b/1"]))
+        async with asyncio.timeout(1):
+            while "http://b/3" not in fake_session.requested:
+                await asyncio.sleep(0.001)
+        assert not crawl.done()
+        answered.set()
+        await crawl
+
+        assert set(crawler.processed_urls) == {"http://a/1", "http://a/2", "http://b/1", "http://b/2", "http://b/3"}
+        assert crawler.unreachable_urls == {}
+        assert fake_session.requested.count("http://a/robots.txt") == 2
+
+    async def test_a_site_given_up_on_is_not_downloaded_again_before_the_next_crawl(self, make_crawler, fake_session):
+        # Once the site is given up, a page that looks in on it later does
+        # not download robots.txt once more; the next crawl does.
+        crawler = make_crawler(respect_robots=True, max_concurrent=1, max_depth=1)
+        crawler.robots.UNREACHABLE_TTL = 0.01
+        crawler.ROBOTS_POLL = 0.01
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=503)
+        fake_session.routes["http://b/robots.txt"] = FakeResponse(status=404)
+        fake_session.routes["http://b/1"] = FakeResponse(b"<a href='http://a/2'>2</a>")
+
+        await crawler.crawl(["http://a/1", "http://b/1"])
+        downloads = fake_session.requested.count("http://a/robots.txt")
+        await crawler.crawl(["http://a/3"])
+
+        assert downloads == 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
+        assert fake_session.requested.count("http://a/robots.txt") == 2 * downloads
+        assert set(crawler.unreachable_urls) == {"http://a/3"}
+
+    async def test_pages_wait_only_so_long_for_the_first_download_of_a_robots_txt(self, make_crawler, fake_session):
+        # The first download of robots.txt of "a" hangs, as a host that
+        # accepts the connection and never answers would. Neither worker
+        # stands still with it: the pages of "a" are put off and the pages
+        # of "b" found meanwhile are crawled, then the download ends.
+        crawler = make_crawler(respect_robots=True, max_concurrent=2, max_depth=1)
+        crawler.ROBOTS_POLL = 0.01
+        answered = asyncio.Event()
+
+        async def hang() -> FakeResponse:
+            await answered.wait()
+            return FakeResponse(status=404)
+
+        fake_session.routes["http://a/robots.txt"] = hang
+        fake_session.routes["http://b/robots.txt"] = FakeResponse(status=404)
+        fake_session.routes["http://b/1"] = FakeResponse(b"<a href='/2'>2</a><a href='/3'>3</a>")
+
+        crawl = asyncio.create_task(crawler.crawl(["http://a/1", "http://a/2", "http://b/1"]))
+        async with asyncio.timeout(1):
+            while "http://b/3" not in fake_session.requested:
+                await asyncio.sleep(0.001)
+        assert not crawl.done()
+        answered.set()
+        await crawl
+
+        assert set(crawler.processed_urls) == {"http://a/1", "http://a/2", "http://b/1", "http://b/2", "http://b/3"}
+        assert crawler.unreachable_urls == {}
+        assert fake_session.requested.count("http://a/robots.txt") == 1

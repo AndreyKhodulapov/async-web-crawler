@@ -96,9 +96,12 @@ class AsyncCrawler:
       `RobotsUnreachableError` (see `RobotsParser`); in `crawl()`, they
       wait for it to be downloaded again, and so do the pages that
       redirect to them and the sitemaps of the site: at most
-      `MAX_ROBOTS_RETRIES` downloads per site and outage, and none after
-      a failure that does not pass by itself, such as a host name that
-      does not resolve.
+      `MAX_ROBOTS_RETRIES` downloads per site and outage, each after the
+      first a single attempt, and none after a failure that does not pass
+      by itself, such as a host name that does not resolve. No page waits
+      for a download of robots.txt longer than `ROBOTS_POLL` seconds: the
+      download goes on, and the page comes back every that long until it
+      is over, so a site that is slow to fail holds no worker back.
     - Redirects are followed one request at a time, up to
       `MAX_REDIRECTS`: the target of each goes through robots.txt, the
       rate limit, the retries and the circuit breaker of its own host.
@@ -134,7 +137,10 @@ class AsyncCrawler:
     A page body over `max_page_size` bytes (None for no limit) fails with
     `PageTooLargeError`; the rest of it is not downloaded. The limit is on
     the unpacked body, so a small gzipped response that unpacks into
-    gigabytes fails too.
+    gigabytes fails too. Parsing a page costs about forty times its size
+    in memory and a couple of seconds per megabyte of CPU, so at most
+    `max_parsing` pages are parsed at once: the memory of parsing is
+    bounded by `max_parsing` times `max_page_size` times that forty.
 
     `user_agent` identifies the crawler, and robots.txt rules are looked up
     by its name ("MyBot/1.0 (+url)" is "mybot"). `user_agents` rotates
@@ -175,7 +181,8 @@ class AsyncCrawler:
     # Sites such as Wikipedia ask bots to identify themselves with a contact
     # URL and may block generic user agents.
     DEFAULT_USER_AGENT = "AsyncWebCrawler/0.1 (+https://github.com/AndreyKhodulapov/async-web-crawler)"
-    DEFAULT_MAX_PAGE_SIZE = 10 * 1024 * 1024
+    # A page at this size takes a few seconds and over a hundred megabytes to parse.
+    DEFAULT_MAX_PAGE_SIZE = 3 * 1024 * 1024
     MAX_TIMEOUT_GROWTH = 4.0
     MAX_REDIRECTS = 10
     REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -191,6 +198,10 @@ class AsyncCrawler:
     # most this many times in a row before its pages, and the pages that
     # redirect to them, are given up; so are its sitemaps.
     MAX_ROBOTS_RETRIES = 3
+    # In crawl(), a page waits at most this many seconds for a download of
+    # robots.txt, then it is put off for this long at a time while the
+    # download goes on: a site that is slow to fail holds no worker back.
+    ROBOTS_POLL = 2.0
     # In crawl(), longer links are not followed: they are mostly generated ones.
     MAX_URL_LENGTH = 2048
     # In crawl(), new links are not queued once the pages queued, in progress
@@ -216,6 +227,7 @@ class AsyncCrawler:
         read_timeout: float = 20.0,
         timeout_growth: float = 1.5,
         max_page_size: int | None = DEFAULT_MAX_PAGE_SIZE,
+        max_parsing: int = 2,
         max_retry_after: float = DEFAULT_MAX_RETRY_AFTER,
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
@@ -236,6 +248,8 @@ class AsyncCrawler:
             raise ValueError(f"timeout_growth must be a number >= 1, got {timeout_growth}")
         if max_page_size is not None and max_page_size < 1:
             raise ValueError(f"max_page_size must be >= 1 or None, got {max_page_size}")
+        if max_parsing < 1:
+            raise ValueError(f"max_parsing must be >= 1, got {max_parsing}")
         if max_retry_after <= 0:
             raise ValueError(f"max_retry_after must be positive, got {max_retry_after}")
         if isinstance(user_agents, str):
@@ -265,6 +279,10 @@ class AsyncCrawler:
         )
         self.timeout_growth = timeout_growth
         self.max_page_size = max_page_size
+        self.max_parsing = max_parsing
+        # Parsing runs in a thread per page: this keeps the trees of large
+        # pages from piling up in memory, as the GIL gives them no parallelism anyway.
+        self._parsing = asyncio.Semaphore(max_parsing)
         self.max_retry_after = max_retry_after
         self._user_agent = user_agent
         self._rotated_agents = itertools.cycle(user_agents) if user_agents else None
@@ -415,6 +433,8 @@ class AsyncCrawler:
         follow: Callable[[str], bool] | None = None,
         failure_level: int = logging.WARNING,
         track_errors: bool = True,
+        retry: bool = True,
+        robots_wait: float | None = None,
     ) -> FetchResult:
         """Download a page, following its redirects one at a time.
 
@@ -433,7 +453,10 @@ class AsyncCrawler:
         over the size limit of a sitemap fails with `SitemapError`. With
         `truncate_at`, which is how robots.txt is downloaded, the body is
         cut to that many bytes instead of failing over `max_page_size`. With
-        `track_errors`, the attempts count in `error_stats()`.
+        `track_errors`, the attempts count in `error_stats()`. Without
+        `retry`, every request of the chain is a single attempt. With
+        `robots_wait`, a download of robots.txt is waited for that many
+        seconds at most (see `_check_robots`).
         """
         target, elapsed, retried, attempts = url, 0.0, False, 0
         for redirects in itertools.count():
@@ -445,6 +468,8 @@ class AsyncCrawler:
                 check_robots=check_robots if redirects == 0 else check_redirect_robots,
                 failure_level=failure_level,
                 track_errors=track_errors,
+                retry=retry,
+                robots_wait=robots_wait,
             )
             elapsed += result.elapsed
             retried = retried or attempts > 1
@@ -484,19 +509,21 @@ class AsyncCrawler:
         check_robots: bool,
         failure_level: int,
         track_errors: bool,
+        retry: bool,
+        robots_wait: float | None,
     ) -> tuple[FetchResult, int]:
         """Make the request for one URL, checking robots.txt first and retrying transient failures.
 
         A redirect is not followed: it comes back as a result with
         `redirected` set and `final_url` its Location header as sent. Also
         returns the number of attempts made, 0 if the request was refused
-        before it was sent.
+        before it was sent. Without `retry`, the request is a single attempt.
         """
         # Checked up front as well as in _request(): a closed crawler must
         # report itself even for a URL that robots.txt would block.
         if self._closed:
             return FetchResult.failure(url, CrawlerClosedError(url, "crawler is closed"), 0.0), 0
-        if check_robots and (refusal := await self._check_robots(url)) is not None:
+        if check_robots and (refusal := await self._check_robots(url, wait=robots_wait)) is not None:
             return FetchResult.failure(url, refusal, 0.0), 0
         # Refused at once, without waiting for the turn of the host.
         if (refusal := self._check_circuit(url)) is not None:
@@ -538,14 +565,15 @@ class AsyncCrawler:
                 raise last.error
             return last
 
+        def veto(error: Exception) -> str | None:
+            if not retry:
+                return "a single attempt was asked for"
+            # A retry the circuit breaker would refuse is not waited for.
+            return self.circuit_breaker.refusal(url)
+
         try:
             result = await self.retry_strategy.run(
-                attempt,
-                wait=self._wait_before_retry,
-                target=url,
-                failure_level=failure_level,
-                # A retry the circuit breaker would refuse is not waited for.
-                veto=lambda error: self.circuit_breaker.refusal(url),
+                attempt, wait=self._wait_before_retry, target=url, failure_level=failure_level, veto=veto
             )
         except FetchError as error:
             assert last is not None and last.error is error
@@ -593,16 +621,23 @@ class AsyncCrawler:
             sock_read=base.sock_read * growth,
         )
 
-    async def _check_robots(self, url: str) -> FetchError | None:
-        """Return the error to fail `url` with if robots.txt does not allow it, None if it may be fetched."""
+    async def _check_robots(self, url: str, *, wait: float | None = None) -> FetchError | None:
+        """Return the error to fail `url` with if robots.txt does not allow it, None if it may be fetched.
+
+        With `wait`, a download of robots.txt that takes longer than that
+        many seconds is not waited for: the URL is refused with
+        `RobotsUnreachableError` for now, and the download goes on.
+        """
         host = get_host(url)
         if self.robots is None or host is None:
             return None  # an invalid URL fails in _request() with InvalidURLError
         try:
-            allowed = await self.robots.is_allowed(url, self._user_agent)
+            allowed = await self.robots.is_allowed(url, self._user_agent, wait=wait)
         except (CrawlerClosedError, CircuitOpenError) as error:
             # Raised for the robots.txt URL; the page fails for the same reason under its own.
             return type(error)(url, error.message)
+        except TimeoutError:
+            return RobotsUnreachableError(url, "robots.txt is being downloaded")
         crawl_delay = self.robots.get_crawl_delay(url, self._user_agent)
         if crawl_delay:
             self.rate_limiter.set_delay(host, crawl_delay)
@@ -626,7 +661,13 @@ class AsyncCrawler:
         return None
 
     async def _download_robots(self, url: str) -> tuple[int, str]:
-        """Fetcher for RobotsParser: robots.txt goes through the same limits and retries as a page."""
+        """Fetcher for RobotsParser: robots.txt goes through the same limits and retries as a page.
+
+        A download after a failed one is a single attempt: the site is
+        known to be unreachable, and the retries with their growing
+        timeouts would hold the page that started it for minutes.
+        """
+        assert self.robots is not None  # it is asking
         # Many sites have no robots.txt; RobotsParser logs the outcomes that matter.
         result = await self._fetch(
             url,
@@ -636,6 +677,7 @@ class AsyncCrawler:
             check_redirect_robots=False,
             failure_level=logging.INFO,
             track_errors=False,
+            retry=self.robots.failed_downloads(url) == 0,
         )
         if isinstance(result.error, HTTPStatusError):
             return result.error.status, ""
@@ -739,15 +781,16 @@ class AsyncCrawler:
         )
 
     async def _parse(self, result: FetchResult) -> ParsedPage:
-        """Parse a successful fetch result; a failure counts in `error_stats()`."""
+        """Parse a successful fetch result, at most `max_parsing` at once; a failure counts in `error_stats()`."""
         assert result.content is not None
         try:
-            return await self._parser.parse_html(
-                result.content,
-                result.url,
-                final_url=result.final_url,
-                content_type=result.content_type,
-            )
+            async with self._parsing:
+                return await self._parser.parse_html(
+                    result.content,
+                    result.url,
+                    final_url=result.final_url,
+                    content_type=result.content_type,
+                )
         except ParseError as error:
             self._errors.record_error(error)
             raise
@@ -782,7 +825,11 @@ class AsyncCrawler:
         itself (a bad certificate, a host name that does not resolve); a
         site whose robots.txt failed for a moment is crawled once it is
         back. So does a page that redirects to such a site: it is requested
-        again when it comes back, uncounted meanwhile. Pages that the circuit breaker refuses do not
+        again when it comes back, uncounted meanwhile. Each download after
+        the first is a single attempt, and no page waits for a download
+        longer than `ROBOTS_POLL` seconds: the page is put off for that
+        long at a time while the download goes on, and the workers go on
+        with other sites meanwhile. Pages that the circuit breaker refuses do not
         count either: they are put off until their host may be probed and
         tried again, and the crawl goes on with other pages meanwhile. Once
         the circuit of a host has opened `MAX_CIRCUIT_OPENINGS` times in
@@ -865,7 +912,8 @@ class AsyncCrawler:
         `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `failed_sitemaps`, `url_depths`,
         `stats`, `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()`) is reset
         on every call and stays available after it returns. The rate limits, the robots.txt
-        cache and the states of the circuit breaker carry over.
+        cache and the states of the circuit breaker carry over; a site whose
+        robots.txt the previous crawl gave up on is downloaded again.
 
         Raises:
             TypeError: a single string is passed instead of a list of URLs, patterns or extensions.
@@ -923,6 +971,8 @@ class AsyncCrawler:
         self._errors = ErrorTracker()
         self.rate_limiter.reset_stats()
         self.circuit_breaker.reset_stats()
+        if self.robots is not None:
+            self.robots.forget_outages()
         for url in start_urls:
             self._queue.add_url(url, priority=0, depth=0)
         self._start_urls = set(self._queue.depths)
@@ -1144,7 +1194,11 @@ class AsyncCrawler:
                 # page counts toward max_pages: a refused page costs no request.
                 # A host given up on comes first: its robots.txt is not
                 # downloaded either, which would probe its circuit once more.
-                refusal = self._check_probes_left(url) or await self._check_robots(url) or self._check_circuit(url)
+                refusal = (
+                    self._check_probes_left(url)
+                    or await self._check_robots(url, wait=self.ROBOTS_POLL)
+                    or self._check_circuit(url)
+                )
                 if refusal is not None:
                     if isinstance(refusal, RobotsDisallowedError):
                         queue.mark_blocked(url, refusal.message)
@@ -1196,7 +1250,7 @@ class AsyncCrawler:
                 targets.append(target)
             return skip_reason is None
 
-        result = await self._fetch(url, html_only=True, check_robots=False, follow=follow)
+        result = await self._fetch(url, html_only=True, check_robots=False, follow=follow, robots_wait=self.ROBOTS_POLL)
         if isinstance(result.error, CircuitOpenError):
             # The circuit of the host, or of the host a redirect leads to,
             # opened while the request waited for its turn.
@@ -1456,13 +1510,16 @@ class AsyncCrawler:
         the pages that redirect to it, its sitemaps), and at once when the
         failure does not pass by itself (a bad certificate, a host name that
         does not resolve): three minutes change nothing about a typo. The
-        wait is a second when the download is due already: another task
-        may be making it.
+        wait is `ROBOTS_POLL` when the download is due already: another
+        task is making it, or is about to, and nobody else waits for it.
         """
         assert self.robots is not None  # asked after it refused a URL
         if not self.robots.may_recover(url) or self.robots.failed_downloads(url) > self.MAX_ROBOTS_RETRIES:
+            # Nothing of the crawl downloads it again: a page that looks in
+            # on the site later would otherwise make one more download.
+            self.robots.give_up(url)
             return None
-        return self.robots.unreachable_for(url) or 1.0
+        return self.robots.unreachable_for(url) or self.ROBOTS_POLL
 
     def _wait_for_robots(
         self, url: str, queue: CrawlerQueue, refusal: RobotsUnreachableError, *, requested: bool

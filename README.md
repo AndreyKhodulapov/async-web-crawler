@@ -242,13 +242,18 @@ storages. All of it is described in the [API reference](docs/api.md).
 - **Parsing is bound by one CPU.** HTML is parsed in a worker thread of
   one process; a few heavy pages per second is the ceiling whatever
   `max_concurrent` says. With a rate limit per host it never matters; a
-  crawl of many hosts without one is parsing-bound.
+  crawl of many hosts without one is parsing-bound. A page costs about
+  forty times its size in memory and a couple of seconds per megabyte to
+  parse, so pages over `max_page_size` (3 MiB) are not read and at most
+  `max_parsing` (2) are parsed at once; raising both for a site of huge
+  pages costs memory accordingly.
 - **Some guards are constants, not options.** The URL length limit (2048),
   the redirect limit (10), the queue size (3 times the page limit), the
   wait at which a host's pages are put off (1 second), the times a
-  robots.txt that cannot be read is downloaded again (3) and the times a
-  page waits for a Retry-After too long to retry (3) are class attributes
-  of `AsyncCrawler`.
+  robots.txt that cannot be read is downloaded again (3), how often its
+  pages look in on that download (2 seconds) and the times a page waits
+  for a Retry-After too long to retry (3) are class attributes of
+  `AsyncCrawler`.
 
 ## Documentation
 

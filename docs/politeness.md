@@ -119,8 +119,15 @@ sites it visits and follows their rules.
   site is waited for once by its sitemaps and again by its pages; and do
   not wait at all for a failure that does not pass by itself: a host name
   that does not resolve is a typo, and three minutes change nothing about
-  it. Count such pages apart from the disallowed ones, so the
-  report does not blame robots.txt for a network failure.
+  it. Mind the cost of each try, too: a host that accepts the connection
+  and never answers fails only by timeout, and a download with retries
+  and growing timeouts takes minutes, so download again with a single
+  attempt, and let no page wait for a download for long (here two
+  seconds; the download goes on by itself and the page comes back
+  later), or every worker that takes a page of that site stands still
+  with it. Count such pages apart from the
+  disallowed ones, so the report does not blame robots.txt for a network
+  failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
   origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB,
   and stop downloading there: a huge or endless file must not fill the memory.

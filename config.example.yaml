@@ -30,7 +30,8 @@ crawler:
   connect_timeout: 10.0
   read_timeout: 20.0
   timeout_growth: 1.5   # the timeouts grow by this factor on every retry
-  max_page_size: 10485760  # bytes; a larger page fails unread; null lifts the limit
+  max_page_size: 3145728  # bytes; a larger page fails unread; null lifts the limit
+  max_parsing: 2        # pages parsed at once; parsing takes about 40 times the page size in memory
   max_retry_after: 600.0  # the longest wait a Retry-After header is obeyed for
   keep_pages: true      # false: a page is dropped from memory once it is saved, for large crawls
 
