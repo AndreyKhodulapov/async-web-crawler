@@ -452,6 +452,16 @@ class TestInvalid:
 
         assert str(error.value) == "Invalid configuration: crawler.max_pages: must be >= 1, got 0"
 
+    def test_message_shows_the_first_twenty_problems(self):
+        with pytest.raises(ConfigError) as error:
+            CrawlerConfig.from_dict({"urls": [f"bad{index}" for index in range(25)]})
+
+        assert len(error.value.problems) == 25
+        lines = str(error.value).splitlines()
+        assert lines[0] == "Invalid configuration: 25 problems"
+        assert lines[1:21] == [f"  - {problem}" for problem in error.value.problems[:20]]
+        assert lines[21:] == ["  - ... and 5 more"]
+
     @pytest.mark.parametrize("data", [None, [], "urls", 5])
     def test_top_level_must_be_a_mapping(self, data):
         (problem,) = problems(data)

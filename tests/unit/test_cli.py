@@ -1,6 +1,8 @@
 """Unit tests for the command line of the crawler: options, their priority over the configuration file, exit codes."""
 
+import io
 import json
+import sys
 
 import pytest
 import yaml
@@ -13,6 +15,12 @@ from main import build_config, config_overrides, parse_args
 def write_config(tmp_path, data, name="config.yaml"):
     path = tmp_path / name
     path.write_text(json.dumps(data) if name.endswith(".json") else yaml.safe_dump(data), encoding="utf-8")
+    return str(path)
+
+
+def write_urls(tmp_path, *lines, name="urls.txt"):
+    path = tmp_path / name
+    path.write_text("".join(f"{line}\n" for line in lines), encoding="utf-8")
     return str(path)
 
 
@@ -96,6 +104,7 @@ def test_respect_robots_wins_over_the_file(option, expected, tmp_path):
     [
         ["--urls", "example.com"],
         ["--urls"],
+        ["--urls-file"],
         ["--max-pages", "0"],
         ["--max-pages", "1.5"],
         ["--max-depth", "-1"],
@@ -155,18 +164,76 @@ def test_urls_option_replaces_the_urls_of_the_file(tmp_path):
     assert config.urls == ("https://flag.example/",)
 
 
+def test_urls_file_gives_the_start_urls(tmp_path):
+    path = write_urls(tmp_path, "# start pages", "https://one.example/", "", "https://two.example/")
+
+    assert config_overrides(parse_args(["--urls-file", path])) == {
+        "urls": ["https://one.example/", "https://two.example/"]
+    }
+
+
+def test_urls_option_comes_first_and_repeats_are_dropped(tmp_path):
+    path = write_urls(tmp_path, "https://two.example/", "https://three.example/", "https://one.example/")
+
+    args = parse_args(["--urls", "https://one.example/", "https://two.example/", "--urls-file", path])
+
+    assert build_config(args).urls == ("https://one.example/", "https://two.example/", "https://three.example/")
+
+
+def test_urls_file_replaces_the_urls_of_the_file_and_keeps_its_sitemaps(tmp_path):
+    config = write_config(
+        tmp_path,
+        {"urls": ["https://file.example/"], "sitemaps": {"urls": ["https://file.example/sitemap.xml"]}},
+    )
+
+    built = build_config(parse_args(["--config", config, "--urls-file", write_urls(tmp_path, "https://list.example/")]))
+
+    assert built.urls == ("https://list.example/",)
+    assert built.sitemaps.urls == ("https://file.example/sitemap.xml",)
+
+
+def test_empty_urls_file_with_sitemaps_of_the_file_is_enough_to_crawl(tmp_path):
+    config = write_config(
+        tmp_path,
+        {"urls": ["https://file.example/"], "sitemaps": {"urls": ["https://file.example/sitemap.xml"]}},
+    )
+
+    built = build_config(parse_args(["--config", config, "--urls-file", write_urls(tmp_path, "# none yet")]))
+
+    assert built.urls == ()
+
+
+def test_urls_file_is_read_from_stdin(monkeypatch):
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"https://one.example/\r\n")))
+
+    assert build_config(parse_args(["--urls-file", "-"])).urls == ("https://one.example/",)
+
+
 def test_sitemaps_of_the_file_are_enough_to_crawl(tmp_path):
     path = write_config(tmp_path, {"sitemaps": {"urls": ["https://example.com/sitemap.xml"]}})
 
     assert build_config(parse_args(["--config", path])).urls == ()
 
 
-@pytest.mark.parametrize("with_file", [False, True])
-def test_nothing_to_crawl_is_an_error(with_file, tmp_path):
+@pytest.mark.parametrize(
+    ("with_file", "hint"),
+    [
+        (False, "give --urls or --urls-file"),
+        (True, "give --urls, --urls-file, or `urls` or `sitemaps.urls` in the configuration"),
+    ],
+)
+def test_nothing_to_crawl_is_an_error(with_file, hint, tmp_path):
     argv = ["--config", write_config(tmp_path, {"crawler": {"max_pages": 5}})] if with_file else []
 
-    with pytest.raises(ConfigError, match="nothing to crawl: give --urls"):
+    with pytest.raises(ConfigError) as error:
         build_config(parse_args(argv))
+
+    assert error.value.problems == [f"nothing to crawl: {hint}"]
+
+
+def test_empty_urls_file_alone_is_nothing_to_crawl(tmp_path):
+    with pytest.raises(ConfigError, match="nothing to crawl: give --urls or --urls-file"):
+        build_config(parse_args(["--urls-file", write_urls(tmp_path)]))
 
 
 @pytest.mark.parametrize(
@@ -179,6 +246,7 @@ def test_nothing_to_crawl_is_an_error(with_file, tmp_path):
             'storage.outputs[0]: Cannot choose a storage for "pages.txt"',
         ),
         (["--urls", "https://example.com/", "--log-file", " "], "logging.file: must not be empty"),
+        (["--urls-file", "missing.txt"], "missing.txt: cannot read the file"),
     ],
 )
 def test_invalid_configuration_exits_with_2_before_anything_runs(argv, message, tmp_path, monkeypatch, capsys):
@@ -202,6 +270,21 @@ def test_problems_of_the_file_are_all_reported(tmp_path, capsys):
     assert "2 problems" in error
     assert 'crawler.max_pagse: unknown key; did you mean "max_pages"?' in error
     assert "urls[0]: expected an http:// or https:// URL" in error
+
+
+def test_invalid_lines_of_the_urls_file_exit_with_2_before_anything_runs(tmp_path, monkeypatch, capsys):
+    path = write_urls(tmp_path, "https://ok.example/", "example.com", "# fine", "ftp://files.example/")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main, "run", None)  # would fail if called
+
+    assert main.main(["--urls-file", path, "--output", "pages.jsonl", "--report", "report.html"]) == 2
+
+    assert capsys.readouterr().err == (
+        f"error: Invalid configuration: {path}: 1 URL is valid, 2 lines are not\n"
+        f'  - {path}:2: expected an http:// or https:// URL, got "example.com"\n'
+        f'  - {path}:4: expected an http:// or https:// URL, got "ftp://files.example/"\n'
+    )
+    assert [item.name for item in tmp_path.iterdir()] == ["urls.txt"]
 
 
 @pytest.mark.parametrize(

@@ -46,7 +46,8 @@ configuration file, by command-line options, or from Python.
 - **Configuration file** in YAML or JSON, checked on load with every
   problem reported by the path of its key
 - **Command line** with live progress, a summary, exit codes for scripts
-  and a clean stop on Ctrl-C that keeps the pages fetched so far
+  and a clean stop on Ctrl-C that keeps the pages fetched so far; start
+  URLs from a list file or stdin
 - **Statistics and reports**: pages by outcome, status code, error and
   domain, speed and response time; export to JSON and to a self-contained
   HTML report with charts
@@ -104,16 +105,26 @@ the [configuration guide](docs/configuration.md) explains them.
 python src/main.py --config config.yaml
 python src/main.py --urls https://example.com --max-pages 100 --output results.json
 python src/main.py --config config.yaml --max-pages 500 --report report.html
+python src/main.py --config config.yaml --urls-file urls.txt
+some_tool | python src/main.py --config config.yaml --urls-file -
 ```
 
 A crawl is set up by a configuration file, by options, or by both. An
 option wins over the file; an option left out keeps the value of the file,
 or the default without a file.
 
+A long list of start URLs can be kept in a text file, one URL per line
+([examples/urls.txt](examples/urls.txt)): `#` starts a comment line, blank
+lines are skipped, a URL given twice is crawled once. One file of settings
+then serves many lists. A line that is not an http(s) URL stops the run
+before anything is requested; the error counts the valid and the invalid
+lines and lists the first 20 of the invalid ones by number.
+
 | Option | Configuration key | Effect |
 |--------|-------------------|--------|
 | `--config PATH` | | configuration file, YAML or JSON |
 | `--urls URL [URL ...]` | `urls` | start URLs, in place of those of the file |
+| `--urls-file PATH` | `urls` | start URLs from a text file, one per line; `-` reads them from stdin. With `--urls`, both are crawled, those of `--urls` first; together they replace the `urls` of the file and keep its `sitemaps.urls` |
 | `--max-pages N` | `crawler.max_pages` | pages to request, failed ones included |
 | `--max-depth N` | `crawler.max_depth` | links followed from a start URL; 0 crawls the start URLs only |
 | `--output PATH` | `storage.outputs` | where to save the pages: a `.jsonl`, `.json`, `.csv` or `.db` file, or a database URL; repeat for several, in place of those of the file |
@@ -242,9 +253,9 @@ storages. All of it is described in the [API reference](docs/api.md).
   takes about the sum of their times, not the longest of them (two hosts
   of 30 pages at 2 requests per second: 25 s instead of 15), and the time
   left on the progress line does not know it. One site never notices; for
-  the sitemaps of several hosts, `same_domain_only: false` or a site on
-  many subdomains, set `rate_limit` higher or to `null` and rely on
-  `max_per_domain`. See [docs/concurrency_control.md](docs/concurrency_control.md).
+  the sitemaps of several hosts, a list of start URLs on several hosts,
+  `same_domain_only: false` or a site on many subdomains, set `rate_limit`
+  higher or to `null` and rely on `max_per_domain`. See [docs/concurrency_control.md](docs/concurrency_control.md).
 - **Not for URLs from strangers.** Links to private addresses
   (`127.0.0.1`, `10.0.0.0/8`, the cloud metadata address) are followed
   like any other. The crawler is a command-line tool for sites you choose,
@@ -346,7 +357,7 @@ src/
     ├── error_stats.py      # ErrorTracker: counts errors, retries and their outcomes
     ├── stats.py            # CrawlerStats: pages by outcome, status code and domain, speed, running time
     ├── report.py           # the statistics as JSON and as an HTML report with charts
-    ├── config.py           # CrawlerConfig, load_config: YAML or JSON file, defaults, validation
+    ├── config.py           # CrawlerConfig, load_config, load_urls: YAML or JSON file, defaults, validation, URL lists
     ├── logging_setup.py    # configure_logging: text on the console, JSON Lines in a rotated file
     ├── progress.py         # ProgressTracker, show_progress: percent, speed, time left, active tasks
     ├── filters.py          # UrlFilter: host, pattern and file extension rules
@@ -365,7 +376,8 @@ src/
         └── factory.py      # storage_from_output, storage_from_url, storage_from_env, register_database
 examples/
 ├── advanced_usage.py       # a crawl by a configuration file: progress, statistics, report
-└── config.yaml             # the configuration of the example
+├── config.yaml             # the configuration of the example
+└── urls.txt                # a list of start URLs for --urls-file
 config.example.yaml         # every configuration key with its default
 docker-compose.yml          # PostgreSQL for the crawler and its tests
 tests/

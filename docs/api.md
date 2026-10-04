@@ -17,7 +17,7 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Page statistics](#page-statistics) | `CrawlerStats`, export to JSON and HTML |
 | [AdvancedCrawler](#advancedcrawler) | the crawler set up by a configuration |
 | [Live progress](#live-progress) | `show_progress`, `ProgressTracker` |
-| [Configuration](#configuration) | `load_config`, `CrawlerConfig` |
+| [Configuration](#configuration) | `load_config`, `load_urls`, `CrawlerConfig` |
 | [Logging](#logging) | `configure_logging` |
 | [Saving pages](#saving-pages) | the storages, `PageRecord`, databases by URL |
 | [Parsed page](#parsed-page) | `ParsedPage`, `HTMLParser` |
@@ -627,8 +627,10 @@ line of it.
 
 `load_config(path, overrides)` reads a YAML or a JSON file into a
 `CrawlerConfig`, checked as it is loaded; `CrawlerConfig.from_dict(mapping)`
-does the same for a mapping. The keys, their limits, the errors and the
-overrides are described in the [configuration guide](configuration.md).
+does the same for a mapping. `load_urls(path)` reads start URLs from a
+text file, one per line (`"-"` is stdin), and raises `ConfigError` listing
+every line that is not an http(s) URL. The keys, their limits, the errors
+and the overrides are described in the [configuration guide](configuration.md).
 
 ## Logging
 

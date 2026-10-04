@@ -4,6 +4,8 @@ Usage:
     python src/main.py --config config.yaml
     python src/main.py --urls https://example.com --max-pages 100 --output results.json
     python src/main.py --config config.yaml --max-pages 500 --report report.html
+    python src/main.py --config config.yaml --urls-file urls.txt
+    cat urls.txt | python src/main.py --config config.yaml --urls-file -
 
 A crawl is set up by a configuration file (see config.example.yaml), by
 options, or by both: an option wins over the file. Logs and progress go to
@@ -21,7 +23,7 @@ import sys
 from typing import Any
 
 from cli_options import hide_password, http_url, positive
-from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, StorageError, load_config, show_progress
+from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, StorageError, load_config, load_urls, show_progress
 from crawler.config import LOG_LEVELS
 
 
@@ -33,6 +35,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", metavar="PATH", help="configuration file, YAML or JSON; see config.example.yaml")
     parser.add_argument(
         "--urls", nargs="+", type=http_url, metavar="URL", help="start URLs, in place of those of the configuration"
+    )
+    parser.add_argument(
+        "--urls-file",
+        metavar="PATH",
+        help='start URLs from a text file, one per line, "#" for comments; "-" reads them from stdin. '
+        "With --urls, both are crawled",
     )
     parser.add_argument("--max-pages", type=positive(int), metavar="N", help="pages to request, failed ones included")
     parser.add_argument(
@@ -78,11 +86,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def start_urls(args: argparse.Namespace) -> list[str] | None:
+    """The URLs of --urls, then those of --urls-file, each once; None if neither is given.
+
+    Raises:
+        ConfigError: the file cannot be read, or lines of it are not URLs.
+    """
+    if args.urls_file is None:
+        return args.urls
+    return list(dict.fromkeys([*(args.urls or ()), *load_urls(args.urls_file)]))
+
+
 def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    """The options that were given, shaped like the configuration file."""
+    """The options that were given, shaped like the configuration file.
+
+    Raises:
+        ConfigError: the file of --urls-file cannot be read, or lines of it are not URLs.
+    """
     # (section, key, value); a value of None is an option that was not given.
     options = [
-        (None, "urls", args.urls),
+        (None, "urls", start_urls(args)),
         ("crawler", "max_pages", args.max_pages),
         ("crawler", "max_depth", args.max_depth),
         ("crawler", "respect_robots", args.respect_robots),
@@ -117,7 +140,11 @@ def build_config(args: argparse.Namespace) -> CrawlerConfig:
     overrides.setdefault("crawler", {})["keep_pages"] = False
     config = CrawlerConfig.from_dict(overrides) if args.config is None else load_config(args.config, overrides)
     if not config.urls and not config.sitemaps.urls:
-        where = "--urls" if args.config is None else "--urls, or `urls` or `sitemaps.urls` in the configuration"
+        where = (
+            "--urls or --urls-file"
+            if args.config is None
+            else "--urls, --urls-file, or `urls` or `sitemaps.urls` in the configuration"
+        )
         raise ConfigError([f"nothing to crawl: give {where}"])
     return config
 

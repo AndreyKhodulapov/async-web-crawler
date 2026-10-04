@@ -29,7 +29,16 @@ python src/main.py --config config.yaml
 
 The options and the keys they stand for are listed in the
 [README](../README.md#command-line). An option that takes a list (`--urls`,
-`--output`) replaces the whole list of the file. Sitemaps, filters, retries,
+`--output`) replaces the whole list of the file.
+
+The start URLs come from `urls` of the file, or from the command line:
+`--urls` and `--urls-file` (a text file with a URL per line, or `-` for
+stdin; see [examples/urls.txt](../examples/urls.txt)). Given together, both
+are crawled, those of `--urls` first, and a URL given twice is crawled
+once; either of them replaces `urls` of the file, and `sitemaps.urls` stay.
+A list file is an option of the command line only: the configuration has
+no key for it, so one file of settings serves many lists. In code,
+`load_urls(path)` reads such a file. Sitemaps, filters, retries,
 the circuit breaker and timeouts have no options: they are set in the file.
 The command line always turns `crawler.keep_pages` off, whatever the file
 says: it saves the pages and does not need them in memory.
@@ -205,7 +214,9 @@ written. A problem is reported by the path of its key:
 - a key written twice in YAML (plain YAML would keep the last one silently);
 - keys that do not go together: `sitemaps.from_robots` without
   `crawler.respect_robots`, a `user_agents` entry with another bot name;
-- a file that cannot be read, has another extension or is not valid YAML or JSON.
+- a file that cannot be read, has another extension or is not valid YAML or JSON;
+- in the file of `--urls-file`, a line that is not an http(s) URL, reported
+  by its number, or a file that cannot be read or is not UTF-8.
 
 All the problems are listed at once:
 
@@ -215,7 +226,17 @@ Invalid configuration: config.yaml: 2 problems
   - filters.exclude[0]: not a regular expression: missing ), unterminated subpattern at position 0, got "("
 ```
 
-The command line prints the list and exits with code 2. In code it is a
+A list of start URLs is checked the same way; its error counts the lines:
+
+```
+Invalid configuration: urls.txt: 9870 URLs are valid, 130 lines are not
+  - urls.txt:12: expected an http:// or https:// URL, got "example.com"
+  ...
+  - ... and 110 more
+```
+
+The message shows the first 20 problems; `error.problems` holds all of
+them. The command line prints the message and exits with code 2. In code it is a
 `ConfigError` (a `ValueError`) with the list in `error.problems` and the
 file in `error.source`.
 

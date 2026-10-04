@@ -5,6 +5,7 @@ import difflib
 import json
 import math
 import re
+import sys
 import types
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -281,6 +282,44 @@ def load_config(path: str | Path, overrides: Mapping[str, Any] | None = None) ->
     if overrides and isinstance(mapping, Mapping):
         mapping = _merge(mapping, overrides)
     return CrawlerConfig.from_dict(mapping, source=str(path))
+
+
+def load_urls(path: str | Path) -> list[str]:
+    """Read start URLs from a text file, one per line; "-" reads them from stdin.
+
+    The file is UTF-8, with or without a BOM. Blank lines and lines that
+    start with "#" are skipped, spaces around a URL are dropped, and a URL
+    given again is dropped too: the first one keeps its place.
+
+    Raises:
+        ConfigError: the file cannot be read or is not UTF-8, or lines of it
+            are not http(s) URLs; every such line is listed by its number.
+    """
+    name = "<stdin>" if path == "-" else str(path)
+    try:
+        content = sys.stdin.buffer.read() if path == "-" else Path(path).read_bytes()
+        text = content.decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ConfigError([f"cannot read the file: {error}"], name) from error
+    urls: list[str] = []
+    problems: list[str] = []
+    # Not splitlines(): it also breaks at form feeds and Unicode separators,
+    # and the line numbers would not be those an editor shows.
+    for number, line in enumerate(text.split("\n"), start=1):
+        url = line.strip()
+        if not url or url.startswith("#"):
+            continue
+        problem = _http_url(url)
+        if problem is None:
+            urls.append(url)
+        else:
+            shown = url if len(url) <= 100 else f"{url[:100]}..."
+            problems.append(f"{name}:{number}: {problem}, got {_show(shown)}")
+    if problems:
+        valid = f"{len(urls)} URL is valid" if len(urls) == 1 else f"{len(urls)} URLs are valid"
+        invalid = "1 line is not" if len(problems) == 1 else f"{len(problems)} lines are not"
+        raise ConfigError(problems, name, summary=f"{valid}, {invalid}")
+    return list(dict.fromkeys(urls))
 
 
 class _UniqueKeyLoader(yaml.SafeLoader):

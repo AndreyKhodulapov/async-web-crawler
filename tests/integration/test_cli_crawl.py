@@ -235,6 +235,35 @@ async def test_crawl_is_stopped_when_the_progress_cannot_be_shown(url, site, con
     assert (stats["total_pages"], stats["successful"], stats["errors"]) == (1, 1, {})
 
 
+async def test_crawl_by_a_list_of_urls(url, site, config_file, tmp_path, capsys):
+    urls_file = tmp_path / "urls.txt"
+    urls_file.write_text(f"# pages to crawl\n{url('/site/a.html')}\n\n{url('/site/b.html')}\n", encoding="utf-8")
+    out = tmp_path / "pages.jsonl"
+    argv = ["--config", config_file(), "--urls-file", str(urls_file), "--max-depth", "0", "--output", str(out)]
+
+    code = await run(build_config(parse_args(argv)), progress=False)
+
+    assert code == 0
+    # The list replaces the start URL of the configuration.
+    assert set(site.hits) == {"/site/a.html", "/site/b.html"}
+    assert saved_urls(out) == {url("/site/a.html"), url("/site/b.html")}
+    assert "Pages: 2 (2 successful" in capsys.readouterr().out
+
+
+async def test_command_reads_the_list_of_urls_from_stdin(url, site, config_file, tmp_path):
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, str(Path(main.__file__)), "--config", config_file(), "--urls-file", "-",
+        "--max-depth", "0", "--output", str(tmp_path / "pages.jsonl"), "--no-progress",
+        cwd=tmp_path, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )  # fmt: skip
+    urls = f"{url('/site/a.html')}\r\n{url('/site/a.html')}\r\n{url('/site/b.html')}\r\n".encode()
+    output, errors = await asyncio.wait_for(process.communicate(urls), timeout=30)
+
+    assert process.returncode == 0, errors.decode()
+    assert "Pages: 2 (2 successful, 0 failed, 0 skipped)" in output.decode()
+    assert saved_urls(tmp_path / "pages.jsonl") == {url("/site/a.html"), url("/site/b.html")}
+
+
 async def test_command_runs_as_a_script(url, config_file, tmp_path):
     script = Path(main.__file__)
     process = await asyncio.create_subprocess_exec(
