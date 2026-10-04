@@ -117,6 +117,15 @@ def is_same_host(url: str, other: str) -> bool:
     return host is not None and host == get_host(other)
 
 
+def hide_password(url: str) -> str:
+    """A URL fit to be shown, such as that of a database or a proxy: its password is replaced with ***."""
+    password = urlsplit(url).password
+    if password is not None:
+        url = url.replace(f":{password}@", ":***@", 1)
+    # PostgreSQL takes the password as a parameter of the URL too.
+    return re.sub(r"(?<=[?&]password=)[^&#]*", "***", url)
+
+
 def percent_encode(component: str) -> str | None:
     """Percent-encode non-ASCII characters, spaces and the like; None if impossible.
 

@@ -15,10 +15,13 @@ from crawler.exceptions import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    NoProxyError,
     PageTooLargeError,
     ParseError,
     PermanentError,
     PermanentHTTPError,
+    ProxyError,
+    ProxyNetworkError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     SitemapError,
@@ -39,10 +42,12 @@ from crawler.models import (
     FetchResult,
     PageRecord,
     ParsedPage,
+    ProxyStats,
     RateStats,
 )
 from crawler.parser import HTMLParser
 from crawler.progress import Progress, ProgressTracker, format_progress, show_progress
+from crawler.proxy import Proxy, ProxyPool
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
 from crawler.retry import RetryRule, RetryStrategy
@@ -98,6 +103,7 @@ __all__ = [
     "InvalidURLError",
     "JSONStorage",
     "NetworkError",
+    "NoProxyError",
     "PageRecord",
     "PageTooLargeError",
     "ParseError",
@@ -107,6 +113,11 @@ __all__ = [
     "PostgresStorage",
     "Progress",
     "ProgressTracker",
+    "Proxy",
+    "ProxyError",
+    "ProxyNetworkError",
+    "ProxyPool",
+    "ProxyStats",
     "RateLimiter",
     "RateStats",
     "RetryRule",

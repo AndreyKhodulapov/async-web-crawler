@@ -22,9 +22,10 @@ import asyncio
 import sys
 from typing import Any
 
-from cli_options import hide_password, http_url, positive
+from cli_options import http_url, positive
 from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, StorageError, load_config, load_urls, show_progress
 from crawler.config import LOG_LEVELS
+from crawler.urls import hide_password
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

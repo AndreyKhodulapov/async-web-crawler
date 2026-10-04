@@ -9,9 +9,12 @@ from crawler import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    NoProxyError,
     ParseError,
     PermanentError,
     PermanentHTTPError,
+    ProxyError,
+    ProxyNetworkError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     TooManyRedirectsError,
@@ -63,6 +66,8 @@ def test_http_error_subclass_keeps_its_own_kind():
         (CrawlerClosedError(URL, "crawler is closed"), None),
         (RobotsUnreachableError(URL, "robots.txt is unreachable (HTTP 503)"), None),
         (UnexpectedError(URL, "KeyError: 'x'"), None),
+        (ProxyNetworkError(URL, "cannot connect to the proxy"), NetworkError),
+        (NoProxyError(URL, "no proxy available"), None),
     ],
 )
 def test_errors_have_one_kind_at_most(error, kind):
@@ -80,8 +85,15 @@ def test_errors_have_one_kind_at_most(error, kind):
         (ParseError(URL, "empty document"), "ParseError"),
         (UnexpectedError(URL, "KeyError: 'x'"), "other"),
         (CrawlerClosedError(URL, "crawler is closed"), "other"),
+        (ProxyNetworkError(URL, "cannot connect to the proxy"), "NetworkError"),
+        (NoProxyError(URL, "no proxy available"), "other"),
         (KeyError("x"), "other"),
     ],
 )
 def test_error_kind(error, kind):
     assert error_kind(error) == kind
+
+
+@pytest.mark.parametrize("error_type", [ProxyNetworkError, NoProxyError])
+def test_errors_of_proxies_share_a_base(error_type):
+    assert isinstance(error_type(URL, "proxy failed"), ProxyError)

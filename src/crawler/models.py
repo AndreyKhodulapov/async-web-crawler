@@ -176,6 +176,22 @@ class CircuitStats:
     rejected: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class ProxyStats:
+    """One proxy of a `ProxyPool`.
+
+    `state` is "active", or "out" while the proxy is out of rotation.
+    `requests` (those sent through the proxy), `failures` (those the proxy
+    failed) and `times_removed` (out of rotation) count since the stats
+    were last reset.
+    """
+
+    state: str
+    requests: int = 0
+    failures: int = 0
+    times_removed: int = 0
+
+
 class Metadata(TypedDict):
     title: str | None
     description: str | None

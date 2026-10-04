@@ -30,7 +30,6 @@ from cli_options import (
     at_least_one,
     database_url,
     encoding,
-    hide_password,
     http_url,
     positive,
     regex,
@@ -63,6 +62,7 @@ from crawler import (
 from crawler.logging_setup import configure_logging
 from crawler.progress import show_progress
 from crawler.storage import DATABASE_URL_VARIABLE, DEFAULT_DATABASE_URL
+from crawler.urls import hide_password
 from demo_scale import Comparison, compare
 from demo_site import DemoSite
 

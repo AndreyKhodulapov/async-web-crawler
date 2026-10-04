@@ -11,14 +11,19 @@ Most errors fall into one of four kinds that decide whether a retry can help:
   reset connection); worth retrying too. `DNSError` is the one of them
   that is mostly for good: a host name that does not exist. A resolver
   that fails for now (EAI_AGAIN) gives a plain `NetworkError`.
+  `ProxyNetworkError` is the one where a proxy failed, not the site: its
+  retry goes through another proxy.
 - `PermanentError`: the request is wrong or forbidden (HTTP 404, 403, a bad
   certificate, a page over the size limit, a sitemap that is not one); every
   attempt would fail the same way.
 - `ParseError`: the page was downloaded but is not an HTML document.
 
-`CrawlerClosedError`, `RobotsUnreachableError`, `CircuitOpenError` and
-`UnexpectedError` belong to none of them: they are not about the request
-itself, and none is retried.
+`CrawlerClosedError`, `RobotsUnreachableError`, `CircuitOpenError`,
+`NoProxyError` and `UnexpectedError` belong to none of them: they are not
+about the request itself, and none is retried.
+
+`ProxyError` is the base of the errors of proxies, `ProxyNetworkError` and
+`NoProxyError`: they say nothing about the site.
 
 `StorageError` is not about a URL at all: it reports a failure to save the
 pages already crawled.
@@ -129,6 +134,18 @@ class RobotsUnreachableError(FetchError):
 
 class CircuitOpenError(FetchError):
     """The circuit breaker of the host is open: the request was not sent."""
+
+
+class ProxyError(FetchError):
+    """The request could not go through a proxy; the site is not to blame."""
+
+
+class ProxyNetworkError(ProxyError, NetworkError):
+    """A proxy failed: it could not be reached, or it refused the request (HTTP 407)."""
+
+
+class NoProxyError(ProxyError):
+    """Every proxy for the URL is out of rotation: the request was not sent."""
 
 
 class PageTooLargeError(PermanentError):

@@ -15,6 +15,8 @@ from crawler import (
     FetchTimeoutError,
     HTTPStatusError,
     NetworkError,
+    NoProxyError,
+    ProxyNetworkError,
 )
 
 URL = "http://a.test/page"
@@ -89,6 +91,13 @@ class TestClosed:
         request(breaker, BAD_CERTIFICATE, BAD_CERTIFICATE, TIMEOUT, TIMEOUT, TIMEOUT)
         assert breaker.state("a.test") is CircuitState.CLOSED
         assert breaker.get_stats()["a.test"] == CircuitStats(state="closed", requests=3, failures=3)
+
+    def test_errors_of_proxies_count_neither_way(self, breaker):
+        # A dead proxy must not block the sites behind it.
+        proxy_failed = ProxyNetworkError(URL, "cannot connect to the proxy")
+        request(breaker, *[proxy_failed, NoProxyError(URL, "no proxy available")] * 3)
+        assert breaker.state("a.test") is CircuitState.CLOSED
+        assert breaker.get_stats()["a.test"] == CircuitStats(state="closed")
 
     def test_old_outcomes_leave_the_window(self, breaker, clock):
         request(breaker, TIMEOUT, TIMEOUT, TIMEOUT)
@@ -372,6 +381,10 @@ def test_is_failure_says_what_counts_against_a_host(error, failure):
     assert CircuitBreaker.is_failure(error) is failure
 
 
-@pytest.mark.parametrize("outcome", [None, BAD_CERTIFICATE], ids=["success", "certificate"])
+@pytest.mark.parametrize(
+    "outcome",
+    [None, BAD_CERTIFICATE, ProxyNetworkError(URL, "cannot connect to the proxy")],
+    ids=["success", "certificate", "proxy"],
+)
 def test_what_counts_neither_way_is_not_a_failure(outcome):
     assert CircuitBreaker.is_failure(outcome) is False
