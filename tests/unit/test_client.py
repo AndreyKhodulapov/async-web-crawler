@@ -1180,3 +1180,50 @@ class TestRobots:
         assert crawler.unreachable_urls == {"http://a/1": reason, "http://a/2": reason}
         assert crawler.crawl_stats().unreachable == 2
         assert f"Gave up on http://a/1: {reason}" in [r.getMessage() for r in caplog.records]
+
+    async def test_crawl_waits_for_the_robots_txt_of_the_host_a_page_redirects_to(
+        self, make_crawler, fake_session, caplog
+    ):
+        caplog.set_level(logging.INFO, logger="crawler.client")
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        crawler.robots.UNREACHABLE_TTL = 0.1
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=404)
+        fake_session.routes["http://a/1"] = FakeResponse(status=302, location="http://b/1")
+        fake_session.routes["http://b/robots.txt"] = [FakeResponse(status=503), FakeResponse(status=404)]
+        fake_session.routes["http://b/1"] = FakeResponse(b"ok")
+
+        await crawler.crawl(["http://a/1"], max_pages=1)
+
+        # The page is requested again once robots.txt of the target is back.
+        assert fake_session.requested == [
+            "http://a/robots.txt",
+            "http://a/1",
+            "http://b/robots.txt",
+            "http://a/1",
+            "http://b/robots.txt",
+            "http://b/1",
+        ]
+        assert set(crawler.processed_urls) == {"http://a/1"}
+        assert crawler.unreachable_urls == {}
+        assert crawler.crawl_stats().queued == 0
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred ")]
+        assert deferred == ["Deferred http://a/1 for 0.1s: robots.txt is unreachable (HTTP 503)"]
+
+    async def test_crawl_gives_up_on_a_page_redirecting_to_a_site_whose_robots_txt_stays_unreachable(
+        self, make_crawler, fake_session, caplog
+    ):
+        caplog.set_level(logging.INFO, logger="crawler.client")
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=404)
+        fake_session.routes["http://a/1"] = FakeResponse(status=302, location="http://b/1")
+        fake_session.routes["http://b/robots.txt"] = FakeResponse(status=503)
+
+        await crawler.crawl(["http://a/1"])
+
+        reason = "redirects to http://b/1, robots.txt is unreachable (HTTP 503)"
+        assert fake_session.requested.count("http://a/1") == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+        assert fake_session.requested.count("http://b/robots.txt") == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+        assert crawler.unreachable_urls == {"http://a/1": reason}
+        assert crawler.crawl_stats().unreachable == 1
+        assert f"Gave up on http://a/1: {reason}" in [r.getMessage() for r in caplog.records]

@@ -113,7 +113,9 @@ sites it visits and follows their rules.
   the whole crawl. The TTL alone helps only the URLs that come later; the
   pages refused during the outage must wait for it too (here up to three
   times), or a crawl of that one site ends empty after a 503 of a few
-  seconds. Count such pages apart from the disallowed ones, so the
+  seconds. The same goes for every way into the site: a start URL that
+  redirects there and a sitemap of it, or the fix covers the direct links
+  only. Count such pages apart from the disallowed ones, so the
   report does not blame robots.txt for a network failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
   origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB,

@@ -225,6 +225,45 @@ class TestRobots:
             r.getMessage() for r in caplog.records
         ]
 
+    async def test_crawl_waits_for_robots_txt_of_the_host_a_start_url_redirects_to(self, url, site, caplog):
+        # /site/to-other-host on 127.0.0.1 redirects to /site/ on localhost,
+        # whose robots.txt answers 503 once: the start URL waits for it and
+        # is requested again, instead of ending the crawl unreachable.
+        caplog.set_level(logging.INFO, logger="crawler.client")
+        site.robots, site.robots_failures_by_host = "", {"localhost": 1}
+        start = url("/site/to-other-host")
+        async with polite(respect_robots=True) as crawler:
+            crawler.robots.UNREACHABLE_TTL = 0.1
+            # One page: the wait uncounts it, so the crawl does not end over max_pages.
+            pages = await crawler.crawl([start], max_pages=1)
+        stats = crawler.crawl_stats()
+
+        assert list(pages) == [start]
+        assert pages[start]["final_url"] == url("/site/", host="localhost")
+        assert (stats.processed, stats.unreachable, stats.queued) == (1, 0, 0)
+        assert site.hits["/site/to-other-host"] == 2
+        assert site.robots_hits == {"127.0.0.1": 1, "localhost": 2}
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred ")]
+        assert deferred == [f"Deferred {start} for 0.1s: robots.txt is unreachable (HTTP 503)"]
+
+    async def test_crawl_gives_up_on_a_start_url_redirecting_to_a_site_whose_robots_txt_stays_down(
+        self, url, site, caplog
+    ):
+        caplog.set_level(logging.INFO, logger="crawler.client")
+        site.robots, site.robots_failures_by_host = "", {"localhost": 100}
+        start = url("/site/to-other-host")
+        async with polite(respect_robots=True) as crawler:
+            crawler.robots.UNREACHABLE_TTL = 0.05
+            pages = await crawler.crawl([start])
+
+        reason = f"redirects to {url('/site/', host='localhost')}, robots.txt is unreachable (HTTP 503)"
+        assert pages == {}
+        assert crawler.unreachable_urls == {start: reason}
+        # Requested once more after each of the three waits.
+        assert site.hits["/site/to-other-host"] == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+        assert site.robots_hits["localhost"] == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+        assert f"Gave up on {start}: {reason}" in [r.getMessage() for r in caplog.records]
+
     async def test_unreachable_pages_are_not_blocked_and_do_not_count_toward_max_pages(
         self, url, site, closed_port_url
     ):

@@ -101,7 +101,9 @@ is fetched again. Such pages are counted as unreachable, not as blocked:
 the site did not forbid them. In a crawl they are put off until robots.txt
 is fetched again, up to `AsyncCrawler.MAX_WAITS_PER_PAGE` (3) times, so a
 site whose robots.txt failed for a moment is crawled once it is back; only
-after three minutes of failures do its pages go to `unreachable_urls`.
+after three minutes of failures do its pages go to `unreachable_urls`. A
+page that redirects to such a site waits the same way and is requested
+again, and so does a sitemap of the site (see [Crawling](#crawling)).
 Redirects are followed by
 the crawler, one request at a time: the target of each is checked against
 robots.txt of its own site and waits for the rate limit of its own host, as
@@ -390,7 +392,12 @@ into the crawl. `same_domain_only` keeps the hosts of `sitemap_urls` as well
 as those of the start URLs; when a start URL redirects to another host
 ("example.org" to "example.com"), the sitemap pages on that host are
 crawled too. A sitemap that cannot be downloaded or read is logged and
-listed in `failed_sitemaps`, and the crawl goes on.
+listed in `failed_sitemaps`, and the crawl goes on. A sitemap of a site
+whose robots.txt cannot be read waits for it to be downloaded again, up to
+`AsyncCrawler.MAX_WAITS_PER_PAGE` (3) times, as a page does, and so do the
+sitemaps that such a robots.txt names under `robots_sitemaps`: the first
+page is fetched after that wait, so that a crawl fed by sitemaps alone does
+not end empty after a 503 of a few seconds.
 
 `crawl()` returns every parsed page, so it holds them all in memory until
 it ends. A large crawl that saves its pages to a storage does not need
