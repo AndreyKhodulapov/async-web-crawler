@@ -30,10 +30,12 @@ def render_json(stats: Mapping[str, Any]) -> str:
 def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str:
     """The statistics as an HTML page: a summary, then a chart and a table per breakdown.
 
-    `stats` is what `CrawlerStats.get_stats()` returns. The page is one
-    file that needs nothing else: the styles are inline, the charts are
-    PNG images embedded as data URIs, and there are no scripts. Everything
-    that comes from the crawl (hosts, error names) is escaped.
+    `stats` is what `CrawlerStats.get_stats()` returns; with a `proxies`
+    key, as `AdvancedCrawler.get_stats()` has it, a table of the proxies
+    follows. The page is one file that needs nothing else: the styles are
+    inline, the charts are PNG images embedded as data URIs, and there are
+    no scripts. Everything that comes from the crawl (hosts, error names,
+    proxies) is escaped.
     """
     style = textwrap.dedent(f"""
     body {{ margin: 0; padding: 32px 16px; background: {_SURFACE}; color: {_TEXT};
@@ -64,11 +66,13 @@ def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str
     }
     tiles = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in summary.items())
     status_codes = {_status_name(code): pages for code, pages in stats["status_codes"].items()}
-    sections = (
+    sections = [
         _section("Status codes", "Status", status_codes, total, "No page got a response."),
         _section("Top domains", "Domain", stats["top_domains"], total, "No pages were crawled."),
         _section("Errors", "Error", stats["errors"], total, "No page failed."),
-    )
+    ]
+    if "proxies" in stats:
+        sections.append(_proxy_section(stats["proxies"]))
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
@@ -94,6 +98,21 @@ def _section(title: str, column: str, counts: Mapping[str, int], total: int, emp
         f'<img src="data:image/png;base64,{chart}" alt="{title}: pages as bars, the same numbers as in the table">\n'
         f'<table>\n<thead><tr><th>{column}</th><th class="number">Pages</th>'
         f'<th class="number">Share of pages</th></tr></thead>\n<tbody>\n{rows}</tbody>\n</table>\n</section>\n'
+    )
+
+
+def _proxy_section(proxies: Mapping[str, Mapping[str, Any]]) -> str:
+    rows = "".join(
+        f'<tr><td>{escape(label)}</td><td class="number">{_count(proxy["requests"])}</td>'
+        f'<td class="number">{_count(proxy["failures"])}</td><td class="number">{_count(proxy["times_removed"])}</td>'
+        f"<td>{'out of rotation' if proxy['state'] == 'out' else 'active'}</td></tr>\n"
+        for label, proxy in proxies.items()
+    )
+    return (
+        "<section>\n<h2>Proxies</h2>\n"
+        '<table>\n<thead><tr><th>Proxy</th><th class="number">Requests</th><th class="number">Failures</th>'
+        '<th class="number">Times out of rotation</th><th>State</th></tr></thead>\n'
+        f"<tbody>\n{rows}</tbody>\n</table>\n</section>\n"
     )
 
 

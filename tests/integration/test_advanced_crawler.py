@@ -1,5 +1,6 @@
 """Integration tests: AdvancedCrawler set up by a configuration crawls a local site, saves, logs and reports."""
 
+import base64
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -9,6 +10,7 @@ import yaml
 from helpers import BOT, FAST_CONFIG, urlset
 
 from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, CSVStorage, JSONStorage, configure_logging
+from demo_site import free_port
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
 
@@ -234,3 +236,96 @@ async def test_log_file_that_cannot_be_opened_fails_the_constructor(tmp_path):
         AdvancedCrawler(make_config(logging={"file": str(tmp_path / "taken" / "crawler.log")}))
 
     assert file_handlers() == []
+
+
+class TestProxies:
+    PASSWORD = "pr0xy-secret"
+    AUTHORIZATION = "Basic " + base64.b64encode(f"crawler:{PASSWORD}".encode()).decode()
+
+    @pytest.fixture(autouse=True)
+    def clean_environment(self, monkeypatch):
+        for name in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "REQUEST_METHOD"]:
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.upper(), raising=False)
+
+    def with_password(self, proxy_url: str) -> str:
+        return proxy_url.replace("http://", f"http://crawler:{self.PASSWORD}@")
+
+    async def test_crawl_through_the_proxies_of_the_configuration(self, url, make_proxy, tmp_path):
+        proxy = await make_proxy(authorization=self.AUTHORIZATION)
+        dead = f"http://127.0.0.1:{free_port()}"
+        out = tmp_path / "out"
+        config = make_config(
+            urls=[url("/site/")],
+            proxy={
+                "urls": [self.with_password(dead), self.with_password(proxy.url)],
+                "rotation": "per_request",
+                "max_failures": 1,
+            },
+            retry={"max_retries": 1, "base_delay": 0.01, "max_delay": 0.01},
+            logging={"level": "DEBUG", "file": str(out / "crawler.log")},
+            report={"stats_json": str(out / "stats.json"), "html": str(out / "report.html")},
+        )
+
+        async with AdvancedCrawler(config) as crawler:
+            pages = await crawler.crawl()
+            stats = crawler.get_stats()
+
+        # The first request failed through the dead proxy and went through the other one.
+        assert url("/site/") in pages
+        assert f"GET {url('/site/')}" in proxy.requests
+        dead_label, live_label = (address.replace("http://", "http://crawler:***@") for address in (dead, proxy.url))
+        assert stats["proxies"] == {
+            dead_label: {"state": "out", "requests": 1, "failures": 1, "times_removed": 1},
+            live_label: {"state": "active", "requests": len(proxy.requests), "failures": 0, "times_removed": 0},
+        }
+        assert json.loads((out / "stats.json").read_text(encoding="utf-8"))["proxies"] == stats["proxies"]
+        report = (out / "report.html").read_text(encoding="utf-8")
+        assert "<h2>Proxies</h2>" in report and live_label in report
+        log = (out / "crawler.log").read_text(encoding="utf-8")
+        assert f"Proxy {dead_label} is out of rotation" in log
+        for text in (log, report, (out / "stats.json").read_text(encoding="utf-8")):
+            assert self.PASSWORD not in text
+
+    async def test_crawl_through_the_proxies_of_the_environment(self, url, make_proxy, monkeypatch):
+        proxy = await make_proxy()
+        monkeypatch.setenv("HTTP_PROXY", proxy.url)
+        config = make_config(urls=[url("/site/c.html")], proxy={"from_env": True})
+
+        async with AdvancedCrawler(config) as crawler:
+            await crawler.crawl()
+            stats = crawler.get_stats()
+
+        assert proxy.requests == [f"GET {url('/site/c.html')}"]
+        assert stats["proxies"] == {proxy.url: {"state": "active", "requests": 1, "failures": 0, "times_removed": 0}}
+
+    async def test_from_env_without_proxies_goes_directly_and_says_so(self, url, site, caplog):
+        config = make_config(urls=[url("/site/c.html")], proxy={"from_env": True})
+
+        with caplog.at_level(logging.WARNING, logger="crawler.advanced"):
+            async with AdvancedCrawler(config) as crawler:
+                await crawler.crawl()
+                stats = crawler.get_stats()
+
+        assert crawler.crawler.proxies is None
+        assert "proxies" not in stats
+        assert site.hits == {"/site/c.html": 1}
+        assert "neither HTTP_PROXY nor HTTPS_PROXY is set, requests go directly" in caplog.text
+
+    async def test_invalid_variable_of_the_environment_fails_the_constructor(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HTTP_PROXY", f"http://crawler:{self.PASSWORD}@proxy.example")
+
+        with pytest.raises(ConfigError) as error:
+            AdvancedCrawler(make_config(proxy={"from_env": True}, logging={"file": str(tmp_path / "crawler.log")}))
+
+        assert str(error.value) == (
+            "Invalid configuration: proxy.from_env: HTTP_PROXY: the proxy URL needs a port, "
+            "such as http://proxy.example:3128"
+        )
+        assert file_handlers() == []
+
+    async def test_no_proxies_no_key_in_the_stats(self, url):
+        async with AdvancedCrawler(make_config(urls=[url("/site/c.html")])) as crawler:
+            await crawler.crawl()
+
+        assert "proxies" not in crawler.get_stats()

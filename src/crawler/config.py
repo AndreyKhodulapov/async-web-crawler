@@ -18,6 +18,7 @@ import yaml
 from crawler.client import AsyncCrawler
 from crawler.exceptions import ConfigError
 from crawler.filters import extension_problem, normalize_extension
+from crawler.proxy import Proxy, ProxyPool, proxy_url_problem
 from crawler.robots import product_token
 from crawler.session import (
     cookie_domain_problem,
@@ -121,6 +122,10 @@ def _log_level(value: str) -> str | None:
 
 def _not_blank(value: str) -> str | None:
     return None if value.strip() else "must not be empty"
+
+
+def _rotation(value: str) -> str | None:
+    return None if value in ("per_host", "per_request") else "expected per_host or per_request"
 
 
 def _cookie_path(value: str) -> str | None:
@@ -255,6 +260,34 @@ class SessionOptions:
 
 
 @dataclass(frozen=True)
+class ProxyOptions:
+    """Section `proxy`: the proxies requests go through, see `ProxyPool`. Without any, requests go directly."""
+
+    urls: tuple[str, ...] = _option((), check=proxy_url_problem, secret=True)  # http://user:password@host:port
+    rotation: str = _option("per_host", check=_rotation)  # per_host: a host keeps its proxy; per_request: in turn
+    from_env: bool = False  # the proxies of HTTP_PROXY, HTTPS_PROXY and NO_PROXY instead of `urls`
+    max_failures: int = _option(3, minimum=1)  # failures in a row that take a proxy out of rotation
+    cooldown: float = _option(60.0, above=0)  # how long a proxy stays out
+
+    def build(self) -> ProxyPool | None:
+        """The pool of the proxies; None if there are none, `from_env` included.
+
+        The environment is read here, once.
+
+        Raises:
+            ConfigError: with `from_env`, a variable is not the URL of a proxy.
+        """
+        if self.from_env:
+            try:
+                return ProxyPool.from_env(max_failures=self.max_failures, cooldown=self.cooldown)
+            except ValueError as error:
+                raise ConfigError([f"proxy.from_env: {error}"]) from None
+        if not self.urls:
+            return None
+        return ProxyPool(self.urls, rotation=self.rotation, max_failures=self.max_failures, cooldown=self.cooldown)
+
+
+@dataclass(frozen=True)
 class StorageOptions:
     """Section `storage`: where the crawled pages are saved, see `storage_from_output`."""
 
@@ -325,6 +358,7 @@ class CrawlerConfig:
     circuit_breaker: CircuitBreakerOptions = field(default_factory=CircuitBreakerOptions)
     filters: FilterOptions = field(default_factory=FilterOptions)
     session: SessionOptions = field(default_factory=SessionOptions)
+    proxy: ProxyOptions = field(default_factory=ProxyOptions)
     storage: StorageOptions = field(default_factory=StorageOptions)
     logging: LoggingOptions = field(default_factory=LoggingOptions)
     report: ReportOptions = field(default_factory=ReportOptions)
@@ -350,7 +384,8 @@ class CrawlerConfig:
         """The configuration as a mapping that `from_dict` takes and JSON or YAML can hold.
 
         It holds the secrets of the configuration, such as the values of
-        cookies and headers, which `repr()` leaves out: it is not for logs.
+        cookies and headers or the passwords of proxies, which `repr()`
+        leaves out: it is not for logs.
         """
         return _plain(dataclasses.asdict(self))
 
@@ -513,7 +548,7 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
         return _convert_mapping(value, hint, limits, path, problems)
     if get_origin(hint) is tuple:
         if not isinstance(value, list):
-            problems.append(f"{path}: expected a list, got {_show(value)}")
+            problems.append(f"{path}: expected a list{_got(value, limits)}")
             return _INVALID
         items = [
             _convert(item, get_args(hint)[0], limits, f"{path}[{index}]", problems) for index, item in enumerate(value)
@@ -547,7 +582,7 @@ def _got(value: Any, limits: Mapping[str, Any]) -> str:
 def _convert_mapping(value: Any, hint: Any, limits: Mapping[str, Any], path: str, problems: list[str]) -> Any:
     """A mapping of names to values, such as `session.headers`; `check_name` looks at the names."""
     if not isinstance(value, Mapping):
-        problems.append(f"{path}: expected a mapping of names to values, got {_show(value)}")
+        problems.append(f"{path}: expected a mapping of names to values{_got(value, limits)}")
         return _INVALID
     name_hint, item_hint = get_args(hint)
     name_limits = {"check": limits["check_name"]} if "check_name" in limits else {}
@@ -590,6 +625,13 @@ def _check_together(config: CrawlerConfig, problems: list[str]) -> None:
     names = [name.lower() for name in session.headers]
     for name in sorted({name for name in names if names.count(name) > 1}):
         problems.append(f'session.headers: the header "{name}" is given twice, in different case')
+    proxy = config.proxy
+    if proxy.from_env and proxy.urls:
+        problems.append("proxy.from_env: cannot be used with proxy.urls; give one of them")
+    labels = [Proxy.from_url(url).label for url in proxy.urls]
+    for index, label in enumerate(labels):
+        if label in labels[:index]:
+            problems.append(f"proxy.urls[{index}]: {label} is listed twice")
     try:
         "".encode(config.storage.csv_encoding)
     except (LookupError, ValueError):  # ValueError: a name with a null character, or the codec "undefined"

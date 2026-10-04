@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 from crawler import is_valid_http_url, storage_from_url
 from crawler.config import http_url_problem
+from crawler.proxy import proxy_url_problem
 
 
 def number(raw: str, number_type: type[int] | type[float] = float) -> int | float:
@@ -49,6 +50,13 @@ def http_url(raw: str) -> str:
     # Here rather than in the check of the configuration, which would name `urls`.
     if (problem := http_url_problem(raw)) is not None:
         raise argparse.ArgumentTypeError(f"{problem}, got {raw!r}")
+    return raw
+
+
+def proxy_url(raw: str) -> str:
+    # The value is not repeated: it may hold a password.
+    if (problem := proxy_url_problem(raw)) is not None:
+        raise argparse.ArgumentTypeError(problem)
     return raw
 
 

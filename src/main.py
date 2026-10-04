@@ -22,7 +22,7 @@ import asyncio
 import sys
 from typing import Any
 
-from cli_options import http_url, positive
+from cli_options import http_url, positive, proxy_url
 from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, StorageError, load_config, load_urls, show_progress
 from crawler.config import LOG_LEVELS
 from crawler.urls import hide_password
@@ -69,6 +69,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--save-cookies", metavar="PATH", help="write the cookies to a cookies.txt file after the crawl"
+    )
+    parser.add_argument(
+        "--proxy",
+        action="append",
+        type=proxy_url,
+        metavar="URL",
+        help="send the requests through a proxy, http://[user:password@]host:port; "
+        "repeat for several, in place of those of the configuration",
     )
     parser.add_argument(
         "--respect-robots",
@@ -133,6 +141,8 @@ def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         if value is not None:
             target = overrides if section is None else overrides.setdefault(section, {})
             target[key] = value
+    if args.proxy is not None:
+        overrides["proxy"] = {"urls": args.proxy, "from_env": False}
     if args.rate_limit is not None:
         # The configuration spells "no limit" as null.
         overrides.setdefault("crawler", {})["rate_limit"] = args.rate_limit or None
@@ -181,6 +191,13 @@ def print_summary(crawler: AdvancedCrawler, *, interrupted: bool = False) -> Non
     ):
         if counts:
             print(f"{title}: {', '.join(f'{name}: {pages}' for name, pages in counts.items())}")
+    if "proxies" in stats:
+        proxies = [
+            f"{label} ({proxy['requests']} sent, {proxy['failures']} failed"
+            f"{', out of rotation' if proxy['state'] == 'out' else ''})"
+            for label, proxy in stats["proxies"].items()
+        ]
+        print(f"Proxies: {', '.join(proxies)}")
     outputs = crawler.config.storage.outputs
     if outputs:
         saving = crawler.crawler.crawl_stats()
@@ -203,7 +220,8 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
     that was closed.
 
     Raises:
-        ConfigError: the file of `session.cookies_file` cannot be read.
+        ConfigError: the file of `session.cookies_file` cannot be read, or with
+            `proxy.from_env` a variable is not the URL of a proxy.
         OSError: a directory cannot be created, or the log file cannot be opened.
         StorageError: an output file or the database cannot be opened; nothing is requested.
     """

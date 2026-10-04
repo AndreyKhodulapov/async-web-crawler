@@ -76,6 +76,15 @@ session:
   # sites included; User-Agent, Cookie and Host have keys of their own.
   headers: {}           # e.g. {Accept-Language: en, Authorization: "Bearer ..."}
 
+# Proxies the requests go through; without any, requests go directly.
+# robots.txt, rate limits and max_per_domain still go by the host of the site.
+proxy:
+  urls: []              # e.g. ["http://user:password@proxy-1.example:3128", "http://proxy-2.example:3128"]
+  rotation: per_host    # per_host: a host always goes through one proxy; per_request: the proxies take turns
+  from_env: false       # true takes HTTP_PROXY, HTTPS_PROXY and NO_PROXY instead of urls
+  max_failures: 3       # failures in a row that take a proxy out of rotation
+  cooldown: 60.0        # seconds a proxy stays out of rotation
+
 # Where the crawled pages are saved: files, by extension (.jsonl, .json,
 # .csv, .db), or database URLs (sqlite:///pages.db, postgresql://...).
 storage:

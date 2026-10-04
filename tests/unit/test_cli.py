@@ -39,6 +39,8 @@ def test_options_are_shaped_like_the_configuration():
             "--overwrite",
             "--cookies-file", "cookies.txt",
             "--save-cookies", "saved.txt",
+            "--proxy", "http://user:secret@proxy-1.example:3128",
+            "--proxy", "http://proxy-2.example:3128",
             "--no-respect-robots",
             "--no-same-domain-only",
             "--rate-limit", "2.5",
@@ -55,6 +57,10 @@ def test_options_are_shaped_like_the_configuration():
         "filters": {"same_domain_only": False},
         "storage": {"outputs": ["pages.jsonl", "sqlite:///pages.db"], "overwrite": True},
         "session": {"cookies_file": "cookies.txt", "save_cookies": "saved.txt"},
+        "proxy": {
+            "urls": ["http://user:secret@proxy-1.example:3128", "http://proxy-2.example:3128"],
+            "from_env": False,
+        },
         "report": {"stats_json": "stats.json", "html": "report.html"},
         "logging": {"level": "DEBUG", "file": "crawler.log"},
     }
@@ -95,6 +101,35 @@ def test_cookie_options_keep_the_rest_of_the_session_of_the_file(tmp_path):
     session = build_config(parse_args(["--config", config, "--save-cookies", "flag.txt"])).session
 
     assert (session.save_cookies, session.headers) == ("flag.txt", {"Accept-Language": "en"})
+
+
+@pytest.mark.parametrize("section", [{"urls": ["http://file.example:3128"]}, {"from_env": True}])
+def test_proxy_option_replaces_the_proxies_of_the_file_and_keeps_the_rest(section, tmp_path):
+    config = write_config(
+        tmp_path, {"urls": ["https://example.com/"], "proxy": section | {"rotation": "per_request", "cooldown": 5}}
+    )
+
+    proxy = build_config(parse_args(["--config", config, "--proxy", "http://flag.example:3128"])).proxy
+
+    assert (proxy.urls, proxy.from_env) == (("http://flag.example:3128",), False)
+    assert (proxy.rotation, proxy.cooldown) == ("per_request", 5.0)
+
+
+@pytest.mark.parametrize(
+    "url, problem",
+    [
+        ("socks5://user:pr0xyp4ss@proxy.example:1080", "SOCKS proxies are not supported"),
+        ("http://user:pr0xyp4ss@proxy.example", "the proxy URL needs a port"),
+    ],
+)
+def test_invalid_proxy_is_an_error_of_the_option_without_the_password(url, problem, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["--proxy", url])
+
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert f"argument --proxy: {problem}" in err
+    assert "pr0xyp4ss" not in err
 
 
 def test_crawl_stays_on_the_start_hosts_by_default():

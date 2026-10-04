@@ -11,6 +11,7 @@ from helpers import FAST_CONFIG
 
 import main
 from crawler import AdvancedCrawler, JSONStorage, StorageError
+from demo_site import free_port
 from main import build_config, parse_args, run
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
@@ -118,6 +119,29 @@ async def test_password_of_a_database_is_not_shown(url, config_file, capsys, mon
     output = capsys.readouterr().out
     assert "postgresql://crawler:***@db.example/pages" in output
     assert "secret" not in output
+
+
+async def test_crawl_through_proxies_shows_them_without_the_passwords(url, config_file, make_proxy, capsys):
+    proxy = await make_proxy()
+    dead = f"http://127.0.0.1:{free_port()}"
+    config = config_file(
+        proxy={"rotation": "per_request", "max_failures": 1},
+        retry={"max_retries": 1, "base_delay": 0.01, "max_delay": 0.01},
+    )
+    proxies = [address.replace("http://", "http://crawler:pr0xy-secret@") for address in (dead, proxy.url)]
+    argv = ["--config", config, "--max-depth", "0", "--proxy", proxies[0], "--proxy", proxies[1]]
+
+    code = await run(build_config(parse_args(argv)), progress=False)
+
+    assert code == 0
+    assert proxy.requests == [f"GET {url('/site/')}"]
+    captured = capsys.readouterr()
+    dead_label, live_label = (address.replace("http://", "http://crawler:***@") for address in (dead, proxy.url))
+    assert f"Proxies: {dead_label} (1 sent, 1 failed, out of rotation), {live_label} (1 sent, 0 failed)\n" in (
+        captured.out
+    )
+    assert f"Proxy {dead_label} is out of rotation" in captured.err
+    assert "pr0xy-secret" not in captured.out + captured.err
 
 
 async def test_no_page_fetched_is_exit_code_1(url, config_file, capsys):

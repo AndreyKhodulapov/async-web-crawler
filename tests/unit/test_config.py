@@ -15,6 +15,7 @@ from crawler import (
     CrawlerConfig,
     CSVStorage,
     JSONStorage,
+    ProxyPool,
     RetryStrategy,
     load_config,
 )
@@ -24,6 +25,7 @@ from crawler.config import (
     CrawlOptions,
     FilterOptions,
     LoggingOptions,
+    ProxyOptions,
     ReportOptions,
     RetryOptions,
     SessionOptions,
@@ -72,6 +74,13 @@ FULL = {
         "cookies_file": "cookies.txt",
         "save_cookies": "saved-cookies.txt",
         "headers": {"Accept-Language": "en", "Authorization": "Bearer t0ken"},
+    },
+    "proxy": {
+        "urls": ["http://user:pr0xyp4ss@proxy-1.example:3128", "https://proxy-2.example:8443"],
+        "rotation": "per_request",
+        "from_env": False,
+        "max_failures": 5,
+        "cooldown": 30.0,
     },
     "storage": {
         "outputs": ["pages.jsonl", "pages.csv"],
@@ -127,6 +136,7 @@ class TestDefaults:
         assert config.session == SessionOptions(
             keep_cookies=True, cookies=(), cookies_file=None, save_cookies=None, headers={}
         )
+        assert config.proxy == ProxyOptions(urls=(), rotation="per_host", from_env=False, max_failures=3, cooldown=60.0)
 
     def test_defaults_are_those_of_the_components(self):
         """The crawler built without a configuration and with an empty one behave the same."""
@@ -163,6 +173,9 @@ class TestDefaults:
         assert crawl["same_domain_only"] is False
         assert crawl["exclude_extensions"] == ()
         assert SitemapOptions().from_robots == crawl["robots_sitemaps"]
+        pool = defaults(ProxyPool.__init__)
+        for name in ("rotation", "max_failures", "cooldown"):
+            assert getattr(ProxyOptions(), name) == pool[name], name
 
     def test_configuration_cannot_be_changed(self):
         config = CrawlerConfig()
@@ -709,10 +722,10 @@ class TestSession:
             "session.headers.Authorization: must not be empty",
         )
 
-    def test_headers_must_be_a_mapping(self):
-        assert problems({"session": {"headers": ["Accept-Language: en"]}}) == [
-            "session.headers: expected a mapping of names to values, got a list"
-        ]
+    @pytest.mark.parametrize("headers", [["Accept-Language: en"], "Authorization: Bearer t0ken"])
+    def test_headers_must_be_a_mapping(self, headers):
+        # The value is not shown: it may hold a secret.
+        assert problems({"session": {"headers": headers}}) == ["session.headers: expected a mapping of names to values"]
 
     def test_header_given_twice_in_different_case(self):
         assert problems({"session": {"headers": {"Accept": "a", "accept": "b"}}}) == [
@@ -772,3 +785,107 @@ class TestSession:
 
         (problem,) = error.value.problems
         assert problem.startswith("session.cookies_file: cannot read the cookies: ")
+
+
+class TestProxy:
+    @pytest.fixture(autouse=True)
+    def clean_environment(self, monkeypatch):
+        for name in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "REQUEST_METHOD"]:
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.upper(), raising=False)
+
+    @pytest.mark.parametrize(
+        "url, problem",
+        [
+            ("socks5://user:pr0xyp4ss@proxy.example:1080", "SOCKS proxies are not supported: use an http:// proxy"),
+            ("http://user:pr0xyp4ss@proxy.example", "the proxy URL needs a port"),
+            ("ftp://user:pr0xyp4ss@proxy.example:21", "expected an http:// or https:// proxy URL"),
+            ("http://user:pr0xyp4ss@proxy.example:3128/path", "a proxy URL has no path, query or fragment"),
+        ],
+    )
+    def test_invalid_url_is_not_shown(self, url, problem):
+        (found,) = problems({"proxy": {"urls": ["http://proxy.example:3128", url]}})
+
+        assert found.startswith(f"proxy.urls[1]: {problem}")
+        assert "pr0xyp4ss" not in found
+        assert "got" not in found
+
+    def test_urls_given_as_a_string_are_not_shown(self):
+        assert problems({"proxy": {"urls": "http://user:pr0xyp4ss@proxy.example:3128"}}) == [
+            "proxy.urls: expected a list"
+        ]
+
+    def test_invalid_rotation(self):
+        assert problems({"proxy": {"rotation": "random"}}) == [
+            'proxy.rotation: expected per_host or per_request, got "random"'
+        ]
+
+    @pytest.mark.parametrize(
+        "section, problem",
+        [
+            ({"max_failures": 0}, "proxy.max_failures: must be >= 1, got 0"),
+            ({"cooldown": 0}, "proxy.cooldown: must be > 0, got 0.0"),
+        ],
+    )
+    def test_limits(self, section, problem):
+        assert problems({"proxy": section}) == [problem]
+
+    def test_from_env_cannot_be_used_with_urls(self):
+        assert problems({"proxy": {"urls": ["http://proxy.example:3128"], "from_env": True}}) == [
+            "proxy.from_env: cannot be used with proxy.urls; give one of them"
+        ]
+
+    def test_proxy_listed_twice_is_named_without_its_password(self):
+        found = problems(
+            {
+                "proxy": {
+                    "urls": [
+                        "http://user:pr0xyp4ss@proxy.example:3128",
+                        "http://proxy.example:3128",
+                        "http://user:other@proxy.example:3128",
+                    ]
+                }
+            }
+        )
+
+        assert found == ["proxy.urls[2]: http://user:***@proxy.example:3128 is listed twice"]
+
+    def test_repr_hides_the_passwords(self):
+        text = repr(CrawlerConfig.from_dict(FULL))
+
+        assert "pr0xyp4ss" not in text
+        assert "rotation='per_request'" in text
+
+    def test_no_proxies_build_no_pool(self):
+        assert ProxyOptions().build() is None
+
+    def test_urls_build_a_pool(self):
+        pool = CrawlerConfig.from_dict(FULL).proxy.build()
+
+        assert [proxy.label for proxy in pool.proxies] == [
+            "http://user:***@proxy-1.example:3128",
+            "https://proxy-2.example:8443",
+        ]
+        assert (pool.rotation, pool.max_failures, pool.cooldown) == ("per_request", 5, 30.0)
+
+    def test_from_env_builds_a_pool_of_the_environment(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://user:pr0xyp4ss@proxy.example:3128")
+
+        pool = ProxyOptions(from_env=True, max_failures=2, cooldown=5.0).build()
+
+        assert [proxy.label for proxy in pool.proxies] == ["http://user:***@proxy.example:3128"]
+        assert (pool.max_failures, pool.cooldown) == (2, 5.0)
+        assert pool.pick("http://example.com/") is None  # no HTTP_PROXY
+
+    def test_from_env_without_proxies_builds_no_pool(self):
+        assert ProxyOptions(from_env=True).build() is None
+
+    def test_invalid_variable_is_named_without_its_value(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "socks5://user:pr0xyp4ss@proxy.example:1080")
+
+        with pytest.raises(ConfigError) as error:
+            ProxyOptions(from_env=True).build()
+
+        (problem,) = error.value.problems
+        assert problem.startswith("proxy.from_env: HTTPS_PROXY: SOCKS proxies are not supported")
+        assert "pr0xyp4ss" not in str(error.value)
