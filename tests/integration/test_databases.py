@@ -2,22 +2,17 @@
 
 import asyncio
 import contextlib
-import os
 import sqlite3
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime, timedelta, timezone
 
 import asyncpg
 import pytest
-from helpers import make_record
+from helpers import POSTGRES_DSN, make_record
 
 from crawler import DatabaseStorage, PostgresStorage, RetryStrategy, SQLiteStorage, StorageError, storage_from_env
 
 StorageFactory = Callable[..., DatabaseStorage]
-
-
-# The server of docker-compose.yml, unless another one is given.
-POSTGRES_DSN = os.environ.get("CRAWLER_TEST_DATABASE_URL", "postgresql://crawler:crawler@localhost:5432/crawler")
 
 
 async def run_in_postgres(query: str) -> list[asyncpg.Record]:

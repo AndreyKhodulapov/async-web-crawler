@@ -790,7 +790,7 @@ PostgreSQL server for the crawler, use the compose file of the repository:
 docker compose up -d --wait                  # PostgreSQL 17 on localhost:5432
 export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
 python src/demo_main.py save
-CRAWLER_POSTGRES_PORT=55432 docker compose up -d --wait   # if port 5432 is taken
+CRAWLER_POSTGRES_PORT=55432 docker compose up -d --wait   # if port 5432 is taken; the URL then has :55432
 ```
 
 Another database needs a driver and a few lines of storage: `DatabaseStorage`

@@ -1,6 +1,8 @@
 # PostgreSQL for the crawler and its tests:
 #   docker compose up -d --wait
 #   export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
+# If port 5432 is taken, export CRAWLER_POSTGRES_PORT=55432 first and put
+# that port in the URL; the tests read the port from the same variable.
 services:
   postgres:
     image: postgres:17-alpine

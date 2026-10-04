@@ -2,12 +2,12 @@
 
 import csv
 import json
-import os
 import sqlite3
 from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
+from helpers import POSTGRES_DSN
 
 from crawler import CSVStorage
 from demo_main import parse_args, run_crawl, run_errors, run_save
@@ -209,10 +209,9 @@ async def test_save_demo_writes_an_indented_array_in_another_encoding(tmp_path):
 
 @pytest.mark.postgres
 async def test_save_demo_with_postgres(tmp_path, capsys, monkeypatch):
-    dsn = os.environ.get("CRAWLER_TEST_DATABASE_URL", "postgresql://crawler:crawler@localhost:5432/crawler")
-    connection = await asyncpg.connect(dsn)
+    connection = await asyncpg.connect(POSTGRES_DSN)
     await connection.execute("DROP TABLE IF EXISTS pages")
-    monkeypatch.setenv("CRAWLER_DATABASE_URL", dsn)
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", POSTGRES_DSN)
     files = ["--json", str(tmp_path / "pages.jsonl"), "--csv", str(tmp_path / "pages.csv")]
 
     try:
@@ -226,6 +225,6 @@ async def test_save_demo_with_postgres(tmp_path, capsys, monkeypatch):
     assert "=== Saved pages (this crawl: 12 saved, 0 not saved) ===" in output
     row = next(line.split() for line in output.splitlines() if line.startswith("PostgresStorage "))
     assert row[1:3] == ["12", "-"]
-    assert f":{urlsplit(dsn).password}@" not in row[-1]
+    assert f":{urlsplit(POSTGRES_DSN).password}@" not in row[-1]
     assert ":***@" in row[-1]
     assert "Pages found by URL in postgresql://" in output

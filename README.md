@@ -327,11 +327,29 @@ The database tests run on SQLite by default. With the marker `postgres` the
 same checks run on a PostgreSQL server: start it with `docker compose up -d
 --wait`, or point `CRAWLER_TEST_DATABASE_URL` at another one (the default is
 `postgresql://crawler:crawler@localhost:5432/crawler`). The tests drop and
-create the `pages` table.
+create the `pages` table. A server of the compose file on another port is
+found by the same variable that moved it:
+
+```bash
+export CRAWLER_POSTGRES_PORT=55432          # port 5432 is taken
+docker compose up -d --wait
+pytest -m ""                                # every test: the default ones, network and postgres
+```
 
 ```bash
 ruff format src tests       # format
 ruff check src tests        # lint
+```
+
+The [Makefile](Makefile) keeps these commands short, with the tools of `.venv`:
+
+```bash
+make test                   # the default tests
+make test-all               # every test, network and postgres too
+make lint                   # ruff check and a format check
+make db                     # start the PostgreSQL of docker-compose.yml
+make check                  # lint and every test: what a change must pass
+make db check CRAWLER_POSTGRES_PORT=55432   # the same with the server on another port
 ```
 
 ## Project structure
@@ -380,6 +398,7 @@ examples/
 └── urls.txt                # a list of start URLs for --urls-file
 config.example.yaml         # every configuration key with its default
 docker-compose.yml          # PostgreSQL for the crawler and its tests
+Makefile                    # test, lint and database commands
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests

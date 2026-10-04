@@ -1,12 +1,21 @@
 """Helpers shared by unit and integration tests."""
 
 import asyncio
+import os
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 
 from crawler import CircuitBreaker, DataStorage, PageRecord, RetryStrategy
 
 BOT = "TestBot/1.0 (+https://example.com/bot)"
+
+# The server of docker-compose.yml, on the port it was started with,
+# unless CRAWLER_TEST_DATABASE_URL names another one. An empty port is no
+# port, as in the compose file.
+POSTGRES_DSN = os.environ.get(
+    "CRAWLER_TEST_DATABASE_URL",
+    f"postgresql://crawler:crawler@localhost:{os.environ.get('CRAWLER_POSTGRES_PORT') or 5432}/crawler",
+)
 SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
 
 # Crawler options for tests that check something other than politeness:
