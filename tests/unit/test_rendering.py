@@ -1,6 +1,7 @@
 """Unit tests for rendering without a browser: its settings, which pages go to the browser, its errors."""
 
 import asyncio
+import logging
 import sys
 import time
 
@@ -323,11 +324,24 @@ class TestCookieSync:
         sync = CookieSync()
 
         assert sync.to_browser([SID, LANG]) == ([SID, LANG], [])
+        sync.sent([SID, LANG], [SID, LANG])
         assert sync.to_browser([SID, LANG]) == ([], [])
+
+    def test_what_the_jar_failed_to_take_is_not_taken_again_and_again(self) -> None:
+        sync = CookieSync()
+        sync.to_jar([SID])  # writing it failed: written() was not called
+
+        assert sync.to_jar([SID]) == ([], [])
+
+    def test_what_was_not_sent_goes_to_the_browser_again(self) -> None:
+        sync = CookieSync()
+        sync.to_browser([SID, LANG])  # giving them failed: sent() was not called
+
+        assert sync.to_browser([SID, LANG]) == ([SID, LANG], [])
 
     def test_only_what_the_jar_changed_goes_to_the_browser(self) -> None:
         sync = CookieSync()
-        sync.to_browser([SID, LANG])
+        sync.sent(sync.to_browser([SID, LANG])[0], [SID, LANG])
         changed = make_cookie("sid", "2", "a.test")
 
         assert sync.to_browser([changed]) == ([changed], [LANG])
@@ -457,6 +471,141 @@ class TestBypassRules:
     )
     def test_no_proxy_as_rules_of_the_browser(self, no_proxy, rules) -> None:
         assert bypass_rules(no_proxy) == rules
+
+
+class CookieContext:
+    """A context that keeps cookies as Chromium does: one cookie named in `refused` fails its whole batch."""
+
+    def __init__(self, refused: frozenset[str] = frozenset()) -> None:
+        self.refused = refused
+        self.kept: dict[tuple[str, str, str], dict] = {}
+        self.batches: list[list[str]] = []
+        self.reads = 0
+        self.closed = False
+        self.crash_on_add = False  # the browser crashes as cookies are added
+
+    async def add_cookies(self, cookies) -> None:
+        from playwright.async_api import Error
+
+        self.closed = self.closed or self.crash_on_add
+        if self.closed:
+            raise Error("Target page, context or browser has been closed")
+        self.batches.append([cookie["name"] for cookie in cookies])
+        if any(cookie["name"] in self.refused for cookie in cookies):
+            raise Error("Protocol error (Storage.setCookies): Invalid cookie fields")
+        for cookie in cookies:
+            self.kept[cookie["domain"], cookie["path"], cookie["name"]] = {"expires": -1, **cookie}
+
+    async def clear_cookies(self, *, name: str, domain: str, path: str) -> None:
+        self.kept.pop((domain, path, name), None)
+
+    async def cookies(self) -> list[dict]:
+        from playwright.async_api import Error
+
+        if self.closed:
+            raise Error("Target page, context or browser has been closed")
+        self.reads += 1
+        return list(self.kept.values())
+
+    def set(self, name: str, value: str, domain: str = "a.test") -> None:
+        """As a script of a page does."""
+        self.kept[domain, "/", name] = {"name": name, "value": value, "domain": domain, "path": "/", "expires": -1}
+
+
+class JarTransport(ScriptedTransport):
+    """A transport whose jar is a dict."""
+
+    def __init__(self, cookies: list) -> None:
+        super().__init__({})
+        self.jar = {(cookie.domain, cookie.path, cookie.name): cookie for cookie in cookies}
+
+    def cookies(self) -> list:
+        return list(self.jar.values())
+
+    def update_cookies(self, changed, removed) -> None:
+        for cookie in changed:
+            self.jar[cookie.domain, cookie.path, cookie.name] = cookie
+        for cookie in removed:
+            self.jar.pop((cookie.domain, cookie.path, cookie.name), None)
+
+
+class TestCookiesOfAContext:
+    def make_renderer(self, jar: JarTransport) -> Renderer:
+        return Renderer(DEFAULT, user_agent="TestBot/1.0", cookies=jar)
+
+    async def test_a_cookie_the_browser_refuses_does_not_keep_the_others_out(self, caplog) -> None:
+        pytest.importorskip("playwright")
+        refused = make_cookie("__Host-x", "secret-value", "a.test", path="/x")
+        renderer = self.make_renderer(JarTransport([SID, refused]))
+        context, sync = CookieContext(refused=frozenset({"__Host-x"})), CookieSync()
+
+        with caplog.at_level(logging.WARNING, logger="crawler.rendering"):
+            await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+
+        assert [cookie["name"] for cookie in await context.cookies()] == ["sid"]
+        assert "The browser refused the cookie __Host-x of a.test" in caplog.text
+        assert "secret-value" not in caplog.text
+        batches = len(context.batches)
+        await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+        assert len(context.batches) == batches  # neither is sent again
+
+    async def test_a_cookie_refused_in_place_of_another_takes_that_one_out(self) -> None:
+        pytest.importorskip("playwright")
+        jar = JarTransport([SID, make_cookie("token", "old", "a.test")])
+        renderer = self.make_renderer(jar)
+        context, sync = CookieContext(), CookieSync()
+        await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+
+        # The crawler gets a token the browser refuses: the browser would go on with the old one.
+        context.refused = frozenset({"token"})
+        jar.update_cookies([make_cookie("token", "new", "a.test")], [])
+        await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+        await renderer._take_cookies(context, sync)  # type: ignore[arg-type]
+
+        assert [cookie["name"] for cookie in await context.cookies()] == ["sid"]
+        assert {cookie.name: cookie.value for cookie in jar.cookies()} == {"sid": "1", "token": "new"}
+
+    async def test_a_context_gone_fails_the_page_without_refusals(self, caplog) -> None:
+        Error = pytest.importorskip("playwright.async_api").Error
+
+        renderer = self.make_renderer(JarTransport([SID, LANG]))
+        context, sync = CookieContext(), CookieSync()
+        context.crash_on_add = True
+
+        with caplog.at_level(logging.WARNING, logger="crawler.rendering"), pytest.raises(Error):
+            await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+
+        assert "refused" not in caplog.text
+        context.closed = context.crash_on_add = False
+        await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+        assert len(await context.cookies()) == 2  # given once the context works
+
+    async def test_nothing_to_give_asks_the_browser_nothing(self) -> None:
+        pytest.importorskip("playwright")
+        renderer = self.make_renderer(JarTransport([SID]))
+        context, sync = CookieContext(), CookieSync()
+        await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+        reads = context.reads
+
+        await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+
+        assert context.reads == reads
+
+    async def test_a_cookie_both_changed_meanwhile_is_that_of_the_browser(self) -> None:
+        pytest.importorskip("playwright")
+        jar = JarTransport([SID])
+        renderer = self.make_renderer(jar)
+        context, sync = CookieContext(), CookieSync()
+        await renderer._send_cookies(context, sync)  # type: ignore[arg-type]
+
+        # A script of a page still open sets sid; a response gives the crawler another sid meanwhile.
+        context.set("sid", "browser")
+        jar.update_cookies([make_cookie("sid", "jar", "a.test")], [])
+        await renderer._send_cookies(context, sync)  # type: ignore[arg-type]  # the next page opens
+        await renderer._take_cookies(context, sync)  # type: ignore[arg-type]  # the first page ends
+
+        assert [cookie["value"] for cookie in await context.cookies()] == ["browser"]
+        assert [cookie.value for cookie in jar.cookies()] == ["browser"]
 
 
 class FakeContext:

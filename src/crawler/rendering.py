@@ -174,7 +174,8 @@ class CookieSync:
     page that opens while another one runs does not overwrite with the
     jar the cookies the other one's JavaScript set, and the cookies the
     crawler gets while a page runs are not lost. When both sides change
-    a cookie, the browser wins.
+    a cookie, the browser wins: what the browser changed is taken before
+    what the jar changed is given.
 
     `sent` and `written` record how a side kept what it was given,
     which may differ from what it was given (Chromium refuses some
@@ -190,20 +191,28 @@ class CookieSync:
         self.lock = asyncio.Lock()
         self._jar: dict[_Key, Cookie] = {}  # how each side was the last time
         self._browser: dict[_Key, Cookie] = {}
+        self._giving: dict[_Key, Cookie] = {}  # the jar of `to_browser`, until `sent`
 
     def to_browser(self, jar: Iterable[Cookie]) -> tuple[list[Cookie], list[Cookie]]:
-        """The cookies the jar has changed and those it has dropped since the last time."""
-        now = _by_key(jar)
-        changes = _changes(self._jar, now)
-        self._jar = now
-        return changes
+        """The cookies the jar has changed and those it has dropped since the last time.
+
+        They count as given once `sent` says how the browser keeps them:
+        if giving them fails, they are given again the next time.
+        """
+        self._giving = _by_key(jar)
+        return _changes(self._jar, self._giving)
 
     def sent(self, cookies: Iterable[Cookie], browser: Iterable[Cookie]) -> None:
         """How the browser keeps `cookies`, just sent to it: as it has them in `browser`, or not at all."""
+        self._jar = self._giving
         _record(self._browser, cookies, _by_key(browser))
 
     def to_jar(self, browser: Iterable[Cookie]) -> tuple[list[Cookie], list[Cookie]]:
-        """The cookies the browser has changed and those it has dropped since the last time."""
+        """The cookies the browser has changed and those it has dropped since the last time.
+
+        They count as taken at once: one the jar fails to take is not
+        taken again before every page.
+        """
         now = _by_key(browser)
         changes = _changes(self._browser, now)
         self._browser = now
@@ -276,6 +285,32 @@ def from_playwright(cookie: Mapping[str, Any]) -> Cookie:
         expires=int(expires) if expires > 0 else None,
         http_only=cookie.get("httpOnly", False),
     )
+
+
+async def _add_cookies(context: "BrowserContext", cookies: list[Cookie]) -> None:
+    """Add `cookies` to `context`; one Chromium refuses is left out, not the others with it.
+
+    Chromium refuses a whole batch for one cookie it takes for invalid,
+    such as a `__Host-` cookie with a path, so after a refusal they are
+    added one by one. A cookie refused takes the one of its name the
+    browser had out too: the browser would go on with a value the
+    crawler no longer has.
+    """
+    from playwright.async_api import Error
+
+    try:
+        await context.add_cookies([to_playwright(cookie) for cookie in cookies])  # type: ignore[arg-type]
+        return
+    except Error:
+        # Unless the context is gone, which fails the page: one cookie was refused.
+        await context.cookies()
+    for cookie in cookies:
+        try:
+            await context.add_cookies([to_playwright(cookie)])  # type: ignore[arg-type]
+        except Error:
+            # The value is a secret, and so may be the message.
+            logger.warning("The browser refused the cookie %s of %s", cookie.name, cookie.domain)
+            await context.clear_cookies(name=cookie.name, domain=cookie.domain, path=cookie.path)
 
 
 class Rendered(NamedTuple):
@@ -534,14 +569,23 @@ class Renderer:
                     await (context.close() if sync is None else self._take_cookies(context, sync))
 
     async def _send_cookies(self, context: "BrowserContext", sync: CookieSync) -> None:
-        """Give the context the cookies the crawler has changed since the last time."""
+        """Give the context the cookies the crawler has changed since the last time.
+
+        What the context has changed meanwhile, by the scripts of a page
+        still open, goes to the crawler first: when both changed a cookie,
+        that of the browser wins.
+        """
         assert self._cookies is not None
         async with sync.lock:
             changed, removed = sync.to_browser(self._cookies.cookies())
             if not changed and not removed:
-                return
+                return  # what the browser changed is taken when its page ends
+            if await self._collect_cookies(context, sync):
+                changed, removed = sync.to_browser(self._cookies.cookies())
+                if not changed and not removed:
+                    return  # the browser had changed them too, and won
             if changed:
-                await context.add_cookies([to_playwright(cookie) for cookie in changed])  # type: ignore[arg-type]
+                await _add_cookies(context, changed)
             for cookie in removed:
                 await context.clear_cookies(name=cookie.name, domain=cookie.domain, path=cookie.path)
             sync.sent([*changed, *removed], map(from_playwright, await context.cookies()))
@@ -549,14 +593,19 @@ class Renderer:
 
     async def _take_cookies(self, context: "BrowserContext", sync: CookieSync) -> None:
         """Give the crawler the cookies the context has changed since the last time."""
-        assert self._cookies is not None
         async with sync.lock:
-            changed, removed = sync.to_jar(map(from_playwright, await context.cookies()))
-            if not changed and not removed:
-                return
-            self._cookies.update_cookies(changed, removed)
-            sync.written([*changed, *removed], self._cookies.cookies())
-            logger.debug("Took %d cookies from the browser, %d removed", len(changed), len(removed))
+            await self._collect_cookies(context, sync)
+
+    async def _collect_cookies(self, context: "BrowserContext", sync: CookieSync) -> bool:
+        """As `_take_cookies`, with `sync.lock` held by the caller; whether the browser had changed any."""
+        assert self._cookies is not None
+        changed, removed = sync.to_jar(map(from_playwright, await context.cookies()))
+        if not changed and not removed:
+            return False
+        self._cookies.update_cookies(changed, removed)
+        sync.written([*changed, *removed], self._cookies.cookies())
+        logger.debug("Took %d cookies from the browser, %d removed", len(changed), len(removed))
+        return True
 
     async def _load(self, page: "Page", url: str, tab: _Tab) -> Rendered:
         """Load the page and wait for it, unless it goes to another URL meanwhile."""

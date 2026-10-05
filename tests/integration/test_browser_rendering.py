@@ -217,6 +217,16 @@ async def test_cookies_of_the_crawler_and_of_the_page_itself_are_seen_by_javascr
     assert "doc=2" in page["text"]
 
 
+async def test_a_cookie_chromium_refuses_keeps_no_other_from_javascript(url, caplog):
+    # Chromium takes a __Secure- cookie without Secure for invalid, and with it the whole batch.
+    cookies = [make_cookie("given", "1", HOST), make_cookie("__Secure-bad", "2", HOST)]
+    async with make_crawler(cookies=cookies) as crawler:
+        page = await crawler.fetch_and_parse(url("/js/cookie-read", HOST))
+
+    assert "given=1" in page["text"]
+    assert "The browser refused the cookie __Secure-bad of localhost" in caplog.text
+
+
 async def test_cookies_javascript_and_its_requests_set_go_with_the_next_page(url):
     async with make_crawler(COOKIES_SET) as crawler:
         await crawler.fetch_url(url("/js/cookie-set", HOST))

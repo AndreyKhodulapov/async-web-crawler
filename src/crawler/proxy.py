@@ -222,13 +222,11 @@ class ProxyPool:
         if not candidates:
             return None
         now = self._clock()
-        start = self._start(url, candidates)
-        for step in range(len(candidates)):
-            index = (start + step) % len(candidates)
-            if self._is_active(candidates[index], now):
-                if self.rotation == "per_request":
-                    self._turn = index + 1
-                return candidates[index]
+        index = self._search(url, candidates, lambda proxy: self._is_active(proxy, now))
+        if index is not None:
+            if self.rotation == "per_request":
+                self._turn = index + 1
+            return candidates[index]
         back_in = min(self._states[proxy.label].out_until or now for proxy in candidates) - now
         if len(candidates) == 1:
             message = f"no proxy available: {candidates[0].label} is out of rotation, back in {back_in:.1f}s"
@@ -255,13 +253,17 @@ class ProxyPool:
             return
         state.failures += 1
         state.failures_in_a_row += 1
-        if self.rotation == "per_host" and (host := get_host(url)) is not None:
-            # The host moves to the proxy after the one that failed, however
-            # many of its requests fail through that one at once.
-            candidates = self._candidates(url)
-            if proxy in candidates:
-                self._shifts[host] = (candidates.index(proxy) + 1 - _hash(host)) % len(candidates)
         now = self._clock()
+        if self.rotation == "per_host" and (host := get_host(url)) is not None:
+            # The host moves to the proxy after the one that failed, if that is
+            # still the proxy of the host: the requests that fail through it at
+            # once move the host once, and a request sent before the host moved
+            # does not move it back.
+            candidates = self._candidates(url)
+            # The proxy `pick` would give the host now, without bringing one back to rotation.
+            index = self._search(url, candidates, lambda other: not self._is_out(other, now)) if candidates else None
+            if index is not None and candidates[index] == proxy:
+                self._shifts[host] = (index + 1 - _hash(host)) % len(candidates)
         if state.failures_in_a_row >= self.max_failures and self._is_active(proxy, now):
             state.out_until = now + self.cooldown
             state.times_removed += 1
@@ -310,6 +312,15 @@ class ProxyPool:
             return self._turn % len(candidates)
         host = get_host(url) or ""
         return (_hash(host) + self._shifts.get(host, 0)) % len(candidates)
+
+    def _search(self, url: str, candidates: list[Proxy], active: Callable[[Proxy], bool]) -> int | None:
+        """The index of the first of `candidates` that is `active`, from where the turn of `url` starts; None if none is."""
+        start = self._start(url, candidates)
+        for step in range(len(candidates)):
+            index = (start + step) % len(candidates)
+            if active(candidates[index]):
+                return index
+        return None
 
     def _is_out(self, proxy: Proxy, now: float) -> bool:
         """Whether `proxy` is out of rotation at `now`."""

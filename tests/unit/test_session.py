@@ -165,6 +165,38 @@ class TestCookieJar:
         ]
         assert next(cookie for cookie in cookies if cookie.name == "wide").has_nonstandard_attr("HTTPOnly")
 
+    async def test_a_cookie_of_a_parent_domain_leaves_the_one_of_the_host_for_it_only(self):
+        jar = CookieJar()
+        set_cookie(jar, "sid=1", "http://a.example.com/")
+        set_cookie(jar, "sid=2; Domain=example.com", "http://a.example.com/")
+
+        assert summary(jar.export()) == [
+            (".example.com", "/", "sid", "2", False),
+            ("a.example.com", "/", "sid", "1", False),
+        ]
+
+    @pytest.mark.parametrize(
+        "steps",
+        [
+            [("sid=1", "http://example.com/")],
+            [("sid=1", "http://example.com/"), ("wide=2; Domain=example.com", "http://example.com/")],
+            [("sid=1", "http://a.example.com/"), ("sid=2; Domain=example.com", "http://a.example.com/")],
+            # aiohttp keeps the mark of the host in these, unlike a browser: so does the export.
+            [("sid=1", "http://example.com/"), ("sid=2; Domain=example.com", "http://example.com/")],
+            [("sid=1", "http://example.com/"), ("sid=2; Domain=example.com", "http://www.example.com/")],
+            [("a=1; Path=/x", "http://example.com/x"), ("a=2; Domain=example.com; Path=/y", "http://example.com/y")],
+        ],
+        ids=["host only", "domain", "parent domain", "host again", "subdomain for the host", "two paths"],
+    )
+    async def test_a_cookie_is_exported_for_the_hosts_the_crawler_sends_it_to(self, steps):
+        jar = CookieJar()
+        for header, url in steps:
+            set_cookie(jar, header, url)
+
+        for cookie in jar.export():
+            to_subdomain = sent(jar, f"http://sub.{cookie.domain.removeprefix('.')}{cookie.path}")
+            assert (to_subdomain.get(cookie.name) == cookie.value) == cookie.domain.startswith("."), cookie
+
     async def test_max_age_becomes_an_expiry(self):
         jar = CookieJar()
         before = time.time()
@@ -225,10 +257,12 @@ class TestCookieJar:
 
         jar.remove([make_cookie("sid", "any value", "example.com"), make_cookie("wide", "", ".example.org")])
 
+        # aiohttp marks a cookie for its host only by host and name: the one of /app loses it with that of /.
         assert summary(jar.export()) == [
+            (".example.com", "/app", "sid", "2", False),
             ("example.com", "/", "other", "4", False),
-            ("example.com", "/app", "sid", "2", False),
         ]
+        assert sent(jar, "http://sub.example.com/app/page") == {"sid": "2"}
 
 
 def make_transport(**options) -> HttpTransport:

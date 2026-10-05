@@ -73,6 +73,27 @@ class TestPerHost:
         pool.record(proxy, OTHER_PAGE, failed(OTHER_PAGE))
         assert pool.pick(PAGE).url == URLS[(URLS.index(proxy.url) + 1) % len(URLS)]
 
+    def test_a_late_failure_of_a_proxy_the_host_left_does_not_move_it_back(self, pool):
+        first = pool.pick(PAGE)  # a request sent before the host moved
+        pool.record(first, OTHER_PAGE, failed(OTHER_PAGE))
+        second = pool.pick(PAGE)
+        pool.record(second, OTHER_PAGE, failed(OTHER_PAGE))
+        third = pool.pick(PAGE)
+        assert len({first, second, third}) == 3
+
+        pool.record(first, PAGE, failed())
+
+        assert pool.pick(PAGE) == third
+
+    def test_a_failure_of_the_proxy_standing_in_for_one_out_moves_the_host_on(self, pool):
+        own = pool.pick(PAGE)
+        fail(pool, own, 2, url="http://b.test/")  # another host takes it out
+        stand_in = pool.pick(PAGE)
+
+        pool.record(stand_in, PAGE, failed())
+
+        assert pool.pick(PAGE) not in (own, stand_in)
+
     def test_other_errors_do_not_move_the_host(self, pool):
         proxy = pool.pick(PAGE)
         pool.record(proxy, PAGE, FetchTimeoutError(PAGE, "timed out"))
@@ -251,6 +272,16 @@ class TestFromEnv:
         monkeypatch.setenv("HTTP_PROXY", "http://plain:3128")
         monkeypatch.setenv("NO_PROXY", no_proxy)
         assert ProxyPool.from_env().pick(url) is None
+
+    def test_a_failure_for_a_host_of_no_proxy_is_counted(self, monkeypatch):
+        # record() is public: a transport of its own may tell of a URL the pool sends directly.
+        monkeypatch.setenv("HTTP_PROXY", "http://plain:3128")
+        monkeypatch.setenv("NO_PROXY", "a.test")
+        pool = ProxyPool.from_env()
+
+        fail(pool, pool.proxies[0], 1, url="http://a.test/")
+
+        assert pool.get_stats()["http://plain:3128"].failures == 1
 
     def test_the_pool_tells_its_no_proxy(self, monkeypatch):
         monkeypatch.setenv("HTTP_PROXY", "http://plain:3128")

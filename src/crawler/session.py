@@ -185,17 +185,16 @@ class CookieJar(aiohttp.CookieJar):
     """aiohttp's cookie jar that can give its cookies back as `http.cookiejar` cookies.
 
     A cookies.txt file says whether a cookie is for its host only and when
-    it expires, and aiohttp keeps neither where it can be read. So the jar
-    remembers the cookies set without a Domain, and turns a Max-Age into
-    an Expires date as the cookie arrives.
+    it expires. Whether it is for its host only is what aiohttp says when it
+    sends the cookie, so that the file and the browser get what the crawler
+    does: aiohttp marks by host and name, not by path, and keeps a mark once
+    given even when the host sets the cookie again for its subdomains, so
+    it may differ from what a browser would keep (RFC 6265). aiohttp keeps
+    no expiry date where it can be read, so the jar turns a Max-Age into an
+    Expires date as the cookie arrives.
     """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._for_host_only: set[tuple[str, str]] = set()  # (host, name)
-
     def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:  # noqa: B008, as aiohttp has it
-        host = response_url.raw_host
         received = []
         for name, cookie in cookies.items() if isinstance(cookies, Mapping) else cookies:
             if isinstance(cookie, Morsel):
@@ -208,15 +207,14 @@ class CookieJar(aiohttp.CookieJar):
             if max_age.isdigit() and int(max_age) > 0:
                 cookie["expires"] = formatdate(min(time.time() + int(max_age), self.MAX_TIME), usegmt=True)
                 cookie["max-age"] = ""
-            if host is not None:
-                # aiohttp ignores a domain with a trailing dot, and one that does not match the host.
-                domain = cookie["domain"].removeprefix(".")
-                if not domain or domain.endswith("."):
-                    self._for_host_only.add((host, name))
-                elif host == domain or host.endswith(f".{domain}"):
-                    self._for_host_only.discard((host, name))
             received.append((name, cookie))
         super().update_cookies(received, response_url)
+
+    def _host_only(self) -> frozenset[tuple[str, str]] | set[tuple[str, str]]:
+        """The (host, name) of the cookies aiohttp sends to their host only."""
+        if hasattr(aiohttp.CookieJar, "host_only_cookies"):
+            return self.host_only_cookies
+        return self._host_only_cookies  # before aiohttp made it public, as late as 3.10
 
     def add(self, cookies: Iterable[Cookie]) -> None:
         """Add cookies of `http.cookiejar`, such as those of `load_cookies_file()`."""
@@ -242,20 +240,18 @@ class CookieJar(aiohttp.CookieJar):
         for cookie in cookies:
             host, path, name = cookie.domain.removeprefix("."), cookie.path, cookie.name
             self.clear(lambda morsel: (morsel["domain"], morsel["path"], morsel.key) == (host, path, name))  # noqa: B023, called at once
-            # The mark is by host and name: a cookie of another path may still have it.
-            if not any((morsel["domain"], morsel.key) == (host, name) for morsel in self):
-                self._for_host_only.discard((host, name))
 
     def export(self) -> list[Cookie]:
         """The cookies kept, expired ones left out, as `http.cookiejar` cookies."""
         cookies = []
+        host_only = self._host_only()
         for morsel in self:
             host = morsel["domain"]
             cookies.append(
                 make_cookie(
                     morsel.key,
                     morsel.value,
-                    host if (host, morsel.key) in self._for_host_only else f".{host}",
+                    host if (host, morsel.key) in host_only else f".{host}",
                     path=morsel["path"] or "/",
                     secure=bool(morsel["secure"]),
                     expires=http2time(morsel["expires"]) if morsel["expires"] else None,
