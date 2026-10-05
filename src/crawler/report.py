@@ -32,7 +32,7 @@ def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str
 
     `stats` is what `CrawlerStats.get_stats()` returns; with a `proxies`
     key, as `AdvancedCrawler.get_stats()` has it, a table of the proxies
-    follows. The page is one file that needs nothing else: the styles are
+    follows, and with a `rendering` key, the numbers of the rendering. The page is one file that needs nothing else: the styles are
     inline, the charts are PNG images embedded as data URIs, and there are
     no scripts. Everything that comes from the crawl (hosts, error names,
     proxies) is escaped.
@@ -73,6 +73,8 @@ def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str
     ]
     if "proxies" in stats:
         sections.append(_proxy_section(stats["proxies"]))
+    if "rendering" in stats:
+        sections.append(_rendering_section(stats["rendering"]))
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
@@ -114,6 +116,16 @@ def _proxy_section(proxies: Mapping[str, Mapping[str, Any]]) -> str:
         '<th class="number">Times out of rotation</th><th>State</th></tr></thead>\n'
         f"<tbody>\n{rows}</tbody>\n</table>\n</section>\n"
     )
+
+
+def _rendering_section(rendering: Mapping[str, Any]) -> str:
+    numbers = {
+        "Pages rendered": _count(rendering["rendered"]),
+        "Failed": _count(rendering["failed"]),
+        "Average render time": _duration(rendering["avg_render_time"]),
+    }
+    tiles = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in numbers.items())
+    return f'<section>\n<h2>Rendering</h2>\n<dl class="summary">{tiles}</dl>\n</section>\n'
 
 
 def _bar_chart(counts: Mapping[str, int]) -> bytes:

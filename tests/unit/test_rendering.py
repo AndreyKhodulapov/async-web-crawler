@@ -1,5 +1,6 @@
 """Unit tests for rendering without a browser: its settings, which pages go to the browser, its errors."""
 
+import asyncio
 import sys
 import time
 
@@ -10,10 +11,12 @@ from test_transport_contract import ScriptedTransport, make_fetcher, page
 from crawler import (
     AsyncCrawler,
     CrawlerClosedError,
+    FetchTimeoutError,
     PageTooLargeError,
     ProxyPool,
     RenderError,
     Rendering,
+    RenderStats,
     make_cookie,
 )
 from crawler.proxy import Proxy
@@ -52,6 +55,12 @@ class FakeRenderer:
     async def close(self) -> None:
         self.closed = True
         raise RuntimeError("the browser would not close")
+
+    def stats(self) -> RenderStats:
+        return RenderStats(rendered=len(self.pages))
+
+    def reset_stats(self) -> None:
+        self.pages.clear()
 
 
 def make_transport(
@@ -525,3 +534,121 @@ class TestContextsOfProxies:
 
         assert all(context.closed for context in contexts)
         assert renderer._contexts == {}
+
+
+class TabContext:
+    """A context whose tabs do nothing."""
+
+    async def new_page(self) -> "TabContext":
+        return self
+
+    def on(self, event, handler) -> None:
+        pass
+
+    async def close(self) -> None:
+        pass
+
+
+class TestRenderStats:
+    LOAD = 0.05
+
+    def make_renderer(self, load, *, start=None, max_open_pages: int = 2) -> Renderer:
+        """A renderer whose tabs take as long as `load` does, and whose contexts as long as `start`."""
+        renderer = Renderer(Rendering(max_open_pages=max_open_pages), user_agent="TestBot/1.0")
+
+        async def get_context(url, proxy):
+            if start is not None:
+                await start(url)
+            return TabContext(), None
+
+        async def load_page(page, url, tab):
+            return await load(url)
+
+        renderer._get_context = get_context  # type: ignore[method-assign]
+        renderer._load = load_page  # type: ignore[method-assign]
+        return renderer
+
+    async def slow_page(self, url: str) -> Rendered:
+        await asyncio.sleep(self.LOAD)
+        return Rendered("<p>page</p>") if url == URL else Rendered("", "https://a.test/elsewhere")
+
+    async def test_pages_rendered_and_those_that_went_elsewhere_count(self) -> None:
+        renderer = self.make_renderer(self.slow_page)
+        assert renderer.stats() == RenderStats()
+
+        await renderer.render(URL, page(URL, "page"))
+        await renderer.render("https://a.test/going", page(URL, "page"))
+
+        stats = renderer.stats()
+        assert (stats.rendered, stats.failed) == (2, 0)
+        assert self.LOAD <= stats.avg_render_time < self.LOAD * 3
+
+    async def test_the_time_is_without_the_wait_for_a_tab_and_for_the_browser(self) -> None:
+        async def start(url: str) -> None:
+            await asyncio.sleep(self.LOAD * 4)  # as a browser starting
+
+        renderer = self.make_renderer(self.slow_page, start=start, max_open_pages=1)
+
+        # The second page waits for the tab of the first.
+        await asyncio.gather(*(renderer.render(URL, page(URL, "page")) for _ in range(2)))
+
+        stats = renderer.stats()
+        assert stats.rendered == 2
+        assert self.LOAD <= stats.avg_render_time < self.LOAD * 3
+
+    async def test_timeouts_and_failures_of_the_browser_count_as_failed(self) -> None:
+        from playwright.async_api import Error, TimeoutError
+
+        failures = {
+            "https://a.test/slow": TimeoutError("Timeout 30000ms exceeded."),
+            "https://a.test/crash": Error("Target page, context or browser has been closed"),
+        }
+
+        async def load(url: str) -> Rendered:
+            if url in failures:
+                raise failures[url]
+            return await self.slow_page(url)
+
+        async def start(url: str) -> None:
+            if url == "https://a.test/no-browser":
+                raise RenderError(url, "Chromium is not installed; run: playwright install chromium")
+
+        renderer = self.make_renderer(load, start=start)
+        errors = []
+        for url in (URL, *failures, "https://a.test/no-browser"):
+            try:
+                await renderer.render(url, page(url, "page"))
+            except (RenderError, FetchTimeoutError) as exc:
+                errors.append(type(exc))
+
+        assert errors == [FetchTimeoutError, RenderError, RenderError]
+        stats = renderer.stats()
+        assert (stats.rendered, stats.failed) == (1, 3)
+        # The failures do not stretch the average.
+        assert stats.avg_render_time < self.LOAD * 3
+
+    async def test_a_page_of_a_closed_renderer_is_not_a_failure(self) -> None:
+        async def start(url: str) -> None:
+            raise CrawlerClosedError(url, "crawler is closed")
+
+        renderer = self.make_renderer(self.slow_page, start=start)
+        with pytest.raises(CrawlerClosedError):
+            await renderer.render(URL, page(URL, "page"))
+
+        assert renderer.stats() == RenderStats()
+
+    async def test_the_transport_counts_anew_with_its_requests(self) -> None:
+        http = ScriptedTransport({URL: page(URL, "page")})
+        transport = BrowserTransport(http, DEFAULT, user_agent="TestBot/1.0", max_page_size=None)
+        transport.renderer = self.make_renderer(self.slow_page)
+        await get(transport)
+        assert transport.render_stats().rendered == 1
+
+        transport.reset_stats()
+
+        assert transport.render_stats() == RenderStats()
+        assert http.resets == 1
+
+    def test_the_crawler_has_stats_of_rendering_only_with_rendering(self) -> None:
+        assert AsyncCrawler().render_stats() is None
+        assert AsyncCrawler(rendering=DEFAULT).render_stats() == RenderStats()

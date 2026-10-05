@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import re
 import subprocess
 
 import pytest
@@ -23,6 +24,7 @@ from crawler import (
     ProxyStats,
     RenderError,
     Rendering,
+    RenderStats,
     RobotsDisallowedError,
     load_cookies_file,
     make_cookie,
@@ -70,6 +72,17 @@ async def test_a_crawl_follows_links_only_javascript_shows(url):
         await crawler.crawl([url("/js/start")])
 
     assert {url("/js/target"), url("/js/other-target")} <= crawler.visited_urls
+    stats = crawler.render_stats()
+    assert (stats.rendered, stats.failed) == (len(crawler.visited_urls), 0)
+    assert 0 < stats.avg_render_time < DEFAULT.timeout
+
+
+async def test_a_crawl_counts_the_rendering_anew(url):
+    async with make_crawler() as crawler:
+        await crawler.crawl([url("/js/target")])
+        await crawler.crawl([url("/data.json")])
+
+        assert crawler.render_stats() == RenderStats()
 
 
 async def test_patterns_render_only_the_pages_they_match(url):
@@ -146,6 +159,7 @@ async def test_a_page_rendered_too_slowly_times_out(url):
 
     assert isinstance(result.error, FetchTimeoutError)
     assert "rendering timeout (0.5s)" in result.error.message
+    assert crawler.render_stats() == RenderStats(failed=1)
 
 
 async def test_a_page_over_the_size_limit_once_rendered_fails(url):
@@ -181,6 +195,7 @@ async def test_the_browser_crashed_is_started_again_once(url, site):
     assert isinstance(result.error, RenderError)
     assert "crashed 2 times" in result.error.message
     assert isinstance(again.error, RenderError)
+    assert (crawler.render_stats().rendered, crawler.render_stats().failed) == (2, 2)
     # Not retried, and the site is not to blame.
     assert site.hits["/js/target"] == 3
     breaker = crawler.circuit_breaker.get_stats()["127.0.0.1"]
@@ -374,4 +389,6 @@ async def test_the_command_line_renders_with_render(url, tmp_path, capsys):
     # The one link of the page is made by JavaScript.
     saved = {json.loads(line)["url"] for line in output.read_text(encoding="utf-8").splitlines()}
     assert saved == {url("/js/links"), url("/js/target")}
-    assert "Pages: 2 (2 successful" in capsys.readouterr().out
+    summary = capsys.readouterr().out
+    assert "Pages: 2 (2 successful" in summary
+    assert re.search(r"^Rendering: 2 pages rendered, 0 failed, average \d+\.\d\ds$", summary, re.MULTILINE)

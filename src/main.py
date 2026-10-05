@@ -210,6 +210,12 @@ def print_summary(crawler: AdvancedCrawler, *, interrupted: bool = False) -> Non
             for label, proxy in stats["proxies"].items()
         ]
         print(f"Proxies: {', '.join(proxies)}")
+    if "rendering" in stats:
+        rendering = stats["rendering"]
+        print(
+            f"Rendering: {rendering['rendered']} pages rendered, {rendering['failed']} failed, "
+            f"average {rendering['avg_render_time']:.2f}s"
+        )
     outputs = crawler.config.storage.outputs
     if outputs:
         saving = crawler.crawler.crawl_stats()

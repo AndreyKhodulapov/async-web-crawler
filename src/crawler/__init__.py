@@ -45,6 +45,7 @@ from crawler.models import (
     ParsedPage,
     ProxyStats,
     RateStats,
+    RenderStats,
 )
 from crawler.parser import HTMLParser
 from crawler.progress import Progress, ProgressTracker, format_progress, show_progress
@@ -123,6 +124,7 @@ __all__ = [
     "RateLimiter",
     "RateStats",
     "RenderError",
+    "RenderStats",
     "Rendering",
     "RetryRule",
     "RetryStrategy",

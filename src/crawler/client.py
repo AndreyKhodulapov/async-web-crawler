@@ -15,7 +15,7 @@ from crawler.crawl_run import CrawlRun
 from crawler.exceptions import ParseError, StorageError
 from crawler.fetching import Fetcher
 from crawler.filters import UrlFilter
-from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage, ProxyStats
+from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage, ProxyStats, RenderStats
 from crawler.parser import HTMLParser
 from crawler.proxy import ProxyPool
 from crawler.rate_limiter import RateLimiter
@@ -163,7 +163,8 @@ class AsyncCrawler:
     with `RenderError`, which is not retried and which the circuit
     breaker does not count. robots.txt and sitemaps are never rendered.
     The browser starts with the first page to render and is closed by
-    `close()`.
+    `close()`. `render_stats()` counts the pages rendered and failed, and
+    the time the browser took for them.
 
     `error_stats()` counts the errors of page requests and their retries
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
@@ -759,6 +760,10 @@ class AsyncCrawler:
     def proxy_stats(self) -> dict[str, ProxyStats]:
         """The proxies by label (their URLs with the password hidden); empty without `proxies`."""
         return {} if self.proxies is None else self.proxies.get_stats()
+
+    def render_stats(self) -> RenderStats | None:
+        """The pages rendered in the browser since the latest crawl() started; None without `rendering`."""
+        return self._transport.render_stats() if isinstance(self._transport, BrowserTransport) else None
 
     def error_stats(self) -> ErrorStats:
         """Errors of page requests since the latest crawl() started, or since the crawler was created."""

@@ -247,11 +247,15 @@ class AdvancedCrawler:
 
         With proxies, `proxies` too: label (the URL with the password
         hidden) -> `state`, `requests`, `failures` and `times_removed`, see
-        `ProxyStats`.
+        `ProxyStats`. With rendering, `rendering` too: `rendered`, `failed`
+        and `avg_render_time`, see `RenderStats`.
         """
         stats = self.crawler.stats.get_stats()
         if self.crawler.proxies is not None:
             stats["proxies"] = {label: dataclasses.asdict(proxy) for label, proxy in self.crawler.proxy_stats().items()}
+        render_stats = self.crawler.render_stats()
+        if render_stats is not None:
+            stats["rendering"] = dataclasses.asdict(render_stats)
         return stats
 
     def export_to_json(self, filename: str | Path) -> None:

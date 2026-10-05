@@ -127,6 +127,25 @@ async def test_defaults_without_a_configuration():
         assert crawler.storage is None
         assert file_handlers() == []
         assert crawler.get_stats()["total_pages"] == 0
+        assert "rendering" not in crawler.get_stats()
+
+
+async def test_stats_of_rendering_with_rendering(url, tmp_path):
+    out = tmp_path / "out"
+    config = make_config(
+        urls=[url("/data.json")],
+        rendering={"mode": "always"},
+        report={"stats_json": str(out / "stats.json"), "html": str(out / "report.html")},
+    )
+
+    # A page that is not HTML does not go to the browser.
+    async with AdvancedCrawler(config) as crawler:
+        await crawler.crawl()
+        stats = crawler.get_stats()
+
+    assert stats["rendering"] == {"rendered": 0, "failed": 0, "avg_render_time": 0.0}
+    assert json.loads((out / "stats.json").read_text(encoding="utf-8"))["rendering"] == stats["rendering"]
+    assert "<h2>Rendering</h2>" in (out / "report.html").read_text(encoding="utf-8")
 
 
 async def test_nothing_to_crawl_is_an_error_of_the_configuration():

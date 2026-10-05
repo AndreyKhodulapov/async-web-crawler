@@ -20,6 +20,7 @@ import aiohttp
 
 from crawler.exceptions import CrawlerClosedError, FetchTimeoutError, PageTooLargeError, RenderError
 from crawler.filters import UrlFilter
+from crawler.models import RenderStats
 from crawler.parser import is_html_content_type
 from crawler.proxy import Proxy
 from crawler.session import cookie_domain_problem, cookie_name_problem, cookie_value_problem, make_cookie
@@ -385,6 +386,11 @@ class BrowserTransport:
 
     def reset_stats(self) -> None:
         self.http.reset_stats()
+        self.renderer.reset_stats()
+
+    def render_stats(self) -> RenderStats:
+        """The pages rendered since the stats were last reset, see `RenderStats`."""
+        return self.renderer.stats()
 
     def cookies(self) -> list[Cookie]:
         return self.http.cookies()
@@ -429,6 +435,9 @@ class Renderer:
     `RenderError` and is started again for the next one, once: after
     that, and after a browser that could not start, every page fails
     with `RenderError` at once.
+
+    `stats()` counts the pages rendered and failed, and the time the
+    browser took for them, see `RenderStats`.
     """
 
     MAX_LAUNCHES = 2
@@ -457,6 +466,17 @@ class Renderer:
         self._launches = 0
         self._failure: str | None = None  # why the browser is not used any more
         self._closed = False
+        self.reset_stats()
+
+    def stats(self) -> RenderStats:
+        """The pages rendered since the stats were last reset."""
+        average = self._render_time / self._rendered if self._rendered else 0.0
+        return RenderStats(rendered=self._rendered, failed=self._failed, avg_render_time=average)
+
+    def reset_stats(self) -> None:
+        """Count the pages anew."""
+        self._rendered = self._failed = 0
+        self._render_time = 0.0
 
     @property
     def running(self) -> bool:
@@ -471,8 +491,20 @@ class Renderer:
             RenderError: the browser is not installed, could not start or crashed.
             CrawlerClosedError: the renderer is closed.
         """
+        try:
+            rendered, elapsed = await self._render(url, document)
+        except (FetchTimeoutError, RenderError):
+            self._failed += 1
+            raise
+        self._rendered += 1
+        self._render_time += elapsed
+        return rendered
+
+    async def _render(self, url: str, document: Response) -> tuple[Rendered, float]:
+        """Render the page as `render` says; with the seconds it took once the browser was ready for it."""
         async with self._pages:
             context, sync = await self._get_context(url, document.proxy)
+            started = time.monotonic()
             from playwright.async_api import Error as PlaywrightError
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -485,7 +517,8 @@ class Renderer:
                 self._tabs[page] = tab
                 page.on("crash", lambda _: setattr(tab, "crashed", True))
                 page.on("popup", self._close_popup)
-                return await self._load(page, url, tab)
+                rendered = await self._load(page, url, tab)
+                return rendered, time.monotonic() - started
             except PlaywrightTimeoutError as exc:
                 raise FetchTimeoutError(url, f"rendering timeout ({self.rendering.timeout:.1f}s)") from exc
             except PlaywrightError as exc:
