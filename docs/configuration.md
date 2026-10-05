@@ -162,7 +162,8 @@ started on.
 ### `session`
 
 The cookies and the headers of the requests; see
-[Cookies and headers](api.md#cookies-and-headers).
+[Cookies and headers](api.md#cookies-and-headers), and for the ideas
+behind them, [the note on sessions](sessions_proxies_rendering.md#cookies-and-sessions).
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
@@ -213,7 +214,8 @@ back. Keep a file with them private, or keep them in `cookies_file`.
 ### `proxy`
 
 The proxies the requests go through; without any, requests go directly.
-See [Proxies](api.md#proxies).
+See [Proxies](api.md#proxies), and for the ideas behind them,
+[the note on proxies](sessions_proxies_rendering.md#proxies).
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
@@ -282,7 +284,8 @@ limits of a site.
 
 Pages rendered in a headless Chromium, for sites whose links and text
 JavaScript makes: without it, such a page is an empty shell. Off by
-default. See [Rendering](api.md#rendering).
+default. See [Rendering](api.md#rendering), and for the ideas behind
+it, [the note on the headless browser](sessions_proxies_rendering.md#headless-browser).
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
@@ -561,6 +564,31 @@ circuit_breaker:
   cooldown: 120
 ```
 
+A site behind a login, with the session of a browser: log in in the
+browser and export its cookies to `cookies.txt` with a browser extension,
+then:
+
+```yaml
+urls: [https://example.com/account/]
+crawler:
+  max_concurrent: 2
+  rate_limit: 1.0
+filters:
+  exclude: ['/log-?out', '/sign-?out']   # the links that end the session
+session:
+  cookies_file: cookies.txt   # exported from the browser after logging in
+  save_cookies: cookies.txt   # the session the site renewed, for the next run
+```
+
+The crawl must not follow the link that logs out: the site would end the
+session, and the rest of the crawl would get the login page. Leave
+`crawler.user_agents` empty: a site that ties its session to the browser
+may end it when the User-Agent changes. A site that takes a token instead
+of a cookie gets it in a header, `session.headers: {Authorization:
+"Bearer ..."}`, with `filters.same_domain_only: true`, the default, so that
+the token does not reach other sites. The file is the session: it is
+written readable by its owner only; keep it out of version control.
+
 Through a few proxies, each site on one of them, a dead proxy left alone
 for five minutes:
 
@@ -575,3 +603,39 @@ proxy:
 report:
   html: reports/site.html   # the requests and failures of every proxy
 ```
+
+With `rotation: per_request` the requests of a site take turns over the
+proxies instead. The proxies of the environment, `HTTP_PROXY` and
+`HTTPS_PROXY`, with the hosts of `NO_PROXY` reached directly:
+
+```yaml
+urls: [https://example.com/]
+proxy:
+  from_env: true
+```
+
+A single-page application, rendered in a browser where it needs to be:
+
+```yaml
+urls: [https://example.com/app/]
+crawler:
+  max_concurrent: 4
+  rate_limit: 1.0
+rendering:
+  mode: patterns
+  include: ['^https://example\.com/app/']
+  wait_for: "#content"      # an element the data of the page makes
+  timeout: 20
+  max_open_pages: 2
+```
+
+Look at a page without the browser first: many sites send their content
+in the HTML, and rendering costs seconds and tens of megabytes a page;
+[examples/render_js.py](../examples/render_js.py) shows what it adds to a
+page. `wait_for` with an element the data makes is surer and faster than
+`wait_until: networkidle`, which waits for every request of the page,
+analytics included. A page is rendered within the slot of its request,
+so `max_concurrent` bounds the browser too, and `max_open_pages` the tabs
+open at once. For one run, `--render` renders every page instead. The
+recipes add up: with `session` and `proxy`, the browser gets the cookies,
+the headers and the proxy of the crawler.

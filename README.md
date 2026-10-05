@@ -328,6 +328,13 @@ storages. All of it is described in the [API reference](docs/api.md).
   its circuit breaker, and never takes the proxy out of rotation. A proxy
   that loses packets looks like slow sites; a proxy that cannot be reached
   or refuses the password is taken out as it should be.
+- **An error page of an http proxy is the site's.** An `http://` URL is
+  asked of the proxy itself, which answers for the site: its own 502 or
+  503, when it cannot reach the site or fails, cannot be told from the
+  site's. Such a response is retried and counts against the site, in its
+  circuit breaker, and as a response through the proxy it clears the
+  failures of the proxy, so a proxy that fails this way is never taken
+  out of rotation.
 - **A proxy sees what plain HTTP carries.** Through an http proxy the
   cookies and the headers of `session` reach `http://` sites in the clear,
   as the proxy reads the request; `https://` sites go through a tunnel the
@@ -412,6 +419,7 @@ Notes on the concepts behind the crawler:
 [error handling](docs/error_handling.md),
 [data storage](docs/data_storage.md),
 [advanced features](docs/advanced_features.md),
+[sessions, proxies and rendering](docs/sessions_proxies_rendering.md),
 [architecture](docs/architecture.md).
 
 ## Demo
@@ -546,5 +554,6 @@ docs/
 ├── error_handling.md       # notes on error kinds, retries, timeouts and circuit breakers
 ├── html_parsing.md         # notes on HTML parsing and URL handling
 ├── performance.md          # sync vs async measurements, memory, bottlenecks found and fixed
-└── politeness.md           # notes on rate limiting, robots.txt and backoff
+├── politeness.md           # notes on rate limiting, robots.txt and backoff
+└── sessions_proxies_rendering.md  # notes on cookies, proxies and a headless browser
 ```

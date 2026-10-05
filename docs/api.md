@@ -383,6 +383,7 @@ aiohttp keeps cookies of host names only.
 `AdvancedCrawler` takes all of it from the `session` section (see the
 [configuration guide](configuration.md#session)) and writes `save_cookies`
 when the crawl ends; `save_cookies()` writes it after a cancelled crawl.
+Why it works this way: [the note on sessions](sessions_proxies_rendering.md#cookies-and-sessions).
 
 ## Proxies
 
@@ -464,7 +465,8 @@ SOCKS proxies are not supported; an http proxy, or a local bridge from
 HTTP to SOCKS, does instead.
 
 `AdvancedCrawler` makes the pool of the `proxy` section (see the
-[configuration guide](configuration.md#proxy)).
+[configuration guide](configuration.md#proxy)). Why it works this way:
+[the note on proxies](sessions_proxies_rendering.md#proxies).
 
 ## Rendering
 
@@ -560,7 +562,8 @@ or after a browser that could not start, every page to render fails with
 `RenderError` at once. `error_stats()` counts `RenderError` as `other`.
 
 `AdvancedCrawler` makes the settings of the `rendering` section (see the
-[configuration guide](configuration.md#rendering)).
+[configuration guide](configuration.md#rendering)). Why it works this way:
+[the note on the headless browser](sessions_proxies_rendering.md#headless-browser).
 
 ## Crawling
 
