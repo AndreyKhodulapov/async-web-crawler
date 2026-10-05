@@ -42,7 +42,10 @@ configuration file, by command-line options, or from Python.
   every HTML page or those matching patterns, waiting for an event or a
   CSS selector; the page itself downloaded as without a browser, images
   and fonts not loaded, navigations of a page checked against robots.txt
-  and the filters like redirects
+  and the filters like redirects; the browser shares the cookies, the
+  headers and the proxy of the crawler, and the cookies its scripts set
+  are saved; pages rendered and the time they took in the summary and
+  the reports
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that
   grow with every retry
@@ -187,7 +190,9 @@ Log: out/crawler.log
 At the default level `INFO` the log has a line per request; `--log-level
 WARNING` leaves the progress line and the failures. A password in a database
 or a proxy URL is shown as `***`. With proxies, the summary has a line of
-them: `Proxies: http://user:***@proxy-1:3128 (41 sent, 0 failed), ...`.
+them: `Proxies: http://user:***@proxy-1:3128 (41 sent, 0 failed), ...`;
+with rendering, a line of the pages rendered: `Rendering: 12 pages
+rendered, 1 failed, average 0.84s` (the average of the rendered ones).
 
 | Exit code | Meaning |
 |-----------|---------|
@@ -234,6 +239,23 @@ with live progress, ready to run:
 ```bash
 python examples/advanced_usage.py      # crawls by examples/config.yaml, writes to out/
 PYTHONPATH=src python examples/advanced_usage.py   # the same without `pip install -e .`
+```
+
+[examples/render_js.py](examples/render_js.py) shows what rendering adds
+to a page: it downloads one without and with the browser and prints the
+text and the links of both (needs the extra `js` and Chromium):
+
+```bash
+python examples/render_js.py                                   # https://quotes.toscrape.com/js/
+python examples/render_js.py https://example.com/app/
+```
+
+```
+https://quotes.toscrape.com/js/
+  without rendering: 74 characters of text, 5 links
+  with rendering:    1485 characters of text, 5 links, rendered in 1.45s
+  links only JavaScript shows: none
+  text: Quotes to Scrape Login “The world as we have created it is a process of our thinking. ...
 ```
 
 `AsyncCrawler` is the crawler itself, without files or configuration:
@@ -316,9 +338,29 @@ storages. All of it is described in the [API reference](docs/api.md).
 - **A rendered page is fetched by two clients.** The document is
   downloaded by aiohttp, its scripts, styles and data by Chromium: a site
   that compares the fingerprints of TLS and headers sees two clients.
-  The browser's own requests go directly, without the proxies, the
-  cookies and the headers of `session`, and the cookies a script sets do
-  not reach `save_cookies`.
+- **The browser shares the session, not all of it.** The cookies go
+  between the crawler and the browser around every page, but `SameSite`
+  is not kept (as in `cookies.txt`): a cookie the browser gets from the
+  crawler has the default of Chromium, `Lax`. A cookie a script sets for
+  an IP address stays in the browser and never reaches `save_cookies`.
+  With `keep_cookies: false` every page has a browser context of its own,
+  so its scripts and styles are downloaded again for every page.
+- **The browser goes through the proxy of the page.** The requests of a
+  rendered page go through the proxy its document came through: with
+  `per_request` one page is one address, the next page another. Every
+  proxy has a browser context of its own for the whole crawl: many
+  proxies with `per_request` cost memory. With `from_env` the requests of
+  a page all go through the proxy of the scheme of its document, and the
+  ranges of addresses in `NO_PROXY` (`10.0.0.0/8`) are not read, by the
+  browser as by the crawler. The browser's requests are not counted in
+  the statistics of the proxies, and their failures never take a proxy
+  out of rotation.
+- **A rendered page cannot reach a private network of another origin.**
+  The browser gets the document from the crawler, not from its address,
+  so Chromium takes the page for a public one and refuses its requests to
+  another origin on a loopback or private address (Local Network Access).
+  A site on an intranet whose scripts come from another private host is
+  rendered without them. The page's own origin is not affected.
 - **The browser's own requests are not checked against robots.txt**, as
   no browser checks them: scripts, styles, data, the requests of a page
   after it loaded. They are not counted against the rate limit either; a
@@ -360,7 +402,7 @@ storages. All of it is described in the [API reference](docs/api.md).
 | [docs/demo.md](docs/demo.md) | the demo commands and their output |
 | [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler, memory, bottlenecks found and fixed |
 | [config.example.yaml](config.example.yaml) | every configuration key with its default |
-| [examples/](examples/) | a crawl from Python by a configuration file |
+| [examples/](examples/) | a crawl from Python by a configuration file; what rendering adds to a page |
 
 Notes on the concepts behind the crawler:
 [asyncio](docs/asyncio_concepts.md),
@@ -394,11 +436,15 @@ Their options and output are described in [docs/demo.md](docs/demo.md).
 ```bash
 pytest                      # unit + integration, no internet needed
 pytest tests/unit           # parser, URLs, queue, limits, robots.txt, retries, circuit breaker, storages, client with a fake session
-pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker, saving, AdvancedCrawler, the command line, the example and the scale demo against a local aiohttp server
+pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.txt, retries, the circuit breaker, saving, AdvancedCrawler, the command line, the examples and the scale demo against a local aiohttp server
 pytest -m network           # smoke tests against the real internet
 pytest -m postgres          # the database tests and the save demo against PostgreSQL
 pytest -m browser           # rendering in a headless Chromium; skipped without Playwright or Chromium
 ```
+
+The test of `examples/render_js.py` against the real site has both
+markers, `network` and `browser`, so `-m browser` reaches the internet
+for it; `pytest -m "browser and not network"` leaves it out.
 
 The database tests run on SQLite by default. With the marker `postgres` the
 same checks run on a PostgreSQL server: start it with `docker compose up -d
@@ -464,7 +510,7 @@ src/
     ├── filters.py          # UrlFilter: host, pattern and file extension rules
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
-    ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats
+    ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats, ProxyStats, RenderStats
     ├── exceptions.py       # FetchError hierarchy, StorageError, ConfigError
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes

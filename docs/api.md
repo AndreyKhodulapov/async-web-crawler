@@ -495,6 +495,7 @@ async with AsyncCrawler(rendering=rendering) as crawler:
 | `renders(url)` | whether the page at `url` is rendered, if it is HTML |
 | `AsyncCrawler(rendering=)` | render pages as it says; `None`, the default, renders none |
 | `crawler.rendering` | the settings, `None` without rendering |
+| `render_stats()` | a `RenderStats`: `rendered` (pages the browser loaded to the end, those that went elsewhere on their own included), `failed` (a timeout, a `RenderError`), `avg_render_time` (seconds per rendered page, from a free tab in a running browser to the HTML); `None` without rendering. `crawl()` counts anew |
 | `browser_problem()`, `playwright_problem()` of `crawler.rendering` | why pages cannot be rendered here (Playwright or Chromium is not installed), with the command to install it; `None` if they can. `browser_problem()` is a coroutine that starts the driver of Playwright for a moment |
 
 Every request is made as without a browser first: the page is downloaded
@@ -521,8 +522,28 @@ of the page. Service workers are blocked.
 The rendered page keeps the status, the headers and the final URL of its
 download; its text is the HTML of the page once rendered (the DOM, as
 `page.content()` serializes it), and its size the bytes of that HTML in
-UTF-8. The browser has one context for the crawler, with its
-`user_agent`; a tab is opened for every page and closed after it.
+UTF-8. A tab is opened for every page and closed after it.
+
+The browser shares the cookies, the headers and the proxies of the
+crawler. A page is rendered in the browser context of the proxy its
+document came through (one context per proxy, and one for the pages
+without a proxy, each for the life of the browser), so all its requests
+go through that proxy, with the password of it; the hosts of `NO_PROXY`
+of a `ProxyPool.from_env()` are reached directly. The requests carry the
+`user_agent` and the `headers`. Before a page, the context gets the
+cookies the crawler changed since the last page, and after it, the
+crawler gets those the context changed: cookies set by JavaScript and by
+the responses to the page's requests go with the next download, to
+`export_cookies()` and to `save_cookies`, and a cookie a script deletes
+is deleted. Only the changes go each way, so two tabs do not undo each
+other; when both sides change one cookie, the browser wins. Not shared:
+`SameSite`, which `http.cookiejar` does not keep (Chromium gives such a
+cookie its default, `Lax`), and the cookies of IP addresses or with a
+value the crawler cannot send, which stay in the browser. With
+`keep_cookies=False`, every page has a context of its own, without
+cookies, closed after it. The requests of the browser are not those of
+the crawler: `proxy_stats()` does not count them, and their failures
+neither take a proxy out of rotation nor count in the circuit breaker.
 
 | Error | When | Retried | Circuit breaker |
 |-------|------|---------|-----------------|
@@ -771,7 +792,7 @@ asyncio.run(main())
 | `AdvancedCrawler.from_config(path, overrides, configure_logging=True)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
 | `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section and the cookies of `session.save_cookies`; returns the pages by URL |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
-| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report |
+| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report; with rendering, `rendering`: `{rendered, failed, avg_render_time}` (see `render_stats()` in [Rendering](#rendering)), also in the JSON and the HTML report |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
 | `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats`; `crawler.proxies` and `crawler.rendering` are the pool and the settings of rendering, `None` without them |
@@ -1068,7 +1089,7 @@ and may change. A layer calls only the one below it.
 | Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
 | HTTP | `transport.py` | `Transport`, `HttpTransport` | `Transport` is the contract the request layer sends through; `HttpTransport` makes a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
-| HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash | robots.txt, filters, retries, limits |
+| HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, with the proxy their document came through (`Response.proxy`), a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a context per proxy, the cookies kept in step with those of `HttpTransport` (`CookieSync`, `Transport.update_cookies`), a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash, the counters of `render_stats()` | robots.txt, filters, retries, limits |
 
 Who owns what:
 

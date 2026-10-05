@@ -29,7 +29,11 @@ listed in the [API reference](api.md#internals).
     page is downloaded as before and only then handed to the browser. A
     page that goes to another URL on its own comes back as a redirect, so
     the request layer checks robots.txt, the filters and the redirect
-    limit for it as for any redirect; the transport never calls up to ask;
+    limit for it as for any redirect; the transport never calls up to ask.
+    The response names the proxy it came through, so the browser renders
+    the page through the same one, and the cookies the page set go back
+    into the cookie jar of the first transport, which stays the one the
+    crawler keeps;
   - a crawl shared by several machines replaces the queue and the set of seen URLs of the crawl layer.
 
 ## Contracts between layers
@@ -47,7 +51,8 @@ listed in the [API reference](api.md#internals).
   contract lived in the docstring of `HttpTransport`. The `Protocol`
   (`Transport`: structural typing, no base class to inherit) is made for
   the browser transport, shaped by what both need: `get()`, `close()`,
-  `reset_stats()` and `cookies()`. The request layer knows only
+  `reset_stats()`, `cookies()` and `update_cookies()` (the browser gives
+  back the cookies its pages set). The request layer knows only
   `Transport`; the facade builds the transports and knows what they are.
 
 ## State of a unit of work

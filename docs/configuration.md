@@ -325,6 +325,22 @@ page counts once against `max_pages` and the rate limit, whatever it
 loads, and is rendered within the slot of its request, so
 `max_concurrent` and `max_per_domain` bound the browser too.
 
+The browser shares the session of the crawler. Before every page it
+gets the cookies the crawler keeps, and after it the crawler gets those
+the page set, by JavaScript or in the responses to its requests: they go
+with the next download and to `save_cookies`. Only the changes go each
+way, so two pages rendered at once do not undo each other's cookies; when
+both change the same cookie, the browser wins. The requests of the
+browser carry `crawler.user_agent` and `session.headers`, and go through
+the proxy the document of the page came through: every proxy has a
+browser context of its own (cookies, cache), so with `per_host` a site
+and its scripts stay on one address. The hosts of `NO_PROXY` are reached
+directly with `from_env`. With `keep_cookies: false` every page is
+rendered in a context of its own, closed after it: nothing goes from one
+page to the next, the cache neither. The browser's requests are not
+counted in the statistics of the proxies, and their failures neither take
+a proxy out of rotation nor count against the site.
+
 A page that goes to another URL on its own (JavaScript setting
 `location`, `<meta http-equiv="refresh">`) is a redirect: the browser is
 stopped, and the crawler checks the target against robots.txt and the
@@ -347,6 +363,11 @@ better, `wait_for` with an element the data makes. Rendering costs: a
 page takes seconds and tens of megabytes instead of milliseconds, and
 the site serves its scripts and data too. Use `patterns` when only some
 pages need it.
+
+The summary, the JSON statistics and the HTML report count the pages
+rendered and failed (a timeout, a browser that failed) and the average
+time the browser took for a rendered page, without the wait for a free
+tab.
 
 ### `storage`
 
