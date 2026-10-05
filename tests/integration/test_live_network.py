@@ -1,6 +1,9 @@
 """Smoke tests against the real internet. Run with: pytest -m network"""
 
+import re
+
 import pytest
+from helpers import load_example
 
 from crawler import AsyncCrawler, DNSError, RetryStrategy, RobotsUnreachableError
 
@@ -40,3 +43,15 @@ async def test_parse_scraping_sandbox():
     assert page["title"]
     assert any(link.startswith("https://apilearn.tukas.dev/") for link in page["links"])
     assert page["headings"]
+
+
+@pytest.mark.browser
+@pytest.mark.usefixtures("chromium")
+async def test_rendering_example_on_a_page_javascript_writes(capsys):
+    # The quotes of the page are written by JavaScript.
+    await load_example("render_js").main()
+
+    output = capsys.readouterr().out
+    plain, rendered = (int(chars) for chars in re.findall(r"rendering: +(\d+) characters of text", output))
+    assert rendered > plain + 1000
+    assert "Albert Einstein" in output

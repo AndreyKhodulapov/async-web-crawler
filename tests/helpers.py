@@ -1,9 +1,12 @@
 """Helpers shared by unit and integration tests."""
 
 import asyncio
+import importlib.util
 import os
 from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
+from types import ModuleType
 
 from crawler import CircuitBreaker, DataStorage, PageRecord, RetryStrategy
 
@@ -17,6 +20,7 @@ POSTGRES_DSN = os.environ.get(
     f"postgresql://crawler:crawler@localhost:{os.environ.get('CRAWLER_POSTGRES_PORT') or 5432}/crawler",
 )
 SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
+EXAMPLES = Path(__file__).parents[1] / "examples"
 
 # Crawler options for tests that check something other than politeness:
 # without the rate limit, robots.txt, retries and the circuit breaker they
@@ -111,3 +115,12 @@ class MemoryStorage(DataStorage):
 
     async def _close(self) -> None:
         self.released += 1
+
+
+def load_example(name: str) -> ModuleType:
+    """The script `name`.py of examples/, imported as a module."""
+    spec = importlib.util.spec_from_file_location(name, EXAMPLES / f"{name}.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
