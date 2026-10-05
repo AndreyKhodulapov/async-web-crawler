@@ -1,7 +1,9 @@
 """Integration tests: pages are rendered in a headless Chromium, and what they do on their own is checked."""
 
 import asyncio
+import base64
 import json
+import logging
 import os
 import subprocess
 
@@ -13,9 +15,12 @@ from crawler import (
     AdvancedCrawler,
     AsyncCrawler,
     CircuitBreaker,
+    CircuitState,
     CrawlerConfig,
     FetchTimeoutError,
     PageTooLargeError,
+    ProxyPool,
+    ProxyStats,
     RenderError,
     Rendering,
     RobotsDisallowedError,
@@ -254,6 +259,87 @@ async def test_saved_cookies_hold_those_javascript_set(url, tmp_path):
         (HOST, "from_fetch", "2"),
         (HOST, "from_js", "1"),
     ]
+
+
+PASSWORD = "s3cr3t-pw"
+AUTHORIZATION = "Basic " + base64.b64encode(f"crawler:{PASSWORD}".encode()).decode()
+
+
+def requests_of_links(url, query: str = "") -> list[str]:
+    """What a proxy sees of /js/links: the page, then its script; the image is blocked."""
+    return [f"GET {url('/js/links' + query)}", f"GET {url('/js/app.js')}"]
+
+
+async def test_the_requests_of_a_page_go_through_the_proxy_of_its_document(url, make_proxy):
+    proxies = [await make_proxy(), await make_proxy()]
+    async with make_crawler(proxies=ProxyPool([proxy.url for proxy in proxies])) as crawler:
+        page = await crawler.fetch_and_parse(url("/js/links"))
+
+    assert "made by javascript" in page["text"]
+    # per_host: the host goes through one of them, its page and the script of the page alike.
+    assert sorted([proxy.requests for proxy in proxies], key=len) == [[], requests_of_links(url)]
+
+
+async def test_with_a_proxy_per_request_each_page_goes_through_its_own(url, make_proxy):
+    proxies = [await make_proxy(), await make_proxy()]
+    pool = ProxyPool([proxy.url for proxy in proxies], rotation="per_request")
+    async with make_crawler(proxies=pool) as crawler:
+        await crawler.fetch_url(url("/js/links"))
+        await crawler.fetch_url(url("/js/links?second"))
+
+    assert proxies[0].requests == requests_of_links(url)
+    assert proxies[1].requests == requests_of_links(url, "?second")
+
+
+async def test_the_browser_gives_the_password_of_the_proxy_and_the_log_does_not(url, site, make_proxy, caplog):
+    proxy = await make_proxy(authorization=AUTHORIZATION)
+    pool = ProxyPool([proxy.url.replace("http://", f"http://crawler:{PASSWORD}@")])
+    with caplog.at_level(logging.DEBUG):
+        async with make_crawler(proxies=pool) as crawler:
+            page = await crawler.fetch_and_parse(url("/js/links"))
+
+    assert "made by javascript" in page["text"]
+    assert site.hits["/js/app.js"] == 1
+    # The browser sends it once the proxy asks for it.
+    assert proxy.requests[-1] == f"GET {url('/js/app.js')}"
+    assert proxy.authorizations[-1] == AUTHORIZATION
+    assert "crawler:***@127.0.0.1" in caplog.text
+    assert PASSWORD not in caplog.text
+
+
+async def test_a_request_of_the_browser_the_proxy_fails_fails_neither_the_proxy_nor_the_site(url, site, make_proxy):
+    proxy = await make_proxy(drop="/js/app.js")
+    breaker = CircuitBreaker(0.5, min_requests=1)
+    pool = ProxyPool([proxy.url], max_failures=1)
+    async with make_crawler(proxies=pool, circuit_breaker=breaker) as crawler:
+        page = await crawler.fetch_and_parse(url("/js/links"))
+        stats = crawler.proxy_stats()
+
+    # The page is rendered without its script.
+    assert "made by undefined" in page["text"]
+    assert f"GET {url('/js/app.js')}" in proxy.requests
+    assert site.hits["/js/app.js"] == 0
+    # Only the requests of the crawler count.
+    assert stats == {proxy.url: ProxyStats(state="active", requests=1)}
+    assert breaker.state("127.0.0.1") is CircuitState.CLOSED
+
+
+async def test_the_browser_renders_the_pages_of_no_proxy_without_the_proxy(url, site, make_proxy, monkeypatch):
+    proxy = await make_proxy()
+    for name in ["http_proxy", "https_proxy", "no_proxy", "REQUEST_METHOD"]:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+    monkeypatch.setenv("HTTP_PROXY", proxy.url)
+    monkeypatch.setenv("NO_PROXY", "localhost")
+    async with make_crawler(proxies=ProxyPool.from_env()) as crawler:
+        # The context of the proxy takes the rules of NO_PROXY.
+        proxied = await crawler.fetch_and_parse(url("/js/links"))
+        direct = await crawler.fetch_and_parse(url("/js/links", "localhost"))
+
+    assert "made by javascript" in proxied["text"]
+    assert "made by javascript" in direct["text"]
+    assert proxy.requests == requests_of_links(url)
+    assert site.hits["/js/app.js"] == 2
 
 
 async def test_close_ends_the_browser_and_its_processes(url):

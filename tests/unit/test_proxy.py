@@ -252,6 +252,13 @@ class TestFromEnv:
         monkeypatch.setenv("NO_PROXY", no_proxy)
         assert ProxyPool.from_env().pick(url) is None
 
+    def test_the_pool_tells_its_no_proxy(self, monkeypatch):
+        monkeypatch.setenv("HTTP_PROXY", "http://plain:3128")
+        assert ProxyPool.from_env().no_proxy is None
+        monkeypatch.setenv("no_proxy", "a.test, .b.test")
+        assert ProxyPool.from_env().no_proxy == "a.test, .b.test"
+        assert ProxyPool(["http://plain:3128"]).no_proxy is None
+
     def test_no_proxy_leaves_other_hosts_to_the_proxy(self, monkeypatch):
         monkeypatch.setenv("HTTP_PROXY", "http://plain:3128")
         monkeypatch.setenv("no_proxy", "a.test")
@@ -289,11 +296,13 @@ class TestProxyUrls:
         proxy = Proxy.from_url("http://user:p%40ss@proxy.example:3128")
         assert proxy.url == "http://proxy.example:3128"
         assert proxy.label == "http://user:***@proxy.example:3128"
+        assert proxy.credentials == ("user", "p@ss")
         assert proxy.authorization == "Basic dXNlcjpwQHNz"  # user:p@ss
-        assert "p%40ss" not in repr(proxy) and "dXNlcjpwQHNz" not in repr(proxy)
+        assert all(secret not in repr(proxy) for secret in ("p%40ss", "p@ss", "dXNlcjpwQHNz"))
 
     def test_a_user_without_a_password(self):
         proxy = Proxy.from_url("HTTP://user@proxy.example:3128/")
+        assert proxy.credentials == ("user", "")
         assert (proxy.url, proxy.label, proxy.authorization) == (
             "http://proxy.example:3128",
             "http://user@proxy.example:3128",
@@ -306,7 +315,8 @@ class TestProxyUrls:
         assert proxy.authorization == "Basic VXNlcjpTZWNyZXQ="  # User:Secret
 
     def test_a_proxy_without_a_user_has_no_header(self):
-        assert Proxy.from_url("https://[::1]:8443").authorization is None
+        proxy = Proxy.from_url("https://[::1]:8443")
+        assert (proxy.credentials, proxy.authorization) == (None, None)
 
     @pytest.mark.parametrize(
         ("url", "problem"),

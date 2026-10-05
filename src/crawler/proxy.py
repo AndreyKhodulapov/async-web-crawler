@@ -48,14 +48,24 @@ def proxy_url_problem(value: str) -> str | None:
 class Proxy:
     """A proxy to send requests through.
 
-    `url` has no user name or password: they go in `authorization`, the
-    value of the Proxy-Authorization header. `label` is the URL to show,
-    with the password hidden; it names the proxy in the log and the stats.
+    `url` has no user name or password: they are the `credentials`, sent
+    as the Proxy-Authorization header, `authorization`. `label` is the URL
+    to show, with the password hidden; it names the proxy in the log and
+    the stats.
     """
 
     url: str
     label: str
-    authorization: str | None = field(default=None, repr=False)
+    credentials: tuple[str, str] | None = field(default=None, repr=False)  # the user name and password
+
+    @property
+    def authorization(self) -> str | None:
+        """The value of the Proxy-Authorization header, None without `credentials`."""
+        if self.credentials is None:
+            return None
+        login, password = self.credentials
+        # Basic authentication (RFC 7617) in UTF-8; aiohttp.BasicAuth is deprecated since aiohttp 3.14.
+        return "Basic " + base64.b64encode(f"{login}:{password}".encode()).decode("ascii")
 
     @classmethod
     def from_url(cls, value: str) -> "Proxy":
@@ -66,15 +76,13 @@ class Proxy:
         user, at, address = parts.netloc.rpartition("@")
         address = address.lower()  # a host in any case is one proxy; the user and password keep theirs
         scheme = parts.scheme.lower()
-        authorization = None
+        credentials = None
         if parts.username is not None:
-            login, password = unquote(parts.username), unquote(parts.password or "")
-            # Basic authentication (RFC 7617) in UTF-8; aiohttp.BasicAuth is deprecated since aiohttp 3.14.
-            authorization = "Basic " + base64.b64encode(f"{login}:{password}".encode()).decode("ascii")
+            credentials = unquote(parts.username), unquote(parts.password or "")
         return cls(
             url=f"{scheme}://{address}",
             label=hide_password(f"{scheme}://{user}{at}{address}"),
-            authorization=authorization,
+            credentials=credentials,
         )
 
 
@@ -199,6 +207,11 @@ class ProxyPool:
     @property
     def proxies(self) -> list[Proxy]:
         return list(self._proxies)
+
+    @property
+    def no_proxy(self) -> str | None:
+        """The NO_PROXY variable a pool of `from_env` follows, None for any other pool or when it is not set."""
+        return self._environment.get("no")
 
     def pick(self, url: str) -> Proxy | None:
         """The proxy for a request to `url`; None to send it directly (NO_PROXY, or no proxy for its scheme).

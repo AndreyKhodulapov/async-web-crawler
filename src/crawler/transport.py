@@ -53,6 +53,7 @@ class Response(NamedTuple):
     redirected: bool = False  # a redirect, not followed; `final_url` is its Location header
     body: bytes | None = None  # the bytes as sent, when asked for instead of the text
     robots_tag: tuple[str, ...] = ()  # the X-Robots-Tag headers as sent
+    proxy: Proxy | None = None  # the proxy the request went through
 
 
 @runtime_checkable
@@ -125,6 +126,7 @@ class HttpTransport:
     through a proxy times out the same way whether the proxy or the site
     is slow. The password of a proxy is sent in the Proxy-Authorization
     header, never as part of a URL, and errors name the proxy by its label.
+    A response names the proxy it came through, as `Response.proxy`.
 
     The session keeps the cookies that sites set, along with the starting
     `cookies`, and sends them back as a browser would; `cookies()` gives
@@ -255,6 +257,7 @@ class HttpTransport:
             raise
         if pool is not None and proxy is not None:
             pool.record(proxy, url, None)
+            response = response._replace(proxy=proxy)
         return response
 
     async def _request(

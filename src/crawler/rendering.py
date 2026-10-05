@@ -21,6 +21,7 @@ import aiohttp
 from crawler.exceptions import CrawlerClosedError, FetchTimeoutError, PageTooLargeError, RenderError
 from crawler.filters import UrlFilter
 from crawler.parser import is_html_content_type
+from crawler.proxy import Proxy
 from crawler.session import cookie_domain_problem, cookie_name_problem, cookie_value_problem, make_cookie
 from crawler.transport import Response, Transport
 
@@ -137,6 +138,26 @@ async def browser_problem() -> str | None:
     except (Error, OSError) as exc:  # OSError: the driver cannot be run
         return f"Playwright could not start: {_first_line(exc)}"
     return None if os.path.exists(executable) else _NO_CHROMIUM
+
+
+def bypass_rules(no_proxy: str | None) -> str | None:
+    """The hosts of NO_PROXY as Chromium's rules for the hosts it reaches without a proxy; None if there are none.
+
+    As the crawler reads NO_PROXY, a name is that host and its subdomains,
+    a dot in front of it changes nothing, and a port is part of the name.
+    A range of addresses ("10.0.0.0/8") is left out: the crawler does not
+    read one, and sends its requests through the proxy.
+    """
+    rules = []
+    for entry in (no_proxy or "").split(","):
+        name = entry.strip().lstrip(".").lower()
+        if name and "/" not in name:
+            rules += [name, f"*.{name}"]
+    if not rules:
+        return None
+    # Chromium reaches every loopback address directly, and Playwright stops that only while the
+    # rules name none of them: with "localhost", 127.0.0.1 would bypass the proxy, unlike for the crawler.
+    return ", ".join(["<-loopback>", *rules])
 
 
 _Key = tuple[str, str, str]  # the domain, path and name of a cookie
@@ -284,7 +305,11 @@ class BrowserTransport:
     in the responses to its requests) after it, see `CookieSync`. With
     `keep_cookies=False` nothing goes between them, and each page has a
     browser of its own. The requests of the browser carry `user_agent`
-    and the `headers`.
+    and the `headers`, and go through the proxy the document of their
+    page came through (`Response.proxy`), or directly if it came so; the
+    hosts `no_proxy` names (as the NO_PROXY variable does) are reached
+    directly. They are not requests of the crawler: their failures are
+    neither those of the proxy nor of the site.
 
     A rendered page keeps the status, the headers and the final URL of
     its download; its content is the HTML of the page once rendered,
@@ -303,11 +328,16 @@ class BrowserTransport:
         max_page_size: int | None,
         headers: Mapping[str, str] | None = None,
         keep_cookies: bool = True,
+        no_proxy: str | None = None,
     ) -> None:
         self.http = http
         self.rendering = rendering
         self.renderer = Renderer(
-            rendering, user_agent=user_agent, headers=headers, cookies=http if keep_cookies else None
+            rendering,
+            user_agent=user_agent,
+            headers=headers,
+            cookies=http if keep_cookies else None,
+            no_proxy=no_proxy,
         )
         self._max_page_size = max_page_size
 
@@ -339,6 +369,7 @@ class BrowserTransport:
                 final_url=rendered.location,
                 content_type=response.content_type,
                 redirected=True,
+                proxy=response.proxy,
             )
         size = len(rendered.content.encode("utf-8", "replace"))
         if self._max_page_size is not None and size > self._max_page_size:
@@ -380,14 +411,18 @@ class Renderer:
     """Renders pages in one headless Chromium, at most `rendering.max_open_pages` at once.
 
     The browser is started for the first page and closed by `close()`.
-    Its pages share one context (cookies, cache), whose cookies are kept
-    in step with those of `cookies`, the transport of the crawler, around
-    every page (see `CookieSync`). Without `cookies`, each page has a
-    context of its own, closed after it: nothing goes from one page to
-    the next. The requests of the browser carry the `user_agent` and the
-    `headers` of the crawler. Every request of a page goes through
-    `_route`: the page gets its document as downloaded, its own
-    navigations are stopped and reported, frames and pop-ups get
+    A page is rendered in the context (cookies, cache) of the proxy its
+    document came through, so all its requests go through that proxy;
+    the pages of a proxy share one, those without one share another. The
+    cookies of a context are kept in step with those of `cookies`, the
+    transport of the crawler, around every page (see `CookieSync`), and
+    so go from one context to the others. Without `cookies`, each page
+    has a context of its own, closed after it: nothing goes from one page
+    to the next. The requests of the browser carry the `user_agent` and
+    the `headers` of the crawler; the hosts of `no_proxy` (see
+    `bypass_rules`) are reached without a proxy. Every request of a page
+    goes through `_route`: the page gets its document as downloaded, its
+    own navigations are stopped and reported, frames and pop-ups get
     nothing, and the `block_resources` are not requested.
 
     A browser that crashes fails the pages being rendered with
@@ -405,17 +440,19 @@ class Renderer:
         user_agent: str,
         headers: Mapping[str, str] | None = None,
         cookies: Transport | None = None,
+        no_proxy: str | None = None,
     ) -> None:
         self.rendering = rendering
         self._user_agent = user_agent
         self._headers = dict(headers or {})
         self._cookies = cookies
+        self._bypass = bypass_rules(no_proxy)
         self._pages = asyncio.Semaphore(rendering.max_open_pages)
         self._lock = asyncio.Lock()  # one launch at a time
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
-        self._context: BrowserContext | None = None  # shared by the pages, with cookies
-        self._sync: CookieSync | None = None  # of that context
+        # Shared by the pages of a proxy, by its label (None: without a proxy), with what keeps their cookies in step.
+        self._contexts: dict[str | None, tuple[BrowserContext, CookieSync]] = {}
         self._tabs: dict[Page, _Tab] = {}
         self._launches = 0
         self._failure: str | None = None  # why the browser is not used any more
@@ -435,7 +472,7 @@ class Renderer:
             CrawlerClosedError: the renderer is closed.
         """
         async with self._pages:
-            context, sync = await self._get_context(url)
+            context, sync = await self._get_context(url, document.proxy)
             from playwright.async_api import Error as PlaywrightError
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -569,11 +606,12 @@ class Renderer:
             return RenderError(url, "the browser crashed")
         return RenderError(url, f"browser: {_first_line(exc)}")
 
-    async def _get_context(self, url: str) -> tuple["BrowserContext", CookieSync | None]:
-        """The context to render a page in, and what keeps its cookies in step; the browser is started now if it is not running.
+    async def _get_context(self, url: str, proxy: Proxy | None) -> tuple["BrowserContext", CookieSync | None]:
+        """The context to render a page through `proxy` in, and what keeps its cookies in step.
 
-        Without cookies, it is a context of the page's own, with no
-        `CookieSync`, to close after the page.
+        The browser is started now if it is not running. Without cookies,
+        it is a context of the page's own, with no `CookieSync`, to close
+        after the page.
         """
         async with self._lock:
             if self._closed:
@@ -586,11 +624,11 @@ class Renderer:
 
             try:
                 if self._cookies is None:
-                    return await self._new_context(browser), None
-                if self._context is None:
-                    self._context, self._sync = await self._new_context(browser), CookieSync()
-                assert self._sync is not None
-                return self._context, self._sync
+                    return await self._new_context(browser, proxy), None
+                key = None if proxy is None else proxy.label
+                if key not in self._contexts:
+                    self._contexts[key] = await self._new_context(browser, proxy), CookieSync()
+                return self._contexts[key]
             except Error as exc:
                 raise self._error(url, None, exc) from exc
 
@@ -624,11 +662,19 @@ class Renderer:
         self._browser.on("disconnected", self._on_disconnected)
         logger.info("Started Chromium %s to render pages", self._browser.version)
 
-    async def _new_context(self, browser: "Browser") -> "BrowserContext":
-        """A context of `browser` whose requests are those of the crawler and go through `_route`."""
+    async def _new_context(self, browser: "Browser", proxy: Proxy | None) -> "BrowserContext":
+        """A context of `browser` whose requests are those of the crawler, go through `proxy` and through `_route`."""
+        settings: dict[str, Any] = {}
+        if proxy is not None:
+            settings["proxy"] = {"server": proxy.url}
+            if proxy.credentials is not None:
+                # Given to the browser as they are, sent when the proxy asks for them (HTTP 407).
+                settings["proxy"]["username"], settings["proxy"]["password"] = proxy.credentials
+            if self._bypass is not None:
+                settings["proxy"]["bypass"] = self._bypass
         # Service workers would take requests past the routing of the context.
         context = await browser.new_context(
-            user_agent=self._user_agent, extra_http_headers=self._headers, service_workers="block"
+            user_agent=self._user_agent, extra_http_headers=self._headers, service_workers="block", **settings
         )
         try:
             await context.route("**/*", self._route)
@@ -636,6 +682,8 @@ class Renderer:
             with contextlib.suppress(Exception):
                 await context.close()
             raise
+        if proxy is not None:
+            logger.debug("Opened a browser context for proxy %s", proxy.label)
         return context
 
     def _on_disconnected(self, browser: "Browser") -> None:
@@ -656,17 +704,17 @@ class Renderer:
             logger.debug("Browser closed")
 
     async def _shutdown(self) -> None:
-        """Close the context, the browser and Playwright, whatever state they are in."""
+        """Close the contexts, the browser and Playwright, whatever state they are in."""
         for close in (
-            self._context.close if self._context is not None else None,
+            *(context.close for context, _ in self._contexts.values()),
             self._browser.close if self._browser is not None else None,
             self._playwright.stop if self._playwright is not None else None,
         ):
             if close is not None:
                 with contextlib.suppress(Exception):
                     await close()
-        self._context = self._browser = self._playwright = None
-        self._sync = None
+        self._browser = self._playwright = None
+        self._contexts.clear()
 
 
 def _first_line(exc: BaseException) -> str:

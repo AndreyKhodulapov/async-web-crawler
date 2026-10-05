@@ -3,8 +3,9 @@
 import base64
 import logging
 
+import aiohttp
 import pytest
-from helpers import UNTHROTTLED, FakeClock
+from helpers import BOT, UNTHROTTLED, FakeClock
 
 from crawler import (
     AsyncCrawler,
@@ -12,11 +13,13 @@ from crawler import (
     CircuitState,
     NetworkError,
     NoProxyError,
+    Proxy,
     ProxyNetworkError,
     ProxyPool,
     ProxyStats,
     RetryStrategy,
 )
+from crawler.transport import HttpTransport
 from demo_site import free_port
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
@@ -46,6 +49,30 @@ async def test_a_page_goes_through_the_proxy(url, site, make_proxy):
     assert "hello" in page
     assert proxy.requests == [f"GET {url('/robots.txt')}", f"GET {url('/ok')}"]
     assert stats == {proxy.url: ProxyStats(state="active", requests=2)}
+
+
+async def test_a_response_names_the_proxy_it_came_through(url, make_proxy):
+    proxy = await make_proxy()
+    timeout = aiohttp.ClientTimeout(total=5)
+    responses = {}
+    for proxies in (ProxyPool([proxy.url]), None):
+        transport = HttpTransport(
+            max_concurrent=1, timeout=timeout, user_agent=BOT, max_page_size=None, proxies=proxies
+        )
+        try:
+            for path in ("/ok", "/moved", "/data.json"):
+                response = await transport.get(
+                    url(path), html_only=True, raw_limit=None, truncate_at=None, timeout=timeout
+                )
+                responses[path, proxies is not None] = response
+        finally:
+            await transport.close()
+
+    assert responses["/moved", True].redirected
+    assert responses["/data.json", True].content == ""  # not HTML
+    for path in ("/ok", "/moved", "/data.json"):
+        assert responses[path, True].proxy == Proxy.from_url(proxy.url)
+        assert responses[path, False].proxy is None
 
 
 async def test_an_https_page_goes_through_a_connect_tunnel(https_server, make_proxy):

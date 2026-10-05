@@ -7,13 +7,23 @@ import aiohttp
 import pytest
 from test_transport_contract import ScriptedTransport, make_fetcher, page
 
-from crawler import AsyncCrawler, CrawlerClosedError, PageTooLargeError, RenderError, Rendering, make_cookie
+from crawler import (
+    AsyncCrawler,
+    CrawlerClosedError,
+    PageTooLargeError,
+    ProxyPool,
+    RenderError,
+    Rendering,
+    make_cookie,
+)
+from crawler.proxy import Proxy
 from crawler.rendering import (
     BrowserTransport,
     CookieSync,
     Rendered,
     Renderer,
     browser_problem,
+    bypass_rules,
     from_playwright,
     playwright_problem,
     to_playwright,
@@ -150,6 +160,16 @@ class TestBrowserTransport:
         assert (await get(transport, URL)).content == "<p>rendered page</p>"
         assert [url for url, _ in renderer.pages] == [URL]
 
+    async def test_a_page_keeps_the_proxy_of_its_download(self) -> None:
+        proxy = Proxy.from_url("http://proxy.test:3128")
+        transport, _, renderer = make_transport({URL: page(URL, "page")._replace(proxy=proxy)})
+        rendered = await get(transport)
+        renderer.rendered = Rendered("", "https://a.test/elsewhere")
+        redirect = await get(transport)
+
+        assert renderer.pages[0][1].proxy == proxy
+        assert rendered.proxy == redirect.proxy == proxy
+
     async def test_a_page_that_goes_elsewhere_comes_back_as_a_redirect(self) -> None:
         target = "https://a.test/target"
         transport, _, _ = make_transport({URL: page(URL, "page")}, renderer=FakeRenderer(Rendered("", target)))
@@ -212,6 +232,19 @@ class TestBrowserTransport:
 
         assert (shared.renderer._cookies, shared.renderer._headers) == (http, {"X-Key": "1"})
         assert (alone.renderer._cookies, alone.renderer._headers) == (None, {})
+
+    def test_the_browser_takes_no_proxy_of_the_environment(self, monkeypatch) -> None:
+        for name in ["http_proxy", "https_proxy", "no_proxy", "REQUEST_METHOD"]:
+            monkeypatch.delenv(name, raising=False)
+            monkeypatch.delenv(name.upper(), raising=False)
+        monkeypatch.setenv("HTTP_PROXY", "http://proxy.test:3128")
+        monkeypatch.setenv("NO_PROXY", "a.test")
+
+        from_env = AsyncCrawler(rendering=DEFAULT, proxies=ProxyPool.from_env())
+        listed = AsyncCrawler(rendering=DEFAULT, proxies=ProxyPool(["http://proxy.test:3128"]))
+
+        assert from_env._transport.renderer._bypass == "<-loopback>, a.test, *.a.test"
+        assert listed._transport.renderer._bypass is None
 
 
 class TestRenderErrors:
@@ -396,3 +429,99 @@ class TestPlaywrightCookies:
 
         assert from_playwright(cookie | {"expires": 1791140938.75}).expires == 1791140938
         assert from_playwright(cookie | {"expires": -1}).expires is None
+
+
+class TestBypassRules:
+    @pytest.mark.parametrize(
+        ("no_proxy", "rules"),
+        [
+            (None, None),
+            ("", None),
+            (" , ", None),
+            ("a.test", "<-loopback>, a.test, *.a.test"),
+            (".A.test, b.test:8080", "<-loopback>, a.test, *.a.test, b.test:8080, *.b.test:8080"),
+            ("localhost", "<-loopback>, localhost, *.localhost"),
+            # The crawler does not read a range of addresses: it sends those hosts through the proxy.
+            ("10.0.0.0/8, a.test", "<-loopback>, a.test, *.a.test"),
+            ("10.0.0.0/8", None),
+        ],
+    )
+    def test_no_proxy_as_rules_of_the_browser(self, no_proxy, rules) -> None:
+        assert bypass_rules(no_proxy) == rules
+
+
+class FakeContext:
+    closed = False
+
+    async def route(self, pattern, handler) -> None:
+        pass
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeBrowser:
+    """A running browser that makes contexts and remembers how."""
+
+    def __init__(self) -> None:
+        self.settings: list[dict] = []
+
+    def is_connected(self) -> bool:
+        return True
+
+    async def new_context(self, **settings) -> FakeContext:
+        self.settings.append(settings)
+        return FakeContext()
+
+
+class TestContextsOfProxies:
+    FIRST = Proxy.from_url("http://user:p%40ss@first.test:3128")
+    SECOND = Proxy.from_url("http://second.test:3128")
+
+    def make_renderer(self, **options) -> tuple[Renderer, FakeBrowser]:
+        renderer = Renderer(DEFAULT, user_agent="TestBot/1.0", **options)
+        browser = renderer._browser = FakeBrowser()  # type: ignore[assignment]
+        return renderer, browser
+
+    async def test_a_context_goes_through_its_proxy_with_its_password(self) -> None:
+        renderer, browser = self.make_renderer(no_proxy="a.test")
+        await renderer._new_context(browser, self.FIRST)  # type: ignore[arg-type]
+        await renderer._new_context(browser, self.SECOND)  # type: ignore[arg-type]
+        await renderer._new_context(browser, None)  # type: ignore[arg-type]
+
+        bypass = "<-loopback>, a.test, *.a.test"
+        assert [settings.get("proxy") for settings in browser.settings] == [
+            {"server": "http://first.test:3128", "username": "user", "password": "p@ss", "bypass": bypass},
+            {"server": "http://second.test:3128", "bypass": bypass},
+            None,
+        ]
+
+    async def test_the_pages_of_a_proxy_share_its_context(self) -> None:
+        renderer, browser = self.make_renderer(cookies=ScriptedTransport({}))
+        first = await renderer._get_context(URL, self.FIRST)
+        second = await renderer._get_context(URL, self.SECOND)
+        direct = await renderer._get_context(URL, None)
+
+        assert await renderer._get_context(URL, Proxy.from_url("http://user:p%40ss@first.test:3128")) == first
+        assert await renderer._get_context(URL, None) == direct
+        assert len({id(first[0]), id(second[0]), id(direct[0])}) == 3
+        assert first[1] is not second[1]
+        assert len(browser.settings) == 3
+
+    async def test_without_cookies_each_page_has_a_context_through_its_proxy(self) -> None:
+        renderer, browser = self.make_renderer()
+        context, sync = await renderer._get_context(URL, self.SECOND)
+        again, _ = await renderer._get_context(URL, self.SECOND)
+
+        assert sync is None and context is not again
+        assert [settings["proxy"]["server"] for settings in browser.settings] == ["http://second.test:3128"] * 2
+
+    async def test_close_closes_every_context(self) -> None:
+        renderer, _ = self.make_renderer(cookies=ScriptedTransport({}))
+        contexts = [(await renderer._get_context(URL, proxy))[0] for proxy in (self.FIRST, None)]
+        renderer._browser = None  # nothing to close in the fake one
+
+        await renderer.close()
+
+        assert all(context.closed for context in contexts)
+        assert renderer._contexts == {}

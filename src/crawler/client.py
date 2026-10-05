@@ -331,6 +331,7 @@ class AsyncCrawler:
                 max_page_size=max_page_size,
                 headers=headers,
                 keep_cookies=keep_cookies,
+                no_proxy=None if proxies is None else proxies.no_proxy,
             )
         self._proxies = proxies
         self._rendering = rendering
