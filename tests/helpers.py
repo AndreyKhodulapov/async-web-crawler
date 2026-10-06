@@ -4,7 +4,7 @@ import asyncio
 import base64
 import importlib.util
 import os
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
@@ -110,15 +110,27 @@ def make_record(url: str = "https://site/page", **fields: object) -> PageRecord:
 
 
 class MemoryStorage(DataStorage):
-    """Keeps the batches in a list; a write fails with the next of `failures`, if any."""
+    """Keeps the batches in a list; a write fails with the next of `failures`, if any.
 
-    def __init__(self, batch_size: int = 100, *, failures: Sequence[Exception] = (), **options) -> None:
+    A write of a batch with a record whose URL is in `refused` fails with
+    ValueError, every time: the record is one the storage cannot write.
+    """
+
+    def __init__(
+        self,
+        batch_size: int = 100,
+        *,
+        failures: Sequence[Exception] = (),
+        refused: Collection[str] = (),
+        **options,
+    ) -> None:
         options.setdefault("retry_strategy", RetryStrategy(retry_on=(OSError,), base_delay=0.001, max_delay=0.001))
         # No pause after a failed write, unless a test asks for one.
         options.setdefault("cooldown", 0)
         super().__init__(batch_size, **options)
         self.batches: list[list[PageRecord]] = []
         self.failures = list(failures)
+        self.refused = refused
         self.attempts = 0
         self.released = 0
         self._writing = False
@@ -135,6 +147,9 @@ class MemoryStorage(DataStorage):
             await asyncio.sleep(0)
             if self.failures:
                 raise self.failures.pop(0)
+            for record in records:
+                if record["url"] in self.refused:
+                    raise ValueError(f"cannot write {record['url']}")
             self.batches.append(list(records))
         finally:
             self._writing = False

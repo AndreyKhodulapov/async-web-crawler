@@ -985,9 +985,12 @@ All of them share the behavior of `DataStorage`:
   the buffer, so the next write takes them along. A repeated write does not
   duplicate records. For `cooldown` seconds after that (5 by default)
   `save()` only buffers, so a storage that is down does not slow the crawl
-  down; `flush()` and `close()` write at once all the same. Any other error (e.g. a value the database refuses) is
-  raised as it is and its batch is dropped, so that one bad record does not
-  fail every later write.
+  down; `flush()` and `close()` write at once all the same. Any other error
+  (e.g. a value the database refuses, text that is not valid UTF-8) is one
+  no retry cures: the batch is written again a record at a time, and only
+  the records that fail on their own are dropped, each logged with its URL,
+  so that one bad record neither fails every later write nor takes its batch
+  along. The error of the first record dropped is raised as it is.
 - `read()` iterates over the saved records, oldest first, without loading
   them all; `pending` and `written` count the records in the buffer and those
   written out.

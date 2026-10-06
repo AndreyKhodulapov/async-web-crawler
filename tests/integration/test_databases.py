@@ -133,15 +133,39 @@ class TestSavingAndReading:
 
         assert [record["title"] for record in await read_all(storage)] == ["Second"]
 
-    async def test_batch_is_saved_whole_or_not_at_all(self, open_storage):
-        storage = open_storage(batch_size=3)
+    async def test_batch_is_written_whole_or_not_at_all(self, open_storage):
+        # A failed batch is written again one record at a time: no record of it may be in the table.
+        storage = open_storage()
         records = [make_record("https://site/a"), make_record("https://site/b"), make_record("https://site/c")]
         records[2]["title"] = None  # the column does not allow it
 
         with pytest.raises(Exception, match="(?i)null"):
-            await save_all(storage, records)
+            await storage._write_batch(records)
 
         assert await open_storage().count() == 0
+
+    async def test_only_the_record_the_database_refuses_is_dropped(self, open_storage):
+        storage = open_storage(batch_size=3)
+        records = [make_record("https://site/a"), make_record("https://site/b"), make_record("https://site/c")]
+        records[1]["title"] = None  # the column does not allow it
+
+        with pytest.raises(Exception, match="(?i)null"):
+            await save_all(storage, records)
+
+        assert [record["url"] for record in await read_all(open_storage())] == ["https://site/a", "https://site/c"]
+        assert (storage.pending, storage.written) == (0, 2)
+
+    async def test_text_with_a_lone_surrogate_is_dropped_alone(self, open_storage):
+        # Not valid UTF-8: no database takes it.
+        storage = open_storage(batch_size=10)
+        records = [make_record(f"https://site/{number}") for number in range(10)]
+        records[4]["text"] = "broken \ud83d emoji"
+
+        with pytest.raises(Exception, match="(?i)surrogate"):
+            await save_all(storage, records)
+
+        assert await open_storage().count() == 9
+        assert await open_storage().get("https://site/4") is None
 
     async def test_many_records_in_batches(self, open_storage):
         records = [make_record(f"https://site/page-{number}") for number in range(2000)]
@@ -279,6 +303,19 @@ class TestPostgres:
         rows = await run_in_postgres("SELECT url FROM pages WHERE metadata ->> 'language' = 'fr'")
 
         assert [url for (url,) in rows] == ["https://site/page"]
+
+    @pytest.mark.postgres
+    async def test_text_with_a_nul_character_is_dropped_alone(self):
+        # SQLite keeps it; a text column of PostgreSQL cannot.
+        await run_in_postgres("DROP TABLE IF EXISTS pages")
+        records = [make_record(f"https://site/{number}") for number in range(10)]
+        records[4]["text"] = "before\x00after"
+
+        async with PostgresStorage(POSTGRES_DSN, batch_size=10) as storage:
+            with pytest.raises(asyncpg.CharacterNotInRepertoireError):
+                await save_all(storage, records)
+
+            assert await storage.count() == 9
 
     @pytest.mark.postgres
     async def test_storage_chosen_by_the_url_reaches_the_server(self):

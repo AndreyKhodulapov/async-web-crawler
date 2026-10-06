@@ -114,8 +114,14 @@ blocking the event loop, losing pages or writing them twice.
   writes at once.
 - Keep only what a retry can cure. A batch that fails with any other error
   (a value the database refuses, a record that cannot be serialized) is a
-  **poison batch**: kept in the buffer, it fails every later write. Drop it,
-  log it and raise.
+  **poison batch**: kept in the buffer, it fails every later write. But the
+  poison is usually one record, and dropping the whole batch loses up to
+  `batch_size` good pages with it. Write the batch again **one record at a
+  time** and drop only the records that fail on their own: log each with
+  its URL and raise the error of the first. This is safe only because a
+  batch is written whole or not at all (one transaction, or a file write
+  that starts where the last good one ended): otherwise the records of the
+  failed batch that did get written would be written twice.
 - **Saving must not kill the crawl**: catch at the boundary of one page, log,
   count, go on. Fetched pages are expensive, a failed save is not a reason to
   throw away the rest.
