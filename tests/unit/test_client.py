@@ -1349,9 +1349,10 @@ class TestCrawlHeldBackHost:
 class SharedMemoryFrontier(MemoryFrontier):
     """A `MemoryFrontier` that says it is shared by several processes, as one in a database is.
 
-    It keeps the holds it is told of in `holds`, and a page put back while
-    its host is held comes back when the hold ends, as a frontier in a
-    database hands it out.
+    It keeps the holds it is told of in `holds` and the pages put back in
+    `put_backs` (URL, uncount, waited), and a page put back while its host
+    is held comes back when the hold ends, as a frontier in a database
+    hands it out.
     """
 
     shared = True
@@ -1359,15 +1360,17 @@ class SharedMemoryFrontier(MemoryFrontier):
     def __init__(self, **options) -> None:
         super().__init__(**options)
         self.holds: list[tuple[str, float, str | None]] = []
+        self.put_backs: list[tuple[str, bool, bool]] = []
         self._held_until: dict[str, float] = {}
 
     async def hold_host(self, host: str, seconds: float, reason: str | None) -> None:
         self.holds.append((host, seconds, reason))
         self._held_until[host] = max(self._held_until.get(host, 0.0), time.monotonic() + seconds)
 
-    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool) -> None:
+    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool, waited: bool = False) -> None:
+        self.put_backs.append((page.url, uncount, waited))
         held = self._held_until.get(get_host(page.url) or "", 0.0) - time.monotonic()
-        await super().put_back(page, max(delay, held), uncount=uncount)
+        await super().put_back(page, max(delay, held), uncount=uncount, waited=waited)
 
 
 class TestCrawlSharedFrontier:
@@ -1434,6 +1437,72 @@ class TestCrawlSharedFrontier:
         assert frontier.holds == []
         deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred ")]
         assert deferred and all(message.endswith("robots.txt is being downloaded") for message in deferred)
+
+    async def test_page_whose_host_is_held_back_while_it_waits_for_its_turn_goes_back_uncounted(
+        self, make_crawler, fake_session, caplog
+    ):
+        # a/1 and a/2 are taken at once; a/2 waits for the turn of host a
+        # when a/1 is answered with a Retry-After of 1 s. a/2 goes back to
+        # the queue rather than wait it out: uncounted, as nothing was sent
+        # for it, and not as a wait of its own.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(max_concurrent=2, max_depth=0, requests_per_second=3.0)  # 0.33 s apart
+        crawler.MIN_PENALTY_TO_DEFER = 0.1
+        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
+        frontier = SharedMemoryFrontier()
+
+        pages = await crawler.crawl_frontier(frontier, ["http://a/1", "http://a/2"])
+
+        assert set(pages) == {"http://a/2"}
+        assert fake_session.requested.count("http://a/2") == 1
+        assert ("http://a/2", True, False) in frontier.put_backs
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/2")]
+        assert len(deferred) == 1
+
+    async def test_page_whose_redirect_target_is_held_back_waits_on_its_own(self, make_crawler, fake_session):
+        # c/1 is answered with a redirect to host a, held back meanwhile: the
+        # request was made, so the page waits, and the wait is counted.
+        crawler = make_crawler(max_concurrent=2, max_depth=0, requests_per_second=3.0)
+        crawler.MIN_PENALTY_TO_DEFER = 0.1
+        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
+        fake_session.routes["http://c/1"] = FakeResponse(status=302, location="http://a/2")
+        frontier = SharedMemoryFrontier()
+
+        pages = await crawler.crawl_frontier(frontier, ["http://a/1", "http://c/1"])
+
+        assert set(pages) == {"http://c/1"}
+        assert frontier.put_backs[0] == ("http://c/1", True, True)
+        # Its own host is not held: it came back after the hold of a, not at once.
+        assert [host for host, _, _ in frontier.holds] == ["a"] * len(frontier.holds)
+
+    async def test_page_that_has_waited_its_last_waits_in_the_rate_limiter(self, make_crawler, fake_session):
+        crawler = make_crawler(max_concurrent=2, max_depth=0, requests_per_second=3.0)
+        crawler.MIN_PENALTY_TO_DEFER = 0.1
+        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
+        fake_session.routes["http://c/1"] = FakeResponse(status=302, location="http://a/2")
+        frontier = SharedMemoryFrontier()
+        await frontier.seed(["http://c/1"])
+        for _ in range(AsyncCrawler.MAX_WAITS_PER_PAGE):
+            await frontier.put_back(await frontier.take(), waited=True, uncount=False)
+        frontier.put_backs.clear()
+
+        pages = await crawler.crawl_frontier(frontier, ["http://a/1", "http://c/1"])
+
+        assert set(pages) == {"http://c/1"}
+        assert frontier.put_backs == []
+        assert fake_session.requested.count("http://c/1") == 1
+
+    async def test_crawl_of_one_process_waits_in_the_rate_limiter(self, make_crawler, fake_session, caplog):
+        # Its frontier is not shared: the page waits for the host as before.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(max_concurrent=2, max_depth=0, requests_per_second=3.0)
+        crawler.MIN_PENALTY_TO_DEFER = 0.1
+        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
+
+        await crawler.crawl(["http://a/1", "http://a/2"])
+
+        assert set(crawler.processed_urls) == {"http://a/2"}
+        assert not [r for r in caplog.records if r.getMessage().startswith("Deferred http://a/2")]
 
 
 class TestCrawlStorage:

@@ -3,7 +3,6 @@
 import asyncio
 import logging
 import time
-from collections import Counter
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from contextlib import aclosing
 from datetime import UTC, datetime
@@ -14,6 +13,7 @@ from crawler.exceptions import (
     CircuitOpenError,
     CrawlerClosedError,
     FetchError,
+    HostHeldBackError,
     HTTPStatusError,
     ParseError,
     PermanentError,
@@ -48,10 +48,12 @@ class CrawlRun:
     """
 
     MAX_CIRCUIT_OPENINGS = 3
-    # In crawl(), a page whose host is held back longer than this is put off.
+    # In crawl(), a page whose host is held back longer than this is put off;
+    # in a crawl of several processes, even once it waits for its turn.
     MIN_PENALTY_TO_DEFER = 1.0
     # In crawl(), a page waits at most this many times for a Retry-After
-    # too long to retry it, before it is given up.
+    # too long to retry it, before it is given up; in a crawl of several
+    # processes the waits for the held host of its redirect count too.
     MAX_WAITS_PER_PAGE = 3
     # In crawl(), the unreachable robots.txt of a site is downloaded again at
     # most this many times in a row before its pages, and the pages that
@@ -104,7 +106,6 @@ class CrawlRun:
         self._redirect_sources: dict[str, str] = {}  # redirect target -> the page that led to it
         self._failed_sitemaps: dict[str, str] = {}
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
-        self._page_waits: Counter[str] = Counter()  # times a page waited for a Retry-After too long to retry
         self._pages_to_save = 0
         self._written_before = 0
         self._pending_before = 0
@@ -434,8 +435,18 @@ class CrawlRun:
             return skip_reason is None
 
         result = await self._fetcher.fetch(
-            url, html_only=True, check_robots=False, follow=follow, robots_wait=self.ROBOTS_POLL
+            url,
+            html_only=True,
+            check_robots=False,
+            follow=follow,
+            robots_wait=self.ROBOTS_POLL,
+            max_wait=self._max_wait(page),
         )
+        if isinstance(result.error, HostHeldBackError):
+            # The target was not requested: whoever takes the page again follows the redirect anew.
+            await self._forget_redirects(url, targets)
+            await self._put_back_held(page, result.error, requested=sent)
+            return
         if (refusal := self._circuit_refusal(result)) is not None:
             # The circuit of the host, or of the host a redirect leads to,
             # opened while the request waited for its turn or was in flight.
@@ -676,6 +687,30 @@ class CrawlRun:
         self._hosts_warned_held_back.add(host)
         logger.warning("%s asked to wait %.0fs (Retry-After); its pages are put off until then", host, penalty)
 
+    def _max_wait(self, page: FrontierPage) -> float | None:
+        """How long a request of the page waits for a host held back; None for as long as it is held.
+
+        In a crawl of several processes, a page whose host is held back
+        after it was taken goes back to the queue rather than keep the worker
+        waiting (see `_put_back_held`); once it has waited `MAX_WAITS_PER_PAGE`
+        times it waits in the rate limiter, as in a crawl of one process.
+        """
+        if not self._frontier.shared or self._frontier.waits(page) >= self.MAX_WAITS_PER_PAGE:
+            return None
+        return self.MIN_PENALTY_TO_DEFER
+
+    async def _put_back_held(self, page: FrontierPage, error: HostHeldBackError, *, requested: bool) -> None:
+        """Put back a page whose request was not sent: its host, or that of its redirect, is held back since it was taken.
+
+        Nothing was sent to the host held back, so the page is uncounted. A
+        page that was `requested` was answered with a redirect: it waits,
+        and the wait counts toward `MAX_WAITS_PER_PAGE`, as for a page
+        asked to wait (see `_wait_for_host`).
+        """
+        self._warn_once_held_back(error.url, error.seconds)
+        reason = "its host is held back" if not requested else f"redirects to {error.url}, whose host is held back"
+        await self._put_off_for_host(page, error.url, error.seconds, reason, uncount=True, waited=requested)
+
     def _penalty_left(self, url: str) -> float:
         """Seconds the host of `url` is still held back for, after Retry-After or before a retry."""
         host = get_host(url)
@@ -745,14 +780,17 @@ class CrawlRun:
             unreachable = None
         return refusal.message if unreachable is None else f"robots.txt is unreachable ({unreachable})"
 
-    async def _put_off_page(self, page: FrontierPage, delay: float, reason: str, *, uncount: bool) -> None:
+    async def _put_off_page(
+        self, page: FrontierPage, delay: float, reason: str, *, uncount: bool, waited: bool = False
+    ) -> None:
         """Put a page of the crawl back into the queue for `delay` seconds.
 
         With `uncount`, the page is uncounted from the limits first: it
-        is counted again when it is taken again.
+        is counted again when it is taken again. With `waited`, it counts
+        a wait for its host (see `Frontier.waits`).
         """
         logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
-        await self._frontier.put_back(page, delay, uncount=uncount)
+        await self._frontier.put_back(page, delay, uncount=uncount, waited=waited)
 
     async def _put_off_for_host(
         self,
@@ -762,6 +800,7 @@ class CrawlRun:
         reason: str,
         *,
         uncount: bool,
+        waited: bool = False,
         hold_reason: str | None = None,
     ) -> None:
         """Put a page of the crawl off while the host of `url` is held back, for `delay` seconds.
@@ -777,13 +816,14 @@ class CrawlRun:
         would be handed out at once and redirect to the held one again.
         """
         if not self._frontier.shared:
-            await self._put_off_page(page, delay, reason, uncount=uncount)
+            await self._put_off_page(page, delay, reason, uncount=uncount, waited=waited)
             return
         host = get_host(url)
         assert host is not None  # a URL without a host is not requested
         await self._fetcher.tell_host_held(host, delay, hold_reason)
         logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
-        await self._frontier.put_back(page, 0.0 if host == get_host(page.url) else delay, uncount=uncount)
+        own_delay = 0.0 if host == get_host(page.url) else delay
+        await self._frontier.put_back(page, own_delay, uncount=uncount, waited=waited)
 
     async def _hold_open_circuit(self, url: str) -> None:
         """In a frontier shared by several processes, hold the host of `url` back for all of them while its circuit is open here.
@@ -822,14 +862,11 @@ class CrawlRun:
         to another one. Returns False once the page has waited
         `MAX_WAITS_PER_PAGE` times: the caller fails it then.
         """
-        url = page.url
-        if self._page_waits[url] >= self.MAX_WAITS_PER_PAGE:
-            del self._page_waits[url]
+        if self._frontier.waits(page) >= self.MAX_WAITS_PER_PAGE:
             return False
-        self._page_waits[url] += 1
         delay = self._penalty_left(error.url) or 1.0
         # The request was answered, but not with the page: it is not a page requested.
-        await self._put_off_for_host(page, error.url, delay, error.message, uncount=True)
+        await self._put_off_for_host(page, error.url, delay, error.message, uncount=True, waited=True)
         self._warn_once_held_back(error.url, delay)
         return True
 

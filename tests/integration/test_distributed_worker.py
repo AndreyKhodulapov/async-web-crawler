@@ -442,6 +442,29 @@ async def test_page_that_redirects_to_a_held_host_waits_as_long_on_its_own(
     assert holds["127.0.0.1"]["hold_reason"] is None
 
 
+async def test_page_that_keeps_asking_to_wait_fails_after_the_waits_of_all_workers(url, site):
+    # Retry-After of 2 s is too long to retry and capped to 0.2 s of
+    # holding the host back. The first worker stops after the first wait:
+    # the next one knows of it from the database, and the page fails after
+    # as many waits in all as one process allows.
+    page = url("/busy/2")
+    job = make_config(
+        urls=[page], crawler={"max_depth": 0, "max_retry_after": 0.2}, retry={"max_retries": 1, "max_delay": 0.5}
+    )
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    async def waited_once() -> bool:
+        return site.hits["/busy/2"] == 1 and await state_of(page) == "queued"
+
+    await run_worker_until(worker_config(), waited_once)
+    await run_workers(worker_config(), 2)
+
+    assert site.hits["/busy/2"] == 1 + AsyncCrawler.MAX_WAITS_PER_PAGE
+    (row,) = await fetch("SELECT state, reason, waits FROM frontier WHERE url = $1", page)
+    assert (row["state"], row["reason"]) == ("failed", "TransientHTTPError: HTTP 429 Too Many Requests")
+    assert row["waits"] == AsyncCrawler.MAX_WAITS_PER_PAGE
+
+
 async def test_job_sections_of_the_configuration_of_a_worker_give_way_to_those_of_the_job(url, site, caplog):
     site.latency = 0.05
     await create_job(

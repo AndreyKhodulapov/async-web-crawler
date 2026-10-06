@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 
 # Every URL of a job, once: the primary key is the deduplication. The
 # sequence keeps the order pages were queued in among those of one depth.
+# `attempts` counts the leases that expired, `waits` the times the page
+# went back to wait for its host.
 _FRONTIER = """
 CREATE TABLE IF NOT EXISTS frontier (
     job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS frontier (
     lease_until TIMESTAMPTZ,
     worker TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
+    waits INTEGER NOT NULL DEFAULT 0,
     counted BOOLEAN NOT NULL DEFAULT false,
     reason TEXT,
     PRIMARY KEY (job, url)

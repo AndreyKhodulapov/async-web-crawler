@@ -21,8 +21,9 @@ Most errors fall into one of four kinds that decide whether a retry can help:
 - `ParseError`: the page was downloaded but is not an HTML document.
 
 `CrawlerClosedError`, `RobotsUnreachableError`, `CircuitOpenError`,
-`NoProxyError`, `RenderError` and `UnexpectedError` belong to none of them:
-they are not about the request itself, and none is retried.
+`HostHeldBackError`, `NoProxyError`, `RenderError` and `UnexpectedError`
+belong to none of them: they are not about the request itself, and none is
+retried.
 
 `ProxyError` is the base of the errors of proxies, `ProxyNetworkError` and
 `NoProxyError`: they say nothing about the site.
@@ -137,6 +138,19 @@ class RobotsUnreachableError(FetchError):
 
 class CircuitOpenError(FetchError):
     """The circuit breaker of the host is open: the request was not sent."""
+
+
+class HostHeldBackError(FetchError):
+    """The host is held back for longer than the request was to wait: the request was not sent.
+
+    Only a crawl of several workers asks for it (see `Fetcher.fetch`): its
+    page goes back to the queue, and the worker takes another one meanwhile.
+    `seconds` is how much longer the host is held back.
+    """
+
+    def __init__(self, url: str, message: str, *, seconds: float) -> None:
+        super().__init__(url, message)
+        self.seconds = seconds
 
 
 class ProxyError(FetchError):

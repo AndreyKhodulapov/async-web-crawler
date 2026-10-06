@@ -194,9 +194,26 @@ run against it; what it adds is what sharing needs.
     worker that took one before the hold reached the database knows of
     the hold from its own rate limiter and puts the page back, holding
     the host again in case its hold is the first to arrive (with no
-    reason, so the one the fetcher gave stays). Another worker that took
-    one knows nothing of it and sends the request: at most one request
-    per page in progress, whatever the length of the queue.
+    reason, so the one the fetcher gave stays). It does so even when the
+    hold comes while the page waits for its turn in the rate limiter: a
+    request of the crawl waits there `MIN_PENALTY_TO_DEFER` at most for
+    a penalty of its host (`max_wait` of `Fetcher.fetch`), then fails
+    with `HostHeldBackError`, unsent, and the worker takes a page of
+    another host instead of sleeping out the hold. Nothing was sent, so
+    the page is uncounted and the put-back is not a wait; a page that was
+    answered with a redirect to the held host waits, and that counts. A
+    retry waits out its own pause however long: a page put back would
+    start its retries anew, and an overloaded host would get more
+    requests than `max_retries` allows. Another worker that took a page
+    of the host knows nothing of the hold and sends the request: at most
+    one request per page in progress, whatever the length of the queue.
+  - The waits of a page are counted in the database (`frontier.waits`),
+    so `MAX_WAITS_PER_PAGE` holds for the job, not for each worker: a page
+    asked to wait comes back three times in all, whichever workers take
+    it. `take` hands the count out with the page; an expired lease is
+    not a wait. A page asked to wait fails after its last wait; a page
+    whose host is held back after it was taken waits in the rate limiter
+    after its last one, as in a local crawl.
   - `take` cannot undo a hold: it moves `next_allowed_at` on only for a
     host its condition finds ready, and locks the row of the host in the
     same statement. A row changed after the snapshot of the statement is

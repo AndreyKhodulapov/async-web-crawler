@@ -213,6 +213,23 @@ class TestLease:
         assert (await row_of(page.url))[:2] == ("leased", "other")
 
 
+class TestWaits:
+    async def test_waits_of_a_page_are_known_to_the_next_worker_and_outlast_its_lease(self, open_frontier):
+        first = await open_frontier("first", lease_seconds=0.2, heartbeat_seconds=60)
+        second = await open_frontier("second")
+        await first.seed(["http://site/"])
+        await first.put_back(await take(first), waited=True, uncount=False)
+
+        page = await take(second)
+        assert second.waits(page) == 1
+        await second.put_back(page, waited=True, uncount=False)
+        await take(first)  # its lease expires: not a wait
+
+        page = await asyncio.wait_for(second.take(), 5)
+        assert second.waits(page) == 2
+        assert (await row_of(page.url))["attempts"] == 1
+
+
 class TestPendingSave:
     async def test_page_pending_its_save_holds_the_other_workers_until_saved(self, open_frontier):
         saving, other = await open_frontier("saving"), await open_frontier("other")

@@ -215,6 +215,30 @@ class TestPutBack:
         assert await drain(frontier) == ["http://site/a", "http://site/c", "http://site/b"]
 
 
+class TestWaits:
+    """How many times a page waited for its host, which bounds its waits across takes."""
+
+    async def test_page_counts_the_waits_it_was_put_back_for(self, frontier):
+        await frontier.seed(["http://site/a"])
+        page = await take(frontier)
+        assert frontier.waits(page) == 0
+
+        await frontier.put_back(page, waited=True, uncount=False)
+        page = await take(frontier)
+        assert frontier.waits(page) == 1
+
+        await frontier.put_back(page, waited=True, uncount=False)
+        page = await take(frontier)
+        assert frontier.waits(page) == 2
+
+    async def test_page_put_back_without_a_wait_keeps_its_count(self, frontier):
+        await frontier.seed(["http://site/a"])
+        await frontier.put_back(await take(frontier), waited=True, uncount=False)
+        await frontier.put_back(await take(frontier), uncount=False)
+
+        assert frontier.waits(await take(frontier)) == 1
+
+
 class TestOutcomes:
     async def test_stats_follow_the_lifecycle(self, frontier):
         await frontier.seed([f"http://site/{name}" for name in "abcdef"])

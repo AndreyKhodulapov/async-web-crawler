@@ -58,14 +58,14 @@ WITH page AS (
     SET state = 'leased', worker = $2, lease_until = now() + make_interval(secs => $3)
     FROM queued
     WHERE f.job = $1 AND f.url = queued.url
-    RETURNING f.url, f.depth, f.host
+    RETURNING f.url, f.depth, f.host, f.waits
 ), turn AS (
     UPDATE hosts AS h
     SET next_allowed_at = now() + make_interval(secs => $4)
     FROM leased
     WHERE h.job = $1 AND h.host = leased.host
 )
-SELECT url, depth, (SELECT scope_version FROM crawl_jobs WHERE id = $1) AS scope_version FROM leased
+SELECT url, depth, waits, (SELECT scope_version FROM crawl_jobs WHERE id = $1) AS scope_version FROM leased
 """
 
 # What a worker that got no page waits for, if for anything.
@@ -269,7 +269,7 @@ class PostgresFrontier(Frontier):
         self._pool = pool
         self._max_queued = None if max_pages is None else frontier_factor * max_pages
         self._max_host_queued = None if max_pages_per_host is None else frontier_factor * max_pages_per_host
-        self._held: set[str] = set()  # pages taken and not finished
+        self._held: dict[str, int] = {}  # pages taken and not finished, with their waits
         self._counted: set[str] = set()  # pages held and counted toward the limits
         self._wakeup = asyncio.Event()
         # The heartbeat, saved and close each change many rows of this
@@ -412,7 +412,7 @@ class PostgresFrontier(Frontier):
                 await self._reclaim(connection)
                 row = await connection.fetchrow(_TAKE, self.job_id, self.worker, self.lease_seconds, self.host_interval)
                 if row is not None:
-                    self._held.add(row["url"])
+                    self._held[row["url"]] = row["waits"]
                     if row["scope_version"] != self._scope_version:
                         await self._read_scope(connection)
                     return FrontierPage(row["url"], row["depth"])
@@ -466,7 +466,7 @@ class PostgresFrontier(Frontier):
         self._stats = dataclasses.replace(self._stats, requested=requested)
         return Admission.ADMITTED
 
-    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool) -> None:
+    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool, waited: bool = False) -> None:
         self._check_held(page)
         uncount = uncount and page.url in self._counted
         try:
@@ -476,11 +476,12 @@ class PostgresFrontier(Frontier):
                     await self._uncount(connection, page)
                 await connection.execute(
                     "UPDATE frontier SET state = 'queued', worker = NULL, lease_until = NULL, counted = false,"
-                    " not_before = now() + make_interval(secs => $3), seq = nextval('frontier_seq')"
-                    " WHERE job = $1 AND url = $2",
+                    " not_before = now() + make_interval(secs => $3), seq = nextval('frontier_seq'),"
+                    " waits = waits + $4::int WHERE job = $1 AND url = $2",
                     self.job_id,
                     page.url,
                     float(delay),
+                    int(waited),
                 )
         except _LeaseLost:
             _log_lease_lost(page)
@@ -540,6 +541,10 @@ class PostgresFrontier(Frontier):
                 self.worker,
                 urls,
             )
+
+    def waits(self, page: FrontierPage) -> int:
+        self._check_held(page)
+        return self._held[page.url]
 
     async def mark_seen(self, url: str) -> bool:
         form = queue_form(url)
@@ -817,7 +822,7 @@ class PostgresFrontier(Frontier):
             raise ValueError(f"{page.url} is not in progress")
 
     def _release(self, page: FrontierPage) -> None:
-        self._held.discard(page.url)
+        self._held.pop(page.url, None)
         self._counted.discard(page.url)
 
     def _added(self, accepted: int, dropped: int, accepted_by_host: dict[str, int]) -> None:

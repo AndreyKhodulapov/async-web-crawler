@@ -17,6 +17,7 @@ from crawler.exceptions import (
     CrawlerClosedError,
     FetchError,
     FetchTimeoutError,
+    HostHeldBackError,
     HTTPStatusError,
     InvalidURLError,
     ProxyError,
@@ -28,7 +29,7 @@ from crawler.exceptions import (
     UnexpectedError,
 )
 from crawler.models import FetchResult
-from crawler.rate_limiter import RateLimiter
+from crawler.rate_limiter import HostPenalizedError, RateLimiter
 from crawler.retry import RetryStrategy
 from crawler.robots import RobotsParser, robots_tag_directives
 from crawler.semaphores import SemaphoreManager
@@ -120,6 +121,7 @@ class Fetcher:
         track_errors: bool = True,
         retry: bool = True,
         robots_wait: float | None = None,
+        max_wait: float | None = None,
     ) -> FetchResult:
         """Download a page, following its redirects one at a time.
 
@@ -142,7 +144,13 @@ class Fetcher:
         `retry`, every request of the chain is a single attempt at its
         site: one that failed in a proxy is still made again. With
         `robots_wait`, a download of robots.txt is waited for that many
-        seconds at most (see `check_robots`).
+        seconds at most (see `check_robots`). With `max_wait`, a request of
+        the chain whose host is held back longer than that (see
+        `RateLimiter.penalize`) is not sent and fails with
+        `HostHeldBackError`, which is neither retried nor counted in
+        `errors`; a crawl of several workers puts its page back and takes
+        another one meanwhile. A retry waits out its pause however long:
+        the page put back would start its retries anew.
         """
         target, elapsed, retried, attempts = url, 0.0, False, 0
         for redirects in itertools.count():
@@ -156,6 +164,7 @@ class Fetcher:
                 track_errors=track_errors,
                 retry=retry,
                 robots_wait=robots_wait,
+                max_wait=max_wait,
             )
             elapsed += result.elapsed
             retried = retried or attempts > 1
@@ -197,6 +206,7 @@ class Fetcher:
         track_errors: bool,
         retry: bool,
         robots_wait: float | None,
+        max_wait: float | None,
     ) -> tuple[FetchResult, int]:
         """Make the request for one URL, checking robots.txt first and retrying transient failures.
 
@@ -204,7 +214,8 @@ class Fetcher:
         `redirected` set and `final_url` its Location header as sent. Also
         returns the number of attempts made, 0 if the request was refused
         before it was sent. Without `retry`, the request is a single attempt
-        at the site: a proxy that failed is passed over all the same.
+        at the site: a proxy that failed is passed over all the same. The
+        first attempt gives up on a host held back longer than `max_wait`.
         """
         # Checked up front as well as by the transport: a closed crawler must
         # report itself even for a URL that robots.txt would block.
@@ -227,10 +238,19 @@ class Fetcher:
         async def attempt() -> FetchResult:
             nonlocal last, attempts, failed_at
             timeout = self._timeout_for(retries=attempts)
-            attempts += 1
             result = await self._fetch_once(
-                url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout, call=call
+                url,
+                html_only=html_only,
+                raw=raw,
+                truncate_at=truncate_at,
+                timeout=timeout,
+                call=call,
+                max_wait=max_wait if attempts == 0 else None,
             )
+            if isinstance(result.error, HostHeldBackError):
+                # Not sent, and nothing for the strategy to retry or report.
+                return result
+            attempts += 1
             if isinstance(result.error, CircuitOpenError):
                 # Not sent. A retry fails as the attempt before it did: the
                 # strategy sees the circuit open and stops, and the failure
@@ -412,8 +432,13 @@ class Fetcher:
         truncate_at: int | None,
         timeout: aiohttp.ClientTimeout,
         call: BreakerCall,
+        max_wait: float | None,
     ) -> FetchResult:
-        """Make one request under the breaker `call` of `url`, unless the circuit breaker of the host refuses it."""
+        """Make one request under the breaker `call` of `url`, unless the circuit breaker of the host refuses it.
+
+        Nor is it made when its host is held back longer than `max_wait`.
+        A probe of a half-open circuit it took is let go then.
+        """
         host = get_host(url)
 
         @contextlib.asynccontextmanager
@@ -435,7 +460,7 @@ class Fetcher:
                 # The rate limit is waited for before taking a concurrency slot,
                 # so a request waiting for its host does not hold a slot another
                 # host could use; inside the slot the interval is checked once more.
-                async with gate() if host is None else self.rate_limiter.slot(host, gate):
+                async with gate() if host is None else self.rate_limiter.slot(host, gate, max_wait=max_wait):
                     result = await self._send(
                         url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout
                     )
@@ -443,6 +468,8 @@ class Fetcher:
                     return result
         except CircuitOpenError as error:
             return FetchResult.failure(url, error, 0.0)
+        except HostPenalizedError as held:
+            return FetchResult.failure(url, HostHeldBackError(url, str(held), seconds=held.seconds), 0.0)
 
     async def _send(
         self, url: str, *, html_only: bool, raw: bool, truncate_at: int | None, timeout: aiohttp.ClientTimeout

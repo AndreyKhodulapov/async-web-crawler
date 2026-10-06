@@ -65,7 +65,9 @@ class Frontier(ABC):
     once it is. Before it is requested it must be admitted: `admit` counts
     it toward `max_pages` and `max_pages_per_host`. A page that goes back
     unanswered, or is given up before its request, can be uncounted, so
-    that it costs nothing of the limits until it is taken again.
+    that it costs nothing of the limits until it is taken again. A page put
+    back to wait for its host counts the wait (`waits`), so that the crawl
+    gives it up after so many, whichever process takes it.
 
     The frontier is bounded: once the pages queued, in progress and
     requested reach `frontier_factor` times `max_pages`, found pages are not
@@ -126,8 +128,15 @@ class Frontier(ABC):
         """
 
     @abstractmethod
-    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool) -> None:
-        """Queue a page taken again, after `delay` seconds; with `uncount`, uncount it from the limits first."""
+    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool, waited: bool = False) -> None:
+        """Queue a page taken again, after `delay` seconds; with `uncount`, uncount it from the limits first.
+
+        With `waited`, the page goes back to wait for its host, and the wait counts in `waits`.
+        """
+
+    @abstractmethod
+    def waits(self, page: FrontierPage) -> int:
+        """How many times a page taken was put back to wait for its host, by any process."""
 
     @abstractmethod
     async def finish(
@@ -243,6 +252,7 @@ class MemoryFrontier(Frontier):
         self._links_dropped_by_host = 0
         self._out_of_scope: list[str] = []
         self._scope_hosts: list[str] = []
+        self._waits: Counter[str] = Counter()
 
     async def seed(self, urls: Iterable[str]) -> list[str]:
         seeded: dict[str, None] = {}
@@ -277,11 +287,13 @@ class MemoryFrontier(Frontier):
             self.queue.close()
         return Admission.ADMITTED
 
-    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool) -> None:
+    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool, waited: bool = False) -> None:
         # Uncounted first: a page put off reopens a closed queue and waits
         # its delay, rather than come back at once as it would after close.
         if uncount:
             self._uncount(page)
+        if waited:
+            self._waits[page.url] += 1
         if delay > 0:
             self.queue.defer(page.url, delay, priority=page.depth)
         else:
@@ -300,6 +312,7 @@ class MemoryFrontier(Frontier):
         # cannot be handed out to another one.
         if uncount:
             self._uncount(page)
+        self._waits.pop(page.url, None)
         if outcome is Outcome.PROCESSED:
             self.queue.mark_processed(page.url)
             return
@@ -314,6 +327,9 @@ class MemoryFrontier(Frontier):
                 self.queue.mark_blocked(page.url, reason)
             case Outcome.UNREACHABLE:
                 self.queue.mark_unreachable(page.url, reason)
+
+    def waits(self, page: FrontierPage) -> int:
+        return self._waits[page.url]
 
     async def saved(self, urls: Iterable[str]) -> None:
         pass
