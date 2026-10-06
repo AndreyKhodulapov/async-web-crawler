@@ -4,7 +4,8 @@ import asyncio
 import logging
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+from contextlib import aclosing
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
@@ -205,32 +206,51 @@ class CrawlRun:
         return self.processed_urls
 
     async def _queue_sitemap_pages(self, sitemap_urls: list[str], robots_of: list[str], url_filter: UrlFilter) -> None:
-        """Queue the pages listed in `sitemap_urls` and in the sitemaps robots.txt of the sites of `robots_of` names."""
+        """Queue the pages listed in `sitemap_urls` and in the sitemaps robots.txt of the sites of `robots_of` names.
+
+        The sitemaps are read one by one, in order, and only until the
+        queue is full: the rest of a sitemap and the sitemaps after it are
+        not downloaded, so a crawl of a few pages does not read an index
+        of hundreds of files for them.
+        """
         async with asyncio.TaskGroup() as group:
             named = [group.create_task(self._sitemaps_in_robots(url)) for url in robots_of]
         # Normalized, so a sitemap given twice, or given and named in robots.txt, is read once.
-        sitemaps = dict.fromkeys(normalize_url(url) for url in sitemap_urls)
+        sitemaps = dict.fromkeys(url for url in map(normalize_url, sitemap_urls) if url is not None)
         for task in named:
             sitemaps.update(dict.fromkeys(task.result()))
-        async with asyncio.TaskGroup() as group:
-            loads = [group.create_task(self._load_sitemap(url)) for url in sitemaps if url is not None]
-        listed = queued = 0
-        for load in loads:
-            for page in load.result():
-                listed += 1
-                if not url_filter.allows(page):
-                    # Hosts join the scope only under `same_domain_only`.
-                    if url_filter.allowed_hosts is not None:
-                        self._sitemap_pages_out_of_scope.append(page)
-                elif self._queue_found(self._queue, page, depth=0):
-                    queued += 1
+        opened = listed = queued = 0
+        for sitemap in sitemaps:
+            if self._frontier_full(self._queue):
+                break
+            opened += 1
+            async with aclosing(self._read_sitemap(sitemap)) as batches:
+                async for pages in batches:
+                    listed += len(pages)
+                    queued += self._queue_sitemap_batch(pages, url_filter)
+                    if self._frontier_full(self._queue):
+                        logger.info("Stopped reading sitemaps at %s: the queue is full", sitemap)
+                        break
         logger.info(
-            "Sitemaps: %d read, %d failed, %d pages listed, %d new queued",
-            len(loads) - len(self._failed_sitemaps),
+            "Sitemaps: %d read, %d failed, %d not read, %d pages listed, %d new queued",
+            opened - len(self._failed_sitemaps),
             len(self._failed_sitemaps),
+            len(sitemaps) - opened,
             listed,
             queued,
         )
+
+    def _queue_sitemap_batch(self, pages: list[str], url_filter: UrlFilter) -> int:
+        """Queue the sitemap pages that pass the filter; the number queued."""
+        queued = 0
+        for page in pages:
+            if not url_filter.allows(page):
+                # Hosts join the scope only under `same_domain_only`.
+                if url_filter.allowed_hosts is not None:
+                    self._sitemap_pages_out_of_scope.append(page)
+            elif self._queue_found(self._queue, page, depth=0):
+                queued += 1
+        return queued
 
     def _queue_sitemap_pages_in_scope(self, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
         """Queue the sitemap pages that the filter let through once a start URL redirected to their host.
@@ -257,7 +277,7 @@ class CrawlRun:
             if not queue.closed and not queue.is_seen(url):
                 self._links_dropped_by_host += 1
             return False
-        if not queue.closed and queue.unfinished + self._pages_requested >= self._max_frontier:
+        if self._frontier_full(queue):
             if not queue.is_seen(url):
                 if not self._links_dropped:
                     logger.info(
@@ -279,6 +299,10 @@ class CrawlRun:
                 self.FRONTIER_FACTOR,
             )
         return True
+
+    def _frontier_full(self, queue: CrawlerQueue) -> bool:
+        """Whether the pages queued, in progress and requested reach `FRONTIER_FACTOR` times max_pages."""
+        return not queue.closed and queue.unfinished + self._pages_requested >= self._max_frontier
 
     async def _sitemaps_in_robots(self, url: str) -> list[str]:
         """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read.
@@ -302,24 +326,29 @@ class CrawlRun:
         logger.warning("No sitemaps from robots.txt of %s: %s", url, reason)
         return []
 
-    async def _load_sitemap(self, url: str) -> list[str]:
-        """The pages a sitemap lists; a sitemap that cannot be read is logged and lists none.
+    async def _read_sitemap(self, url: str) -> AsyncGenerator[list[str], None]:
+        """The pages a sitemap lists, in the batches of `SitemapParser.iter_pages`; none if it cannot be read, which is logged.
 
         While robots.txt of its site is unreachable, the sitemap waits for
         it to be downloaded again, as a page of the crawl does (see
         `_robots_wait`): a crawl fed by sitemaps alone would otherwise end
-        empty after a 503 of a few seconds.
+        empty after a 503 of a few seconds. A sitemap fails, if at all,
+        before its first pages are yielded, so reading it again from the
+        start yields no page twice.
         """
         while True:
             try:
-                return await self.sitemaps.fetch_sitemap(url)
+                async with aclosing(self.sitemaps.iter_pages(url)) as batches:
+                    async for pages in batches:
+                        yield pages
+                return
             except FetchError as error:
                 delay = self._robots_wait(error.url) if isinstance(error, RobotsUnreachableError) else None
                 if delay is None:
                     reason = f"{type(error).__name__}: {error.message}"
                     logger.warning("Sitemap %s is left out: %s", url, reason)
                     self._failed_sitemaps[url] = reason
-                    return []
+                    return
                 logger.info("Sitemap %s waits %.1fs: %s", url, delay, error.message)
                 await asyncio.sleep(delay)
 

@@ -648,7 +648,9 @@ class AsyncCrawler:
         The pages listed in the sitemaps `sitemap_urls` are crawled too, and
         with `robots_sitemaps` so are those of the sitemaps that robots.txt
         of the start URLs' sites names. The sitemaps are read before the
-        first page is fetched (see `SitemapParser`). A page a sitemap lists
+        first page is fetched, one after another and only until the queue
+        is full: the rest of a sitemap and the sitemaps after it are not
+        downloaded (see `SitemapParser`). A page a sitemap lists
         has depth 0, like a start URL, but must pass the filters, like a
         link; it comes after the start URLs and before the links.
         `same_domain_only` keeps the hosts of `sitemap_urls` as well as

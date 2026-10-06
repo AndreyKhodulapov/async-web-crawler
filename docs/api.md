@@ -657,9 +657,12 @@ async with AsyncCrawler(max_depth=1) as crawler:
     crawler.failed_sitemaps                                # {sitemap URL: "ErrorType: message"}
 ```
 
-Sitemaps are read before the first page is fetched: indexes are followed,
-gzipped files unpacked (see `SitemapParser` for the limits; a sitemap over
-50 MB is not downloaded to the end). A sitemap is
+Sitemaps are read before the first page is fetched, one after another and
+only until the queue is full (see below): the rest of a sitemap and the
+sitemaps after it are not downloaded, so a crawl of 10 pages reads an index
+and its first few files, not the hundreds of files it may list. Indexes are
+followed, gzipped files unpacked (see `SitemapParser` for the limits; a
+sitemap over 50 MB is not downloaded to the end). A sitemap is
 downloaded like a page: robots.txt, the rate limit, retries and the circuit
 breaker apply, and its requests count in `crawl_stats().requests`, but not
 in `max_pages` or `error_stats()`. A page a sitemap lists has depth 0, like
@@ -1095,7 +1098,7 @@ and may change. A layer calls only the one below it.
 | Layer | Module | Class | Responsible for | Knows nothing of |
 |-------|--------|-------|-----------------|------------------|
 | Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
-| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
+| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page until the queue is full, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
 | HTTP | `transport.py` | `Transport`, `HttpTransport` | `Transport` is the contract the request layer sends through; `HttpTransport` makes a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
 | HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, with the proxy their document came through (`Response.proxy`), a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a context per proxy, the cookies kept in step with those of `HttpTransport` (`CookieSync`, `Transport.update_cookies`), a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash, the counters of `render_stats()` | robots.txt, filters, retries, limits |

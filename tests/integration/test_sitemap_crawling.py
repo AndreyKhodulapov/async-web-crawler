@@ -321,6 +321,44 @@ async def test_max_pages_caps_the_pages_of_a_sitemap(url, site):
     assert crawler.crawl_stats().queued == 1
 
 
+async def test_sitemaps_are_read_until_the_queue_is_full(url, site):
+    names = [f"{number}.xml" for number in range(300)]
+    site.sitemaps = {"sitemap.xml": index(*(url(f"/sitemaps/{name}") for name in names))} | {
+        name: urlset(*(url(f"/wide/{number * 100 + page}") for page in range(100))) for number, name in enumerate(names)
+    }
+    async with make_crawler() as crawler:
+        pages = await crawler.crawl([], 10, sitemap_urls=[url(SITEMAP)])
+
+    assert len(pages) == 10
+    # The index and its first batch of sitemaps, whose pages fill the queue.
+    assert site.hits[SITEMAP] == 1
+    assert sum(site.hits[f"/sitemaps/{name}"] for name in names) == SitemapParser.CONCURRENCY
+
+
+async def test_sitemap_after_the_one_that_fills_the_queue_is_not_read(url, site):
+    site.sitemaps = {
+        "first.xml": urlset(*(url(f"/wide/{number}") for number in range(AsyncCrawler.FRONTIER_FACTOR * 5))),
+        "second.xml": urlset(url("/site/c.html")),
+    }
+    async with make_crawler() as crawler:
+        pages = await crawler.crawl([], 5, sitemap_urls=[url("/sitemaps/first.xml"), url("/sitemaps/second.xml")])
+
+    assert len(pages) == 5
+    assert site.hits["/sitemaps/second.xml"] == 0
+
+
+async def test_pages_that_only_the_last_sitemap_lets_through_the_filters_are_crawled(url, site):
+    # The pages of the sitemaps before it do not pass the filter, so they do not fill the queue.
+    names = [f"{number}.xml" for number in range(12)]
+    site.sitemaps = {"sitemap.xml": index(*(url(f"/sitemaps/{name}") for name in names))} | {
+        name: urlset(*(url(f"/wide/{number * 10 + page}") for page in range(10))) for number, name in enumerate(names)
+    }
+    async with make_crawler(max_concurrent=1) as crawler:
+        pages = await crawler.crawl([], 5, sitemap_urls=[url(SITEMAP)], include_patterns=[r"/wide/11\d$"])
+
+    assert list(pages) == [url(f"/wide/{number}") for number in range(110, 115)]
+
+
 async def test_invalid_sitemap_arguments_are_rejected(url, site):
     async with make_crawler() as crawler:
         with pytest.raises(ValueError, match="invalid sitemap URLs: 'sitemap.xml'"):

@@ -3,6 +3,7 @@
 import asyncio
 import gzip
 import logging
+from contextlib import aclosing
 
 import pytest
 from helpers import SITEMAP_NAMESPACE as NAMESPACE
@@ -166,6 +167,38 @@ class TestIndex:
         assert urls == ["https://site/0", "https://site/1", "https://site/2"]
         assert len(site.requested) == 4
         assert "7 sitemaps left out" in caplog.text
+
+
+class TestIterPages:
+    async def test_yields_the_new_pages_of_every_batch_of_sitemaps(self):
+        children = [f"https://site/{number}.xml" for number in range(7)]
+        files = {"https://site/sitemap.xml": index(*children)} | {
+            child: urlset(child.replace(".xml", "")) for child in children
+        }
+        # The last sitemap lists a page of the first batch and one of its own.
+        files["https://site/6.xml"] = urlset("https://site/0", "https://site/6")
+        batches = [batch async for batch in SitemapParser(FakeSite(files)).iter_pages("https://site/sitemap.xml")]
+        assert batches == [
+            ["https://site/0", "https://site/1", "https://site/2", "https://site/3", "https://site/4"],
+            ["https://site/5", "https://site/6"],
+        ]
+
+    async def test_sitemaps_are_not_downloaded_once_the_reader_stops(self):
+        children = [f"https://site/{number}.xml" for number in range(12)]
+        site = FakeSite(
+            {"https://site/sitemap.xml": index(*children)}
+            | {child: urlset(child.replace(".xml", "")) for child in children}
+        )
+        async with aclosing(SitemapParser(site).iter_pages("https://site/sitemap.xml")) as batches:
+            async for _ in batches:
+                break
+        assert len(site.requested) == 1 + SitemapParser.CONCURRENCY
+
+    async def test_yields_at_most_max_urls(self):
+        files = {"https://site/sitemap.xml": urlset(*(f"https://site/{number}" for number in range(5)))}
+        parser = SitemapParser(FakeSite(files), max_urls=3)
+        batches = [batch async for batch in parser.iter_pages("https://site/sitemap.xml")]
+        assert batches == [["https://site/0", "https://site/1", "https://site/2"]]
 
 
 class TestGzip:
