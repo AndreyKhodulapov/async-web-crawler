@@ -52,8 +52,12 @@ leaves a failing site alone.
   A browser that cannot start or crashes is a failure of the crawler, not
   of the site (`RenderError`): it is not retried, since another attempt meets the
   same browser, and the circuit breaker does not count it. A page the
-  browser takes too long to render is a timeout of the site, as a slow
-  response would be.
+  browser takes too long to render (`RenderTimeoutError`) is the page's
+  own: its document came in time, and what holds the browser is mostly a
+  selector that never appears or a connection the page keeps open. It is
+  retried as a timeout, but the circuit breaker does not count it and the
+  host is not slowed down for it: a few such pages would otherwise block
+  a site that answers well.
 - An unforeseen exception (a bug) must not break the batch: catch it at the
   boundary of one URL, log the traceback and report it as that URL's error.
 

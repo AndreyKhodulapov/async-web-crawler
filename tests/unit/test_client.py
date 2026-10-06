@@ -1903,6 +1903,29 @@ class TestProxies:
 
         assert crawler.proxy_stats()["http://user:***@proxy:3128"].state == "active"
 
+    async def test_a_robots_txt_downloaded_again_passes_over_a_proxy_that_failed(self, make_proxied, fake_session):
+        # A download after a failed one is a single attempt at the site, and
+        # the failure of a proxy is not one: the page would fail for it.
+        crawler = make_proxied(
+            "http://proxy-1:3128",
+            "http://proxy-2:3128",
+            respect_robots=True,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+        )
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        crawler.ROBOTS_POLL = 0.01
+        fake_session.routes["http://a/robots.txt"] = [
+            *[FakeResponse(status=503)] * 2,  # the first download, with its retry
+            aiohttp.ClientProxyConnectionError(MagicMock(), ConnectionRefusedError("connection refused")),
+            FakeResponse(status=404),
+        ]
+
+        pages = await crawler.crawl(["http://a/1"])
+
+        assert list(pages) == ["http://a/1"]
+        assert fake_session.requested == [*["http://a/robots.txt"] * 4, "http://a/1"]
+
     async def test_no_request_is_sent_without_a_proxy(self, make_proxied, fake_session):
         crawler = make_proxied(retry_strategy=RetryStrategy(max_retries=3, base_delay=0.01))
         fake_session.routes["http://a/"] = aiohttp.ClientProxyConnectionError(

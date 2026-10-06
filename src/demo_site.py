@@ -52,6 +52,8 @@ class DemoSite:
     """
 
     ARTICLES = 8
+    RETRY_AFTER = 1  # seconds /rate-limited asks to wait
+    SLOW_SECONDS = 1.2  # how long /slow takes to answer
 
     def __init__(self, extra_links: list[str] | None = None) -> None:
         self.extra_links = extra_links or []
@@ -119,14 +121,14 @@ class DemoSite:
 
     async def _rate_limited(self, request: web.Request) -> web.Response:
         if self._count(request) == 1:
-            raise web.HTTPTooManyRequests(headers={"Retry-After": "1"})
+            raise web.HTTPTooManyRequests(headers={"Retry-After": str(self.RETRY_AFTER)})
         return page("Rate-limited page", "<p>Answered after the wait the server asked for.</p>")
 
     async def _server_error(self, request: web.Request) -> web.Response:
         raise web.HTTPInternalServerError()
 
     async def _slow(self, request: web.Request) -> web.Response:
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(self.SLOW_SECONDS)
         return page("Slow page", "<p>Answered once the read timeout grew.</p>")
 
     async def _private(self, request: web.Request) -> web.Response:

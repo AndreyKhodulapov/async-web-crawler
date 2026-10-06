@@ -159,9 +159,10 @@ class AsyncCrawler:
     JavaScript or `<meta>` redirect) is followed as a redirect: robots.txt,
     the filters of `crawl()` and `MAX_REDIRECTS` apply to it. A page the
     browser takes longer than `rendering.timeout` to render fails with
-    `FetchTimeoutError`; one it cannot render (not installed, crashed)
-    with `RenderError`, which is not retried and which the circuit
-    breaker does not count. robots.txt and sitemaps are never rendered.
+    `RenderTimeoutError`, a timeout that is retried and not held against
+    the host; one it cannot render (not installed, crashed) with
+    `RenderError`, which is not retried. The circuit breaker counts
+    neither. robots.txt and sitemaps are never rendered.
     The browser starts with the first page to render and is closed by
     `close()`. `render_stats()` counts the pages rendered and failed, and
     the time the browser took for them.

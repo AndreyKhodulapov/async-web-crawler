@@ -5,28 +5,16 @@ import stat
 
 import pytest
 import yaml
-from helpers import FAST_CONFIG, UNTHROTTLED
+from helpers import FAST_CONFIG, UNTHROTTLED, cookies_file, make_config
 
 import main
-from crawler import AdvancedCrawler, AsyncCrawler, CrawlerConfig, load_cookies_file, make_cookie
+from crawler import AdvancedCrawler, AsyncCrawler, load_cookies_file, make_cookie
 from main import build_config, parse_args, run
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
 
 # aiohttp keeps no cookies of IP addresses, so the site is reached by its name.
 HOST = "localhost"
-
-
-def make_config(**sections) -> CrawlerConfig:
-    data = {name: dict(section) for name, section in FAST_CONFIG.items()}
-    for name, section in sections.items():
-        data[name] = {**data[name], **section} if isinstance(section, dict) and name in data else section
-    return CrawlerConfig.from_dict(data)
-
-
-def cookies_file(path, *lines: str) -> str:
-    path.write_text("# Netscape HTTP Cookie File\n" + "".join(f"{line}\n" for line in lines), encoding="utf-8")
-    return str(path)
 
 
 async def test_cookie_of_the_site_comes_back_on_the_next_page(url):

@@ -1,7 +1,6 @@
 """Integration tests: pages are rendered in a headless Chromium, and what they do on their own is checked."""
 
 import asyncio
-import base64
 import json
 import logging
 import os
@@ -9,7 +8,7 @@ import re
 import subprocess
 
 import pytest
-from helpers import BOT, FAST_CONFIG, UNTHROTTLED
+from helpers import BOT, FAST_CONFIG, PROXY_AUTHORIZATION, PROXY_PASSWORD, UNTHROTTLED, with_password
 
 import main
 from crawler import (
@@ -18,13 +17,13 @@ from crawler import (
     CircuitBreaker,
     CircuitState,
     CrawlerConfig,
-    FetchTimeoutError,
     PageTooLargeError,
     ProxyPool,
     ProxyStats,
     RenderError,
     Rendering,
     RenderStats,
+    RenderTimeoutError,
     RobotsDisallowedError,
     load_cookies_file,
     make_cookie,
@@ -157,7 +156,7 @@ async def test_a_page_rendered_too_slowly_times_out(url):
     async with make_crawler(Rendering(wait_for="#never", timeout=0.5)) as crawler:
         result = await crawler.fetch_result(url("/js/late"))
 
-    assert isinstance(result.error, FetchTimeoutError)
+    assert isinstance(result.error, RenderTimeoutError)
     assert "rendering timeout (0.5s)" in result.error.message
     assert crawler.render_stats() == RenderStats(failed=1)
 
@@ -286,10 +285,6 @@ async def test_saved_cookies_hold_those_javascript_set(url, tmp_path):
     ]
 
 
-PASSWORD = "s3cr3t-pw"
-AUTHORIZATION = "Basic " + base64.b64encode(f"crawler:{PASSWORD}".encode()).decode()
-
-
 def requests_of_links(url, query: str = "") -> list[str]:
     """What a proxy sees of /js/links: the page, then its script; the image is blocked."""
     return [f"GET {url('/js/links' + query)}", f"GET {url('/js/app.js')}"]
@@ -317,8 +312,8 @@ async def test_with_a_proxy_per_request_each_page_goes_through_its_own(url, make
 
 
 async def test_the_browser_gives_the_password_of_the_proxy_and_the_log_does_not(url, site, make_proxy, caplog):
-    proxy = await make_proxy(authorization=AUTHORIZATION)
-    pool = ProxyPool([proxy.url.replace("http://", f"http://crawler:{PASSWORD}@")])
+    proxy = await make_proxy(authorization=PROXY_AUTHORIZATION)
+    pool = ProxyPool([with_password(proxy.url)])
     with caplog.at_level(logging.DEBUG):
         async with make_crawler(proxies=pool) as crawler:
             page = await crawler.fetch_and_parse(url("/js/links"))
@@ -327,9 +322,9 @@ async def test_the_browser_gives_the_password_of_the_proxy_and_the_log_does_not(
     assert site.hits["/js/app.js"] == 1
     # The browser sends it once the proxy asks for it.
     assert proxy.requests[-1] == f"GET {url('/js/app.js')}"
-    assert proxy.authorizations[-1] == AUTHORIZATION
+    assert proxy.authorizations[-1] == PROXY_AUTHORIZATION
     assert "crawler:***@127.0.0.1" in caplog.text
-    assert PASSWORD not in caplog.text
+    assert PROXY_PASSWORD not in caplog.text
 
 
 async def test_a_request_of_the_browser_the_proxy_fails_fails_neither_the_proxy_nor_the_site(url, site, make_proxy):
@@ -349,11 +344,9 @@ async def test_a_request_of_the_browser_the_proxy_fails_fails_neither_the_proxy_
     assert breaker.state("127.0.0.1") is CircuitState.CLOSED
 
 
+@pytest.mark.usefixtures("clean_proxy_environment")
 async def test_the_browser_renders_the_pages_of_no_proxy_without_the_proxy(url, site, make_proxy, monkeypatch):
     proxy = await make_proxy()
-    for name in ["http_proxy", "https_proxy", "no_proxy", "REQUEST_METHOD"]:
-        monkeypatch.delenv(name, raising=False)
-        monkeypatch.delenv(name.upper(), raising=False)
     monkeypatch.setenv("HTTP_PROXY", proxy.url)
     monkeypatch.setenv("NO_PROXY", "localhost")
     async with make_crawler(proxies=ProxyPool.from_env()) as crawler:

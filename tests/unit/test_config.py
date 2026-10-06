@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from helpers import cookies_file
 
 from crawler import (
     AsyncCrawler,
@@ -783,14 +784,11 @@ class TestSession:
         assert "name='sid'" in text
 
     def test_initial_cookies_come_from_the_file_then_the_section(self, tmp_path):
-        path = tmp_path / "cookies.txt"
-        path.write_text(
-            "# Netscape HTTP Cookie File\nexample.com\tFALSE\t/\tFALSE\t0\tfrom_file\t1\n", encoding="utf-8"
-        )
+        path = cookies_file(tmp_path / "cookies.txt", "example.com\tFALSE\t/\tFALSE\t0\tfrom_file\t1")
         session = CrawlerConfig.from_dict(
             {
                 "session": {
-                    "cookies_file": str(path),
+                    "cookies_file": path,
                     "cookies": [{"name": "from_config", "value": "2", "domain": "example.com", "secure": True}],
                 }
             }
@@ -817,13 +815,8 @@ class TestSession:
         assert problem.startswith("session.cookies_file: cannot read the cookies: ")
 
 
+@pytest.mark.usefixtures("clean_proxy_environment")
 class TestProxy:
-    @pytest.fixture(autouse=True)
-    def clean_environment(self, monkeypatch):
-        for name in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "REQUEST_METHOD"]:
-            monkeypatch.delenv(name, raising=False)
-            monkeypatch.delenv(name.upper(), raising=False)
-
     @pytest.mark.parametrize(
         "url, problem",
         [

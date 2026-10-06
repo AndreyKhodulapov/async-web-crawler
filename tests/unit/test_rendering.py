@@ -12,12 +12,12 @@ from test_transport_contract import ScriptedTransport, make_fetcher, page
 from crawler import (
     AsyncCrawler,
     CrawlerClosedError,
-    FetchTimeoutError,
     PageTooLargeError,
     ProxyPool,
     RenderError,
     Rendering,
     RenderStats,
+    RenderTimeoutError,
     make_cookie,
 )
 from crawler.proxy import Proxy
@@ -243,10 +243,8 @@ class TestBrowserTransport:
         assert (shared.renderer._cookies, shared.renderer._headers) == (http, {"X-Key": "1"})
         assert (alone.renderer._cookies, alone.renderer._headers) == (None, {})
 
+    @pytest.mark.usefixtures("clean_proxy_environment")
     def test_the_browser_takes_no_proxy_of_the_environment(self, monkeypatch) -> None:
-        for name in ["http_proxy", "https_proxy", "no_proxy", "REQUEST_METHOD"]:
-            monkeypatch.delenv(name, raising=False)
-            monkeypatch.delenv(name.upper(), raising=False)
         monkeypatch.setenv("HTTP_PROXY", "http://proxy.test:3128")
         monkeypatch.setenv("NO_PROXY", "a.test")
 
@@ -287,6 +285,21 @@ class TestRenderErrors:
         assert http.requests == [URL]
         circuit = fetcher.circuit_breaker.get_stats()["a.test"]
         assert (circuit.requests, circuit.failures) == (0, 0)
+
+    async def test_a_timeout_of_rendering_is_retried_and_not_blamed_on_the_site(self, monkeypatch) -> None:
+        timed_out = RenderTimeoutError(URL, "rendering timeout (30.0s)")
+        transport, http, _ = make_transport({URL: page(URL, "page")}, renderer=FakeRenderer(timed_out))
+        fetcher = make_fetcher(transport)
+        penalties: list[tuple[str, float]] = []
+        monkeypatch.setattr(fetcher.rate_limiter, "penalize", lambda host, seconds: penalties.append((host, seconds)))
+        result = await fetcher.fetch(URL)
+
+        assert result.error is timed_out
+        assert http.requests == [URL, URL]
+        circuit = fetcher.circuit_breaker.get_stats()["a.test"]
+        assert (circuit.requests, circuit.failures) == (0, 0)
+        # The other requests to the host did not wait for the retry.
+        assert penalties == []
 
 
 class TestInstallation:
@@ -832,10 +845,10 @@ class TestRenderStats:
         for url in (URL, *failures, "https://a.test/no-browser"):
             try:
                 await renderer.render(url, page(url, "page"))
-            except (RenderError, FetchTimeoutError) as exc:
+            except (RenderError, RenderTimeoutError) as exc:
                 errors.append(type(exc))
 
-        assert errors == [FetchTimeoutError, RenderError, RenderError]
+        assert errors == [RenderTimeoutError, RenderError, RenderError]
         stats = renderer.stats()
         assert (stats.rendered, stats.failed) == (1, 3)
         # The failures do not stretch the average.

@@ -118,7 +118,8 @@ every DNS failure is `DNSError`. A page that redirects to such a site
 waits the same way and is requested again, and so does a
 sitemap of the site (see [Crawling](#crawling)); they all share the
 downloads of the site. Each download after the first is a single attempt,
-without the retries and their growing timeouts, and no page of a crawl
+without the retries and their growing timeouts (an attempt that failed
+in a proxy is still made again through another one), and no page of a crawl
 waits for a download longer than `AsyncCrawler.ROBOTS_POLL` (2) seconds:
 the download goes on, and the page is put off for that long at a time
 until it is over, so a site that is slow to fail holds no worker back
@@ -240,7 +241,9 @@ it says nothing of the site.
 
 Errors of proxies (`ProxyError`) are not counted at all: a dead proxy
 must not open the circuits of healthy sites. Proxies have states of their
-own, see [Proxies](#proxies).
+own, see [Proxies](#proxies). A page the browser took too long to render
+(`RenderTimeoutError`) is not counted either: its document came in time,
+and a few pages with slow scripts must not block the site.
 
 In a crawl, a page the breaker refuses is not failed: it is put off until
 the circuit may let a probe through, or for a second while the probe is in
@@ -434,8 +437,9 @@ takes it out again. A request through a proxy fails with:
 Whatever the site answers through a proxy (a 404, a 503) is the site's,
 and the proxy is up. The circuit breaker counts no `ProxyError`: a dead
 proxy does not open the circuits of healthy sites. A download of robots.txt
-that fails with one is not cached: the page fails with the error of the
-proxy. `error_stats()` counts these errors under their own classes,
+that a proxy failed is retried through the other proxies as the request
+of a page is; one that fails with a `ProxyError` all the same is not
+cached: the page fails with the error of the proxy. `error_stats()` counts these errors under their own classes,
 `ProxyNetworkError` as a `NetworkError`.
 
 The rate limit, robots.txt, Crawl-delay, `max_per_domain` and the circuit
@@ -551,7 +555,7 @@ neither take a proxy out of rotation nor count in the circuit breaker.
 
 | Error | When | Retried | Circuit breaker |
 |-------|------|---------|-----------------|
-| `FetchTimeoutError` | the page took the browser longer than `timeout`: `rendering timeout (30.0s)` | yes, with the same `timeout` | counts, as any timeout |
+| `RenderTimeoutError` (a `FetchTimeoutError`) | the page took the browser longer than `timeout`: `rendering timeout (30.0s)` | yes, with the same `timeout`; the other requests to the host do not wait for the retry | does not count: the host answered in time, the page is slow in the browser |
 | `PageTooLargeError` | the rendered HTML is over `max_page_size` bytes | no | does not count, as without a browser |
 | `RenderError` | Playwright or Chromium is not installed (the message has the command to install it), the browser could not start, crashed, or the page crashed in it | no | does not count: the browser failed, not the site |
 | `CrawlerClosedError` | the crawler was closed while the page was rendered | no | does not count |

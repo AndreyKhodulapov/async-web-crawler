@@ -355,8 +355,10 @@ The rendered HTML is what is parsed and saved; the status, the headers
 (`X-Robots-Tag`) and the final URL are those of the download. A page
 over `max_page_size` once rendered fails with `PageTooLargeError`, one
 the browser takes longer than `timeout` to render fails with a timeout
-and is retried as one, with the same `timeout` (it does not grow with
-the retries). A browser that cannot start or crashes fails the pages
+(`RenderTimeoutError`) and is retried as one, with the same `timeout`
+(it does not grow with the retries); the site is not held to blame for
+it, since the document came in time. A browser that cannot start or
+crashes fails the pages
 with `RenderError`, which is not retried and not held against the site;
 a crashed browser is started again for the next page, once.
 

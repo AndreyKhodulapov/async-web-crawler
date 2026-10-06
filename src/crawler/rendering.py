@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import aiohttp
 
-from crawler.exceptions import CrawlerClosedError, FetchTimeoutError, PageTooLargeError, RenderError
+from crawler.exceptions import CrawlerClosedError, PageTooLargeError, RenderError, RenderTimeoutError
 from crawler.filters import UrlFilter
 from crawler.models import RenderStats
 from crawler.parser import is_html_content_type
@@ -351,7 +351,7 @@ class BrowserTransport:
     its download; its content is the HTML of the page once rendered,
     which fails with `PageTooLargeError` over `max_page_size` bytes. A
     page that takes the browser longer than `rendering.timeout` fails
-    with `FetchTimeoutError`; a browser that is not installed, cannot
+    with `RenderTimeoutError`; a browser that is not installed, cannot
     start or crashes fails it with `RenderError` (see `Renderer`).
     """
 
@@ -522,13 +522,13 @@ class Renderer:
         """Load `document`, downloaded from `url`, in a browser tab and return what it became.
 
         Raises:
-            FetchTimeoutError: the page took longer than `rendering.timeout`.
+            RenderTimeoutError: the page took longer than `rendering.timeout`.
             RenderError: the browser is not installed, could not start or crashed.
             CrawlerClosedError: the renderer is closed.
         """
         try:
             rendered, elapsed = await self._render(url, document)
-        except (FetchTimeoutError, RenderError):
+        except (RenderTimeoutError, RenderError):
             self._failed += 1
             raise
         self._rendered += 1
@@ -555,7 +555,7 @@ class Renderer:
                 rendered = await self._load(page, url, tab)
                 return rendered, time.monotonic() - started
             except PlaywrightTimeoutError as exc:
-                raise FetchTimeoutError(url, f"rendering timeout ({self.rendering.timeout:.1f}s)") from exc
+                raise RenderTimeoutError(url, f"rendering timeout ({self.rendering.timeout:.1f}s)") from exc
             except PlaywrightError as exc:
                 raise self._error(url, tab, exc) from exc
             finally:

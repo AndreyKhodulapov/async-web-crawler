@@ -1,11 +1,18 @@
 """Integration tests: requests go through local proxies, rotate among them, and a dead proxy is taken out."""
 
-import base64
 import logging
 
 import aiohttp
 import pytest
-from helpers import BOT, UNTHROTTLED, FakeClock
+from helpers import (
+    BOT,
+    PROXY_AUTHORIZATION,
+    PROXY_PASSWORD,
+    UNTHROTTLED,
+    FakeClock,
+    dead_proxy,
+    with_password,
+)
 
 from crawler import (
     AsyncCrawler,
@@ -20,23 +27,11 @@ from crawler import (
     RetryStrategy,
 )
 from crawler.transport import HttpTransport
-from demo_site import free_port
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
 
-PASSWORD = "s3cr3t-pw"
-AUTHORIZATION = "Basic " + base64.b64encode(f"crawler:{PASSWORD}".encode()).decode()
 # Counts every request, opens after two failures of the host in a row.
 BREAKER = {"circuit_breaker": CircuitBreaker(0.5, min_requests=2)}
-
-
-def with_password(proxy_url: str, password: str = PASSWORD) -> str:
-    return proxy_url.replace("http://", f"http://crawler:{password}@")
-
-
-def dead_proxy() -> str:
-    """A proxy URL at a local port nothing listens on."""
-    return f"http://127.0.0.1:{free_port()}"
 
 
 async def test_a_page_goes_through_the_proxy(url, site, make_proxy):
@@ -87,21 +82,21 @@ async def test_an_https_page_goes_through_a_connect_tunnel(https_server, make_pr
 
 @pytest.mark.parametrize("scheme", ["http", "https"])
 async def test_the_password_goes_to_the_proxy_alone(url, site, https_server, https_site, make_proxy, scheme):
-    proxy = await make_proxy(authorization=AUTHORIZATION)
+    proxy = await make_proxy(authorization=PROXY_AUTHORIZATION)
     server_site = site if scheme == "http" else https_site
     port = url("").rsplit(":", 1)[1] if scheme == "http" else https_server.port
     page_url = f"{scheme}://localhost:{port}/cookies/echo"
     async with AsyncCrawler(**UNTHROTTLED, proxies=ProxyPool([with_password(proxy.url)])) as crawler:
         await crawler.fetch_url(page_url)
 
-    assert proxy.authorizations == [AUTHORIZATION]
+    assert proxy.authorizations == [PROXY_AUTHORIZATION]
     assert "Proxy-Authorization" not in server_site.headers["/cookies/echo"]
-    assert PASSWORD not in str(server_site.headers["/cookies/echo"])
+    assert PROXY_PASSWORD not in str(server_site.headers["/cookies/echo"])
 
 
 @pytest.mark.parametrize("scheme", ["http", "https"])
 async def test_a_wrong_password_is_an_error_of_the_proxy(url, https_server, make_proxy, scheme):
-    proxy = await make_proxy(authorization=AUTHORIZATION)
+    proxy = await make_proxy(authorization=PROXY_AUTHORIZATION)
     page_url = url("/ok") if scheme == "http" else f"https://localhost:{https_server.port}/ok"
     pool = ProxyPool([with_password(proxy.url, "wrong")], max_failures=5)
     async with AsyncCrawler(**UNTHROTTLED | BREAKER, proxies=pool) as crawler:
@@ -128,6 +123,19 @@ async def test_a_dead_proxy_is_passed_over_within_the_retries(url, make_proxy):
     assert stats[dead].failures >= 1
     assert stats[proxy.url] == ProxyStats(state="active", requests=3)
     assert circuit is CircuitState.CLOSED
+
+
+async def test_a_dead_proxy_is_passed_over_for_robots_txt_as_for_a_page(url, site, make_proxy):
+    site.robots = "User-agent: *\nAllow: /\n"
+    proxy = await make_proxy()
+    options = {"respect_robots": True, "retry_strategy": RetryStrategy(max_retries=1, base_delay=0.01)}
+    pool = ProxyPool([dead_proxy(), proxy.url], rotation="per_request", max_failures=5)
+    async with AsyncCrawler(**UNTHROTTLED | options, proxies=pool) as crawler:
+        page = await crawler.fetch_result(url("/ok"))
+
+    # Each of the two requests met the dead proxy first.
+    assert page.error is None
+    assert proxy.requests == [f"GET {url('/robots.txt')}", f"GET {url('/ok')}"]
 
 
 async def test_per_host_keeps_every_host_on_its_proxy(url, make_proxy):
@@ -211,11 +219,9 @@ async def test_a_proxy_that_cannot_reach_the_site_stays_in_rotation(https_server
     assert stats[proxy.url] == ProxyStats(state="active", requests=1)
 
 
+@pytest.mark.usefixtures("clean_proxy_environment")
 async def test_proxies_of_the_environment(url, make_proxy, monkeypatch):
     proxy = await make_proxy()
-    for name in ["http_proxy", "https_proxy", "no_proxy", "REQUEST_METHOD"]:
-        monkeypatch.delenv(name, raising=False)
-        monkeypatch.delenv(name.upper(), raising=False)
     monkeypatch.setenv("HTTP_PROXY", proxy.url)
     monkeypatch.setenv("NO_PROXY", "localhost")
     async with AsyncCrawler(**UNTHROTTLED, proxies=ProxyPool.from_env()) as crawler:
@@ -226,7 +232,7 @@ async def test_proxies_of_the_environment(url, make_proxy, monkeypatch):
 
 
 async def test_the_password_stays_out_of_the_log_and_the_errors(url, make_proxy, caplog):
-    proxy = await make_proxy(authorization=AUTHORIZATION)
+    proxy = await make_proxy(authorization=PROXY_AUTHORIZATION)
     dead = with_password(dead_proxy())
     pool = ProxyPool([with_password(proxy.url, "wrong"), dead], rotation="per_request", max_failures=1)
     with caplog.at_level(logging.DEBUG):
@@ -235,5 +241,5 @@ async def test_the_password_stays_out_of_the_log_and_the_errors(url, make_proxy,
 
     assert isinstance(results[2].error, NoProxyError)
     texts = [caplog.text, *(str(result.error) for result in results)]
-    assert all(PASSWORD not in text and "wrong" not in text for text in texts)
+    assert all(PROXY_PASSWORD not in text and "wrong" not in text for text in texts)
     assert "crawler:***@127.0.0.1" in caplog.text

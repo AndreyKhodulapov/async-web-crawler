@@ -1,6 +1,7 @@
 """Helpers shared by unit and integration tests."""
 
 import asyncio
+import base64
 import importlib.util
 import os
 from collections.abc import AsyncIterator, Sequence
@@ -8,7 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 
-from crawler import CircuitBreaker, DataStorage, PageRecord, RetryStrategy
+from crawler import CircuitBreaker, CrawlerConfig, DataStorage, PageRecord, RetryStrategy
+from demo_site import free_port
 
 BOT = "TestBot/1.0 (+https://example.com/bot)"
 
@@ -20,6 +22,7 @@ POSTGRES_DSN = os.environ.get(
     f"postgresql://crawler:crawler@localhost:{os.environ.get('CRAWLER_POSTGRES_PORT') or 5432}/crawler",
 )
 SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
+COOKIES_FILE_HEADER = "# Netscape HTTP Cookie File\n"
 EXAMPLES = Path(__file__).parents[1] / "examples"
 
 # Crawler options for tests that check something other than politeness:
@@ -37,6 +40,34 @@ FAST_CONFIG = {
     "retry": {"max_retries": 0},
     "circuit_breaker": {"failure_threshold": None},
 }
+
+
+# The password of the user `crawler` of a test proxy, and the header a proxy that asks for it expects.
+PROXY_PASSWORD = "s3cr3t-pw"
+PROXY_AUTHORIZATION = "Basic " + base64.b64encode(f"crawler:{PROXY_PASSWORD}".encode()).decode()
+
+
+def make_config(**sections) -> CrawlerConfig:
+    """`FAST_CONFIG` with `sections` over it; a section given as a mapping keeps the other keys of its own."""
+    data = {name: dict(section) for name, section in FAST_CONFIG.items()}
+    for name, section in sections.items():
+        data[name] = {**data[name], **section} if isinstance(section, dict) and name in data else section
+    return CrawlerConfig.from_dict(data)
+
+
+def with_password(proxy_url: str, password: str = PROXY_PASSWORD) -> str:
+    return proxy_url.replace("http://", f"http://crawler:{password}@")
+
+
+def dead_proxy() -> str:
+    """A proxy URL at a local port nothing listens on."""
+    return f"http://127.0.0.1:{free_port()}"
+
+
+def cookies_file(path: Path, *lines: str) -> str:
+    """Writes a Netscape cookies.txt of `lines` to `path`; returns the path as a string."""
+    path.write_text(COOKIES_FILE_HEADER + "".join(f"{line}\n" for line in lines), encoding="utf-8")
+    return str(path)
 
 
 def urlset(*locations: str) -> bytes:

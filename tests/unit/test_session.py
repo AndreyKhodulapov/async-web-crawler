@@ -7,18 +7,17 @@ from http.cookies import SimpleCookie
 
 import aiohttp
 import pytest
+from helpers import COOKIES_FILE_HEADER, cookies_file
 from yarl import URL
 
 from crawler import AsyncCrawler, load_cookies_file, make_cookie, save_cookies_file
 from crawler.session import CookieJar
 from crawler.transport import HttpTransport
 
-HEADER = "# Netscape HTTP Cookie File\n"
-
 
 def line(domain: str, name: str, value: str, *, expires: str = "0", path: str = "/", secure: bool = False) -> str:
     flag = "TRUE" if domain.startswith(".") else "FALSE"
-    return "\t".join([domain, flag, path, "TRUE" if secure else "FALSE", expires, name, value]) + "\n"
+    return "\t".join([domain, flag, path, "TRUE" if secure else "FALSE", expires, name, value])
 
 
 def summary(cookies) -> list[tuple]:
@@ -28,14 +27,13 @@ def summary(cookies) -> list[tuple]:
 class TestLoad:
     def test_cookies_of_a_file(self, tmp_path):
         later = str(int(time.time()) + 3600)
-        path = tmp_path / "cookies.txt"
-        path.write_text(
-            HEADER
-            + line("example.com", "host_only", "1", expires=later)
-            + line(".example.com", "wide", "2", path="/app", secure=True, expires=later)
-            + "#HttpOnly_example.org\tFALSE\t/\tFALSE\t0\thidden\t3\n"
-            + "\n# a comment\n",
-            encoding="utf-8",
+        path = cookies_file(
+            tmp_path / "cookies.txt",
+            line("example.com", "host_only", "1", expires=later),
+            line(".example.com", "wide", "2", path="/app", secure=True, expires=later),
+            "#HttpOnly_example.org\tFALSE\t/\tFALSE\t0\thidden\t3",
+            "",
+            "# a comment",
         )
 
         cookies = load_cookies_file(path)
@@ -49,13 +47,11 @@ class TestLoad:
         assert hidden.has_nonstandard_attr("HTTPOnly")
 
     def test_expired_cookies_are_left_out_session_ones_kept(self, tmp_path):
-        path = tmp_path / "cookies.txt"
-        path.write_text(
-            HEADER
-            + line("example.com", "expired", "1", expires=str(int(time.time()) - 60))
-            + line("example.com", "curl_session", "2", expires="0")
-            + line("example.com", "python_session", "3", expires=""),
-            encoding="utf-8",
+        path = cookies_file(
+            tmp_path / "cookies.txt",
+            line("example.com", "expired", "1", expires=str(int(time.time()) - 60)),
+            line("example.com", "curl_session", "2", expires="0"),
+            line("example.com", "python_session", "3", expires=""),
         )
 
         cookies = load_cookies_file(path)
@@ -64,14 +60,12 @@ class TestLoad:
         assert all(cookie.expires is None and cookie.discard for cookie in cookies)
 
     def test_cookies_that_cannot_be_sent_are_left_out_and_logged(self, tmp_path, caplog):
-        path = tmp_path / "cookies.txt"
-        path.write_text(
-            HEADER
-            + line("127.0.0.1", "local", "secret-1")
-            + line("example.com", "", "secret-2")
-            + line("example.com", "Path", "secret-3")
-            + line("example.com", "ok", "2"),
-            encoding="utf-8",
+        path = cookies_file(
+            tmp_path / "cookies.txt",
+            line("127.0.0.1", "local", "secret-1"),
+            line("example.com", "", "secret-2"),
+            line("example.com", "Path", "secret-3"),
+            line("example.com", "ok", "2"),
         )
 
         with caplog.at_level(logging.WARNING, logger="crawler.session"):
@@ -87,8 +81,8 @@ class TestLoad:
         "content",
         [
             b"not a cookies file\n",
-            (HEADER + "example.com\tFALSE\t/\tsecret-value\n").encode(),
-            (HEADER + "example.com\tTRUE\t/\tFALSE\t0\tname\tsecret-value\n").encode(),
+            (COOKIES_FILE_HEADER + "example.com\tFALSE\t/\tsecret-value\n").encode(),
+            (COOKIES_FILE_HEADER + "example.com\tTRUE\t/\tFALSE\t0\tname\tsecret-value\n").encode(),
             b"\xff\xfe\x00binary",
         ],
     )

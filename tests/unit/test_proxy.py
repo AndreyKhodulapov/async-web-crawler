@@ -231,13 +231,8 @@ class TestStats:
         assert pool.get_stats()[proxy.label].failures == 1
 
 
+@pytest.mark.usefixtures("clean_proxy_environment")
 class TestFromEnv:
-    @pytest.fixture(autouse=True)
-    def clean_environment(self, monkeypatch):
-        for name in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "REQUEST_METHOD"]:
-            monkeypatch.delenv(name, raising=False)
-            monkeypatch.delenv(name.upper(), raising=False)
-
     def test_none_without_proxies(self, monkeypatch):
         monkeypatch.setenv("NO_PROXY", "localhost")
         assert ProxyPool.from_env() is None

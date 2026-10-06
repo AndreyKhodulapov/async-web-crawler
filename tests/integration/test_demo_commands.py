@@ -12,6 +12,7 @@ from helpers import POSTGRES_DSN
 
 from crawler import CSVStorage
 from demo_main import parse_args, run_crawl, run_errors, run_save
+from demo_site import DemoSite
 
 # Start page, 8 articles and the three pages a retry makes good.
 SAVED_PATHS = {"/", *(f"/articles/{number}" for number in range(1, 9)), "/flaky", "/rate-limited", "/slow"}
@@ -129,11 +130,24 @@ async def test_errors_demo_meets_every_kind_of_error(url, tmp_path, capsys):
     assert f"Error report saved to {report}" in output
 
 
+# The crawl of the `save` demo without the cooldowns of the breaker for the
+# server that is down, and with short pauses before the retries.
+FAST_CRAWL = ["--no-breaker", "--retry-delay", "0.01"]
+
+
+@pytest.fixture
+def quick_site(monkeypatch):
+    """The demo site without its waits: what `save` shows is the storages, the `errors` demo shows the waits."""
+    monkeypatch.setattr(DemoSite, "RETRY_AFTER", 0)
+    monkeypatch.setattr(DemoSite, "SLOW_SECONDS", 0.0)
+
+
 def save_options(tmp_path, *extra: str) -> list[str]:
     files = ["--json", str(tmp_path / "pages.jsonl"), "--csv", str(tmp_path / "pages.csv")]
-    return ["save", *files, "--database-url", f"sqlite:///{tmp_path / 'crawler.db'}", *extra]
+    return ["save", *files, "--database-url", f"sqlite:///{tmp_path / 'crawler.db'}", *FAST_CRAWL, *extra]
 
 
+@pytest.mark.usefixtures("quick_site")
 async def test_save_demo_writes_three_storages_and_reads_them_back(tmp_path, capsys):
     await run_save(parse_args(save_options(tmp_path, "--preview", "2", "--batch-size", "5")))
 
@@ -169,6 +183,7 @@ async def test_save_demo_writes_three_storages_and_reads_them_back(tmp_path, cap
         assert preview[0].endswith(f"{start['url']}  'Unreliable site'")
 
 
+@pytest.mark.usefixtures("quick_site")
 async def test_save_demo_replaces_the_files_unless_told_to_append(tmp_path, capsys):
     await run_save(parse_args(save_options(tmp_path)))
     await run_save(parse_args(save_options(tmp_path)))
@@ -186,6 +201,7 @@ async def test_save_demo_replaces_the_files_unless_told_to_append(tmp_path, caps
     connection.close()
 
 
+@pytest.mark.usefixtures("quick_site")
 async def test_save_demo_stops_before_the_crawl_when_a_storage_cannot_be_opened(tmp_path, capsys):
     options = save_options(tmp_path, "--batch-size", "100")
     options[options.index("--csv") + 1] = str(tmp_path / "missing" / "pages.csv")
@@ -200,6 +216,7 @@ async def test_save_demo_stops_before_the_crawl_when_a_storage_cannot_be_opened(
     assert (tmp_path / "pages.jsonl").read_text(encoding="utf-8") == ""
 
 
+@pytest.mark.usefixtures("quick_site")
 async def test_save_demo_goes_on_when_a_storage_cannot_be_written(tmp_path, capsys, monkeypatch):
     async def write_batch(self, records):
         raise OSError("disk full")
@@ -218,6 +235,7 @@ async def test_save_demo_goes_on_when_a_storage_cannot_be_written(tmp_path, caps
     assert "earlier runs" not in output
 
 
+@pytest.mark.usefixtures("quick_site")
 async def test_save_demo_writes_an_indented_array_in_another_encoding(tmp_path):
     await run_save(parse_args(save_options(tmp_path, "--indent", "2", "--csv-encoding", "utf-16")))
 
@@ -228,6 +246,7 @@ async def test_save_demo_writes_an_indented_array_in_another_encoding(tmp_path):
 
 
 @pytest.mark.postgres
+@pytest.mark.usefixtures("quick_site")
 async def test_save_demo_with_postgres(tmp_path, capsys, monkeypatch):
     connection = await asyncpg.connect(POSTGRES_DSN)
     await connection.execute("DROP TABLE IF EXISTS pages")
@@ -235,7 +254,7 @@ async def test_save_demo_with_postgres(tmp_path, capsys, monkeypatch):
     files = ["--json", str(tmp_path / "pages.jsonl"), "--csv", str(tmp_path / "pages.csv")]
 
     try:
-        await run_save(parse_args(["save", *files]))
+        await run_save(parse_args(["save", *files, *FAST_CRAWL]))
         saved = await connection.fetch("SELECT url FROM pages")
     finally:
         await connection.close()

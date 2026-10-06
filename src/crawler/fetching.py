@@ -20,6 +20,8 @@ from crawler.exceptions import (
     HTTPStatusError,
     InvalidURLError,
     ProxyError,
+    ProxyNetworkError,
+    RenderTimeoutError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     TooManyRedirectsError,
@@ -132,7 +134,8 @@ class Fetcher:
         `truncate_at`, which is how robots.txt is downloaded, the body is
         cut to that many bytes instead of failing over `max_page_size`. With
         `track_errors`, the attempts count in `errors`. Without
-        `retry`, every request of the chain is a single attempt. With
+        `retry`, every request of the chain is a single attempt at its
+        site: one that failed in a proxy is still made again. With
         `robots_wait`, a download of robots.txt is waited for that many
         seconds at most (see `check_robots`).
         """
@@ -195,7 +198,8 @@ class Fetcher:
         A redirect is not followed: it comes back as a result with
         `redirected` set and `final_url` its Location header as sent. Also
         returns the number of attempts made, 0 if the request was refused
-        before it was sent. Without `retry`, the request is a single attempt.
+        before it was sent. Without `retry`, the request is a single attempt
+        at the site: a proxy that failed is passed over all the same.
         """
         # Checked up front as well as by the transport: a closed crawler must
         # report itself even for a URL that robots.txt would block.
@@ -244,7 +248,8 @@ class Fetcher:
             return last
 
         def veto(error: Exception) -> str | None:
-            if not retry:
+            # A proxy that failed says nothing of the site: the attempt is still owed.
+            if not retry and not isinstance(error, ProxyNetworkError):
                 return "a single attempt was asked for"
             # A retry the circuit breaker would refuse is not waited for.
             return self.circuit_breaker.refusal(url)
@@ -273,9 +278,10 @@ class Fetcher:
         HTTP 429, a Retry-After header or a timeout usually means the whole
         site is overloaded: the pause is spent in the rate limiter, so that
         the retry and every other request to the host wait for it. Any
-        other failure (HTTP 500, a reset connection) is taken to be about
-        the one page: only this request sleeps, and the host is asked for
-        its other pages meanwhile.
+        other failure (HTTP 500, a reset connection, a page the browser
+        took too long to render) is taken to be about the one page: only
+        this request sleeps, and the host is asked for its other pages
+        meanwhile.
         """
         assert isinstance(error, FetchError)  # _fetch_once() reports every failure as one
         if not _signals_overload(error):
@@ -343,7 +349,9 @@ class Fetcher:
 
         A download after a failed one is a single attempt: the site is
         known to be unreachable, and the retries with their growing
-        timeouts would hold the page that started it for minutes.
+        timeouts would hold the page that started it for minutes. An
+        attempt that failed in a proxy is made again through another one
+        all the same: the page would otherwise fail for it.
         """
         assert self.robots is not None  # it is asking
         # Many sites have no robots.txt; RobotsParser logs the outcomes that matter.
@@ -467,7 +475,10 @@ class Fetcher:
 
 
 def _signals_overload(error: FetchError) -> bool:
-    """Whether the failure says the whole host is overloaded, not one page: HTTP 429, a Retry-After header or a timeout."""
+    """Whether the failure says the whole host is overloaded, not one page: HTTP 429, a Retry-After header or a timeout.
+
+    A timeout of rendering does not: the host answered in time.
+    """
     if isinstance(error, HTTPStatusError):
         return error.status == 429 or bool(error.retry_after)
-    return isinstance(error, FetchTimeoutError)
+    return isinstance(error, FetchTimeoutError) and not isinstance(error, RenderTimeoutError)

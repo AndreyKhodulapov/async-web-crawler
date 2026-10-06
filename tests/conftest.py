@@ -316,6 +316,14 @@ def chromium() -> None:
 
 
 @pytest.fixture
+def clean_proxy_environment(monkeypatch) -> None:
+    """Takes the proxy variables of the machine out of the environment, so that a test sees only those it sets."""
+    for name in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "REQUEST_METHOD"]:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+
+
+@pytest.fixture
 def restore_logging():
     """Undoes `configure_logging` after the test: its handlers are removed and closed, the level is put back."""
     level = logging.getLogger().level

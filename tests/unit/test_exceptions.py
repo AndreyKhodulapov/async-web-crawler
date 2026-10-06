@@ -16,6 +16,7 @@ from crawler import (
     ProxyError,
     ProxyNetworkError,
     RenderError,
+    RenderTimeoutError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     TooManyRedirectsError,
@@ -70,6 +71,7 @@ def test_http_error_subclass_keeps_its_own_kind():
         (ProxyNetworkError(URL, "cannot connect to the proxy"), NetworkError),
         (NoProxyError(URL, "no proxy available"), None),
         (RenderError(URL, "the browser crashed"), None),
+        (RenderTimeoutError(URL, "rendering timeout (30.0s)"), TransientError),
     ],
 )
 def test_errors_have_one_kind_at_most(error, kind):
@@ -90,6 +92,7 @@ def test_errors_have_one_kind_at_most(error, kind):
         (ProxyNetworkError(URL, "cannot connect to the proxy"), "NetworkError"),
         (NoProxyError(URL, "no proxy available"), "other"),
         (RenderError(URL, "the browser crashed"), "other"),
+        (RenderTimeoutError(URL, "rendering timeout (30.0s)"), "TransientError"),
         (KeyError("x"), "other"),
     ],
 )

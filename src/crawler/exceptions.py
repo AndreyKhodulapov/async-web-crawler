@@ -7,6 +7,8 @@ Most errors fall into one of four kinds that decide whether a retry can help:
 
 - `TransientError`: the server or the path to it is overloaded for now
   (a timeout, HTTP 429, 503); the same request may succeed later.
+  `RenderTimeoutError` is the timeout of the browser on a page already
+  downloaded: it is retried as one, and not held against the host.
 - `NetworkError`: the request did not reach the server (DNS, a refused or
   reset connection); worth retrying too. `DNSError` is the one of them
   that is mostly for good: a host name that does not exist. A resolver
@@ -152,6 +154,15 @@ class RenderError(FetchError):
     """The headless browser failed to render the page: it is not installed, could not start or crashed.
 
     The site is not to blame: the circuit breaker of its host does not count it.
+    """
+
+
+class RenderTimeoutError(FetchTimeoutError):
+    """The headless browser took longer than the rendering timeout for the page.
+
+    The document was downloaded in time, so the page is to blame, not its
+    host: the circuit breaker does not count it, and the other requests to
+    the host do not wait for its retry.
     """
 
 
