@@ -13,7 +13,9 @@ listed in the [API reference](api.md#internals).
 - The layers here, from the bottom:
   - **HTTP** (a `Transport`, such as `HttpTransport`): one GET, no redirects.
   - **Request** (`Fetcher`): robots.txt, rate limit, circuit breaker, retries, redirects.
-  - **Crawl** (`CrawlRun`): queue, filters, limits, deferred pages, counters.
+  - **Crawl** (`CrawlRun`): filters, deferred pages, counters; the pages
+    come from a `Frontier`: the queue, the URLs seen, the outcomes and the
+    limits on how many pages are requested.
   - **Facade** (`AsyncCrawler`): the public API.
 - **Calls go down only.** A lower layer knows nothing of the one above:
   `Fetcher` has no idea a crawl exists, so `fetch_url()` and `crawl()`
@@ -34,7 +36,8 @@ listed in the [API reference](api.md#internals).
     the page through the same one, and the cookies the page set go back
     into the cookie jar of the first transport, which stays the one the
     crawler keeps;
-  - a crawl shared by several machines replaces the queue and the set of seen URLs of the crawl layer.
+  - a crawl shared by several machines replaces the frontier of the crawl
+    layer: `MemoryFrontier` with one kept in a database.
 
 ## Contracts between layers
 
@@ -54,6 +57,16 @@ listed in the [API reference](api.md#internals).
   `reset_stats()`, `cookies()` and `update_cookies()` (the browser gives
   back the cookies its pages set). The request layer knows only
   `Transport`; the facade builds the transports and knows what they are.
+- The `Frontier` came one step ahead of its second implementation, a
+  frontier in a database that several worker processes share, because
+  that one shapes the contract more than the first: its methods are
+  `async`, found links are added in one call per page, and a page goes
+  back to the queue and is uncounted from `max_pages` in the same call,
+  which is one transaction in a database. The counts of `stats()` are the
+  exception: progress is shown from a synchronous call, so they are what
+  the process knows without asking. It is an ABC, not a `Protocol`: the
+  implementations share the limits they are made with. The contract
+  tests run against every implementation.
 
 ## State of a unit of work
 
@@ -65,9 +78,9 @@ listed in the [API reference](api.md#internals).
 - What must outlive a crawl stays in shared objects: rate limits, the
   robots.txt cache, the states of the circuit breaker, the HTTP session.
   The run receives them; it does not own them.
-- The facade keeps the latest run for its properties (`visited_urls`,
-  `crawl_stats()` ...). An empty run before the first crawl saves a
-  `None` check in every property.
+- The facade keeps the latest run and its frontier for its properties
+  (`visited_urls`, `crawl_stats()` ...). An empty run before the first
+  crawl saves a `None` check in every property.
 - A guard against two crawls at once on one crawler is a property of the
   run (`running`), not a pair of timestamps checked by the caller.
 

@@ -15,6 +15,7 @@ from crawler.crawl_run import CrawlRun
 from crawler.exceptions import ParseError, StorageError
 from crawler.fetching import Fetcher
 from crawler.filters import UrlFilter
+from crawler.frontier import Frontier, MemoryFrontier
 from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage, ProxyStats, RenderStats
 from crawler.parser import HTMLParser
 from crawler.proxy import ProxyPool
@@ -222,7 +223,7 @@ class AsyncCrawler:
     MAX_WAITS_PER_PAGE = CrawlRun.MAX_WAITS_PER_PAGE
     MAX_ROBOTS_RETRIES = CrawlRun.MAX_ROBOTS_RETRIES
     ROBOTS_POLL = CrawlRun.ROBOTS_POLL
-    FRONTIER_FACTOR = CrawlRun.FRONTIER_FACTOR
+    FRONTIER_FACTOR = Frontier.FRONTIER_FACTOR
     # In crawl(), longer links are not followed: they are mostly generated ones.
     MAX_URL_LENGTH = 2048
 
@@ -359,8 +360,9 @@ class AsyncCrawler:
         self.storage = storage
         self._keep_pages = keep_pages
         self.stats = CrawlerStats()
-        # The latest crawl() call; an empty one before the first.
-        self._run = self._new_run()
+        # The latest crawl() call and its frontier; empty ones before the first.
+        self._frontier = MemoryFrontier()
+        self._run = self._new_run(self._frontier)
         # A crawl() that is opening the storage, before its run has started.
         self._starting = False
 
@@ -444,12 +446,12 @@ class AsyncCrawler:
     @property
     def visited_urls(self) -> set[str]:
         """URLs the latest crawl took for fetching, successful or not. Do not modify."""
-        return self._run.queue.visited
+        return self._frontier.queue.visited
 
     @property
     def failed_urls(self) -> dict[str, str]:
         """URL -> error description for pages the latest crawl could not fetch. Do not modify."""
-        return self._run.queue.failed
+        return self._frontier.queue.failed
 
     @property
     def skipped_urls(self) -> dict[str, str]:
@@ -457,17 +459,17 @@ class AsyncCrawler:
 
         All of them were fetched, except those over `max_pages_per_host`.
         """
-        return self._run.queue.skipped
+        return self._frontier.queue.skipped
 
     @property
     def blocked_urls(self) -> dict[str, str]:
         """URL -> reason for pages the latest crawl was not allowed to fetch. Do not modify."""
-        return self._run.queue.blocked
+        return self._frontier.queue.blocked
 
     @property
     def unreachable_urls(self) -> dict[str, str]:
         """URL -> reason for pages the latest crawl skipped because robots.txt was unreachable. Do not modify."""
-        return self._run.queue.unreachable
+        return self._frontier.queue.unreachable
 
     @property
     def failed_sitemaps(self) -> dict[str, str]:
@@ -477,7 +479,7 @@ class AsyncCrawler:
     @property
     def url_depths(self) -> Mapping[str, int]:
         """Depth of every URL the latest crawl accepted: 0 for start URLs and pages listed in sitemaps."""
-        return self._run.queue.depths
+        return self._frontier.queue.depths
 
     async def fetch_url(self, url: str) -> str:
         """Download a single page and return its decoded body.
@@ -725,20 +727,22 @@ class AsyncCrawler:
             exclude_extensions=exclude_extensions,
             max_url_length=self.MAX_URL_LENGTH,
         )
-        self._run = self._new_run()
+        self._frontier = MemoryFrontier(
+            max_pages=max_pages, max_pages_per_host=max_pages_per_host, frontier_factor=self.FRONTIER_FACTOR
+        )
+        self._run = self._new_run(self._frontier)
         return await self._run.run(
             start_urls,
-            max_pages,
-            max_pages_per_host=max_pages_per_host,
             url_filter=url_filter,
             sitemap_urls=sitemap_urls,
             robots_sitemaps=robots_sitemaps,
         )
 
-    def _new_run(self) -> CrawlRun:
+    def _new_run(self, frontier: Frontier) -> CrawlRun:
         run = CrawlRun(
             self._fetcher,
             self._parse,
+            frontier=frontier,
             limits=self._limits,
             stats=self.stats,
             storage=self.storage,

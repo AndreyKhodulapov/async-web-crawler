@@ -720,7 +720,8 @@ After a crawl, and during one, the crawler exposes its state:
 | `circuit_breaker.get_stats()` | `{host: CircuitStats}`, see [Circuit breaker](#circuit-breaker) |
 
 The building blocks can be used on their own: `CrawlerQueue` (priorities,
-deduplication, completion detection), `SemaphoreManager` (global and
+deduplication, completion detection), `MemoryFrontier` (a `CrawlerQueue`
+with the limits on the pages of a crawl), `SemaphoreManager` (global and
 per-domain limits), `RateLimiter`, `RobotsParser`, `SitemapParser`, `RetryStrategy`,
 `CircuitBreaker` and `UrlFilter`.
 
@@ -1103,7 +1104,8 @@ and may change. A layer calls only the one below it.
 | Layer | Module | Class | Responsible for | Knows nothing of |
 |-------|--------|-------|-----------------|------------------|
 | Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
-| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page until the queue is full, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
+| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: what is done with every page its `Frontier` hands out — filters, depth, sitemaps read before the first page until the frontier is full, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched, how the pages are kept |
+| Crawl, frontier | `frontier.py` | `Frontier`, `MemoryFrontier` | `Frontier` is the contract the crawl layer takes its pages through: the queue and the URLs seen, the outcomes of the pages, `max_pages` and `max_pages_per_host` counted as pages are admitted and uncounted when they go back unanswered, the bound of `FRONTIER_FACTOR`. `MemoryFrontier` keeps them in memory, in a `CrawlerQueue` | how a page is fetched or what is done with it |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
 | HTTP | `transport.py` | `Transport`, `HttpTransport` | `Transport` is the contract the request layer sends through; `HttpTransport` makes a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
 | HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, with the proxy their document came through (`Response.proxy`), a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a context per proxy, the cookies kept in step with those of `HttpTransport` (`CookieSync`, `Transport.update_cookies`), a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash, the counters of `render_stats()` | robots.txt, filters, retries, limits |
@@ -1121,15 +1123,19 @@ Who owns what:
 - `Fetcher` creates `RobotsParser` and `SitemapParser`, which download
   through it, so robots.txt and sitemaps get the same politeness as pages;
   `AsyncCrawler.robots` and `.sitemaps` are the same objects.
-- Every `crawl()` makes a new `CrawlRun`, so the state of a crawl is never
-  reset field by field: the previous run stays readable until the next one
-  starts. Before the first crawl the properties read an empty run. The
+- Every `crawl()` makes a new `MemoryFrontier` with its limits and a new
+  `CrawlRun` over it, so the state of a crawl is never reset field by
+  field: the previous run stays readable until the next one starts. The
+  run knows only the `Frontier` contract; the facade made the frontier and
+  reads `visited_urls`, `failed_urls`, `url_depths` ... from it. Before
+  the first crawl the properties read an empty run and frontier. The
   rate limits, the robots.txt cache and the states of the circuit breaker
   live in the shared objects and carry over between crawls.
-- The crawl constants (`ROBOTS_POLL`, `MAX_ROBOTS_RETRIES`,
-  `FRONTIER_FACTOR` ...) are defined by `CrawlRun` and read from the
-  crawler when a run is made, so one set on an `AsyncCrawler` or on a
-  subclass applies to its crawls. The request constants
+- The crawl constants (`ROBOTS_POLL`, `MAX_ROBOTS_RETRIES` ...) are
+  defined by `CrawlRun` and read from the crawler when a run is made, and
+  `FRONTIER_FACTOR` is defined by `Frontier` and read when its frontier is
+  made, so one set on an `AsyncCrawler` or on a subclass applies to its
+  crawls. The request constants
   (`MAX_REDIRECTS`, `MAX_TIMEOUT_GROWTH`, `REDIRECT_STATUSES`) are
   defined by `Fetcher` and `HttpTransport` and read from the crawler when
   it is made: one set on a subclass applies, one set on a crawler later

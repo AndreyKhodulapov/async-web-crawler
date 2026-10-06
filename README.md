@@ -498,7 +498,8 @@ src/
 └── crawler/
     ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
     ├── client.py           # AsyncCrawler: the public API — fetch_*, crawl(), statistics, close()
-    ├── crawl_run.py        # CrawlRun: one crawl — queue, filters, limits, deferred pages, counters, saving
+    ├── crawl_run.py        # CrawlRun: one crawl — filters, deferred pages, counters, saving
+    ├── frontier.py         # Frontier contract; MemoryFrontier: the pages of a crawl, their outcomes, max_pages
     ├── fetching.py         # Fetcher: one URL with robots.txt, circuit breaker, rate limit, retries and redirects
     ├── transport.py        # Transport contract; HttpTransport: single GET requests over an aiohttp session, decoding, size limits
     ├── rendering.py        # Rendering, BrowserTransport, Renderer: HTML pages rendered in a headless Chromium (Playwright)

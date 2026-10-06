@@ -25,9 +25,10 @@ from crawler.exceptions import (
 )
 from crawler.fetching import Fetcher
 from crawler.filters import UrlFilter
+from crawler.frontier import Admission, Frontier, FrontierPage, Outcome
 from crawler.models import CrawlStats, FetchResult, PageRecord, ParsedPage
 from crawler.parser import is_html_content_type
-from crawler.queue import CrawlerQueue, queue_form
+from crawler.queue import queue_form
 from crawler.semaphores import SemaphoreManager
 from crawler.stats import CrawlerStats
 from crawler.storage.base import DataStorage
@@ -37,9 +38,10 @@ logger = logging.getLogger(__name__)
 
 
 class CrawlRun:
-    """One crawl of `AsyncCrawler.crawl()`: its queue, filters, limits and counters.
+    """One crawl of `AsyncCrawler.crawl()`: what is done with every page of its `Frontier`, and the counters.
 
-    Pages are requested through the `Fetcher` of the crawler and parsed by
+    Pages are taken from `frontier`, which also counts them toward the
+    limits, requested through the `Fetcher` of the crawler and parsed by
     `parse`; `stats` and `storage` are those of the crawler. A run is made
     once: every crawl() call makes a new one, so nothing of the previous
     crawl needs to be reset.
@@ -59,10 +61,6 @@ class CrawlRun:
     # robots.txt, then it is put off for this long at a time while the
     # download goes on: a site that is slow to fail holds no worker back.
     ROBOTS_POLL = 2.0
-    # In crawl(), new links are not queued once the pages queued, in progress
-    # and requested reach this many times max_pages: most would never be fetched.
-    # Likewise a host has at most this many times max_pages_per_host queued.
-    FRONTIER_FACTOR = 3
     # The constants above that AsyncCrawler hands over from itself to every run.
     SETTINGS = (
         "MAX_CIRCUIT_OPENINGS",
@@ -70,7 +68,6 @@ class CrawlRun:
         "MAX_WAITS_PER_PAGE",
         "MAX_ROBOTS_RETRIES",
         "ROBOTS_POLL",
-        "FRONTIER_FACTOR",
     )
 
     def __init__(
@@ -78,6 +75,7 @@ class CrawlRun:
         fetcher: Fetcher,
         parse: Callable[[FetchResult], Awaitable[ParsedPage]],
         *,
+        frontier: Frontier,
         limits: SemaphoreManager,
         stats: CrawlerStats,
         storage: DataStorage | None,
@@ -99,31 +97,19 @@ class CrawlRun:
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
         # State of the crawl.
-        self._queue = CrawlerQueue()
+        self._frontier = frontier
         self.processed_urls: dict[str, ParsedPage] = {}
         self._start_urls: set[str] = set()
         self._sitemap_pages_out_of_scope: list[str] = []
         self._redirect_sources: dict[str, str] = {}  # redirect target -> the page that led to it
         self._failed_sitemaps: dict[str, str] = {}
-        self._pages_requested = 0
-        self._host_pages: Counter[str] = Counter()  # pages requested by host
-        self._over_host_limit = 0  # pages skipped without a request over max_pages_per_host
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
         self._page_waits: Counter[str] = Counter()  # times a page waited for a Retry-After too long to retry
-        self._max_frontier = 0  # pages queued, in progress and requested that crawl() allows
-        self._links_dropped = 0
-        self._host_queued: Counter[str] = Counter()  # pages ever queued by host
-        self._max_host_queued: int | None = None  # pages queued by host that crawl() allows
-        self._links_dropped_by_host = 0
         self._pages_to_save = 0
         self._written_before = 0
         self._pending_before = 0
         self._crawl_started: float | None = None
         self._crawl_finished: float | None = None
-
-    @property
-    def queue(self) -> CrawlerQueue:
-        return self._queue
 
     @property
     def failed_sitemaps(self) -> dict[str, str]:
@@ -137,18 +123,17 @@ class CrawlRun:
     async def run(
         self,
         start_urls: list[str],
-        max_pages: int,
         *,
-        max_pages_per_host: int | None,
         url_filter: UrlFilter,
         sitemap_urls: list[str],
         robots_sitemaps: bool,
     ) -> dict[str, ParsedPage]:
-        """Crawl from the start URLs, as `AsyncCrawler.crawl()` describes; the arguments are checked by it."""
+        """Crawl from the start URLs, as `AsyncCrawler.crawl()` describes; the arguments are checked by it.
+
+        The limits on the pages requested are those of the frontier.
+        """
         if self._crawl_started is not None:
             raise RuntimeError("a crawl run is made once")
-        self._max_frontier = self.FRONTIER_FACTOR * max_pages
-        self._max_host_queued = None if max_pages_per_host is None else self.FRONTIER_FACTOR * max_pages_per_host
         self._written_before = self.storage.written if self.storage is not None else 0
         self._pending_before = self.storage.pending if self.storage is not None else 0
         self._fetcher.reset_stats()
@@ -156,13 +141,13 @@ class CrawlRun:
         self.circuit_breaker.reset_stats()
         if self.robots is not None:
             self.robots.forget_outages()
-        for url in start_urls:
-            self._queue.add_url(url, priority=0, depth=0)
-        self._start_urls = set(self._queue.depths)
-        self._host_queued = Counter(get_host(url) for url in self._start_urls)
+        self._start_urls = set(await self._frontier.seed(start_urls))
 
         logger.info(
-            "Crawl started: %d start URLs, max_depth=%d, max_pages=%d", len(start_urls), self.max_depth, max_pages
+            "Crawl started: %d start URLs, max_depth=%d, max_pages=%s",
+            len(start_urls),
+            self.max_depth,
+            self._frontier.max_pages,
         )
         self._crawl_started, self._crawl_finished = time.perf_counter(), None
         self.stats.start()
@@ -171,7 +156,7 @@ class CrawlRun:
                 await self._queue_sitemap_pages(sitemap_urls, start_urls if robots_sitemaps else [], url_filter)
             async with asyncio.TaskGroup() as group:
                 for _ in range(self.max_concurrent):
-                    group.create_task(self._crawl_worker(self._queue, url_filter, max_pages, max_pages_per_host))
+                    group.create_task(self._crawl_worker(url_filter))
             await self._flush_storage()
         finally:
             self._crawl_finished = time.perf_counter()
@@ -191,13 +176,14 @@ class CrawlRun:
             stats.queued,
             stats.elapsed,
         )
-        if self._links_dropped:
-            logger.info("%d links were not queued: the queue was full", self._links_dropped)
-        if self._links_dropped_by_host:
+        frontier = self._frontier.stats()
+        if frontier.links_dropped:
+            logger.info("%d links were not queued: the queue was full", frontier.links_dropped)
+        if frontier.links_dropped_by_host:
             logger.info(
                 "%d links were not queued: their host had %d x max_pages_per_host pages queued",
-                self._links_dropped_by_host,
-                self.FRONTIER_FACTOR,
+                frontier.links_dropped_by_host,
+                self._frontier.frontier_factor,
             )
         if self.storage is not None:
             logger.info(
@@ -221,14 +207,14 @@ class CrawlRun:
             sitemaps.update(dict.fromkeys(task.result()))
         opened = listed = queued = 0
         for sitemap in sitemaps:
-            if self._frontier_full(self._queue):
+            if await self._frontier.full():
                 break
             opened += 1
             async with aclosing(self._read_sitemap(sitemap)) as batches:
                 async for pages in batches:
                     listed += len(pages)
-                    queued += self._queue_sitemap_batch(pages, url_filter)
-                    if self._frontier_full(self._queue):
+                    queued += await self._queue_sitemap_batch(pages, url_filter)
+                    if await self._frontier.full():
                         logger.info("Stopped reading sitemaps at %s: the queue is full", sitemap)
                         break
         logger.info(
@@ -240,69 +226,32 @@ class CrawlRun:
             queued,
         )
 
-    def _queue_sitemap_batch(self, pages: list[str], url_filter: UrlFilter) -> int:
+    async def _queue_sitemap_batch(self, pages: list[str], url_filter: UrlFilter) -> int:
         """Queue the sitemap pages that pass the filter; the number queued."""
-        queued = 0
+        allowed = []
         for page in pages:
-            if not url_filter.allows(page):
-                # Hosts join the scope only under `same_domain_only`.
-                if url_filter.allowed_hosts is not None:
-                    self._sitemap_pages_out_of_scope.append(page)
-            elif self._queue_found(self._queue, page, depth=0):
-                queued += 1
-        return queued
+            if url_filter.allows(page):
+                allowed.append(page)
+            # Hosts join the scope only under `same_domain_only`.
+            elif url_filter.allowed_hosts is not None:
+                self._sitemap_pages_out_of_scope.append(page)
+        return await self._frontier.add(allowed, depth=0)
 
-    def _queue_sitemap_pages_in_scope(self, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
+    async def _queue_sitemap_pages_in_scope(self, url_filter: UrlFilter) -> None:
         """Queue the sitemap pages that the filter let through once a start URL redirected to their host.
 
         The sitemaps are read before the first page, when only the hosts of
         the start URLs are known: the pages of "example.com" are out of
         scope until "example.org" redirects there.
         """
-        out_of_scope = []
+        in_scope, out_of_scope = [], []
         for page in self._sitemap_pages_out_of_scope:
             if url_filter.allows(page):
-                self._queue_found(queue, page, depth=0)
+                in_scope.append(page)
             else:
                 out_of_scope.append(page)
         self._sitemap_pages_out_of_scope = out_of_scope
-
-    def _queue_found(self, queue: CrawlerQueue, url: str, *, depth: int) -> bool:
-        """Queue a link or a sitemap page unless the queue, or the share of its host, is full; True if it was queued.
-
-        Its priority is its depth: breadth-first.
-        """
-        host = get_host(url)
-        if self._max_host_queued is not None and self._host_queued[host] >= self._max_host_queued:
-            if not queue.closed and not queue.is_seen(url):
-                self._links_dropped_by_host += 1
-            return False
-        if self._frontier_full(queue):
-            if not queue.is_seen(url):
-                if not self._links_dropped:
-                    logger.info(
-                        "Queue is full: pages queued, in progress and requested reached %d (%d x max_pages); "
-                        "new links are not queued until it has room",
-                        self._max_frontier,
-                        self.FRONTIER_FACTOR,
-                    )
-                self._links_dropped += 1
-            return False
-        if not queue.add_url(url, priority=depth, depth=depth):
-            return False
-        self._host_queued[host] += 1
-        if self._host_queued[host] == self._max_host_queued:
-            logger.info(
-                "Host %s has %d pages queued (%d x max_pages_per_host): its new links are not queued",
-                host,
-                self._max_host_queued,
-                self.FRONTIER_FACTOR,
-            )
-        return True
-
-    def _frontier_full(self, queue: CrawlerQueue) -> bool:
-        """Whether the pages queued, in progress and requested reach `FRONTIER_FACTOR` times max_pages."""
-        return not queue.closed and queue.unfinished + self._pages_requested >= self._max_frontier
+        await self._frontier.add(in_scope, depth=0)
 
     async def _sitemaps_in_robots(self, url: str) -> list[str]:
         """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read.
@@ -356,7 +305,7 @@ class CrawlRun:
         """Progress of the running crawl, or the result of the latest one."""
         if self._crawl_started is None:
             return CrawlStats()
-        stats = self._queue.get_stats()
+        frontier = self._frontier.stats()
         rate = self.rate_limiter.get_stats()
         saved = save_failed = 0
         if self.storage is not None:
@@ -369,14 +318,14 @@ class CrawlRun:
                 # Buffered pages are yet to be written.
                 save_failed = max(save_failed - self.storage.pending, 0)
         return CrawlStats(
-            processed=stats["processed"],
-            failed=stats["failed"],
-            skipped=stats["skipped"],
-            over_host_limit=self._over_host_limit,
-            blocked=stats["blocked"],
-            unreachable=stats["unreachable"],
-            queued=stats["queued"],
-            in_progress=stats["in_progress"],
+            processed=frontier.processed,
+            failed=frontier.failed,
+            skipped=frontier.skipped,
+            over_host_limit=frontier.over_host_limit,
+            blocked=frontier.blocked,
+            unreachable=frontier.unreachable,
+            queued=frontier.queued,
+            in_progress=frontier.in_progress,
             active_requests=self._limits.active,
             elapsed=(self._crawl_finished or time.perf_counter()) - self._crawl_started,
             requests=rate.requests,
@@ -388,10 +337,10 @@ class CrawlRun:
             save_failed=save_failed,
         )
 
-    async def _crawl_worker(
-        self, queue: CrawlerQueue, url_filter: UrlFilter, max_pages: int, max_pages_per_host: int | None
-    ) -> None:
-        while (url := await queue.get_next()) is not None:
+    async def _crawl_worker(self, url_filter: UrlFilter) -> None:
+        frontier = self._frontier
+        while (page := await frontier.take()) is not None:
+            url = page.url
             try:
                 # A host that asked to wait (Retry-After) or waits out the
                 # pause before a retry: the worker takes pages of other hosts
@@ -399,7 +348,7 @@ class CrawlRun:
                 if (penalty := self._penalty_left(url)) > self.MIN_PENALTY_TO_DEFER:
                     self._warn_once_held_back(url, penalty)
                     logger.info("Deferred %s for %.1fs: its host is held back", url, penalty)
-                    queue.defer(url, penalty, priority=queue.depth(url))
+                    await frontier.put_back(page, penalty, uncount=False)
                     continue
                 # robots.txt and the circuit breaker are checked before the
                 # page counts toward max_pages: a refused page costs no request.
@@ -412,52 +361,44 @@ class CrawlRun:
                 )
                 if refusal is not None:
                     if isinstance(refusal, RobotsDisallowedError):
-                        queue.mark_blocked(url, refusal.message)
+                        await frontier.finish(page, Outcome.BLOCKED, refusal.message)
                     elif isinstance(refusal, RobotsUnreachableError):
-                        if not self._wait_for_robots(url, queue, refusal, requested=False):
+                        if not await self._wait_for_robots(page, refusal, requested=False):
                             reason = self._unreachable_reason(refusal)
                             logger.info("Gave up on %s: %s", url, reason)
-                            queue.mark_unreachable(url, reason)
+                            await frontier.finish(page, Outcome.UNREACHABLE, reason)
                     elif isinstance(refusal, CircuitOpenError):
-                        self._defer_or_fail(url, queue, refusal)
+                        await self._defer_or_fail(page, refusal)
                     else:
-                        self._fail_page(url, queue, refusal)
+                        await self._fail_page(page, refusal)
                     continue
-                if self._pages_requested >= max_pages:
-                    # Taken while another worker was still checking the page
-                    # that reached the limit: it goes back to the queue.
-                    queue.requeue(url, priority=queue.depth(url))
-                    continue
-                host = get_host(url)
-                assert host is not None  # the queue holds valid URLs only
-                if max_pages_per_host is not None and self._host_pages[host] >= max_pages_per_host:
-                    # Not requested, so not counted toward max_pages.
-                    self._over_host_limit += 1
-                    self._skip_page(url, queue, f"max_pages_per_host reached: {max_pages_per_host} pages of {host}")
-                    continue
-                self._pages_requested += 1
-                self._host_pages[host] += 1
-                if self._pages_requested >= max_pages:
-                    # This URL is the last one allowed: the others stop taking new ones.
-                    queue.close()
-                await self._crawl_page(url, queue, url_filter)
+                match await frontier.admit(page):
+                    case Admission.OVER_MAX_PAGES:
+                        await frontier.put_back(page, uncount=False)
+                        continue
+                    case Admission.OVER_HOST_LIMIT:
+                        # Not requested, so not counted toward max_pages.
+                        reason = f"max_pages_per_host reached: {frontier.max_pages_per_host} pages of {get_host(url)}"
+                        await self._skip_page(page, reason)
+                        continue
+                await self._crawl_page(page, url_filter)
             except Exception as exc:
                 # Fetcher.fetch() reports expected failures in the result, so this
-                # is a bug; it must not kill the worker, and the URL
-                # must leave the in-progress state, or get_next() would wait forever.
+                # is a bug; it must not kill the worker, and the page
+                # must leave the in-progress state, or take() would wait forever.
                 logger.exception("Unexpected error while crawling %s", url)
-                self._fail_page(url, queue, UnexpectedError(url, f"{type(exc).__name__}: {exc}"))
+                await self._fail_page(page, UnexpectedError(url, f"{type(exc).__name__}: {exc}"))
 
-    async def _crawl_page(self, url: str, queue: CrawlerQueue, url_filter: UrlFilter) -> None:
-        depth = queue.depth(url)
+    async def _crawl_page(self, page: FrontierPage, url_filter: UrlFilter) -> None:
+        url, depth = page
         skip_reason: str | None = None
         sent = False  # a request of the page got an answer: a redirect
         targets: list[str] = []  # the redirects followed, remembered as seen for this page
 
-        def follow(target: str) -> bool:
+        async def follow(target: str) -> bool:
             nonlocal skip_reason, sent
             sent = True
-            skip_reason = self._redirect_refusal(url, target, queue, url_filter)
+            skip_reason = await self._redirect_refusal(url, target, url_filter)
             if skip_reason is None:
                 targets.append(target)
             return skip_reason is None
@@ -471,33 +412,31 @@ class CrawlRun:
             # A request was sent if it failed with its own error, or if it
             # was answered with a redirect whose target was refused.
             requested = sent or refusal is not result.error
-            if not requested:
-                # Nothing was sent: the page costs nothing of the limits.
-                self._uncount_page(url, queue)
-            if not self._defer_or_fail(url, queue, refusal, result, requested=requested):
-                self._forget_redirects(url, targets, queue)
+            if not await self._defer_or_fail(page, refusal, result, counted=True, requested=requested):
+                await self._forget_redirects(url, targets)
             return
-        if self._outwaits_retries(result.error) and self._wait_for_host(url, queue, result.error):
+        if self._outwaits_retries(result.error) and await self._wait_for_host(page, result.error):
             return
         # The worker has checked robots.txt for the page; these are about the target of its redirect.
-        if isinstance(result.error, RobotsUnreachableError) and self._wait_for_robots(
-            url, queue, result.error, requested=True
+        if isinstance(result.error, RobotsUnreachableError) and await self._wait_for_robots(
+            page, result.error, requested=True
         ):
             return
         if result.error is not None:
             # The page is not crawled: its redirect targets are no longer
             # seen, so that a direct link to one of them is still followed.
-            self._forget_redirects(url, targets, queue)
+            await self._forget_redirects(url, targets)
         if isinstance(result.error, RobotsDisallowedError):
-            queue.mark_blocked(url, f"redirects to {result.error.url}, {result.error.message}")
+            reason = f"redirects to {result.error.url}, {result.error.message}"
+            await self._frontier.finish(page, Outcome.BLOCKED, reason)
             return
         if isinstance(result.error, RobotsUnreachableError):
             reason = f"redirects to {result.error.url}, {self._unreachable_reason(result.error)}"
             logger.info("Gave up on %s: %s", url, reason)
-            queue.mark_unreachable(url, reason)
+            await self._frontier.finish(page, Outcome.UNREACHABLE, reason)
             return
         if result.error is not None:
-            self._fail_page(url, queue, result.error, result)
+            await self._fail_page(page, result.error, result)
             return
         if url in self._start_urls and result.redirected and skip_reason is None:
             # A start URL that redirects ("example.org" -> "example.com")
@@ -506,47 +445,45 @@ class CrawlRun:
             # sitemap has depth 0 too, but is filtered like a link.
             assert result.final_url is not None
             url_filter.allow_host_of(result.final_url)
-            self._queue_sitemap_pages_in_scope(queue, url_filter)
+            await self._queue_sitemap_pages_in_scope(url_filter)
         if skip_reason is None and not is_html_content_type(result.content_type):
             # A link without a file extension may still lead to a PDF or an
             # image. Not a failure: the page is fine, just not one to parse.
             skip_reason = f"not HTML: {result.content_type}"
         if skip_reason is not None:
-            self._skip_page(url, queue, skip_reason, result)
+            await self._skip_page(page, skip_reason, result)
             return
 
         try:
-            page = await self._parse(result)
+            parsed = await self._parse(result)
         except ParseError as error:
             logger.warning("Failed to parse %s: %s", url, error.message)
-            self._fail_page(url, queue, error, result)
+            await self._fail_page(page, error, result)
             return
-        duplicate = self._duplicate_of(url, result.final_url, page, queue)
+        duplicate = await self._duplicate_of(url, result.final_url, parsed)
         if duplicate is not None:
             # A variant of a page already seen ("?sort=price" of "/list"):
             # its links are variants too, so they are not followed.
-            self._skip_page(url, queue, f"duplicate of {duplicate}", result)
+            await self._skip_page(page, f"duplicate of {duplicate}", result)
             return
-        noindex, nofollow = self._robots_directives(result, page)
+        noindex, nofollow = self._robots_directives(result, parsed)
         queued = 0
         if depth < self.max_depth and not nofollow:
-            for link in page["links"]:
-                if url_filter.allows(link) and self._queue_found(queue, link, depth=depth + 1):
-                    queued += 1
+            links = [link for link in parsed["links"] if url_filter.allows(link)]
+            queued = await self._frontier.add(links, depth=depth + 1)
         if noindex is not None:
             # The site asks not to keep the page; its links may still be followed.
-            self._skip_page(url, queue, noindex, result, links_queued=queued)
+            await self._skip_page(page, noindex, result, links_queued=queued)
             return
         if self.keep_pages:
-            self.processed_urls[url] = page
-        queue.mark_processed(url)
+            self.processed_urls[url] = parsed
+        await self._frontier.finish(page, Outcome.PROCESSED)
         self.stats.record_page(url, status=result.status, elapsed=result.elapsed)
-        logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(page["links"]), queued)
+        logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(parsed["links"]), queued)
         if self.storage is not None:
-            await self._save_page(_page_record(result, page, depth))
+            await self._save_page(_page_record(result, parsed, depth))
 
-    @staticmethod
-    def _duplicate_of(url: str, final_url: str | None, page: ParsedPage, queue: CrawlerQueue) -> str | None:
+    async def _duplicate_of(self, url: str, final_url: str | None, page: ParsedPage) -> str | None:
         """The canonical URL of the page `url` if it is another page of the crawl it is a variant of; else None.
 
         `final_url` is where the page was served from after its redirects.
@@ -567,7 +504,7 @@ class CrawlRun:
         target_parts, served_parts = urlsplit(target), urlsplit(served)
         if (target_parts.netloc, target_parts.path) != (served_parts.netloc, served_parts.path):
             return None
-        return canonical if queue.is_pending_or_processed(target) else None
+        return canonical if await self._frontier.is_pending_or_processed(target) else None
 
     def _robots_directives(self, result: FetchResult, page: ParsedPage) -> tuple[str | None, bool]:
         """Whether the page asks not to be kept, and why (None if it does not); whether not to follow its links.
@@ -582,7 +519,7 @@ class CrawlRun:
         nofollow = any({"nofollow", "none"} & set(found) for _, found in sources)
         return noindex, nofollow
 
-    def _redirect_refusal(self, url: str, target: str, queue: CrawlerQueue, url_filter: UrlFilter) -> str | None:
+    async def _redirect_refusal(self, url: str, target: str, url_filter: UrlFilter) -> str | None:
         """Why the page `url` of the crawl must not follow its redirect to `target`; None if it may.
 
         Asked before the target is requested, so a redirect out of the crawl
@@ -601,34 +538,39 @@ class CrawlRun:
         # Compared without tracking parameters, as the queue keeps URLs.
         page = strip_tracking_params(target)
         if page != url and self._redirect_sources.get(page) != url:
-            if queue.is_seen(page):
+            if await self._frontier.is_seen(page):
                 return f"redirected to a page already seen: {target}"
-            queue.mark_seen(page)
+            await self._frontier.mark_seen(page)
             self._redirect_sources[page] = url
         return None
 
-    def _forget_redirects(self, url: str, targets: Iterable[str], queue: CrawlerQueue) -> None:
+    async def _forget_redirects(self, url: str, targets: Iterable[str]) -> None:
         """Let the redirect targets of the page `url` be queued again: the page failed, so they were not crawled."""
         for target in targets:
             page = strip_tracking_params(target)
             if self._redirect_sources.get(page) == url:
                 del self._redirect_sources[page]
-                queue.forget(page)
+                await self._frontier.forget(page)
 
-    def _fail_page(self, url: str, queue: CrawlerQueue, error: FetchError, result: FetchResult | None = None) -> None:
-        """Finish a page of the crawl as failed; `result` is that of its request, None if none was sent."""
-        queue.mark_failed(url, f"{type(error).__name__}: {error.message}")
+    async def _fail_page(
+        self, page: FrontierPage, error: FetchError, result: FetchResult | None = None, *, uncount: bool = False
+    ) -> None:
+        """Finish a page of the crawl as failed; `result` is that of its request, None if none was sent.
+
+        With `uncount`, the page counted toward the limits is uncounted: nothing was sent for it.
+        """
+        reason = f"{type(error).__name__}: {error.message}"
+        await self._frontier.finish(page, Outcome.FAILED, reason, uncount=uncount)
         self.stats.record_page(
-            url,
+            page.url,
             status=None if result is None else result.status,
             elapsed=None if result is None else result.elapsed,
             error=type(error).__name__,
         )
 
-    def _skip_page(
+    async def _skip_page(
         self,
-        url: str,
-        queue: CrawlerQueue,
+        page: FrontierPage,
         reason: str,
         result: FetchResult | None = None,
         *,
@@ -639,12 +581,12 @@ class CrawlRun:
         `links_queued` is how many new links of the page were queued, for the log; None if they were not followed.
         """
         if links_queued is None:
-            logger.info("Skipped %s: %s", url, reason)
+            logger.info("Skipped %s: %s", page.url, reason)
         else:
-            logger.info("Skipped %s: %s; %d new links queued", url, reason, links_queued)
-        queue.mark_skipped(url, reason)
+            logger.info("Skipped %s: %s; %d new links queued", page.url, reason, links_queued)
+        await self._frontier.finish(page, Outcome.SKIPPED, reason)
         self.stats.record_page(
-            url,
+            page.url,
             status=None if result is None else result.status,
             elapsed=None if result is None else result.elapsed,
             skipped=True,
@@ -707,16 +649,6 @@ class CrawlRun:
         host = get_host(url)
         return 0.0 if host is None else self.rate_limiter.penalty_left(host)
 
-    def _uncount_page(self, url: str, queue: CrawlerQueue) -> None:
-        """A page taken by a worker goes back to the queue: it costs nothing of the limits until it is taken again."""
-        self._pages_requested -= 1
-        self._host_pages[get_host(url)] -= 1
-        if queue.closed:
-            # The page reached max_pages and closed the queue; now it is
-            # back under the limit, and this worker goes on to crawl it,
-            # or the page that takes its place, even if the others have stopped.
-            queue.reopen()
-
     def _robots_wait(self, url: str) -> float | None:
         """Seconds the crawl waits for the unreachable robots.txt of the site of `url` to be downloaded again; None to give up.
 
@@ -739,9 +671,7 @@ class CrawlRun:
             return None
         return self.robots.unreachable_for(url) or self.ROBOTS_POLL
 
-    def _wait_for_robots(
-        self, url: str, queue: CrawlerQueue, refusal: RobotsUnreachableError, *, requested: bool
-    ) -> bool:
+    async def _wait_for_robots(self, page: FrontierPage, refusal: RobotsUnreachableError, *, requested: bool) -> bool:
         """Put off a page of the crawl until the robots.txt that refused it is downloaded again, if it is worth waiting for.
 
         The refusal is for the page itself or for the target of its
@@ -754,7 +684,7 @@ class CrawlRun:
         delay = self._robots_wait(refusal.url)
         if delay is None:
             return False
-        self._put_off_page(url, queue, delay, refusal.message, requested=requested)
+        await self._put_off_page(page, delay, refusal.message, uncount=requested)
         return True
 
     def _unreachable_reason(self, refusal: RobotsUnreachableError) -> str:
@@ -771,16 +701,14 @@ class CrawlRun:
             unreachable = None
         return refusal.message if unreachable is None else f"robots.txt is unreachable ({unreachable})"
 
-    def _put_off_page(self, url: str, queue: CrawlerQueue, delay: float, reason: str, *, requested: bool) -> None:
+    async def _put_off_page(self, page: FrontierPage, delay: float, reason: str, *, uncount: bool) -> None:
         """Put a page of the crawl back into the queue for `delay` seconds.
 
-        With `requested`, the page is uncounted from the limits first: it
+        With `uncount`, the page is uncounted from the limits first: it
         is counted again when it is taken again.
         """
-        if requested:
-            self._uncount_page(url, queue)
-        logger.info("Deferred %s for %.1fs: %s", url, delay, reason)
-        queue.defer(url, delay, priority=queue.depth(url))
+        logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
+        await self._frontier.put_back(page, delay, uncount=uncount)
 
     def _outwaits_retries(self, error: FetchError | None) -> bool:
         """Whether `error` carries a Retry-After too long for the retry strategy, so the request was not retried.
@@ -796,7 +724,7 @@ class CrawlRun:
             and error.retry_after > self.retry_strategy.max_delay
         )
 
-    def _wait_for_host(self, url: str, queue: CrawlerQueue, error: HTTPStatusError) -> bool:
+    async def _wait_for_host(self, page: FrontierPage, error: HTTPStatusError) -> bool:
         """Put off a page whose request got a Retry-After too long to retry, until its host may be asked again.
 
         The host is held back for that long anyway (see `Fetcher`): the
@@ -806,13 +734,14 @@ class CrawlRun:
         to another one. Returns False once the page has waited
         `MAX_WAITS_PER_PAGE` times: the caller fails it then.
         """
+        url = page.url
         if self._page_waits[url] >= self.MAX_WAITS_PER_PAGE:
             del self._page_waits[url]
             return False
         self._page_waits[url] += 1
         delay = self._penalty_left(error.url) or 1.0
         # The request was answered, but not with the page: it is not a page requested.
-        self._put_off_page(url, queue, delay, error.message, requested=True)
+        await self._put_off_page(page, delay, error.message, uncount=True)
         self._warn_once_held_back(error.url, delay)
         return True
 
@@ -842,13 +771,13 @@ class CrawlRun:
         message = breaker.refusal(error.url)
         return None if message is None else CircuitOpenError(error.url, message)
 
-    def _defer_or_fail(
+    async def _defer_or_fail(
         self,
-        url: str,
-        queue: CrawlerQueue,
+        page: FrontierPage,
         refusal: CircuitOpenError,
         result: FetchResult | None = None,
         *,
+        counted: bool = False,
         requested: bool = False,
     ) -> bool:
         """Put off a page the circuit breaker refused until its host may be probed, or give up on it.
@@ -856,26 +785,27 @@ class CrawlRun:
         The host is that of the refusal: the page may redirect to another
         one. `result` is that of the page's request, if one was made: a
         page given up on fails with the error of its request, if it got
-        one, else with the refusal. With `requested`, the page was
-        requested: put off, it is uncounted from the limits until it is
-        taken again, as the request was not answered with the page; given
-        up on, it counts. Returns whether the page was put off rather than
+        one, else with the refusal. A page `counted` toward the limits is
+        uncounted when put off, until it is taken again, as no request was
+        answered with the page; given up on, it stays counted if it was
+        `requested`. Returns whether the page was put off rather than
         failed.
         """
         host = get_host(refusal.url)
         assert host is not None  # a URL without a host has no circuit
         opened = self.circuit_breaker.times_opened(host)
         if opened >= self.MAX_CIRCUIT_OPENINGS:
-            logger.info("Gave up on %s: circuit breaker of %s opened %d times", url, host, opened)
+            logger.info("Gave up on %s: circuit breaker of %s opened %d times", page.url, host, opened)
+            uncount = counted and not requested
             if result is not None and result.error is not None and result.error is not refusal:
-                self._fail_page(url, queue, result.error, result)
+                await self._fail_page(page, result.error, result, uncount=uncount)
             else:
-                self._fail_page(url, queue, refusal)
+                await self._fail_page(page, refusal, uncount=uncount)
             return False
         # Back when the probe may go; a page refused while the probe is in
         # flight comes back a second later.
         delay = self.circuit_breaker.probe_in(refusal.url) or 1.0
-        self._put_off_page(url, queue, delay, refusal.message, requested=requested)
+        await self._put_off_page(page, delay, refusal.message, uncount=counted)
         return True
 
 

@@ -1505,10 +1505,10 @@ class TestCrawlPageStats:
         crawler = make_crawler(max_concurrent=1, max_depth=0)
         crawl_page = CrawlRun._crawl_page
 
-        async def broken(self, url, queue, url_filter):
-            if url == "http://a/1":
+        async def broken(self, page, url_filter):
+            if page.url == "http://a/1":
                 raise KeyError("x")
-            await crawl_page(self, url, queue, url_filter)
+            await crawl_page(self, page, url_filter)
 
         # The run of a crawl is made inside crawl().
         monkeypatch.setattr(CrawlRun, "_crawl_page", broken)

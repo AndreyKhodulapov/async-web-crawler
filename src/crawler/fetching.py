@@ -6,7 +6,7 @@ import dataclasses
 import itertools
 import logging
 import time
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import aiohttp
 
@@ -110,7 +110,7 @@ class Fetcher:
         truncate_at: int | None = None,
         check_robots: bool = True,
         check_redirect_robots: bool = True,
-        follow: Callable[[str], bool] | None = None,
+        follow: Callable[[str], Awaitable[bool]] | None = None,
         failure_level: int = logging.WARNING,
         track_errors: bool = True,
         retry: bool = True,
@@ -167,7 +167,7 @@ class Fetcher:
                 error = InvalidURLError(target, f"redirects to an invalid URL: {result.final_url!r}")
                 result = FetchResult.failure(url, error, elapsed)
                 break
-            if follow is not None and not follow(location):
+            if follow is not None and not await follow(location):
                 result = dataclasses.replace(result, final_url=location)
                 break
             logger.info("Redirect %s -> %s (%d)", target, location, result.status)

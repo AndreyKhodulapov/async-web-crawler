@@ -1,0 +1,350 @@
+"""Unit tests for the Frontier contract: order, deduplication, outcomes, completion and the limits on pages."""
+
+import asyncio
+from collections.abc import Callable
+
+import pytest
+
+from crawler import Admission, Frontier, FrontierPage, MemoryFrontier, Outcome
+
+
+@pytest.fixture(params=[MemoryFrontier], ids=["memory"])
+def make_frontier(request) -> Callable[..., Frontier]:
+    """Every implementation of `Frontier`, made with the limits given as keywords."""
+    return request.param
+
+
+@pytest.fixture
+def frontier(make_frontier) -> Frontier:
+    return make_frontier()
+
+
+async def take(frontier: Frontier) -> FrontierPage:
+    page = await frontier.take()
+    assert page is not None
+    return page
+
+
+async def drain(frontier: Frontier) -> list[str]:
+    """Take every page, finishing each as processed right away."""
+    urls = []
+    while (page := await frontier.take()) is not None:
+        urls.append(page.url)
+        await frontier.finish(page, Outcome.PROCESSED)
+    return urls
+
+
+class TestOrder:
+    async def test_lower_depth_comes_first(self, frontier):
+        await frontier.add(["http://site/deep"], depth=2)
+        await frontier.add(["http://site/shallow"], depth=1)
+        await frontier.seed(["http://site/"])
+        assert await drain(frontier) == ["http://site/", "http://site/shallow", "http://site/deep"]
+
+    async def test_equal_depths_keep_the_order_they_were_added_in(self, frontier):
+        urls = [f"http://site/{i}" for i in range(5)]
+        await frontier.add(urls[:2], depth=1)
+        await frontier.add(urls[2:], depth=1)
+        assert await drain(frontier) == urls
+
+
+class TestSeed:
+    async def test_start_urls_are_returned_in_the_form_kept(self, frontier):
+        seeded = await frontier.seed(["HTTP://Site:80/a#top", "http://site/a", "http://site/b?utm_source=x"])
+
+        assert seeded == ["http://site/a", "http://site/b"]
+        assert await take(frontier) == FrontierPage("http://site/a", 0)
+
+    async def test_start_urls_are_accepted_whatever_the_bounds(self, make_frontier):
+        frontier = make_frontier(max_pages=1, max_pages_per_host=1, frontier_factor=1)
+
+        seeded = await frontier.seed([f"http://site/{i}" for i in range(4)])
+
+        assert len(seeded) == 4
+        assert frontier.stats().queued == 4
+        assert await frontier.full()
+
+
+class TestAdd:
+    async def test_duplicates_are_not_accepted(self, frontier):
+        assert await frontier.add(["http://site/a", "HTTP://Site:80/a#top"], depth=1) == 1
+        assert await frontier.add(["http://site/a"], depth=0) == 0
+        assert frontier.stats().queued == 1
+
+    async def test_page_is_not_accepted_again_after_it_was_taken(self, frontier):
+        await frontier.add(["http://site/a"], depth=0)
+        page = await take(frontier)
+        assert await frontier.add(["http://site/a"], depth=0) == 0
+        await frontier.finish(page, Outcome.PROCESSED)
+        assert await frontier.add(["http://site/a"], depth=0) == 0
+
+    async def test_invalid_url_is_not_accepted(self, frontier):
+        assert await frontier.add(["mailto:someone@site"], depth=0) == 0
+        assert await frontier.take() is None
+
+    async def test_tracking_parameters_are_dropped(self, frontier):
+        assert await frontier.add(["http://site/a?id=1&utm_source=mail"], depth=0) == 1
+        assert await frontier.add(["http://site/a?fbclid=x&id=1"], depth=0) == 0
+        assert await frontier.is_seen("http://site/a?id=1&gclid=y")
+        assert await take(frontier) == FrontierPage("http://site/a?id=1", 0)
+
+    async def test_page_keeps_its_depth(self, frontier):
+        await frontier.add(["HTTP://Site/a"], depth=3)
+        assert await take(frontier) == FrontierPage("http://site/a", 3)
+
+    async def test_url_marked_seen_is_not_accepted(self, frontier):
+        await frontier.mark_seen("http://site/redirect-target")
+        assert await frontier.add(["http://site/redirect-target"], depth=0) == 0
+
+    async def test_forgotten_url_is_accepted_again_unless_it_was_accepted(self, frontier):
+        await frontier.mark_seen("http://site/redirect-target")
+        await frontier.add(["http://site/page"], depth=0)
+
+        await frontier.forget("http://site/redirect-target?utm_source=x")
+        await frontier.forget("http://site/page")
+        await frontier.forget("not a url")
+
+        assert await frontier.add(["http://site/redirect-target"], depth=0) == 1
+        assert await frontier.add(["http://site/page"], depth=0) == 0
+
+
+class TestTake:
+    async def test_returns_none_when_empty_and_idle(self, frontier):
+        assert await frontier.take() is None
+
+    async def test_waits_while_a_page_is_in_progress(self, frontier):
+        await frontier.seed(["http://site/"])
+        page = await take(frontier)
+        waiter = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+
+        # The page in progress finds a link: the waiting worker gets it.
+        await frontier.add(["http://site/link"], depth=1)
+        await frontier.finish(page, Outcome.PROCESSED)
+        assert await waiter == FrontierPage("http://site/link", 1)
+
+    async def test_waiters_finish_when_the_last_page_is_done(self, frontier):
+        await frontier.seed(["http://site/"])
+        page = await take(frontier)
+        waiters = [asyncio.create_task(frontier.take()) for _ in range(3)]
+        await asyncio.sleep(0)
+
+        await frontier.finish(page, Outcome.FAILED, "NetworkError: boom")
+
+        assert await asyncio.gather(*waiters) == [None, None, None]
+
+
+class TestPutBack:
+    async def test_page_put_back_is_taken_again_with_its_depth(self, frontier):
+        await frontier.add(["http://site/a"], depth=1)
+        page = await take(frontier)
+
+        await frontier.put_back(page, uncount=False)
+
+        assert frontier.stats().queued == 1
+        assert await take(frontier) == page
+
+    async def test_page_put_off_comes_back_after_the_delay(self, frontier):
+        await frontier.add(["http://site/a"], depth=1)
+        page = await take(frontier)
+
+        await frontier.put_back(page, 0.05, uncount=False)
+
+        assert (frontier.stats().queued, frontier.stats().in_progress) == (1, 0)
+        # Nothing is in progress, yet the crawl is not over.
+        waiter = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0.01)
+        assert not waiter.done()
+        assert await waiter == page
+
+    async def test_page_put_off_waits_its_turn_by_depth(self, frontier):
+        await frontier.seed(["http://site/a"])
+        page = await take(frontier)
+        await frontier.put_back(page, 0.01, uncount=False)
+        await asyncio.sleep(0.02)
+        await frontier.add(["http://site/b"], depth=1)
+        await frontier.seed(["http://site/c"])
+
+        assert await drain(frontier) == ["http://site/a", "http://site/c", "http://site/b"]
+
+
+class TestOutcomes:
+    async def test_stats_follow_the_lifecycle(self, frontier):
+        await frontier.seed([f"http://site/{name}" for name in "abcdef"])
+        a, b, c, d, e = [await take(frontier) for _ in range(5)]
+        stats = frontier.stats()
+        assert (stats.queued, stats.in_progress, stats.processed) == (1, 5, 0)
+
+        await frontier.finish(a, Outcome.PROCESSED)
+        await frontier.finish(b, Outcome.FAILED, "HTTPStatusError: HTTP 404 Not Found")
+        await frontier.finish(c, Outcome.SKIPPED, "redirected out of scope: http://other/")
+        await frontier.finish(d, Outcome.BLOCKED, "disallowed by robots.txt")
+        await frontier.finish(e, Outcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)")
+
+        stats = frontier.stats()
+        assert (stats.queued, stats.in_progress) == (1, 0)
+        assert (stats.processed, stats.failed, stats.skipped, stats.blocked, stats.unreachable) == (1, 1, 1, 1, 1)
+
+    async def test_pending_or_processed_urls(self, frontier):
+        await frontier.seed([f"http://site/{name}" for name in "abcd"])
+        await frontier.mark_seen("http://site/target")
+        a, b = await take(frontier), await take(frontier)
+        await frontier.finish(a, Outcome.PROCESSED)
+        await frontier.finish(b, Outcome.FAILED, "error")
+        c = await take(frontier)
+
+        assert await frontier.is_pending_or_processed("http://site/a?utm_source=x")
+        assert await frontier.is_pending_or_processed(c.url)
+        assert await frontier.is_pending_or_processed("http://site/d")
+        assert not await frontier.is_pending_or_processed(b.url)
+        assert not await frontier.is_pending_or_processed("http://site/target")
+        assert not await frontier.is_pending_or_processed("http://site/never")
+        assert not await frontier.is_pending_or_processed("not a url")
+
+    @pytest.mark.parametrize("outcome", [Outcome.FAILED, Outcome.SKIPPED, Outcome.BLOCKED, Outcome.UNREACHABLE])
+    async def test_outcome_other_than_processed_needs_a_reason(self, frontier, outcome):
+        await frontier.seed(["http://site/a"])
+        page = await take(frontier)
+        with pytest.raises(ValueError, match="needs a reason"):
+            await frontier.finish(page, outcome)
+
+    @pytest.mark.parametrize(
+        "finish",
+        [
+            lambda frontier, page: frontier.finish(page, Outcome.PROCESSED),
+            lambda frontier, page: frontier.finish(page, Outcome.FAILED, "error"),
+            lambda frontier, page: frontier.put_back(page, uncount=False),
+            lambda frontier, page: frontier.put_back(page, 1.0, uncount=False),
+        ],
+        ids=["processed", "failed", "put back", "put off"],
+    )
+    async def test_page_not_taken_cannot_be_finished(self, frontier, finish):
+        await frontier.seed(["http://site/a"])
+        with pytest.raises(ValueError, match="not in progress"):
+            await finish(frontier, FrontierPage("http://site/a", 0))
+
+
+class TestMaxPages:
+    async def test_pages_admitted_up_to_max_pages_and_then_none_is_handed_out(self, make_frontier):
+        frontier = make_frontier(max_pages=2)
+        await frontier.seed([f"http://site/{name}" for name in "abcd"])
+        a, b, c = [await take(frontier) for _ in range(3)]
+
+        assert await frontier.admit(a) is Admission.ADMITTED
+        assert await frontier.admit(b) is Admission.ADMITTED
+        # Taken before the limit was reached: it goes back unrequested.
+        assert await frontier.admit(c) is Admission.OVER_MAX_PAGES
+        await frontier.put_back(c, uncount=False)
+
+        assert await frontier.take() is None
+        await frontier.finish(a, Outcome.PROCESSED)
+        await frontier.finish(b, Outcome.PROCESSED)
+        stats = frontier.stats()
+        assert (stats.requested, stats.processed, stats.queued) == (2, 2, 2)
+
+    async def test_page_put_back_uncounted_frees_its_place_until_taken_again(self, make_frontier):
+        frontier = make_frontier(max_pages=1)
+        await frontier.seed(["http://site/a", "http://site/b"])
+        a = await take(frontier)
+        assert await frontier.admit(a) is Admission.ADMITTED
+
+        await frontier.put_back(a, 0.01, uncount=True)
+
+        assert frontier.stats().requested == 0
+        # The put-off page comes back after the page that took its place.
+        b = await take(frontier)
+        assert await frontier.admit(b) is Admission.ADMITTED
+        await frontier.finish(b, Outcome.PROCESSED)
+        assert await frontier.take() is None
+        assert frontier.stats().queued == 1
+
+    async def test_page_given_up_uncounted_frees_its_place(self, make_frontier):
+        frontier = make_frontier(max_pages=1)
+        await frontier.seed(["http://site/a", "http://site/b"])
+        a = await take(frontier)
+        assert await frontier.admit(a) is Admission.ADMITTED
+
+        await frontier.finish(a, Outcome.FAILED, "CircuitOpenError: refused", uncount=True)
+
+        b = await take(frontier)
+        assert await frontier.admit(b) is Admission.ADMITTED
+        assert frontier.stats().requested == 1
+
+    async def test_page_given_up_after_its_request_stays_counted(self, make_frontier):
+        frontier = make_frontier(max_pages=1)
+        await frontier.seed(["http://site/a", "http://site/b"])
+        a = await take(frontier)
+        assert await frontier.admit(a) is Admission.ADMITTED
+
+        await frontier.finish(a, Outcome.FAILED, "HTTPStatusError: HTTP 503")
+
+        assert await frontier.take() is None
+        assert frontier.stats().requested == 1
+
+    async def test_without_limits_every_page_is_admitted(self, frontier):
+        await frontier.add([f"http://site/{i}" for i in range(50)], depth=1)
+
+        for _ in range(50):
+            assert await frontier.admit(await take(frontier)) is Admission.ADMITTED
+        assert not await frontier.full()
+
+
+class TestMaxPagesPerHost:
+    async def test_page_over_the_host_limit_is_not_admitted(self, make_frontier):
+        frontier = make_frontier(max_pages_per_host=1)
+        await frontier.seed(["http://a/1", "http://a/2", "http://b/1"])
+        a1, a2, b1 = [await take(frontier) for _ in range(3)]
+
+        assert await frontier.admit(a1) is Admission.ADMITTED
+        assert await frontier.admit(a2) is Admission.OVER_HOST_LIMIT
+        assert await frontier.admit(b1) is Admission.ADMITTED
+        assert frontier.stats().over_host_limit == 1
+        assert frontier.stats().requested == 2
+
+    async def test_page_of_the_host_uncounted_frees_its_place(self, make_frontier):
+        frontier = make_frontier(max_pages_per_host=1)
+        await frontier.seed(["http://a/1", "http://a/2"])
+        a1, a2 = await take(frontier), await take(frontier)
+        assert await frontier.admit(a1) is Admission.ADMITTED
+
+        await frontier.put_back(a1, uncount=True)
+
+        assert await frontier.admit(a2) is Admission.ADMITTED
+
+
+class TestBounds:
+    async def test_found_pages_are_accepted_until_the_frontier_is_full(self, make_frontier):
+        frontier = make_frontier(max_pages=1, frontier_factor=3)
+        await frontier.seed(["http://site/"])
+
+        assert await frontier.add([f"http://site/{i}" for i in range(5)], depth=1) == 2
+        assert await frontier.full()
+        assert frontier.stats().links_dropped == 3
+        # Not remembered: a page found again once there is room is accepted then.
+        assert not await frontier.is_seen("http://site/4")
+
+    async def test_pages_requested_take_room_in_the_frontier(self, make_frontier):
+        frontier = make_frontier(max_pages=2, frontier_factor=1)
+        await frontier.seed(["http://site/a"])
+        page = await take(frontier)
+        await frontier.admit(page)
+        await frontier.finish(page, Outcome.PROCESSED)
+
+        assert await frontier.add(["http://site/b", "http://site/c"], depth=1) == 1
+        assert await frontier.full()
+
+    async def test_host_has_a_bounded_share_of_the_frontier(self, make_frontier):
+        frontier = make_frontier(max_pages_per_host=1, frontier_factor=2)
+        await frontier.seed(["http://a/"])
+
+        assert await frontier.add([f"http://a/{i}" for i in range(4)], depth=1) == 1
+        assert await frontier.add(["http://b/1"], depth=1) == 1
+        assert frontier.stats().links_dropped_by_host == 3
+
+    async def test_duplicates_are_not_counted_as_dropped(self, make_frontier):
+        frontier = make_frontier(max_pages=1, frontier_factor=1)
+        await frontier.seed(["http://site/"])
+
+        assert await frontier.add(["http://site/", "http://site/new"], depth=1) == 0
+        assert frontier.stats().links_dropped == 1

@@ -35,6 +35,7 @@ from crawler.exceptions import (
     error_kind,
 )
 from crawler.filters import UrlFilter
+from crawler.frontier import Admission, Frontier, FrontierPage, FrontierStats, MemoryFrontier, Outcome
 from crawler.logging_setup import configure_logging
 from crawler.models import (
     CircuitStats,
@@ -77,6 +78,7 @@ from crawler.storage import (
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
+    "Admission",
     "AdvancedCrawler",
     "AsyncCrawler",
     "BreakerCall",
@@ -102,12 +104,17 @@ __all__ = [
     "FetchError",
     "FetchResult",
     "FetchTimeoutError",
+    "Frontier",
+    "FrontierPage",
+    "FrontierStats",
     "HTMLParser",
     "HTTPStatusError",
     "InvalidURLError",
     "JSONStorage",
+    "MemoryFrontier",
     "NetworkError",
     "NoProxyError",
+    "Outcome",
     "PageRecord",
     "PageTooLargeError",
     "ParseError",
