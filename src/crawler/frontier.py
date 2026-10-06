@@ -164,6 +164,9 @@ class Frontier(ABC):
     def stats(self) -> FrontierStats:
         """The counts of pages by state, as this process knows them; does not wait, so progress can be shown at any time."""
 
+    async def close(self) -> None:
+        """Release what the frontier holds, such as its connections; a frontier in memory holds nothing."""
+
 
 class MemoryFrontier(Frontier):
     """A `Frontier` held in memory, for one process: a `CrawlerQueue` and the counts of its limits.

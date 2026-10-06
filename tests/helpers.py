@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 
+import asyncpg
+
 from crawler import CircuitBreaker, CrawlerConfig, DataStorage, PageRecord, RetryStrategy
 from demo_site import free_port
 
@@ -45,6 +47,17 @@ FAST_CONFIG = {
 # The password of the user `crawler` of a test proxy, and the header a proxy that asks for it expects.
 PROXY_PASSWORD = "s3cr3t-pw"
 PROXY_AUTHORIZATION = "Basic " + base64.b64encode(f"crawler:{PROXY_PASSWORD}".encode()).decode()
+
+
+async def drop_frontier_tables() -> None:
+    """Drop the tables of `PostgresFrontier`, so that the next frontier opened starts on empty ones."""
+    connection = await asyncpg.connect(POSTGRES_DSN)
+    try:
+        await connection.execute(
+            "DROP TABLE IF EXISTS hosts, frontier, crawl_jobs; DROP SEQUENCE IF EXISTS frontier_seq"
+        )
+    finally:
+        await connection.close()
 
 
 def make_config(**sections) -> CrawlerConfig:

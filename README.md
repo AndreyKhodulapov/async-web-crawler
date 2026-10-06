@@ -523,6 +523,9 @@ src/
     ├── urls.py             # URL validation, normalization, resolution
     ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats, ProxyStats, RenderStats
     ├── exceptions.py       # FetchError hierarchy, StorageError, ConfigError
+    ├── distributed/
+    │   ├── frontier.py     # PostgresFrontier: the frontier of a crawl job shared by workers — leases, heartbeat, host turns
+    │   └── schema.py       # the tables crawl_jobs, frontier and hosts, made by the first worker
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes
         ├── json_file.py    # JSONStorage: JSON Lines or an indented array
@@ -544,13 +547,13 @@ tests/
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
 ├── unit/                   # links of the documentation, parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, logging, progress, filters, storages, client
-└── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
+└── integration/            # local HTTP server, databases, the frontier in memory and in PostgreSQL; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── api.md                  # API reference
 ├── configuration.md        # configuration guide: every key, validation, recipes
 ├── demo.md                 # the demo commands and their output
 ├── advanced_features.md    # notes on sitemaps, configuration, logging, monitoring and integration
-├── architecture.md         # notes on the layers of the crawler and refactoring without changing behaviour
+├── architecture.md         # notes on the layers of the crawler, the frontier in a database and refactoring without changing behaviour
 ├── asyncio_concepts.md     # notes on async concepts used here
 ├── concurrency_control.md  # notes on queues, limits and crawl order
 ├── data_storage.md         # notes on saving data: files, databases, batching, failed writes

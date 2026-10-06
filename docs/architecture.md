@@ -64,7 +64,8 @@ listed in the [API reference](api.md#internals).
   back to the queue and is uncounted from `max_pages` in the same call,
   which is one transaction in a database. The counts of `stats()` are the
   exception: progress is shown from a synchronous call, so they are what
-  the process knows without asking. It is an ABC, not a `Protocol`: the
+  the process knows without asking: all of them in memory, a snapshot of
+  the job refreshed now and then in the database. It is an ABC, not a `Protocol`: the
   implementations share the limits they are made with. The contract
   tests run against every implementation.
 - Two more points of that contract come from the database one, though
@@ -85,6 +86,67 @@ listed in the [API reference](api.md#internals).
     runs out. The storage knows nothing of the frontier: a callback of
     URLs is all it offers, so any storage works, not only a table in the
     same database as the queue.
+
+## The frontier in a database
+
+`PostgresFrontier` (`crawler/distributed/`) is the second implementation:
+the frontier of one crawl job, shared by workers in other processes or
+on other machines. It keeps the contract, and the same contract tests
+run against it; what it adds is what sharing needs.
+
+- **Three tables**, made by the first worker that connects:
+  `crawl_jobs` (the limits of a job and the counts they are checked
+  against: pages requested, pages unfinished, links dropped), `frontier`
+  (every URL of a job once: the primary key `(job, url)` is the
+  deduplication) and `hosts` (when a host may be requested next, how
+  many of its pages were accepted and requested). Workers of an
+  existing job take its limits from the database, not from their own
+  configuration, so that they all count against the same ones.
+- **A page is leased, not handed over.** `take` makes it `leased` until
+  `lease_until`, and a heartbeat renews the leases of the worker's pages.
+  A worker that is killed renews nothing: its pages go back to the queue
+  when their leases expire, uncounted from `max_pages`, and fail after
+  `max_attempts` expiries. So a page is crawled **at least once**, not
+  exactly once, and the storage must take a page twice: a table with a
+  row per URL does.
+- **Saved, then done.** A page processed with `pending_save` is
+  `saving`, still leased and renewed, until the storage reports its
+  record written and the crawl calls `saved`. A worker killed with a
+  full buffer leaves its pages `saving`; their leases expire and another
+  worker crawls them again. `take` waits for the `saving` pages of other
+  workers (they may come back) but not for its own: the buffer is
+  written after the last page is taken, and waiting for it would never end.
+- **A host has one turn for all workers.** `take` picks the ready host
+  with the shallowest page, locks the host row with
+  `FOR UPDATE SKIP LOCKED` and moves its `next_allowed_at` on by the
+  interval in the same statement. Two workers never take a page of one
+  host at once, and a worker never waits for a host that another one
+  holds: it takes a page of another host. The order is breadth-first
+  among the ready hosts: a page at depth 2 of a ready host comes before
+  one at depth 1 of a host that has to wait.
+- **Locks in one order, and no waits where the order cannot be kept.**
+  Every operation on a page locks the row of the page, then the job,
+  then the host; adding links locks the job first and only inserts new
+  rows. `take` reads its page from the snapshot of its statement: another
+  worker may have taken the page since and hold its row while it waits
+  for the host `take` holds. So `take` locks the row of the page skipping
+  too, and looks again a moment later if it was taken. The expired
+  leases are taken back skipping the rows other workers hold. The stress
+  check that found this deadlock (32 tasks in 4 workers, pages put off,
+  given up and uncounted at random) now ends with the counts of the job
+  equal to those of its rows.
+- **Waiting is polling.** A worker with nothing to take asks the
+  database what it waits for: a page put off, a host's turn, a lease of
+  another worker that may expire, and sleeps until the nearest of them,
+  at most `poll_interval`. Operations of its own frontier wake it at
+  once. `LISTEN/NOTIFY` could wake it on the operations of others; it
+  is worth it only if the measurements show the polls cost too much.
+- **Times are those of the database**: one clock for all workers, so a
+  host interval holds whatever the clocks of the machines say.
+- **The stats are a snapshot.** Counting every state change in the job
+  row would make that row the one every worker of the job writes on
+  every page. Instead the heartbeat (and `refresh_stats()`) counts the
+  rows of the job by state; `requested` is also taken from `admit`.
 
 ## State of a unit of work
 

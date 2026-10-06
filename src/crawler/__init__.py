@@ -4,6 +4,7 @@ from crawler.advanced import AdvancedCrawler
 from crawler.circuit_breaker import BreakerCall, CircuitBreaker, CircuitState
 from crawler.client import AsyncCrawler
 from crawler.config import CrawlerConfig, load_config, load_urls
+from crawler.distributed import PostgresFrontier
 from crawler.exceptions import (
     CertificateError,
     CircuitOpenError,
@@ -121,6 +122,7 @@ __all__ = [
     "ParsedPage",
     "PermanentError",
     "PermanentHTTPError",
+    "PostgresFrontier",
     "PostgresStorage",
     "Progress",
     "ProgressTracker",

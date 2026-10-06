@@ -1,22 +1,49 @@
-"""Unit tests for the Frontier contract: order, deduplication, outcomes, completion and the limits on pages."""
+"""Integration tests for the Frontier contract, in memory and in PostgreSQL: order, deduplication, outcomes, completion and the limits on pages."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import pytest
+from helpers import POSTGRES_DSN, drop_frontier_tables
 
-from crawler import Admission, Frontier, FrontierPage, MemoryFrontier, Outcome
+from crawler import Admission, Frontier, FrontierPage, FrontierStats, MemoryFrontier, Outcome, PostgresFrontier
+
+FrontierFactory = Callable[..., Awaitable[Frontier]]
 
 
-@pytest.fixture(params=[MemoryFrontier], ids=["memory"])
-def make_frontier(request) -> Callable[..., Frontier]:
-    """Every implementation of `Frontier`, made with the limits given as keywords."""
-    return request.param
+@pytest.fixture(params=["memory", pytest.param("postgres", marks=pytest.mark.postgres)])
+async def make_frontier(request) -> AsyncGenerator[FrontierFactory, None]:
+    """Makes frontiers of every implementation with the limits given as keywords; closes them after the test.
+
+    In PostgreSQL every frontier of a test is a worker of one job on empty tables.
+    """
+    opened = []
+    if request.param == "postgres":
+        await drop_frontier_tables()
+
+    async def make_frontier(**limits) -> Frontier:
+        if request.param == "postgres":
+            frontier = await PostgresFrontier.open(POSTGRES_DSN, job="test", **limits)
+        else:
+            frontier = MemoryFrontier(**limits)
+        opened.append(frontier)
+        return frontier
+
+    yield make_frontier
+    for frontier in opened:
+        await frontier.close()
 
 
 @pytest.fixture
-def frontier(make_frontier) -> Frontier:
-    return make_frontier()
+async def frontier(make_frontier) -> Frontier:
+    return await make_frontier()
+
+
+async def current_stats(frontier: Frontier) -> FrontierStats:
+    """The stats of a frontier, refreshed first where they are a snapshot of a shared database."""
+    if isinstance(frontier, PostgresFrontier):
+        await frontier.refresh_stats()
+    return frontier.stats()
 
 
 async def take(frontier: Frontier) -> FrontierPage:
@@ -56,12 +83,12 @@ class TestSeed:
         assert await take(frontier) == FrontierPage("http://site/a", 0)
 
     async def test_start_urls_are_accepted_whatever_the_bounds(self, make_frontier):
-        frontier = make_frontier(max_pages=1, max_pages_per_host=1, frontier_factor=1)
+        frontier = await make_frontier(max_pages=1, max_pages_per_host=1, frontier_factor=1)
 
         seeded = await frontier.seed([f"http://site/{i}" for i in range(4)])
 
         assert len(seeded) == 4
-        assert frontier.stats().queued == 4
+        assert (await current_stats(frontier)).queued == 4
         assert await frontier.full()
 
 
@@ -69,7 +96,7 @@ class TestAdd:
     async def test_duplicates_are_not_accepted(self, frontier):
         assert await frontier.add(["http://site/a", "HTTP://Site:80/a#top"], depth=1) == 1
         assert await frontier.add(["http://site/a"], depth=0) == 0
-        assert frontier.stats().queued == 1
+        assert (await current_stats(frontier)).queued == 1
 
     async def test_page_is_not_accepted_again_after_it_was_taken(self, frontier):
         await frontier.add(["http://site/a"], depth=0)
@@ -150,7 +177,7 @@ class TestPutBack:
 
         await frontier.put_back(page, uncount=False)
 
-        assert frontier.stats().queued == 1
+        assert (await current_stats(frontier)).queued == 1
         assert await take(frontier) == page
 
     async def test_page_put_off_comes_back_after_the_delay(self, frontier):
@@ -159,7 +186,8 @@ class TestPutBack:
 
         await frontier.put_back(page, 0.05, uncount=False)
 
-        assert (frontier.stats().queued, frontier.stats().in_progress) == (1, 0)
+        stats = await current_stats(frontier)
+        assert (stats.queued, stats.in_progress) == (1, 0)
         # Nothing is in progress, yet the crawl is not over.
         waiter = asyncio.create_task(frontier.take())
         await asyncio.sleep(0.01)
@@ -181,7 +209,7 @@ class TestOutcomes:
     async def test_stats_follow_the_lifecycle(self, frontier):
         await frontier.seed([f"http://site/{name}" for name in "abcdef"])
         a, b, c, d, e = [await take(frontier) for _ in range(5)]
-        stats = frontier.stats()
+        stats = await current_stats(frontier)
         assert (stats.queued, stats.in_progress, stats.processed) == (1, 5, 0)
 
         await frontier.finish(a, Outcome.PROCESSED)
@@ -190,7 +218,7 @@ class TestOutcomes:
         await frontier.finish(d, Outcome.BLOCKED, "disallowed by robots.txt")
         await frontier.finish(e, Outcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)")
 
-        stats = frontier.stats()
+        stats = await current_stats(frontier)
         assert (stats.queued, stats.in_progress) == (1, 0)
         assert (stats.processed, stats.failed, stats.skipped, stats.blocked, stats.unreachable) == (1, 1, 1, 1, 1)
 
@@ -202,9 +230,10 @@ class TestOutcomes:
 
         # The worker that saves it is not kept waiting for its own save.
         assert await frontier.take() is None
-        assert frontier.stats().processed == 1
+        assert (await current_stats(frontier)).processed == 1
         await frontier.saved([page.url])
-        assert (frontier.stats().processed, frontier.stats().in_progress) == (1, 0)
+        stats = await current_stats(frontier)
+        assert (stats.processed, stats.in_progress) == (1, 0)
 
     async def test_pending_or_processed_urls(self, frontier):
         await frontier.seed([f"http://site/{name}" for name in "abcd"])
@@ -247,7 +276,7 @@ class TestOutcomes:
 
 class TestMaxPages:
     async def test_pages_admitted_up_to_max_pages_and_then_none_is_handed_out(self, make_frontier):
-        frontier = make_frontier(max_pages=2)
+        frontier = await make_frontier(max_pages=2)
         await frontier.seed([f"http://site/{name}" for name in "abcd"])
         a, b, c = [await take(frontier) for _ in range(3)]
 
@@ -260,27 +289,27 @@ class TestMaxPages:
         assert await frontier.take() is None
         await frontier.finish(a, Outcome.PROCESSED)
         await frontier.finish(b, Outcome.PROCESSED)
-        stats = frontier.stats()
+        stats = await current_stats(frontier)
         assert (stats.requested, stats.processed, stats.queued) == (2, 2, 2)
 
     async def test_page_put_back_uncounted_frees_its_place_until_taken_again(self, make_frontier):
-        frontier = make_frontier(max_pages=1)
+        frontier = await make_frontier(max_pages=1)
         await frontier.seed(["http://site/a", "http://site/b"])
         a = await take(frontier)
         assert await frontier.admit(a) is Admission.ADMITTED
 
         await frontier.put_back(a, 0.01, uncount=True)
 
-        assert frontier.stats().requested == 0
+        assert (await current_stats(frontier)).requested == 0
         # The put-off page comes back after the page that took its place.
         b = await take(frontier)
         assert await frontier.admit(b) is Admission.ADMITTED
         await frontier.finish(b, Outcome.PROCESSED)
         assert await frontier.take() is None
-        assert frontier.stats().queued == 1
+        assert (await current_stats(frontier)).queued == 1
 
     async def test_page_given_up_uncounted_frees_its_place(self, make_frontier):
-        frontier = make_frontier(max_pages=1)
+        frontier = await make_frontier(max_pages=1)
         await frontier.seed(["http://site/a", "http://site/b"])
         a = await take(frontier)
         assert await frontier.admit(a) is Admission.ADMITTED
@@ -289,10 +318,10 @@ class TestMaxPages:
 
         b = await take(frontier)
         assert await frontier.admit(b) is Admission.ADMITTED
-        assert frontier.stats().requested == 1
+        assert (await current_stats(frontier)).requested == 1
 
     async def test_page_given_up_after_its_request_stays_counted(self, make_frontier):
-        frontier = make_frontier(max_pages=1)
+        frontier = await make_frontier(max_pages=1)
         await frontier.seed(["http://site/a", "http://site/b"])
         a = await take(frontier)
         assert await frontier.admit(a) is Admission.ADMITTED
@@ -300,7 +329,7 @@ class TestMaxPages:
         await frontier.finish(a, Outcome.FAILED, "HTTPStatusError: HTTP 503")
 
         assert await frontier.take() is None
-        assert frontier.stats().requested == 1
+        assert (await current_stats(frontier)).requested == 1
 
     async def test_without_limits_every_page_is_admitted(self, frontier):
         await frontier.add([f"http://site/{i}" for i in range(50)], depth=1)
@@ -312,18 +341,18 @@ class TestMaxPages:
 
 class TestMaxPagesPerHost:
     async def test_page_over_the_host_limit_is_not_admitted(self, make_frontier):
-        frontier = make_frontier(max_pages_per_host=1)
+        frontier = await make_frontier(max_pages_per_host=1)
         await frontier.seed(["http://a/1", "http://a/2", "http://b/1"])
         a1, a2, b1 = [await take(frontier) for _ in range(3)]
 
         assert await frontier.admit(a1) is Admission.ADMITTED
         assert await frontier.admit(a2) is Admission.OVER_HOST_LIMIT
         assert await frontier.admit(b1) is Admission.ADMITTED
-        assert frontier.stats().over_host_limit == 1
-        assert frontier.stats().requested == 2
+        stats = await current_stats(frontier)
+        assert (stats.over_host_limit, stats.requested) == (1, 2)
 
     async def test_page_of_the_host_uncounted_frees_its_place(self, make_frontier):
-        frontier = make_frontier(max_pages_per_host=1)
+        frontier = await make_frontier(max_pages_per_host=1)
         await frontier.seed(["http://a/1", "http://a/2"])
         a1, a2 = await take(frontier), await take(frontier)
         assert await frontier.admit(a1) is Admission.ADMITTED
@@ -335,17 +364,17 @@ class TestMaxPagesPerHost:
 
 class TestBounds:
     async def test_found_pages_are_accepted_until_the_frontier_is_full(self, make_frontier):
-        frontier = make_frontier(max_pages=1, frontier_factor=3)
+        frontier = await make_frontier(max_pages=1, frontier_factor=3)
         await frontier.seed(["http://site/"])
 
         assert await frontier.add([f"http://site/{i}" for i in range(5)], depth=1) == 2
         assert await frontier.full()
-        assert frontier.stats().links_dropped == 3
+        assert (await current_stats(frontier)).links_dropped == 3
         # Not remembered: a page found again once there is room is accepted then.
         assert await frontier.mark_seen("http://site/4")
 
     async def test_pages_requested_take_room_in_the_frontier(self, make_frontier):
-        frontier = make_frontier(max_pages=2, frontier_factor=1)
+        frontier = await make_frontier(max_pages=2, frontier_factor=1)
         await frontier.seed(["http://site/a"])
         page = await take(frontier)
         await frontier.admit(page)
@@ -355,16 +384,16 @@ class TestBounds:
         assert await frontier.full()
 
     async def test_host_has_a_bounded_share_of_the_frontier(self, make_frontier):
-        frontier = make_frontier(max_pages_per_host=1, frontier_factor=2)
+        frontier = await make_frontier(max_pages_per_host=1, frontier_factor=2)
         await frontier.seed(["http://a/"])
 
         assert await frontier.add([f"http://a/{i}" for i in range(4)], depth=1) == 1
         assert await frontier.add(["http://b/1"], depth=1) == 1
-        assert frontier.stats().links_dropped_by_host == 3
+        assert (await current_stats(frontier)).links_dropped_by_host == 3
 
     async def test_duplicates_are_not_counted_as_dropped(self, make_frontier):
-        frontier = make_frontier(max_pages=1, frontier_factor=1)
+        frontier = await make_frontier(max_pages=1, frontier_factor=1)
         await frontier.seed(["http://site/"])
 
         assert await frontier.add(["http://site/", "http://site/new"], depth=1) == 0
-        assert frontier.stats().links_dropped == 1
+        assert (await current_stats(frontier)).links_dropped == 1
