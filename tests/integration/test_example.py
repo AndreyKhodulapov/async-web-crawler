@@ -1,19 +1,20 @@
-"""Integration tests: the example of examples/ crawls a local site by a configuration file."""
+"""Integration tests: the examples of examples/ crawl a local site by a configuration file and render its pages."""
 
 import asyncio
-import importlib.util
 import json
 import logging
+import os
+import re
+import sys
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 
 import pytest
 import yaml
-from helpers import BOT
+from helpers import BOT, EXAMPLES, load_example
 
 from crawler import load_config
 
-EXAMPLES = Path(__file__).parents[2] / "examples"
+SRC = EXAMPLES.parent / "src"
 
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
@@ -21,10 +22,7 @@ pytestmark = pytest.mark.usefixtures("restore_logging")
 
 @pytest.fixture
 def example():
-    spec = importlib.util.spec_from_file_location("advanced_usage", EXAMPLES / "advanced_usage.py")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return load_example("advanced_usage")
 
 
 def test_configuration_of_the_example_is_valid(example):
@@ -94,3 +92,32 @@ async def test_interrupted_example_stops_the_crawl_before_closing(example, url, 
 
     # A crawl left running would have its request fail on the closed session and be retried.
     assert "Connector is closed" not in caplog.text
+
+
+@pytest.mark.browser
+@pytest.mark.usefixtures("chromium")
+async def test_rendering_example_shows_what_javascript_adds(url, capsys):
+    await load_example("render_js").main(url("/js/links"))
+
+    output = capsys.readouterr().out
+    assert re.search(r"without rendering: \d+ characters of text, 0 links\n", output)
+    assert re.search(r"with rendering: +\d+ characters of text, 1 links, rendered in \d+\.\d\ds\n", output)
+    assert f"links only JavaScript shows: {url('/js/target')}\n" in output
+    assert "made by javascript" in output
+
+
+async def test_rendering_example_fails_with_the_error_of_the_page(url):
+    # Without a browser: a page that cannot be downloaded never gets to one.
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(EXAMPLES / "render_js.py"),
+        url("/status/404"),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=os.environ | {"PYTHONPATH": str(SRC)},
+    )
+    async with asyncio.timeout(60):
+        _, stderr = await process.communicate()
+
+    assert process.returncode == 1
+    assert stderr.decode().endswith(f"error: {url('/status/404')}: HTTP 404 Not Found\n")

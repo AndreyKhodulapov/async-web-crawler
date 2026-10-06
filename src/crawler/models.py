@@ -176,6 +176,38 @@ class CircuitStats:
     rejected: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class ProxyStats:
+    """One proxy of a `ProxyPool`.
+
+    `state` is "active", or "out" while the proxy is out of rotation.
+    `requests` (those sent through the proxy), `failures` (those the proxy
+    failed) and `times_removed` (out of rotation) count since the stats
+    were last reset.
+    """
+
+    state: str
+    requests: int = 0
+    failures: int = 0
+    times_removed: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class RenderStats:
+    """The pages rendered in the browser since the stats were last reset.
+
+    `rendered` counts the pages the browser loaded to the end, those that
+    went to another URL on their own included; `failed` those it did not
+    (a timeout, a browser that is not installed or crashed).
+    `avg_render_time` is the average time in seconds the browser took for
+    a rendered page, without the wait for a free tab.
+    """
+
+    rendered: int = 0
+    failed: int = 0
+    avg_render_time: float = 0.0
+
+
 class Metadata(TypedDict):
     title: str | None
     description: str | None

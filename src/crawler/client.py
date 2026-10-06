@@ -4,6 +4,7 @@ import asyncio
 import logging
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from http.cookiejar import Cookie
 from types import TracebackType
 from typing import Self
 
@@ -14,16 +15,24 @@ from crawler.crawl_run import CrawlRun
 from crawler.exceptions import ParseError, StorageError
 from crawler.fetching import Fetcher
 from crawler.filters import UrlFilter
-from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage
+from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage, ProxyStats, RenderStats
 from crawler.parser import HTMLParser
+from crawler.proxy import ProxyPool
 from crawler.rate_limiter import RateLimiter
+from crawler.rendering import BrowserTransport, Rendering
 from crawler.retry import RetryStrategy
 from crawler.robots import RobotsParser, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.session import (
+    cookie_domain_problem,
+    cookie_name_problem,
+    header_name_problem,
+    header_value_problem,
+)
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
 from crawler.storage.base import DataStorage
-from crawler.transport import HttpTransport
+from crawler.transport import HttpTransport, Transport
 from crawler.urls import get_host, is_valid_http_url
 
 logger = logging.getLogger(__name__)
@@ -110,6 +119,54 @@ class AsyncCrawler:
     several User-Agent strings between requests; they must all carry that
     same name, so rotation cannot sidestep robots.txt.
 
+    Every request carries the `headers`, such as Authorization or
+    Accept-Language, whatever its host: pages, robots.txt and sitemaps,
+    the hosts of other sites and redirects to them included. The crawler
+    keeps the cookies that sites set and sends them back as a browser
+    does, robots.txt and sitemaps sharing them with the pages; `cookies`
+    are there from the first request (see `load_cookies_file`), and
+    `export_cookies()` gives them all (see `save_cookies_file`). With
+    `keep_cookies=False` it sends none and keeps none: a site cannot keep
+    a session of the crawler. aiohttp keeps no cookies of IP addresses, so
+    a site reached by one gets none.
+
+    With `proxies`, every request goes through a proxy of the pool: pages,
+    robots.txt and sitemaps alike (see `ProxyPool` for the rotation and
+    the proxies taken out of it). Politeness stays with the sites: the
+    rate limit, robots.txt and `max_per_domain` are those of the host of
+    the URL, whatever proxy the request goes through. A proxy that fails
+    a request fails it with `ProxyNetworkError`, a network error that is
+    retried, through another proxy at once; when every proxy is out of
+    rotation, requests fail with `NoProxyError` without being sent, and
+    are not retried. The circuit breaker counts neither: a dead proxy
+    must not block the sites behind it. robots.txt that cannot be
+    downloaded for this reason is not cached as unreachable: the page
+    fails with the error of the proxy. `proxy_stats()` counts the
+    requests and failures of every proxy; the proxies out of rotation
+    stay out from one `crawl()` to the next.
+
+    With `rendering`, HTML pages are rendered in a headless Chromium
+    (Playwright, an optional dependency), so that the links and the text
+    that JavaScript makes are found: every page, or those the patterns of
+    `rendering` name (see `Rendering`). A page is downloaded as without a
+    browser, through the limits, the proxies and the cookies of the
+    crawler; the browser gets the document as downloaded and loads its
+    scripts, styles and data itself, without asking robots.txt, as a
+    browser does. The browser shares the cookies of the crawler both
+    ways, those JavaScript sets included, and its requests carry the
+    `user_agent` and the `headers`; with `keep_cookies=False` every page
+    has a browser of its own, without cookies. A page that goes to another URL on its own (a
+    JavaScript or `<meta>` redirect) is followed as a redirect: robots.txt,
+    the filters of `crawl()` and `MAX_REDIRECTS` apply to it. A page the
+    browser takes longer than `rendering.timeout` to render fails with
+    `RenderTimeoutError`, a timeout that is retried and not held against
+    the host; one it cannot render (not installed, crashed) with
+    `RenderError`, which is not retried. The circuit breaker counts
+    neither. robots.txt and sitemaps are never rendered.
+    The browser starts with the first page to render and is closed by
+    `close()`. `render_stats()` counts the pages rendered and failed, and
+    the time the browser took for them.
+
     `error_stats()` counts the errors of page requests and their retries
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
     counted there, and neither are the requests the circuit breaker refused
@@ -191,6 +248,11 @@ class AsyncCrawler:
         max_retry_after: float = DEFAULT_MAX_RETRY_AFTER,
         user_agent: str = DEFAULT_USER_AGENT,
         user_agents: Sequence[str] = (),
+        headers: Mapping[str, str] | None = None,
+        cookies: Iterable[Cookie] = (),
+        keep_cookies: bool = True,
+        proxies: ProxyPool | None = None,
+        rendering: Rendering | None = None,
         parser: HTMLParser | None = None,
         storage: DataStorage | None = None,
         keep_pages: bool = True,
@@ -220,6 +282,19 @@ class AsyncCrawler:
                 raise ValueError(
                     f"rotated user agent {agent!r} must use the robots.txt name {robots_name!r} of user_agent"
                 )
+        headers = dict(headers or {})
+        for name, value in headers.items():
+            # The value is not shown: it may be a secret, such as a token.
+            problem = header_name_problem(name) or header_value_problem(value)
+            if problem is not None:
+                raise ValueError(f"header {name!r}: {problem}")
+        cookies = list(cookies)
+        if cookies and not keep_cookies:
+            raise ValueError("cookies need keep_cookies=True")
+        for cookie in cookies:
+            problem = cookie_name_problem(cookie.name) or cookie_domain_problem(cookie.domain)
+            if problem is not None:
+                raise ValueError(f"cookie {cookie.name!r} of {cookie.domain!r}: {problem}")
 
         # These validate their own arguments.
         self._limits = SemaphoreManager(max_concurrent, max_per_domain)
@@ -244,9 +319,26 @@ class AsyncCrawler:
             user_agent=user_agent,
             user_agents=user_agents,
             max_page_size=max_page_size,
+            headers=headers,
+            cookies=cookies,
+            keep_cookies=keep_cookies,
+            proxies=proxies,
         )
+        self._transport: Transport = transport
+        if rendering is not None:
+            self._transport = BrowserTransport(
+                transport,
+                rendering,
+                user_agent=user_agent,
+                max_page_size=max_page_size,
+                headers=headers,
+                keep_cookies=keep_cookies,
+                no_proxy=None if proxies is None else proxies.no_proxy,
+            )
+        self._proxies = proxies
+        self._rendering = rendering
         self._fetcher = Fetcher(
-            transport,
+            self._transport,
             limits=self._limits,
             rate_limiter=rate_limiter,
             retry_strategy=retry_strategy or RetryStrategy(),
@@ -326,6 +418,14 @@ class AsyncCrawler:
     @property
     def circuit_breaker(self) -> CircuitBreaker:
         return self._fetcher.circuit_breaker
+
+    @property
+    def proxies(self) -> ProxyPool | None:
+        return self._proxies
+
+    @property
+    def rendering(self) -> Rendering | None:
+        return self._rendering
 
     @property
     def robots(self) -> RobotsParser | None:
@@ -569,9 +669,10 @@ class AsyncCrawler:
         counted in `crawl_stats()`.
         The state of the crawl (`processed_urls`, `visited_urls`,
         `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`, `failed_sitemaps`, `url_depths`,
-        `stats`, `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()`) is reset
-        on every call and stays available after it returns. The rate limits, the robots.txt
-        cache and the states of the circuit breaker carry over; a site whose
+        `stats`, `crawl_stats()`, `error_stats()`, the counters of `circuit_breaker.get_stats()` and
+        `proxy_stats()`) is reset on every call and stays available after it returns. The rate limits,
+        the robots.txt cache, the states of the circuit breaker and the proxies out of rotation carry
+        over; a site whose
         robots.txt the previous crawl gave up on is downloaded again.
 
         Raises:
@@ -650,12 +751,27 @@ class AsyncCrawler:
         """Progress of the running crawl, or the result of the latest one."""
         return self._run.crawl_stats()
 
+    def export_cookies(self) -> list[Cookie]:
+        """The cookies the crawler keeps, those sites have set included; empty with `keep_cookies=False`.
+
+        They stay available after `close()`.
+        """
+        return self._transport.cookies()
+
+    def proxy_stats(self) -> dict[str, ProxyStats]:
+        """The proxies by label (their URLs with the password hidden); empty without `proxies`."""
+        return {} if self.proxies is None else self.proxies.get_stats()
+
+    def render_stats(self) -> RenderStats | None:
+        """The pages rendered in the browser since the latest crawl() started; None without `rendering`."""
+        return self._transport.render_stats() if isinstance(self._transport, BrowserTransport) else None
+
     def error_stats(self) -> ErrorStats:
         """Errors of page requests since the latest crawl() started, or since the crawler was created."""
         return self._fetcher.errors.get_stats()
 
     async def close(self) -> None:
-        """Close the HTTP session and the storage. Safe to call more than once.
+        """Close the HTTP session, the browser and the storage. Safe to call more than once.
 
         A storage that cannot write its last pages is closed all the same;
         the failure is logged.

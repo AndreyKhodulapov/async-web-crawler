@@ -28,9 +28,14 @@ from crawler import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    NoProxyError,
     ParseError,
     PermanentError,
+    PermanentHTTPError,
     ProgressTracker,
+    ProxyNetworkError,
+    ProxyPool,
+    ProxyStats,
     RateLimiter,
     RetryStrategy,
     RobotsDisallowedError,
@@ -56,6 +61,7 @@ class FakeResponse:
         robots_tag: tuple[str, ...] = (),
     ) -> None:
         self.status = status
+        self.reason = "Error"
         self._body = body
         self.headers: CIMultiDict[str] = CIMultiDict()
         if content_type is not None:
@@ -128,6 +134,8 @@ class FakeSession:
         self.requested: list[str] = []
         self.user_agents: list[str | None] = []  # per-request User-Agent headers
         self.timeouts: list[aiohttp.ClientTimeout | None] = []  # per-request timeouts
+        self.headers: list[dict[str, str]] = []  # per-request headers, beyond those of the session
+        self.proxies: list[tuple[str | None, dict[str, str] | None]] = []  # per-request proxy and its headers
 
     def get(
         self,
@@ -135,10 +143,14 @@ class FakeSession:
         headers: dict[str, str] | None = None,
         timeout: aiohttp.ClientTimeout | None = None,
         allow_redirects: bool = True,
+        proxy: str | None = None,
+        proxy_headers: dict[str, str] | None = None,
     ) -> FakeRequest:
         assert not allow_redirects  # the crawler follows redirects itself
         self.user_agents.append(None if headers is None else headers.get("User-Agent"))
+        self.headers.append(dict(headers or {}))
         self.timeouts.append(timeout)
+        self.proxies.append((proxy, proxy_headers))
         return FakeRequest(self, url)
 
     async def handle(self, url: str) -> FakeResponse:
@@ -380,6 +392,12 @@ class TestErrorMapping:
             await crawler.fetch_url("http://a")
         assert type(raised.value) is kind
         assert os_error.strerror in raised.value.message
+
+    async def test_407_of_a_site_is_an_http_error(self, crawler, fake_session):
+        # Without a proxy, it is the site that asks for one.
+        fake_session.routes["http://a"] = FakeResponse(status=407)
+        with pytest.raises(PermanentHTTPError):
+            await crawler.fetch_url("http://a")
 
     async def test_server_timeout_is_a_timeout(self, crawler, fake_session):
         # aiohttp.ServerTimeoutError is also a ClientError: it must still be
@@ -1757,3 +1775,182 @@ class TestRobots:
         assert set(crawler.processed_urls) == {"http://a/1", "http://a/2", "http://b/1", "http://b/2", "http://b/3"}
         assert crawler.unreachable_urls == {}
         assert fake_session.requested.count("http://a/robots.txt") == 1
+
+
+class TestProxies:
+    """Requests through a proxy: its URL and password, the errors of proxies, the outcomes the pool is told."""
+
+    PROXY = "http://proxy:3128"
+    AUTHORIZATION = "Basic dXNlcjpzM2NyM3Q="  # user:s3cr3t
+
+    @pytest.fixture
+    def make_proxied(self, make_crawler):
+        def make(*urls: str, **options) -> AsyncCrawler:
+            return make_crawler(proxies=ProxyPool(urls or ["http://user:s3cr3t@proxy:3128"], max_failures=1), **options)
+
+        return make
+
+    async def test_the_password_goes_to_the_proxy_of_an_http_url_in_the_request(self, make_proxied, fake_session):
+        await make_proxied().fetch_url("http://a/")
+        assert fake_session.proxies == [(self.PROXY, None)]
+        assert fake_session.headers[0]["Proxy-Authorization"] == self.AUTHORIZATION
+
+    async def test_the_password_goes_to_the_proxy_of_an_https_url_with_connect(self, make_proxied, fake_session):
+        # The request itself goes to the site, through the tunnel: it must not carry the password.
+        await make_proxied().fetch_url("https://a/")
+        assert fake_session.proxies == [(self.PROXY, {"Proxy-Authorization": self.AUTHORIZATION})]
+        assert "Proxy-Authorization" not in fake_session.headers[0]
+
+    async def test_a_proxy_without_a_password_sends_no_header(self, make_proxied, fake_session):
+        await make_proxied("http://proxy:3128").fetch_url("http://a/")
+        assert fake_session.proxies == [(self.PROXY, None)]
+        assert fake_session.headers == [{}]
+
+    @pytest.mark.parametrize(
+        ("outcome", "url"),
+        [
+            (
+                aiohttp.ClientProxyConnectionError(MagicMock(), ConnectionRefusedError("connection refused")),
+                "https://a/",
+            ),
+            # Only the proxy is looked up by the client.
+            (
+                aiohttp.ClientConnectorDNSError(MagicMock(), socket.gaierror(socket.EAI_NONAME, "not known")),
+                "https://a/",
+            ),
+            (
+                aiohttp.ClientHttpProxyError(MagicMock(), (), status=407, message="Proxy Authentication Required"),
+                "https://a/",
+            ),
+            # An http URL is requested from the proxy itself.
+            (FakeResponse(status=407), "http://a/"),
+        ],
+        ids=["refused", "dns", "connect-407", "407"],
+    )
+    async def test_failures_of_the_proxy(self, make_proxied, fake_session, outcome, url):
+        crawler = make_proxied()
+        fake_session.routes[url] = outcome
+        result = await crawler.fetch_result(url)
+
+        assert isinstance(result.error, ProxyNetworkError)
+        assert result.error.message.startswith("proxy http://user:***@proxy:3128")
+        assert crawler.proxy_stats()["http://user:***@proxy:3128"] == ProxyStats(
+            state="out", requests=1, failures=1, times_removed=1
+        )
+
+    @pytest.mark.parametrize(
+        ("outcome", "kind"),
+        [
+            # The proxy cannot reach the site, or may not.
+            (aiohttp.ClientHttpProxyError(MagicMock(), (), status=502, message="Bad Gateway"), NetworkError),
+            (aiohttp.ClientHttpProxyError(MagicMock(), (), status=403, message="Forbidden"), NetworkError),
+            (TimeoutError(), FetchTimeoutError),
+            (aiohttp.ServerDisconnectedError(), NetworkError),
+            # Inside the tunnel of an https URL the site answers, not the proxy.
+            (FakeResponse(status=407), PermanentHTTPError),
+            (
+                aiohttp.ClientConnectorCertificateError(
+                    MagicMock(host="a", port=443), ssl.SSLCertVerificationError("certificate has expired")
+                ),
+                CertificateError,
+            ),
+        ],
+        ids=["connect-502", "connect-403", "timeout", "disconnected", "site-407", "site-certificate"],
+    )
+    async def test_failures_of_the_site_count_neither_way(self, make_proxied, fake_session, outcome, kind):
+        crawler = make_proxied()
+        fake_session.routes["https://a/"] = outcome
+        result = await crawler.fetch_result("https://a/")
+
+        assert type(result.error) is kind
+        assert crawler.proxy_stats()["http://user:***@proxy:3128"] == ProxyStats(state="active", requests=1)
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            aiohttp.ClientConnectorCertificateError(
+                MagicMock(host="proxy", port=3129), ssl.SSLCertVerificationError("self-signed certificate")
+            ),
+            aiohttp.ClientConnectorSSLError(MagicMock(host="proxy", port=3129), ssl.SSLError("wrong version number")),
+        ],
+        ids=["certificate", "tls"],
+    )
+    async def test_tls_failures_with_an_https_proxy_are_its_own(self, make_proxied, fake_session, outcome):
+        # aiohttp names the connection that failed: here that to the proxy, not to the site in the tunnel.
+        crawler = make_proxied("https://proxy:3129")
+        fake_session.routes["https://a/"] = outcome
+        result = await crawler.fetch_result("https://a/")
+
+        assert isinstance(result.error, ProxyNetworkError)
+        assert crawler.proxy_stats()["https://proxy:3129"].failures == 1
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [FakeResponse(), FakeResponse(status=404), FakeResponse(status=503), FakeResponse(body=b"x" * 100)],
+        ids=["200", "404", "503", "too-large"],
+    )
+    async def test_any_response_is_a_success_of_the_proxy(self, make_proxied, fake_session, outcome):
+        crawler = make_proxied(max_page_size=10)
+        fake_session.routes["http://a/"] = [
+            aiohttp.ClientProxyConnectionError(MagicMock(), ConnectionRefusedError("connection refused")),
+            outcome,
+        ]
+        pool = crawler.proxies
+        pool.max_failures = 2
+        await crawler.fetch_result("http://a/")
+        await crawler.fetch_result("http://a/")
+        await crawler.fetch_result("http://a/")  # would take it out, after two failures in a row
+
+        assert crawler.proxy_stats()["http://user:***@proxy:3128"].state == "active"
+
+    async def test_a_robots_txt_downloaded_again_passes_over_a_proxy_that_failed(self, make_proxied, fake_session):
+        # A download after a failed one is a single attempt at the site, and
+        # the failure of a proxy is not one: the page would fail for it.
+        crawler = make_proxied(
+            "http://proxy-1:3128",
+            "http://proxy-2:3128",
+            respect_robots=True,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+        )
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        crawler.ROBOTS_POLL = 0.01
+        fake_session.routes["http://a/robots.txt"] = [
+            *[FakeResponse(status=503)] * 2,  # the first download, with its retry
+            aiohttp.ClientProxyConnectionError(MagicMock(), ConnectionRefusedError("connection refused")),
+            FakeResponse(status=404),
+        ]
+
+        pages = await crawler.crawl(["http://a/1"])
+
+        assert list(pages) == ["http://a/1"]
+        assert fake_session.requested == [*["http://a/robots.txt"] * 4, "http://a/1"]
+
+    async def test_no_request_is_sent_without_a_proxy(self, make_proxied, fake_session):
+        crawler = make_proxied(retry_strategy=RetryStrategy(max_retries=3, base_delay=0.01))
+        fake_session.routes["http://a/"] = aiohttp.ClientProxyConnectionError(
+            MagicMock(), ConnectionRefusedError("connection refused")
+        )
+        result = await crawler.fetch_result("http://a/")
+
+        assert isinstance(result.error, NoProxyError)  # the retry found no proxy, and it is not retried
+        assert fake_session.requested == ["http://a/"]
+        assert crawler.error_stats().retries == 1
+
+    async def test_a_crawl_counts_the_proxies_anew(self, make_proxied, fake_session):
+        crawler = make_proxied("http://proxy-1:3128", "http://proxy-2:3128")
+        fake_session.routes["http://a/"] = aiohttp.ClientProxyConnectionError(
+            MagicMock(), ConnectionRefusedError("connection refused")
+        )
+        await crawler.fetch_result("http://a/")
+        assert sum(stats.requests for stats in crawler.proxy_stats().values()) == 1
+
+        await crawler.crawl(["http://b/"], max_pages=1)
+
+        stats = crawler.proxy_stats()
+        assert sum(each.requests for each in stats.values()) == 1  # the page of the crawl alone
+        assert [each.state for each in stats.values()].count("out") == 1  # the proxy taken out stays out
+
+    async def test_without_proxies_the_stats_are_empty(self, crawler):
+        assert crawler.proxies is None
+        assert crawler.proxy_stats() == {}

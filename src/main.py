@@ -5,6 +5,7 @@ Usage:
     python src/main.py --urls https://example.com --max-pages 100 --output results.json
     python src/main.py --config config.yaml --max-pages 500 --report report.html
     python src/main.py --config config.yaml --urls-file urls.txt
+    python src/main.py --urls https://quotes.toscrape.com/js/ --render
     cat urls.txt | python src/main.py --config config.yaml --urls-file -
 
 A crawl is set up by a configuration file (see config.example.yaml), by
@@ -22,9 +23,11 @@ import asyncio
 import sys
 from typing import Any
 
-from cli_options import hide_password, http_url, positive
+from cli_options import http_url, positive, proxy_url
 from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, StorageError, load_config, load_urls, show_progress
 from crawler.config import LOG_LEVELS
+from crawler.rendering import browser_problem
+from crawler.urls import hide_password
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -60,6 +63,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--overwrite",
         action=argparse.BooleanOptionalAction,
         help="start output files anew, or add to them; databases keep a row per URL either way",
+    )
+    parser.add_argument(
+        "--cookies-file",
+        metavar="PATH",
+        help="send the cookies of a Netscape cookies.txt file, as a browser extension or curl -c exports it",
+    )
+    parser.add_argument(
+        "--save-cookies", metavar="PATH", help="write the cookies to a cookies.txt file after the crawl"
+    )
+    parser.add_argument(
+        "--proxy",
+        action="append",
+        type=proxy_url,
+        metavar="URL",
+        help="send the requests through a proxy, http://[user:password@]host:port; "
+        "repeat for several, in place of those of the configuration",
+    )
+    parser.add_argument(
+        "--render",
+        action="store_true",
+        help="render every HTML page in a headless Chromium, so that links JavaScript makes are found; "
+        "in place of rendering.mode and rendering.include of the configuration. Needs playwright install chromium",
     )
     parser.add_argument(
         "--respect-robots",
@@ -112,6 +137,8 @@ def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         ("filters", "same_domain_only", args.same_domain_only),
         ("storage", "outputs", args.output),
         ("storage", "overwrite", args.overwrite),
+        ("session", "cookies_file", args.cookies_file),
+        ("session", "save_cookies", args.save_cookies),
         ("report", "stats_json", args.stats_json),
         ("report", "html", args.report),
         ("logging", "level", args.log_level),
@@ -122,6 +149,11 @@ def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         if value is not None:
             target = overrides if section is None else overrides.setdefault(section, {})
             target[key] = value
+    if args.proxy is not None:
+        overrides["proxy"] = {"urls": args.proxy, "from_env": False}
+    if args.render:
+        # Every page: the patterns of the file would name only some of them.
+        overrides["rendering"] = {"mode": "always", "include": []}
     if args.rate_limit is not None:
         # The configuration spells "no limit" as null.
         overrides.setdefault("crawler", {})["rate_limit"] = args.rate_limit or None
@@ -170,6 +202,19 @@ def print_summary(crawler: AdvancedCrawler, *, interrupted: bool = False) -> Non
     ):
         if counts:
             print(f"{title}: {', '.join(f'{name}: {pages}' for name, pages in counts.items())}")
+    if "proxies" in stats:
+        proxies = [
+            f"{label} ({proxy['requests']} sent, {proxy['failures']} failed"
+            f"{', out of rotation' if proxy['state'] == 'out' else ''})"
+            for label, proxy in stats["proxies"].items()
+        ]
+        print(f"Proxies: {', '.join(proxies)}")
+    if "rendering" in stats:
+        rendering = stats["rendering"]
+        print(
+            f"Rendering: {rendering['rendered']} pages rendered, {rendering['failed']} failed, "
+            f"average {rendering['avg_render_time']:.2f}s"
+        )
     outputs = crawler.config.storage.outputs
     if outputs:
         saving = crawler.crawler.crawl_stats()
@@ -177,6 +222,8 @@ def print_summary(crawler: AdvancedCrawler, *, interrupted: bool = False) -> Non
         print(f"Saved: {saving.saved} pages to {', '.join(map(hide_password, outputs))}{not_saved}")
     if crawler.reports:
         print(f"Reports: {', '.join(map(str, crawler.reports))}")
+    if crawler.cookie_file is not None:
+        print(f"Cookies: {crawler.cookie_file}")
     if crawler.config.logging.file is not None:
         print(f"Log: {crawler.config.logging.file}")
 
@@ -185,14 +232,22 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
     """Crawl by the configuration, print the summary; return the exit code.
 
     Cancelled (Ctrl-C), it stops the crawl, writes the reports of the pages
-    fetched so far and saves those pages before the cancellation goes on.
+    fetched so far, the cookies and those pages before the cancellation goes on.
     So it does when the progress cannot be shown, e.g. stderr is a pipe
     that was closed.
 
     Raises:
+        ConfigError: the file of `session.cookies_file` cannot be read, with
+            `proxy.from_env` a variable is not the URL of a proxy, or pages are
+            to be rendered and Chromium is not installed; nothing is requested.
         OSError: a directory cannot be created, or the log file cannot be opened.
         StorageError: an output file or the database cannot be opened; nothing is requested.
     """
+    if config.rendering.mode != "off":
+        # Before anything is created: without the check, every page would fail.
+        problem = await browser_problem()
+        if problem is not None:
+            raise ConfigError([f"rendering.mode: {problem}"])
     async with AdvancedCrawler(config) as crawler:
         crawl = asyncio.create_task(crawler.crawl())
         try:
@@ -207,6 +262,7 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
                 # A storage that could not be opened stopped the crawl before
                 # it requested anything: there is nothing to report.
                 crawler.write_reports()
+                crawler.save_cookies()
             if isinstance(error, asyncio.CancelledError):
                 await crawler.close()  # writes the pages the storage still holds, so the summary counts them
                 print_summary(crawler, interrupted=True)
@@ -227,6 +283,9 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     try:
         return asyncio.run(run(config, progress=not args.no_progress))
+    except ConfigError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
     except (OSError, StorageError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

@@ -2,10 +2,12 @@
 
 import inspect
 import json
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
+from helpers import cookies_file
 
 from crawler import (
     AsyncCrawler,
@@ -15,6 +17,8 @@ from crawler import (
     CrawlerConfig,
     CSVStorage,
     JSONStorage,
+    ProxyPool,
+    Rendering,
     RetryStrategy,
     load_config,
 )
@@ -24,8 +28,11 @@ from crawler.config import (
     CrawlOptions,
     FilterOptions,
     LoggingOptions,
+    ProxyOptions,
+    RenderingOptions,
     ReportOptions,
     RetryOptions,
+    SessionOptions,
     SitemapOptions,
     StorageOptions,
 )
@@ -64,6 +71,29 @@ FULL = {
         "include": ["^https://example\\.com/blog/"],
         "exclude": ["\\.pdf$"],
         "exclude_extensions": ["zip", "mp4"],
+    },
+    "session": {
+        "keep_cookies": True,
+        "cookies": [{"name": "sid", "value": "s3cr3t", "domain": ".example.com", "path": "/app", "secure": True}],
+        "cookies_file": "cookies.txt",
+        "save_cookies": "saved-cookies.txt",
+        "headers": {"Accept-Language": "en", "Authorization": "Bearer t0ken"},
+    },
+    "proxy": {
+        "urls": ["http://user:pr0xyp4ss@proxy-1.example:3128", "https://proxy-2.example:8443"],
+        "rotation": "per_request",
+        "from_env": False,
+        "max_failures": 5,
+        "cooldown": 30.0,
+    },
+    "rendering": {
+        "mode": "patterns",
+        "include": ["^https://example\\.com/app/"],
+        "wait_until": "networkidle",
+        "wait_for": "#content",
+        "timeout": 10.0,
+        "max_open_pages": 4,
+        "block_resources": ["image", "stylesheet"],
     },
     "storage": {
         "outputs": ["pages.jsonl", "pages.csv"],
@@ -116,6 +146,19 @@ class TestDefaults:
         assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8", overwrite=False)
         assert config.logging == LoggingOptions(level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5)
         assert config.report == ReportOptions(stats_json=None, html=None, title="Crawl report", top_domains=10)
+        assert config.session == SessionOptions(
+            keep_cookies=True, cookies=(), cookies_file=None, save_cookies=None, headers={}
+        )
+        assert config.proxy == ProxyOptions(urls=(), rotation="per_host", from_env=False, max_failures=3, cooldown=60.0)
+        assert config.rendering == RenderingOptions(
+            mode="off",
+            include=(),
+            wait_until="load",
+            wait_for=None,
+            timeout=30.0,
+            max_open_pages=2,
+            block_resources=("image", "font", "media"),
+        )
 
     def test_defaults_are_those_of_the_components(self):
         """The crawler built without a configuration and with an empty one behave the same."""
@@ -152,6 +195,10 @@ class TestDefaults:
         assert crawl["same_domain_only"] is False
         assert crawl["exclude_extensions"] == ()
         assert SitemapOptions().from_robots == crawl["robots_sitemaps"]
+        pool = defaults(ProxyPool.__init__)
+        for name in ("rotation", "max_failures", "cooldown"):
+            assert getattr(ProxyOptions(), name) == pool[name], name
+        assert RenderingOptions(mode="always").build() == Rendering()
 
     def test_configuration_cannot_be_changed(self):
         config = CrawlerConfig()
@@ -592,3 +639,360 @@ class TestFiles:
     def test_key_that_is_not_a_string(self, tmp_path):
         with pytest.raises(ConfigError, match="200: unknown key"):
             load_config(write(tmp_path, "200: ok"))
+
+
+class TestSession:
+    def test_cookies_and_headers_are_read(self):
+        session = CrawlerConfig.from_dict(FULL).session
+
+        (cookie,) = session.cookies
+        assert (cookie.name, cookie.value, cookie.domain, cookie.path, cookie.secure) == (
+            "sid",
+            "s3cr3t",
+            ".example.com",
+            "/app",
+            True,
+        )
+        assert session.headers == {"Accept-Language": "en", "Authorization": "Bearer t0ken"}
+
+    def test_cookie_needs_a_name_a_value_and_a_domain(self):
+        found = problems({"session": {"cookies": [{"name": "sid", "value": "x"}, {"domain": "example.com"}]}})
+
+        assert found == [
+            'session.cookies[0]: the key "domain" is required',
+            'session.cookies[1]: the key "name" is required',
+            'session.cookies[1]: the key "value" is required',
+        ]
+
+    def test_cookie_defaults(self):
+        config = CrawlerConfig.from_dict(
+            {"session": {"cookies": [{"name": "a", "value": "", "domain": "Example.COM"}]}}
+        )
+
+        (cookie,) = config.session.cookies
+        assert (cookie.domain, cookie.path, cookie.secure) == ("example.com", "/", False)
+
+    @pytest.mark.parametrize(
+        "domain, problem",
+        [
+            ("127.0.0.1", "cookies of an IP address are not kept; use the host name, e.g. localhost"),
+            (".10.0.0.1", "cookies of an IP address are not kept; use the host name, e.g. localhost"),
+            ("[::1]", "cookies of an IP address are not kept; use the host name, e.g. localhost"),
+            ("https://example.com", "expected a host name such as example.com or .example.com"),
+            ("example.com/path", "expected a host name such as example.com or .example.com"),
+            ("", "expected a host name such as example.com or .example.com"),
+        ],
+    )
+    def test_invalid_cookie_domain(self, domain, problem):
+        (found,) = problems({"session": {"cookies": [{"name": "a", "value": "b", "domain": domain}]}})
+
+        assert found.startswith(f"session.cookies[0].domain: {problem}, got ")
+
+    def test_invalid_cookie_name_and_path(self):
+        found = problems(
+            {"session": {"cookies": [{"name": "a b", "value": "x", "domain": "example.com", "path": "app"}]}}
+        )
+
+        assert [problem.partition(",")[0] for problem in found] == [
+            "session.cookies[0].name: not a cookie name: letters",
+            'session.cookies[0].path: expected a path that starts with "/"',
+        ]
+
+    def test_cookie_named_as_an_attribute(self):
+        (found,) = problems({"session": {"cookies": [{"name": "Secure", "value": "x", "domain": "example.com"}]}})
+
+        assert found.startswith("session.cookies[0].name: the name of a cookie attribute, such as Path or Secure, ")
+
+    @pytest.mark.parametrize("value", ["two words", 'quo"te', "a;b", "line\nbreak", "caf\u00e9", "tab\t"])
+    def test_invalid_cookie_value_is_not_shown(self, value):
+        value = value.encode().decode("unicode_escape")
+        (found,) = problems({"session": {"cookies": [{"name": "a", "value": value, "domain": "example.com"}]}})
+
+        assert found == (
+            "session.cookies[0].value: must be printable ASCII without spaces, quotes, commas, semicolons or backslashes"
+        )
+
+    def test_a_cookie_given_as_a_string_is_not_shown(self):
+        assert problems({"session": {"cookies": ["sid=s3cr3t"]}}) == [
+            "session.cookies[0]: expected a mapping of keys to values"
+        ]
+
+    def test_cookies_given_as_a_string_are_not_shown(self):
+        assert problems({"session": {"cookies": "sid=s3cr3t"}}) == ["session.cookies: expected a list"]
+
+    def test_value_of_the_wrong_type_is_not_shown(self):
+        found = problems(
+            {
+                "session": {
+                    "cookies": [{"name": "a", "value": 12345, "domain": "example.com"}],
+                    "headers": {"X-Key": 678},
+                }
+            }
+        )
+
+        assert found == ["session.cookies[0].value: expected a string", "session.headers.X-Key: expected a string"]
+
+    @pytest.mark.parametrize("name", ["User-Agent", "user-agent", "Cookie", "HOST", "Proxy-Authorization"])
+    def test_headers_with_keys_of_their_own_are_refused(self, name):
+        (found,) = problems({"session": {"headers": {name: "value"}}})
+
+        assert found.startswith(f"session.headers.{name}: this header is set by ")
+
+    def test_invalid_header_name(self):
+        (found,) = problems({"session": {"headers": {"X Key": "value"}}})
+
+        assert found.startswith("session.headers.X Key: not a header name")
+
+    @pytest.mark.parametrize("value", ["Bearer secret\r\nX-Injected: 1", "secret\u0000", ""])
+    def test_invalid_header_value_is_not_shown(self, value):
+        value = value.encode().decode("unicode_escape")
+        (found,) = problems({"session": {"headers": {"Authorization": value}}})
+
+        assert found in (
+            "session.headers.Authorization: must be one line without control characters",
+            "session.headers.Authorization: must not be empty",
+        )
+
+    @pytest.mark.parametrize("headers", [["Accept-Language: en"], "Authorization: Bearer t0ken"])
+    def test_headers_must_be_a_mapping(self, headers):
+        # The value is not shown: it may hold a secret.
+        assert problems({"session": {"headers": headers}}) == ["session.headers: expected a mapping of names to values"]
+
+    def test_header_given_twice_in_different_case(self):
+        assert problems({"session": {"headers": {"Accept": "a", "accept": "b"}}}) == [
+            'session.headers: the header "accept" is given twice, in different case'
+        ]
+
+    @pytest.mark.parametrize(
+        "key, value",
+        [
+            ("cookies", [{"name": "a", "value": "b", "domain": "example.com"}]),
+            ("cookies_file", "cookies.txt"),
+            ("save_cookies", "cookies.txt"),
+        ],
+    )
+    def test_cookies_need_keep_cookies(self, key, value):
+        assert problems({"session": {"keep_cookies": False, key: value}}) == [
+            f"session.{key}: needs session.keep_cookies, which is false"
+        ]
+
+    def test_repr_hides_the_secrets(self):
+        text = repr(CrawlerConfig.from_dict(FULL))
+
+        assert "s3cr3t" not in text
+        assert "t0ken" not in text
+        assert "name='sid'" in text
+
+    def test_initial_cookies_come_from_the_file_then_the_section(self, tmp_path):
+        path = cookies_file(tmp_path / "cookies.txt", "example.com\tFALSE\t/\tFALSE\t0\tfrom_file\t1")
+        session = CrawlerConfig.from_dict(
+            {
+                "session": {
+                    "cookies_file": path,
+                    "cookies": [{"name": "from_config", "value": "2", "domain": "example.com", "secure": True}],
+                }
+            }
+        ).session
+
+        cookies = session.initial_cookies()
+
+        assert [(cookie.name, cookie.value, cookie.domain, cookie.secure) for cookie in cookies] == [
+            ("from_file", "1", "example.com", False),
+            ("from_config", "2", "example.com", True),
+        ]
+
+    @pytest.mark.parametrize("content", [None, "not a cookies file\n"])
+    def test_cookies_file_that_cannot_be_read(self, tmp_path, content):
+        path = tmp_path / "cookies.txt"
+        if content is not None:
+            path.write_text(content, encoding="utf-8")
+        session = CrawlerConfig.from_dict({"session": {"cookies_file": str(path)}}).session
+
+        with pytest.raises(ConfigError) as error:
+            session.initial_cookies()
+
+        (problem,) = error.value.problems
+        assert problem.startswith("session.cookies_file: cannot read the cookies: ")
+
+
+@pytest.mark.usefixtures("clean_proxy_environment")
+class TestProxy:
+    @pytest.mark.parametrize(
+        "url, problem",
+        [
+            ("socks5://user:pr0xyp4ss@proxy.example:1080", "SOCKS proxies are not supported: use an http:// proxy"),
+            ("http://user:pr0xyp4ss@proxy.example", "the proxy URL needs a port"),
+            ("ftp://user:pr0xyp4ss@proxy.example:21", "expected an http:// or https:// proxy URL"),
+            ("http://user:pr0xyp4ss@proxy.example:3128/path", "a proxy URL has no path, query or fragment"),
+        ],
+    )
+    def test_invalid_url_is_not_shown(self, url, problem):
+        (found,) = problems({"proxy": {"urls": ["http://proxy.example:3128", url]}})
+
+        assert found.startswith(f"proxy.urls[1]: {problem}")
+        assert "pr0xyp4ss" not in found
+        assert "got" not in found
+
+    def test_urls_given_as_a_string_are_not_shown(self):
+        assert problems({"proxy": {"urls": "http://user:pr0xyp4ss@proxy.example:3128"}}) == [
+            "proxy.urls: expected a list"
+        ]
+
+    def test_invalid_rotation(self):
+        assert problems({"proxy": {"rotation": "random"}}) == [
+            'proxy.rotation: expected per_host or per_request, got "random"'
+        ]
+
+    @pytest.mark.parametrize(
+        "section, problem",
+        [
+            ({"max_failures": 0}, "proxy.max_failures: must be >= 1, got 0"),
+            ({"cooldown": 0}, "proxy.cooldown: must be > 0, got 0.0"),
+        ],
+    )
+    def test_limits(self, section, problem):
+        assert problems({"proxy": section}) == [problem]
+
+    def test_from_env_cannot_be_used_with_urls(self):
+        assert problems({"proxy": {"urls": ["http://proxy.example:3128"], "from_env": True}}) == [
+            "proxy.from_env: cannot be used with proxy.urls; give one of them"
+        ]
+
+    def test_proxy_listed_twice_is_named_without_its_password(self):
+        found = problems(
+            {
+                "proxy": {
+                    "urls": [
+                        "http://user:pr0xyp4ss@proxy.example:3128",
+                        "http://proxy.example:3128",
+                        "http://user:other@Proxy.Example:3128",  # a host in any case is one proxy
+                    ]
+                }
+            }
+        )
+
+        assert found == ["proxy.urls[2]: http://user:***@proxy.example:3128 is listed twice"]
+
+    def test_repr_hides_the_passwords(self):
+        text = repr(CrawlerConfig.from_dict(FULL))
+
+        assert "pr0xyp4ss" not in text
+        assert "rotation='per_request'" in text
+
+    def test_no_proxies_build_no_pool(self):
+        assert ProxyOptions().build() is None
+
+    def test_urls_build_a_pool(self):
+        pool = CrawlerConfig.from_dict(FULL).proxy.build()
+
+        assert [proxy.label for proxy in pool.proxies] == [
+            "http://user:***@proxy-1.example:3128",
+            "https://proxy-2.example:8443",
+        ]
+        assert (pool.rotation, pool.max_failures, pool.cooldown) == ("per_request", 5, 30.0)
+
+    def test_from_env_builds_a_pool_of_the_environment(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "http://user:pr0xyp4ss@proxy.example:3128")
+
+        pool = ProxyOptions(from_env=True, max_failures=2, cooldown=5.0).build()
+
+        assert [proxy.label for proxy in pool.proxies] == ["http://user:***@proxy.example:3128"]
+        assert (pool.max_failures, pool.cooldown) == (2, 5.0)
+        assert pool.pick("http://example.com/") is None  # no HTTP_PROXY
+
+    def test_from_env_without_proxies_builds_no_pool(self):
+        assert ProxyOptions(from_env=True).build() is None
+
+    def test_invalid_variable_is_named_without_its_value(self, monkeypatch):
+        monkeypatch.setenv("HTTPS_PROXY", "socks5://user:pr0xyp4ss@proxy.example:1080")
+
+        with pytest.raises(ConfigError) as error:
+            ProxyOptions(from_env=True).build()
+
+        (problem,) = error.value.problems
+        assert problem.startswith("proxy.from_env: HTTPS_PROXY: SOCKS proxies are not supported")
+        assert "pr0xyp4ss" not in str(error.value)
+
+
+class TestRendering:
+    def test_off_builds_no_settings(self):
+        assert RenderingOptions().build() is None
+
+    def test_patterns_build_the_settings_of_the_browser(self):
+        rendering = CrawlerConfig.from_dict(FULL).rendering.build()
+
+        assert rendering == Rendering(
+            include=("^https://example\\.com/app/",),
+            wait_until="networkidle",
+            wait_for="#content",
+            timeout=10.0,
+            max_open_pages=4,
+            block_resources=frozenset({"image", "stylesheet"}),
+        )
+        assert rendering.renders("https://example.com/app/page")
+        assert not rendering.renders("https://example.com/blog/")
+
+    def test_always_renders_every_page(self):
+        rendering = CrawlerConfig.from_dict({"rendering": {"mode": "always"}}).rendering.build()
+
+        assert rendering.renders("https://example.com/any/page")
+
+    @pytest.mark.parametrize(
+        "section, problem",
+        [
+            ({"mode": "sometimes"}, 'rendering.mode: expected one of off, always, patterns, got "sometimes"'),
+            ({"wait_until": "idle"}, "rendering.wait_until: expected one of load, domcontentloaded, networkidle"),
+            ({"wait_for": " "}, 'rendering.wait_for: must not be empty, got " "'),
+            ({"timeout": 0}, "rendering.timeout: must be > 0, got 0.0"),
+            ({"max_open_pages": 0}, "rendering.max_open_pages: must be >= 1, got 0"),
+            ({"block_resources": ["document"]}, "rendering.block_resources[0]: expected one of eventsource, fetch"),
+            ({"block_resources": "image"}, 'rendering.block_resources: expected a list, got "image"'),
+        ],
+    )
+    def test_invalid_values(self, section, problem):
+        (found,) = problems({"rendering": section})
+
+        assert found.startswith(problem)
+
+    def test_invalid_pattern(self):
+        (found,) = problems({"rendering": {"mode": "patterns", "include": ["/app/(", "/ok/"]}})
+
+        assert found.startswith("rendering.include[0]: not a regular expression: missing ), unterminated subpattern")
+
+    def test_off_written_bare_in_yaml_is_explained(self, tmp_path):
+        path = write(tmp_path, "rendering:\n  mode: off\n")
+
+        with pytest.raises(ConfigError) as error:
+            load_config(path)
+
+        assert error.value.problems == [
+            (
+                "rendering.mode: expected a string, got false; "
+                "YAML reads off, on, no and yes as false or true: put the word in quotes"
+            )
+        ]
+        assert load_config(write(tmp_path, 'rendering:\n  mode: "off"\n')).rendering.mode == "off"
+
+    def test_patterns_need_include(self):
+        assert problems({"rendering": {"mode": "patterns"}}) == [
+            "rendering.mode: patterns needs rendering.include, which is empty"
+        ]
+
+    @pytest.mark.parametrize("mode", ["off", "always"])
+    def test_include_needs_patterns(self, mode):
+        assert problems({"rendering": {"mode": mode, "include": ["/app/"]}}) == [
+            f'rendering.include: needs rendering.mode: patterns, got "{mode}"'
+        ]
+
+    @pytest.mark.parametrize("section", [{"mode": "always"}, {"mode": "patterns", "include": ["/app/"]}])
+    def test_rendering_without_playwright_is_an_error_with_the_command_to_install_it(self, section, monkeypatch):
+        monkeypatch.setitem(sys.modules, "playwright", None)  # find_spec() takes it for a missing package
+
+        assert problems({"rendering": section}) == [
+            "rendering.mode: Playwright is not installed; run: pip install -e ."
+        ]
+
+    def test_off_needs_no_playwright(self, monkeypatch):
+        monkeypatch.setitem(sys.modules, "playwright", None)
+
+        assert CrawlerConfig.from_dict({"rendering": {"mode": "off", "timeout": 5}}).rendering.build() is None

@@ -1,14 +1,14 @@
-"""What the crawler CLI and the demo commands share: checks of command-line values, hiding a password."""
+"""What the crawler CLI and the demo commands share: checks of command-line values."""
 
 import argparse
 import codecs
 import math
 import re
 from collections.abc import Callable
-from urllib.parse import urlsplit
 
 from crawler import is_valid_http_url, storage_from_url
 from crawler.config import http_url_problem
+from crawler.proxy import proxy_url_problem
 
 
 def number(raw: str, number_type: type[int] | type[float] = float) -> int | float:
@@ -53,6 +53,13 @@ def http_url(raw: str) -> str:
     return raw
 
 
+def proxy_url(raw: str) -> str:
+    # The value is not repeated: it may hold a password.
+    if (problem := proxy_url_problem(raw)) is not None:
+        raise argparse.ArgumentTypeError(problem)
+    return raw
+
+
 def regex(raw: str) -> str:
     try:
         re.compile(raw)
@@ -75,12 +82,3 @@ def encoding(raw: str) -> str:
     except LookupError:
         raise argparse.ArgumentTypeError(f"unknown encoding: {raw!r}") from None
     return raw
-
-
-def hide_password(url: str) -> str:
-    """A database URL fit to be shown."""
-    password = urlsplit(url).password
-    if password is not None:
-        url = url.replace(f":{password}@", ":***@", 1)
-    # PostgreSQL takes the password as a parameter of the URL too.
-    return re.sub(r"(?<=[?&]password=)[^&#]*", "***", url)

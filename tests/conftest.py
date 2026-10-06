@@ -2,12 +2,17 @@ import asyncio
 import contextlib
 import gzip
 import logging
+import os
+import ssl
 import time
 from collections import Counter
 
+import certifi
 import pytest
+import trustme
 from aiohttp import web
-from pages import ENCODING_PAGES, SITE_HEADERS, SITE_PAGES, fixture_html
+from pages import ENCODING_PAGES, JS_PAGES, JS_SCRIPT, SITE_HEADERS, SITE_PAGES, fixture_html
+from proxy_server import ProxyServer
 
 from crawler.logging_setup import reset_logging
 from demo_site import free_port
@@ -17,7 +22,7 @@ class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
-    /busy/, /shop/, sitemaps and robots.txt, in the order they arrived. `robots` is the
+    /busy/, /shop/, /js/, sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404; the
     first `robots_failures` requests for it answer 503 whatever it is, or
     the first `robots_failures_by_host[host]` requests from the hosts named
@@ -28,6 +33,8 @@ class SiteState:
     `sitemaps` maps the names of the files under /sitemaps/ to their
     bodies; the first `sitemap_failures` requests for them answer 503.
     `sitemap_headers` are added to the responses with them.
+    `headers` keeps the request headers of the latest request for each
+    path recorded, /cookies/ pages included.
     """
 
     def __init__(self) -> None:
@@ -46,10 +53,12 @@ class SiteState:
         self.sitemaps: dict[str, bytes] = {}
         self.sitemap_failures = 0
         self.sitemap_headers: dict[str, str] = {}
+        self.headers: dict[str, dict[str, str]] = {}
 
     def record(self, request: web.Request) -> None:
         self.hits[request.path] += 1
         self.log.append((request.path, time.monotonic()))
+        self.headers[request.path] = dict(request.headers)
 
 
 SITE_STATE = web.AppKey("site_state", SiteState)
@@ -88,6 +97,32 @@ async def encoding_page(request: web.Request) -> web.Response:
     body, charset, _ = ENCODING_PAGES[request.match_info["name"]]
     content_type = "text/html" if charset is None else f"text/html; charset={charset}"
     return web.Response(body=body, headers={"Content-Type": content_type})
+
+
+async def set_cookies(request: web.Request) -> web.Response:
+    """Sets a cookie for every parameter of the query but `redirect`, which redirects to /cookies/echo instead.
+
+    `/cookies/set?sid=abc` answers a page that links to /cookies/echo; a
+    value may carry attributes after ";", such as "abc; Max-Age=60".
+    """
+    request.app[SITE_STATE].record(request)
+    cookies = {name: value for name, value in request.query.items() if name != "redirect"}
+    if "redirect" in request.query:
+        response = web.Response(status=302, headers={"Location": "/cookies/echo"})
+    else:
+        response = web.Response(
+            text='<html><body><a href="/cookies/echo">echo</a></body></html>', content_type="text/html"
+        )
+    for name, value in cookies.items():
+        response.headers.add("Set-Cookie", f"{name}={value}")
+    return response
+
+
+async def echo_cookies(request: web.Request) -> web.Response:
+    """A page that lists the cookies of the request, as "cookie:name=value", one per paragraph."""
+    request.app[SITE_STATE].record(request)
+    items = "".join(f"<p>cookie:{name}={value}</p>" for name, value in sorted(request.cookies.items()))
+    return web.Response(text=f"<html><body>{items}</body></html>", content_type="text/html")
 
 
 async def robots_txt(request: web.Request) -> web.StreamResponse:
@@ -247,6 +282,47 @@ async def site_page(request: web.Request) -> web.Response:
     return web.Response(text=html, content_type="text/html", headers=SITE_HEADERS.get(request.path))
 
 
+async def js_page(request: web.Request) -> web.Response:
+    """The pages of JS_PAGES, their script and image; any other path under /js/ is a plain page.
+
+    /js/cookie-read sets a cookie for every parameter of its query, as /cookies/set does.
+    """
+    request.app[SITE_STATE].record(request)
+    if request.path == "/js/app.js":
+        return web.Response(text=JS_SCRIPT, content_type="application/javascript")
+    if request.path == "/js/image.png":
+        return web.Response(body=b"\x89PNG\r\n\x1a\n", content_type="image/png")
+    if request.path == "/js/to-private":
+        raise web.HTTPFound("/js/private/page")
+    html = JS_PAGES.get(request.path, f"<html><body><p>{request.path}</p></body></html>")
+    response = web.Response(text=html, content_type="text/html")
+    if request.path == "/js/cookie-read":
+        for name, value in request.query.items():
+            response.headers.add("Set-Cookie", f"{name}={value}")
+    return response
+
+
+@pytest.fixture(scope="session")
+def chromium() -> None:
+    """Skips the test unless Playwright and its Chromium are installed (see `make install`)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        pytest.skip("Playwright is not installed: pip install -e .")
+    with sync_playwright() as playwright:
+        executable = playwright.chromium.executable_path
+    if not os.path.exists(executable):
+        pytest.skip("Chromium of Playwright is not installed: playwright install chromium")
+
+
+@pytest.fixture
+def clean_proxy_environment(monkeypatch) -> None:
+    """Takes the proxy variables of the machine out of the environment, so that a test sees only those it sets."""
+    for name in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "REQUEST_METHOD"]:
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+
+
 @pytest.fixture
 def restore_logging():
     """Undoes `configure_logging` after the test: its handlers are removed and closed, the level is put back."""
@@ -256,9 +332,8 @@ def restore_logging():
     logging.getLogger().setLevel(level)
 
 
-@pytest.fixture
-async def server(aiohttp_server):
-    """Local HTTP server with predictable endpoints; no internet required."""
+def make_app() -> web.Application:
+    """The application of the test site, with a `SiteState` of its own."""
     app = web.Application()
     app[SITE_STATE] = SiteState()
     app.router.add_get("/ok", ok)
@@ -281,7 +356,53 @@ async def server(aiohttp_server):
     app.router.add_get("/shop/list", shop_list)
     app.router.add_get("/shop/item/{n}", shop_item)
     app.router.add_get("/wide/{n}", wide_page)
-    return await aiohttp_server(app)
+    app.router.add_get("/cookies/set", set_cookies)
+    app.router.add_get("/cookies/echo", echo_cookies)
+    app.router.add_get("/js/{path:.*}", js_page)
+    return app
+
+
+@pytest.fixture
+async def server(aiohttp_server):
+    """Local HTTP server with predictable endpoints; no internet required."""
+    return await aiohttp_server(make_app())
+
+
+@pytest.fixture
+async def https_server(aiohttp_server, tmp_path, monkeypatch):
+    """The test site over https, by the name localhost or 127.0.0.1, with a state of its own.
+
+    Its certificate is issued by a test CA that the crawler trusts for the
+    test: certifi gives the file of that CA in place of its bundle.
+    """
+    authority = trustme.CA()
+    context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    authority.issue_cert("localhost", "127.0.0.1").configure_cert(context)
+    ca_file = tmp_path / "test-ca.pem"
+    authority.cert_pem.write_to_path(str(ca_file))
+    monkeypatch.setattr(certifi, "where", lambda: str(ca_file))
+    return await aiohttp_server(make_app(), ssl=context)
+
+
+@pytest.fixture
+def https_site(https_server) -> SiteState:
+    return https_server.app[SITE_STATE]
+
+
+@pytest.fixture
+async def make_proxy():
+    """Starts local proxies, as `make_proxy(**options)` (see `ProxyServer`); they are closed after the test."""
+    proxies: list[ProxyServer] = []
+
+    async def make(**options) -> ProxyServer:
+        proxy = ProxyServer(**options)
+        await proxy.start()
+        proxies.append(proxy)
+        return proxy
+
+    yield make
+    for proxy in proxies:
+        await proxy.close()
 
 
 @pytest.fixture

@@ -16,7 +16,7 @@ from crawler import (
     SQLiteStorage,
     is_valid_http_url,
 )
-from demo_main import format_size, hide_password, make_crawler, open_storages, parse_args, print_error_report
+from demo_main import format_size, make_crawler, open_storages, parse_args, print_error_report
 
 
 @pytest.mark.parametrize(
@@ -232,20 +232,6 @@ def test_save_shows_the_database_without_its_password():
 
     assert location == "postgresql://crawler:***@db.example:5433/pages"
     assert type(storage) is PostgresStorage
-
-
-@pytest.mark.parametrize(
-    ("url", "shown"),
-    [
-        ("postgresql://crawler:secret@host/db", "postgresql://crawler:***@host/db"),
-        ("postgresql://crawler@host/db", "postgresql://crawler@host/db"),
-        ("sqlite:///crawler.db", "sqlite:///crawler.db"),
-        ("postgresql://host/db?user=crawler&password=secret", "postgresql://host/db?user=crawler&password=***"),
-        ("postgresql://host/db?password=secret&sslmode=require", "postgresql://host/db?password=***&sslmode=require"),
-    ],
-)
-def test_hide_password(url, shown):
-    assert hide_password(url) == shown
 
 
 @pytest.mark.parametrize(

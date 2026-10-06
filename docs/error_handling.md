@@ -36,8 +36,28 @@ leaves a failing site alone.
     installed, which gives no code, and then every DNS failure is
     `DNSError`.
 - Some failures are not about the request at all: the crawler is closed, the
-  host's circuit is open, robots.txt is unreachable. Retrying the request
-  cannot fix them.
+  host's circuit is open, robots.txt is unreachable, every proxy is out of
+  rotation. Retrying the request cannot fix them.
+- **Blame the right party.** Through a proxy, a failure may be the proxy's
+  or the site's, and only some tell which: a proxy that cannot be reached,
+  fails its own TLS or asks for a password (407) is the proxy's
+  (`ProxyNetworkError`). A 407 or a bad certificate inside the tunnel of
+  an https URL is the site's. Any other response through a proxy is the
+  site's too, whatever its status, and so is a
+  refused CONNECT (the proxy cannot reach the site). A timeout cannot be
+  told apart: over https the connect step includes the CONNECT, so a slow
+  proxy and a slow site look alike. It is put on the site, as without a
+  proxy; put on the proxy, one dead site would take every proxy out in
+  turn. A proxy that loses packets then looks like slow sites.
+  A browser that cannot start or crashes is a failure of the crawler, not
+  of the site (`RenderError`): it is not retried, since another attempt meets the
+  same browser, and the circuit breaker does not count it. A page the
+  browser takes too long to render (`RenderTimeoutError`) is the page's
+  own: its document came in time, and what holds the browser is mostly a
+  selector that never appears or a connection the page keeps open. It is
+  retried as a timeout, but the circuit breaker does not count it and the
+  host is not slowed down for it: a few such pages would otherwise block
+  a site that answers well.
 - An unforeseen exception (a bug) must not break the batch: catch it at the
   boundary of one URL, log the traceback and report it as that URL's error.
 
@@ -127,6 +147,16 @@ leaves a failing site alone.
   site for its broken links.
 - **Per host**: one dead site must not stop the crawl of the others, and a
   host that is down fails all of its pages, so a circuit per URL learns too late.
+- **Keep the errors of proxies out of it.** A dead proxy would otherwise
+  open the circuits of every site behind it. Proxies get a state of their
+  own, simpler than a breaker: a few failures in a row (not a share, as a
+  proxy serves many hosts and one failure tells little) take a proxy out
+  of rotation for a cooldown, any response clears the count, and the
+  failed request is retried through another proxy at once. There is no
+  half-open probe: the next request after the cooldown is the probe, and
+  one failure takes the proxy out again. When every proxy is out, a
+  request fails at once without being sent, rather than waiting for one
+  to come back.
 - **Retries under a breaker**: a request counts once, however many attempts
   it takes. Its first failure counts at once, so a dead host opens its
   circuit after a few pages, not after their retries; a failed retry adds

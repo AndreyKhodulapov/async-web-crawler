@@ -2,7 +2,15 @@
 
 import pytest
 
-from crawler.urls import get_host, is_same_host, is_valid_http_url, normalize_url, resolve_url, strip_tracking_params
+from crawler.urls import (
+    get_host,
+    hide_password,
+    is_same_host,
+    is_valid_http_url,
+    normalize_url,
+    resolve_url,
+    strip_tracking_params,
+)
 
 BASE = "https://example.com/docs/guide/intro.html?lang=en"
 
@@ -191,3 +199,18 @@ def test_inline_data_is_not_remembered():
 )
 def test_strip_tracking_params(url, stripped):
     assert strip_tracking_params(url) == stripped
+
+
+@pytest.mark.parametrize(
+    ("url", "shown"),
+    [
+        ("postgresql://crawler:secret@host/db", "postgresql://crawler:***@host/db"),
+        ("postgresql://crawler@host/db", "postgresql://crawler@host/db"),
+        ("sqlite:///crawler.db", "sqlite:///crawler.db"),
+        ("postgresql://host/db?user=crawler&password=secret", "postgresql://host/db?user=crawler&password=***"),
+        ("postgresql://host/db?password=secret&sslmode=require", "postgresql://host/db?password=***&sslmode=require"),
+        ("http://user:p%40ss@proxy.example:3128", "http://user:***@proxy.example:3128"),
+    ],
+)
+def test_hide_password(url, shown):
+    assert hide_password(url) == shown

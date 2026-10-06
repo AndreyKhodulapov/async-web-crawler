@@ -15,10 +15,15 @@ from crawler.exceptions import (
     HTTPStatusError,
     InvalidURLError,
     NetworkError,
+    NoProxyError,
     PageTooLargeError,
     ParseError,
     PermanentError,
     PermanentHTTPError,
+    ProxyError,
+    ProxyNetworkError,
+    RenderError,
+    RenderTimeoutError,
     RobotsDisallowedError,
     RobotsUnreachableError,
     SitemapError,
@@ -39,15 +44,20 @@ from crawler.models import (
     FetchResult,
     PageRecord,
     ParsedPage,
+    ProxyStats,
     RateStats,
+    RenderStats,
 )
 from crawler.parser import HTMLParser
 from crawler.progress import Progress, ProgressTracker, format_progress, show_progress
+from crawler.proxy import Proxy, ProxyPool
 from crawler.queue import CrawlerQueue
 from crawler.rate_limiter import RateLimiter
+from crawler.rendering import Rendering
 from crawler.retry import RetryRule, RetryStrategy
 from crawler.robots import RobotsParser, RobotsRules, product_token
 from crawler.semaphores import SemaphoreManager
+from crawler.session import load_cookies_file, make_cookie, save_cookies_file
 from crawler.sitemap import SitemapParser
 from crawler.stats import CrawlerStats
 from crawler.storage import (
@@ -97,6 +107,7 @@ __all__ = [
     "InvalidURLError",
     "JSONStorage",
     "NetworkError",
+    "NoProxyError",
     "PageRecord",
     "PageTooLargeError",
     "ParseError",
@@ -106,8 +117,17 @@ __all__ = [
     "PostgresStorage",
     "Progress",
     "ProgressTracker",
+    "Proxy",
+    "ProxyError",
+    "ProxyNetworkError",
+    "ProxyPool",
+    "ProxyStats",
     "RateLimiter",
     "RateStats",
+    "RenderError",
+    "RenderStats",
+    "RenderTimeoutError",
+    "Rendering",
     "RetryRule",
     "RetryStrategy",
     "RobotsDisallowedError",
@@ -131,9 +151,12 @@ __all__ = [
     "is_same_host",
     "is_valid_http_url",
     "load_config",
+    "load_cookies_file",
     "load_urls",
+    "make_cookie",
     "product_token",
     "register_database",
+    "save_cookies_file",
     "show_progress",
     "storage_from_env",
     "storage_from_output",

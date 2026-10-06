@@ -111,3 +111,49 @@ SITE_PAGES: dict[str, str] = {
 }
 # Response headers of some of SITE_PAGES.
 SITE_HEADERS: dict[str, dict[str, str]] = {"/site/tagged.html": {"X-Robots-Tag": "none"}}
+
+# Pages under /js/ of the test site whose links and text JavaScript makes, for rendering in a browser.
+JS_PAGES = {
+    "/js/links": """
+        <html><head><title>Links</title><script src="/js/app.js"></script></head><body>
+        <img src="/js/image.png"><div id="out"></div>
+        <script>
+            document.getElementById("out").innerHTML = '<a href="/js/target">Target</a> <p>made by ' + window.made + '</p>';
+        </script>
+        </body></html>
+    """,
+    "/js/other": """
+        <html><head><title>Other</title></head><body><div id="out"></div>
+        <script>document.getElementById("out").innerHTML = '<a href="/js/other-target">Other target</a>';</script>
+        </body></html>
+    """,
+    "/js/start": '<html><head><title>Start</title></head><body><a href="links">Links</a> <a href="other">Other</a></body></html>',
+    "/js/to-redirect": '<html><head><title>To redirect</title></head><body><a href="redirect">Away</a></body></html>',
+    "/js/target": "<html><head><title>Target</title></head><body><p>the target</p></body></html>",
+    "/js/other-target": "<html><head><title>Other target</title></head><body></body></html>",
+    "/js/redirect": '<html><body><script>location.href = "/js/target";</script><p>leaving</p></body></html>',
+    "/js/redirect-private": '<html><body><script>location.href = "/js/private/page";</script></body></html>',
+    "/js/meta-refresh": '<html><head><meta http-equiv="refresh" content="0; url=/js/target"></head><body></body></html>',
+    "/js/late": """
+        <html><body><script>
+            setTimeout(() => { document.body.innerHTML += '<p id="late">late text</p>'; }, 300);
+        </script></body></html>
+    """,
+    "/js/big": '<html><body><script>document.body.innerHTML = "<p>" + "x".repeat(20000) + "</p>";</script></body></html>',
+    "/js/cookie-read": """
+        <html><body><p id="out"></p>
+        <script>document.getElementById("out").textContent = "seen:" + document.cookie;</script></body></html>
+    """,
+    "/js/cookie-set": """
+        <html><body><script>
+            document.cookie = "from_js=1; path=/";
+            fetch("/cookies/set?from_fetch=2").then(() => { document.body.innerHTML += '<p id="done">done</p>'; });
+        </script></body></html>
+    """,
+    "/js/cookie-delete": '<html><body><script>document.cookie = "sid=; path=/; max-age=0";</script></body></html>',
+    "/js/popup": """
+        <html><body><iframe src="/js/framed"></iframe>
+        <script>window.open("/js/opened");</script><p>popup</p></body></html>
+    """,
+}
+JS_SCRIPT = "window.made = 'javascript';"

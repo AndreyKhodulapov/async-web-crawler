@@ -10,7 +10,15 @@ from enum import StrEnum
 from types import TracebackType
 from typing import Self
 
-from crawler.exceptions import CircuitOpenError, FetchError, HTTPStatusError, NetworkError, TransientError
+from crawler.exceptions import (
+    CircuitOpenError,
+    FetchError,
+    HTTPStatusError,
+    NetworkError,
+    ProxyError,
+    RenderTimeoutError,
+    TransientError,
+)
 from crawler.models import CircuitStats
 from crawler.urls import get_host
 
@@ -76,7 +84,10 @@ class CircuitBreaker:
     HTTP 5xx, even one not worth a retry, such as 501. Any other response
     of the server, HTTP 404 included, is a success: the host is up, and a
     site with broken links must not be blocked for them. Other errors, such
-    as a bad certificate, count neither way.
+    as a bad certificate, count neither way, and so does a `ProxyError`
+    (a `ProxyNetworkError` included): a dead proxy says nothing of the host.
+    Neither does a `RenderTimeoutError`: the host answered, the browser
+    took too long for the page.
 
     A call counts once, however many attempts it takes: the retries of a
     request reuse its `BreakerCall`, and each `record` replaces the outcome
@@ -169,7 +180,10 @@ class CircuitBreaker:
 
     @staticmethod
     def is_failure(error: FetchError | None) -> bool:
-        """Whether an outcome counts as a failure of the host: a transient or network error, or an HTTP 5xx."""
+        """Whether an outcome counts as a failure of the host: a transient or network error, or an HTTP 5xx.
+
+        An error of a proxy is not one, nor is a timeout of rendering.
+        """
         return _is_failure(error) is True
 
     def call(self, url: str) -> "BreakerCall":
@@ -352,6 +366,10 @@ class BreakerCall:
 
 def _is_failure(error: FetchError | None) -> bool | None:
     """Whether an outcome counts as a failure of the host; None if it counts neither way."""
+    if isinstance(error, ProxyError):
+        return None  # a dead proxy must not block the sites behind it
+    if isinstance(error, RenderTimeoutError):
+        return None  # the host answered: a page slow in the browser must not block the others
     if isinstance(error, TransientError | NetworkError):
         return True
     if isinstance(error, HTTPStatusError):

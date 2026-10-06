@@ -1,5 +1,6 @@
 """AdvancedCrawler: a crawler assembled from a configuration, with storage, statistics, reports and logging."""
 
+import dataclasses
 import logging
 from collections.abc import Mapping
 from pathlib import Path
@@ -12,7 +13,9 @@ from crawler.client import AsyncCrawler
 from crawler.config import CrawlerConfig, load_config
 from crawler.exceptions import ConfigError
 from crawler.models import ParsedPage
+from crawler.report import render_html, render_json
 from crawler.retry import RetryStrategy
+from crawler.session import save_cookies_file
 from crawler.stats import CrawlerStats
 from crawler.storage import CompositeStorage, DataStorage
 
@@ -35,8 +38,12 @@ class AdvancedCrawler:
     retries, the circuit breaker), where to save the pages, where to write
     the log and the reports. The parts are there to be used directly:
     `crawler` is the `AsyncCrawler` that does the work, `storage` its
-    storage (None without outputs), `stats` its `CrawlerStats`. `reports`
-    are the report files the latest crawl wrote.
+    storage (None without outputs), `stats` its `CrawlerStats`,
+    `crawler.proxies` its proxies (None without any) and
+    `crawler.rendering` the settings of its browser (None if pages are
+    not rendered). `reports`
+    are the report files the latest crawl wrote, `cookie_file` the file the
+    cookies were saved to.
 
     Directories of the log, the reports and the files of the storage are
     created if they are missing. Logging is set up when the crawler is
@@ -49,10 +56,14 @@ class AdvancedCrawler:
     def __init__(self, config: CrawlerConfig | None = None, *, configure_logging: bool = True) -> None:
         """
         Raises:
+            ConfigError: `session.cookies_file` cannot be read, or is not a cookies.txt file;
+                with `proxy.from_env`, a variable is not the URL of a proxy.
             OSError: a directory cannot be created, or the log file cannot be opened.
         """
         self.config = config = CrawlerConfig() if config is None else config
         options = config.crawler
+        cookies = config.session.initial_cookies()
+        proxies = config.proxy.build()
         self.storage = config.storage.build()
         self.crawler = AsyncCrawler(
             max_concurrent=options.max_concurrent,
@@ -84,28 +95,35 @@ class AdvancedCrawler:
             max_retry_after=options.max_retry_after,
             user_agent=options.user_agent,
             user_agents=options.user_agents,
+            headers=config.session.headers,
+            cookies=cookies,
+            keep_cookies=config.session.keep_cookies,
+            proxies=proxies,
+            rendering=config.rendering.build(),
             storage=self.storage,
             keep_pages=options.keep_pages,
         )
         self.crawler.sitemaps.max_urls = config.sitemaps.max_urls
         self.crawler.stats.top_domains = config.report.top_domains
         self.reports: list[Path] = []
+        self.cookie_file: Path | None = None
         self._closed = False
         self._configures_logging = configure_logging
 
         for path in _storage_files(self.storage):
             _make_directory(path)
-        if not configure_logging:
-            return
-        if config.logging.file is not None:
-            _make_directory(config.logging.file)
-        # The last step: nothing after it can fail and leave the log file open.
-        logging_setup.configure_logging(
-            config.logging.level,
-            config.logging.file,
-            max_bytes=config.logging.max_bytes,
-            backup_count=config.logging.backup_count,
-        )
+        if configure_logging:
+            if config.logging.file is not None:
+                _make_directory(config.logging.file)
+            # The last step that can fail: nothing after it can leave the log file open.
+            logging_setup.configure_logging(
+                config.logging.level,
+                config.logging.file,
+                max_bytes=config.logging.max_bytes,
+                backup_count=config.logging.backup_count,
+            )
+        if config.proxy.from_env and proxies is None:
+            logger.warning("proxy.from_env: neither HTTP_PROXY nor HTTPS_PROXY is set, requests go directly")
 
     @classmethod
     def from_config(
@@ -116,7 +134,7 @@ class AdvancedCrawler:
         `configure_logging` is that of the constructor.
 
         Raises:
-            ConfigError: the file cannot be read, or holds an unknown key or an invalid value.
+            ConfigError: the file cannot be read, holds an unknown key or an invalid value, or as the constructor.
             OSError: as the constructor.
         """
         return cls(load_config(path, overrides), configure_logging=configure_logging)
@@ -149,8 +167,8 @@ class AdvancedCrawler:
 
         The pages are saved to the storage as they are crawled. Afterwards
         the statistics are written to the files of the `report` section,
-        if it names any; a report that cannot be written is logged and
-        does not fail the crawl. See `AsyncCrawler.crawl` for the rules of
+        if it names any, and the cookies to `session.save_cookies`; a file
+        that cannot be written is logged and does not fail the crawl. See `AsyncCrawler.crawl` for the rules of
         the crawl itself. A closed crawler fetches nothing: every page
         fails with `CrawlerClosedError`.
 
@@ -175,6 +193,7 @@ class AdvancedCrawler:
             robots_sitemaps=config.sitemaps.from_robots,
         )
         self.write_reports()
+        self.save_cookies()
         return pages
 
     def write_reports(self) -> list[Path]:
@@ -201,27 +220,62 @@ class AdvancedCrawler:
         self.reports = written
         return written
 
+    def save_cookies(self) -> Path | None:
+        """Write the cookies to the cookies.txt file of `session.save_cookies`; return it, None if not written.
+
+        `crawl()` does it when the crawl ends; call it yourself after a
+        crawl that was cancelled. The file can be read by its owner only.
+        One that cannot be written is logged. The file is kept in
+        `cookie_file` as well.
+        """
+        path = self.config.session.save_cookies
+        self.cookie_file = None
+        if path is None:
+            return None
+        cookies = self.crawler.export_cookies()
+        try:
+            save_cookies_file(cookies, _make_directory(path))
+        except OSError as error:
+            logger.error("Failed to save the cookies to %s: %s", path, error)
+            return None
+        logger.info("Saved %d cookies to %s", len(cookies), path)
+        self.cookie_file = Path(path)
+        return self.cookie_file
+
     def get_stats(self) -> dict[str, Any]:
-        """The statistics of the latest crawl: `total_pages`, `successful`, `failed` and the rest of `CrawlerStats.get_stats`."""
-        return self.crawler.stats.get_stats()
+        """The statistics of the latest crawl: `total_pages`, `successful`, `failed` and the rest of `CrawlerStats.get_stats`.
+
+        With proxies, `proxies` too: label (the URL with the password
+        hidden) -> `state`, `requests`, `failures` and `times_removed`, see
+        `ProxyStats`. With rendering, `rendering` too: `rendered`, `failed`
+        and `avg_render_time`, see `RenderStats`.
+        """
+        stats = self.crawler.stats.get_stats()
+        if self.crawler.proxies is not None:
+            stats["proxies"] = {label: dataclasses.asdict(proxy) for label, proxy in self.crawler.proxy_stats().items()}
+        render_stats = self.crawler.render_stats()
+        if render_stats is not None:
+            stats["rendering"] = dataclasses.asdict(render_stats)
+        return stats
 
     def export_to_json(self, filename: str | Path) -> None:
-        """Write `get_stats()` to a JSON file, see `CrawlerStats.export_to_json`.
+        """Write `get_stats()` to a JSON file (UTF-8), replacing the file if it exists.
 
         Raises:
             OSError: the file cannot be written.
         """
-        self.crawler.stats.export_to_json(_make_directory(filename))
+        _make_directory(filename).write_text(render_json(self.get_stats()), encoding="utf-8")
 
     def export_to_html_report(self, filename: str | Path, *, title: str | None = None) -> None:
-        """Write the HTML report, see `CrawlerStats.export_to_html_report`; the title is that of the configuration.
+        """Write the HTML report of `get_stats()`, see `CrawlerStats.export_to_html_report`.
+
+        The title is that of the configuration unless given.
 
         Raises:
             OSError: the file cannot be written.
         """
-        self.crawler.stats.export_to_html_report(
-            _make_directory(filename), title=self.config.report.title if title is None else title
-        )
+        report = render_html(self.get_stats(), title=self.config.report.title if title is None else title)
+        _make_directory(filename).write_text(report, encoding="utf-8")
 
     async def close(self) -> None:
         """Close the crawler, write what the storage still holds and stop logging to the file. Safe to call more than once."""

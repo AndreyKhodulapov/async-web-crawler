@@ -6,18 +6,19 @@ from logging.handlers import RotatingFileHandler
 
 import pytest
 import yaml
-from helpers import BOT, FAST_CONFIG, urlset
+from helpers import BOT, FAST_CONFIG, PROXY_AUTHORIZATION, PROXY_PASSWORD, make_config, urlset, with_password
 
-from crawler import AdvancedCrawler, ConfigError, CrawlerConfig, CSVStorage, JSONStorage, configure_logging
+from crawler import (
+    AdvancedCrawler,
+    ConfigError,
+    CrawlerConfig,
+    CSVStorage,
+    JSONStorage,
+    Rendering,
+    configure_logging,
+)
 
 pytestmark = pytest.mark.usefixtures("restore_logging")
-
-
-def make_config(**sections) -> CrawlerConfig:
-    data = {name: dict(section) for name, section in FAST_CONFIG.items()}
-    for name, section in sections.items():
-        data[name] = {**data[name], **section} if isinstance(section, dict) and name in data else section
-    return CrawlerConfig.from_dict(data)
 
 
 def file_handlers() -> list[logging.Handler]:
@@ -95,6 +96,7 @@ async def test_configuration_reaches_every_part(tmp_path):
         storage={"outputs": [str(tmp_path / "pages.jsonl"), str(tmp_path / "pages.csv")]},
         logging={"level": "ERROR"},
         report={"top_domains": 3},
+        rendering={"mode": "always", "wait_for": "#content"},
     )
     async with AdvancedCrawler(config) as advanced:
         crawler = advanced.crawler
@@ -107,6 +109,7 @@ async def test_configuration_reaches_every_part(tmp_path):
         assert advanced.storage is crawler.storage
         assert [type(storage) for storage in advanced.storage.storages] == [JSONStorage, CSVStorage]
         assert logging.getLogger().level == logging.ERROR
+        assert crawler.rendering == Rendering(wait_for="#content")
 
 
 async def test_defaults_without_a_configuration():
@@ -115,6 +118,25 @@ async def test_defaults_without_a_configuration():
         assert crawler.storage is None
         assert file_handlers() == []
         assert crawler.get_stats()["total_pages"] == 0
+        assert "rendering" not in crawler.get_stats()
+
+
+async def test_stats_of_rendering_with_rendering(url, tmp_path):
+    out = tmp_path / "out"
+    config = make_config(
+        urls=[url("/data.json")],
+        rendering={"mode": "always"},
+        report={"stats_json": str(out / "stats.json"), "html": str(out / "report.html")},
+    )
+
+    # A page that is not HTML does not go to the browser.
+    async with AdvancedCrawler(config) as crawler:
+        await crawler.crawl()
+        stats = crawler.get_stats()
+
+    assert stats["rendering"] == {"rendered": 0, "failed": 0, "avg_render_time": 0.0}
+    assert json.loads((out / "stats.json").read_text(encoding="utf-8"))["rendering"] == stats["rendering"]
+    assert "<h2>Rendering</h2>" in (out / "report.html").read_text(encoding="utf-8")
 
 
 async def test_nothing_to_crawl_is_an_error_of_the_configuration():
@@ -234,3 +256,76 @@ async def test_log_file_that_cannot_be_opened_fails_the_constructor(tmp_path):
         AdvancedCrawler(make_config(logging={"file": str(tmp_path / "taken" / "crawler.log")}))
 
     assert file_handlers() == []
+
+
+@pytest.mark.usefixtures("clean_proxy_environment")
+class TestProxies:
+    async def test_crawl_through_the_proxy_of_the_configuration(self, url, make_proxy, tmp_path):
+        proxy = await make_proxy(authorization=PROXY_AUTHORIZATION)
+        out = tmp_path / "out"
+        config = make_config(
+            urls=[url("/site/")],
+            proxy={"urls": [with_password(proxy.url)]},
+            logging={"level": "DEBUG", "file": str(out / "crawler.log")},
+            report={"stats_json": str(out / "stats.json"), "html": str(out / "report.html")},
+        )
+
+        async with AdvancedCrawler(config) as crawler:
+            pages = await crawler.crawl()
+            stats = crawler.get_stats()
+
+        assert url("/site/") in pages
+        assert f"GET {url('/site/')}" in proxy.requests
+        label = with_password(proxy.url, "***")
+        assert stats["proxies"] == {
+            label: {"state": "active", "requests": len(proxy.requests), "failures": 0, "times_removed": 0}
+        }
+        assert json.loads((out / "stats.json").read_text(encoding="utf-8"))["proxies"] == stats["proxies"]
+        report = (out / "report.html").read_text(encoding="utf-8")
+        assert "<h2>Proxies</h2>" in report and label in report
+        log = (out / "crawler.log").read_text(encoding="utf-8")
+        for text in (log, report, (out / "stats.json").read_text(encoding="utf-8")):
+            assert PROXY_PASSWORD not in text
+
+    async def test_crawl_through_the_proxies_of_the_environment(self, url, make_proxy, monkeypatch):
+        proxy = await make_proxy()
+        monkeypatch.setenv("HTTP_PROXY", proxy.url)
+        config = make_config(urls=[url("/site/c.html")], proxy={"from_env": True})
+
+        async with AdvancedCrawler(config) as crawler:
+            await crawler.crawl()
+            stats = crawler.get_stats()
+
+        assert proxy.requests == [f"GET {url('/site/c.html')}"]
+        assert stats["proxies"] == {proxy.url: {"state": "active", "requests": 1, "failures": 0, "times_removed": 0}}
+
+    async def test_from_env_without_proxies_goes_directly_and_says_so(self, url, site, caplog):
+        config = make_config(urls=[url("/site/c.html")], proxy={"from_env": True})
+
+        with caplog.at_level(logging.WARNING, logger="crawler.advanced"):
+            async with AdvancedCrawler(config) as crawler:
+                await crawler.crawl()
+                stats = crawler.get_stats()
+
+        assert crawler.crawler.proxies is None
+        assert "proxies" not in stats
+        assert site.hits == {"/site/c.html": 1}
+        assert "neither HTTP_PROXY nor HTTPS_PROXY is set, requests go directly" in caplog.text
+
+    async def test_invalid_variable_of_the_environment_fails_the_constructor(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HTTP_PROXY", with_password("http://proxy.example"))
+
+        with pytest.raises(ConfigError) as error:
+            AdvancedCrawler(make_config(proxy={"from_env": True}, logging={"file": str(tmp_path / "crawler.log")}))
+
+        assert str(error.value) == (
+            "Invalid configuration: proxy.from_env: HTTP_PROXY: the proxy URL needs a port, "
+            "such as http://proxy.example:3128"
+        )
+        assert file_handlers() == []
+
+    async def test_no_proxies_no_key_in_the_stats(self, url):
+        async with AdvancedCrawler(make_config(urls=[url("/site/c.html")])) as crawler:
+            await crawler.crawl()
+
+        assert "proxies" not in crawler.get_stats()

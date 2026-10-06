@@ -13,6 +13,9 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Circuit breaker](#circuit-breaker) | `CircuitBreaker` |
 | [Error statistics](#error-statistics) | `error_stats()` |
 | [Timeouts](#timeouts) | connect, read and total timeouts |
+| [Cookies and headers](#cookies-and-headers) | the session of the crawler, `cookies.txt` files |
+| [Proxies](#proxies) | `ProxyPool`: rotation, proxies taken out of it, their errors |
+| [Rendering](#rendering) | `Rendering`: pages rendered in a headless Chromium, their errors |
 | [Crawling](#crawling) | `crawl()`: depth, filters, sitemaps, state of a crawl |
 | [Page statistics](#page-statistics) | `CrawlerStats`, export to JSON and HTML |
 | [AdvancedCrawler](#advancedcrawler) | the crawler set up by a configuration |
@@ -76,7 +79,10 @@ Every method checks robots.txt, waits for the rate limit and retries transient
 failures; a URL that robots.txt disallows fails with `RobotsDisallowedError`
 without being requested, and a URL of a site whose robots.txt cannot be read
 fails with `RobotsUnreachableError`. A request to a host blocked by the
-circuit breaker fails with `CircuitOpenError` without being sent.
+circuit breaker fails with `CircuitOpenError` without being sent, and one
+for which every proxy is out of rotation with `NoProxyError` (see
+[Proxies](#proxies)). With `rendering`, an HTML page is rendered in a
+headless browser before it is returned (see [Rendering](#rendering)).
 
 ## Politeness
 
@@ -112,7 +118,8 @@ every DNS failure is `DNSError`. A page that redirects to such a site
 waits the same way and is requested again, and so does a
 sitemap of the site (see [Crawling](#crawling)); they all share the
 downloads of the site. Each download after the first is a single attempt,
-without the retries and their growing timeouts, and no page of a crawl
+without the retries and their growing timeouts (an attempt that failed
+in a proxy is still made again through another one), and no page of a crawl
 waits for a download longer than `AsyncCrawler.ROBOTS_POLL` (2) seconds:
 the download goes on, and the page is put off for that long at a time
 until it is over, so a site that is slow to fail holds no worker back
@@ -228,7 +235,15 @@ slot of a host behind the one that opened its circuit is refused too. A
 retry the breaker would refuse is not made, so the request fails with the
 error of its last attempt, not with `CircuitOpenError`. When the breaker
 refuses the download of robots.txt, the page fails with `CircuitOpenError`
-under its own URL, and robots.txt is not cached as unreachable.
+under its own URL, and robots.txt is not cached as unreachable. The same
+goes for a download of robots.txt that failed in a proxy (`ProxyError`):
+it says nothing of the site.
+
+Errors of proxies (`ProxyError`) are not counted at all: a dead proxy
+must not open the circuits of healthy sites. Proxies have states of their
+own, see [Proxies](#proxies). A page the browser took too long to render
+(`RenderTimeoutError`) is not counted either: its document came in time,
+and a few pages with slow scripts must not block the site.
 
 In a crawl, a page the breaker refuses is not failed: it is put off until
 the circuit may let a probe through, or for a second while the probe is in
@@ -334,6 +349,227 @@ megabyte to parse (a 10 MiB page full of links measured 20 s and 400 MB),
 and the GIL runs the parses one at a time anyway. With the defaults no
 more than two pages of 3 MiB are parsed at once, about 250 MB; a site of
 larger pages needs a larger `max_page_size`, and the memory grows with it.
+
+## Cookies and headers
+
+The crawler keeps the cookies sites set and sends them back, as a browser
+does; robots.txt and sitemaps share them with the pages. Starting cookies,
+extra headers and the cookies of a `cookies.txt` file are given to the
+crawler, and its cookies are taken back after the crawl:
+
+```python
+from crawler import AsyncCrawler, load_cookies_file, make_cookie, save_cookies_file
+
+cookies = load_cookies_file("cookies.txt")  # exported from the browser
+cookies.append(make_cookie("consent", "yes", ".example.com"))  # the host and its subdomains
+
+async with AsyncCrawler(cookies=cookies, headers={"Accept-Language": "en"}) as crawler:
+    await crawler.crawl(["https://example.com/account/"], same_domain_only=True)
+    save_cookies_file(crawler.export_cookies(), "cookies.txt")
+```
+
+| Name | What it does |
+|------|--------------|
+| `AsyncCrawler(headers=)` | headers sent with every request to every host; `User-Agent`, `Cookie`, `Host` and `Proxy-Authorization` are refused (`ValueError`) |
+| `AsyncCrawler(cookies=)` | `http.cookiejar.Cookie` objects sent from the first request, each to its own domain |
+| `AsyncCrawler(keep_cookies=False)` | no cookies sent or kept (aiohttp's `DummyCookieJar`); with `cookies` it is a `ValueError` |
+| `export_cookies()` | the cookies the crawler keeps, those sites set included, as `http.cookiejar.Cookie`; also after `close()`. A cookie is for its host only if aiohttp sends it so: a cookie set without `Domain`, until the host sets it again with one |
+| `make_cookie(name, value, domain, path=, secure=, expires=, http_only=)` | a cookie; `example.com` is that host only, `.example.com` also its subdomains |
+| `load_cookies_file(path)` | the cookies of a Netscape `cookies.txt` file; expired ones are left out, session ones kept, those the crawler cannot send (of an IP address, with an invalid name) left out with a warning. A malformed file raises `ValueError` whose message does not quote it |
+| `save_cookies_file(cookies, path)` | writes a `cookies.txt` file with mode `0600`, session cookies included; an existing file is replaced whole, so it gets that mode too |
+
+The `cookies.txt` format is read and written by `http.cookiejar`, never with
+`pickle`, which aiohttp's `CookieJar.save()` and `load()` use: loading a
+pickle runs the code it holds. A cookie of an IP address is a `ValueError`:
+aiohttp keeps cookies of host names only.
+
+`AdvancedCrawler` takes all of it from the `session` section (see the
+[configuration guide](configuration.md#session)) and writes `save_cookies`
+when the crawl ends; `save_cookies()` writes it after a cancelled crawl.
+Why it works this way: [the note on sessions](sessions_proxies_rendering.md#cookies-and-sessions).
+
+## Proxies
+
+With a `ProxyPool`, every request goes through a proxy of the pool: pages,
+robots.txt and sitemaps alike.
+
+```python
+from crawler import AsyncCrawler, ProxyPool
+
+proxies = ProxyPool(
+    ["http://user:secret@proxy-1.example:3128", "http://proxy-2.example:3128"],
+    rotation="per_host",
+    max_failures=3,
+    cooldown=60.0,
+)
+async with AsyncCrawler(proxies=proxies) as crawler:
+    await crawler.crawl(["https://example.com/"], same_domain_only=True)
+for label, stats in crawler.proxy_stats().items():
+    print(label, stats.state, stats.requests, stats.failures)  # http://user:***@proxy-1.example:3128 active 41 0
+```
+
+| Name | What it does |
+|------|--------------|
+| `ProxyPool(urls, rotation=, max_failures=, cooldown=)` | the proxies, `http://` or `https://` with a port; `ValueError` for a URL that is not one, a SOCKS proxy or a proxy listed twice; the message never shows a password |
+| `ProxyPool.from_env(max_failures=, cooldown=)` | a pool of the proxies of `HTTP_PROXY` and `HTTPS_PROXY`, with `NO_PROXY`; `None` if neither is set |
+| `AsyncCrawler(proxies=)` | send the requests through the pool; `None`, the default, sends them directly |
+| `crawler.proxies` | the pool, `None` without one |
+| `proxy_stats()` | `{label: ProxyStats}`: `state` (`"active"` or `"out"`), `requests`, `failures`, `times_removed`; empty without a pool |
+| `pick(url)`, `record(proxy, url, error)` | the proxy for a request (`None`: directly), and how it went; for a transport of your own |
+
+`rotation="per_host"`, the default, sends every host through a proxy of
+its own, chosen by a hash of the host that is the same in every run, so a
+site sees one address and its session does not move between addresses.
+`"per_request"` lets the proxies take turns, one request each.
+
+A proxy that fails `max_failures` requests in a row is out of rotation for
+`cooldown` seconds, logged as a warning, and its return as INFO; any
+response through it clears the count, and once back, one more failure
+takes it out again. A request through a proxy fails with:
+
+| Error | When | Retried |
+|-------|------|---------|
+| `ProxyNetworkError` (a `ProxyError` and a `NetworkError`) | the proxy cannot be reached, its name does not resolve, the TLS of an `https://` proxy fails, or it answers HTTP 407 to CONNECT or to the request of an `http://` URL (inside the tunnel of an `https://` URL the site answers) | yes, through the next proxy at once; with `per_host` the host stays on that proxy |
+| `NoProxyError` (a `ProxyError`) | every proxy for the URL is out of rotation: the request is not sent; the message says when the first is back | no |
+| `NetworkError` | the proxy answered CONNECT with another status: it cannot or may not reach the site | yes, as any network error of the site |
+| `FetchTimeoutError` | a timeout: the proxy and the site cannot be told apart | yes, as any timeout of the site |
+
+Whatever the site answers through a proxy (a 404, a 503) is the site's,
+and the proxy is up. The circuit breaker counts no `ProxyError`: a dead
+proxy does not open the circuits of healthy sites. A download of robots.txt
+that a proxy failed is retried through the other proxies as the request
+of a page is; one that fails with a `ProxyError` all the same is not
+cached: the page fails with the error of the proxy. `error_stats()` counts these errors under their own classes,
+`ProxyNetworkError` as a `NetworkError`.
+
+The rate limit, robots.txt, Crawl-delay, `max_per_domain` and the circuit
+breaker go by the host of the URL, whatever proxy a request goes through.
+`crawl()` counts `requests`, `failures` and `times_removed` anew, as it
+does the counters of the breaker; the proxies out of rotation stay out.
+
+The user name and the password of a proxy are taken out of its URL:
+aiohttp gets the URL without them, and the password goes in the
+`Proxy-Authorization` header, with CONNECT for an `https://` site, so the
+site never sees it, and with the request itself for an `http://` one, which
+the proxy takes out. A proxy is named by its `label`, the URL with the
+password hidden (`http://user:***@host:port`), in the log, the errors and
+the statistics; `repr()` of a `Proxy` leaves the header out.
+
+`from_env()` reads the variables once, in either case, without
+`ALL_PROXY`, `~/.netrc` or the proxies of the system settings, unlike
+aiohttp's `trust_env`: a URL goes through the proxy of its scheme, or
+directly when its scheme has none or `NO_PROXY` names its host. A proxy
+without a scheme is an `http://` one. Each scheme has one proxy, so the
+rotation does not matter. A variable that is not a proxy URL raises
+`ValueError` with the name of the variable, not its value, and so does
+one proxy in both variables with different passwords. The host of a proxy
+is lowercased: `Proxy.example` and `proxy.example` are one proxy.
+
+SOCKS proxies are not supported; an http proxy, or a local bridge from
+HTTP to SOCKS, does instead.
+
+`AdvancedCrawler` makes the pool of the `proxy` section (see the
+[configuration guide](configuration.md#proxy)). Why it works this way:
+[the note on proxies](sessions_proxies_rendering.md#proxies).
+
+## Rendering
+
+With `Rendering`, HTML pages are rendered in a headless Chromium before
+they are parsed, so the links and the text that JavaScript makes are
+found. It needs the browser of Playwright, `playwright install chromium`;
+Playwright is imported when the first page is rendered, so the crawler
+works without the browser until then.
+
+```python
+from crawler import AsyncCrawler, Rendering
+
+rendering = Rendering(wait_until="load", wait_for=".quote", timeout=20.0)
+async with AsyncCrawler(rendering=rendering) as crawler:
+    page = await crawler.fetch_and_parse("https://quotes.toscrape.com/js/")
+    print(len(page["text"]))  # about 1500 characters of quotes; without rendering, 74 of the header and footer
+```
+
+| Name | What it does |
+|------|--------------|
+| `Rendering(include=, wait_until=, wait_for=, timeout=, max_open_pages=, block_resources=)` | which pages are rendered and how long they are waited for; `ValueError` for a value out of its range or a pattern that is not a regular expression, `TypeError` for a string in place of a list |
+| `include` | regular expressions searched in the URL, as in `UrlFilter`; given, only the pages that match one are rendered; empty (the default), every HTML page |
+| `wait_until` | `"load"` (the default), `"domcontentloaded"` or `"networkidle"` (no request for half a second) |
+| `wait_for` | a CSS selector to wait for after that; `None` by default |
+| `timeout` | seconds the browser has for a page, the waits included; `30.0` |
+| `max_open_pages` | pages rendered at once, each a browser tab of 50 to 100 MB; `2` |
+| `block_resources` | types of requests the browser does not make (`RESOURCE_TYPES` of `crawler.rendering`: `"image"`, `"script"`, `"xhr"` ...); images, fonts and media by default |
+| `renders(url)` | whether the page at `url` is rendered, if it is HTML |
+| `AsyncCrawler(rendering=)` | render pages as it says; `None`, the default, renders none |
+| `crawler.rendering` | the settings, `None` without rendering |
+| `render_stats()` | a `RenderStats`: `rendered` (pages the browser loaded to the end, those that went elsewhere on their own included), `failed` (a timeout, a `RenderError`), `avg_render_time` (seconds per rendered page, from a free tab in a running browser to the HTML); `None` without rendering. `crawl()` counts anew |
+| `browser_problem()`, `playwright_problem()` of `crawler.rendering` | why pages cannot be rendered here (Playwright or Chromium is not installed), with the command to install it; `None` if they can. `browser_problem()` is a coroutine that starts the driver of Playwright for a moment |
+
+Every request is made as without a browser first: the page is downloaded
+by aiohttp, through the proxies, with the cookies and the headers, within
+`max_page_size`. Only a response that is HTML, for a URL that
+`renders()`, goes to the browser: robots.txt, sitemaps, redirects and
+other types never do. The browser gets the document as downloaded, not
+again from the site, runs its JavaScript and loads what it asks for
+itself, but `block_resources`. The page counts once against `max_pages`
+and the rate limit, and is rendered within the concurrency slot of its
+request; its response time includes the rendering. `fetch_url()` and the
+other methods render an HTML page too.
+
+A page that goes to another URL on its own (JavaScript setting
+`location`, `<meta http-equiv="refresh">`, a form sent) comes back as a
+redirect to that URL, with the status of the download: the browser is
+stopped, and the crawler checks the target against robots.txt and the
+filters, waits for the rate limit of its host and requests it, within
+`MAX_REDIRECTS`, as it does after an HTTP redirect. A disallowed target
+fails with `RobotsDisallowedError` before it is requested. Navigations of
+frames and pop-up windows are refused: what they show is not in the HTML
+of the page. Service workers are blocked.
+
+The rendered page keeps the status, the headers and the final URL of its
+download; its text is the HTML of the page once rendered (the DOM, as
+`page.content()` serializes it), and its size the bytes of that HTML in
+UTF-8. A tab is opened for every page and closed after it.
+
+The browser shares the cookies, the headers and the proxies of the
+crawler. A page is rendered in the browser context of the proxy its
+document came through (one context per proxy, and one for the pages
+without a proxy, each for the life of the browser), so all its requests
+go through that proxy, with the password of it; the hosts of `NO_PROXY`
+of a `ProxyPool.from_env()` are reached directly. The requests carry the
+`user_agent` and the `headers`. Before a page, the context gets the
+cookies the crawler changed since the last page, and after it, the
+crawler gets those the context changed: cookies set by JavaScript and by
+the responses to the page's requests go with the next download, to
+`export_cookies()` and to `save_cookies`, and a cookie a script deletes
+is deleted. Only the changes go each way, so two tabs do not undo each
+other; when both sides change one cookie, the browser wins. Not shared:
+`SameSite`, which `http.cookiejar` does not keep (Chromium gives such a
+cookie its default, `Lax`), and the cookies of IP addresses or with a
+value the crawler cannot send, which stay in the browser. A cookie
+Chromium refuses, such as a `__Secure-` one without `Secure`, is left
+out of the browser with a warning, the others go. With
+`keep_cookies=False`, every page has a context of its own, without
+cookies, closed after it. The requests of the browser are not those of
+the crawler: `proxy_stats()` does not count them, and their failures
+neither take a proxy out of rotation nor count in the circuit breaker.
+
+| Error | When | Retried | Circuit breaker |
+|-------|------|---------|-----------------|
+| `RenderTimeoutError` (a `FetchTimeoutError`) | the page took the browser longer than `timeout`: `rendering timeout (30.0s)` | yes, with the same `timeout`; the other requests to the host do not wait for the retry | does not count: the host answered in time, the page is slow in the browser |
+| `PageTooLargeError` | the rendered HTML is over `max_page_size` bytes | no | does not count, as without a browser |
+| `RenderError` | Playwright or Chromium is not installed (the message has the command to install it), the browser could not start, crashed, or the page crashed in it | no | does not count: the browser failed, not the site |
+| `CrawlerClosedError` | the crawler was closed while the page was rendered | no | does not count |
+
+The browser is started for the first page to render, so a crawl without
+such a page never starts it, and closed by `close()`. A browser that
+crashes fails the pages it was rendering and is started again for the
+next one, once (`Renderer.MAX_LAUNCHES`, 2 launches in all); after that,
+or after a browser that could not start, every page to render fails with
+`RenderError` at once. `error_stats()` counts `RenderError` as `other`.
+
+`AdvancedCrawler` makes the settings of the `rendering` section (see the
+[configuration guide](configuration.md#rendering)). Why it works this way:
+[the note on the headless browser](sessions_proxies_rendering.md#headless-browser).
 
 ## Crawling
 
@@ -563,13 +799,14 @@ asyncio.run(main())
 |--------|--------------|
 | `AdvancedCrawler(config, configure_logging=True)` | takes a `CrawlerConfig`; the defaults without one |
 | `AdvancedCrawler.from_config(path, overrides, configure_logging=True)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
-| `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section; returns the pages by URL |
+| `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section and the cookies of `session.save_cookies`; returns the pages by URL |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
-| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics) |
+| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report; with rendering, `rendering`: `{rendered, failed, avg_render_time}` (see `render_stats()` in [Rendering](#rendering)), also in the JSON and the HTML report |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
-| `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats` |
+| `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats`; `crawler.proxies` and `crawler.rendering` are the pool and the settings of rendering, `None` without them |
 | `reports` | the report files the latest `write_reports()` wrote |
+| `save_cookies()`, `cookie_file` | writes the cookies to `session.save_cookies` and returns the file, `None` without one or when it cannot be written (logged); `crawl()` calls it, call it yourself after a crawl that was cancelled. `cookie_file` is the file it wrote |
 
 Directories of the log, the reports and the files of the storage are created
 if they are missing. A configuration with neither `urls` nor `sitemaps.urls`
@@ -860,12 +1097,14 @@ and may change. A layer calls only the one below it.
 | Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
 | Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: the queue and the URLs seen, filters, depth, `max_pages` and `max_pages_per_host`, sitemaps read before the first page, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
-| HTTP | `transport.py` | `HttpTransport` | a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
+| HTTP | `transport.py` | `Transport`, `HttpTransport` | `Transport` is the contract the request layer sends through; `HttpTransport` makes a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
+| HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, with the proxy their document came through (`Response.proxy`), a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a context per proxy, the cookies kept in step with those of `HttpTransport` (`CookieSync`, `Transport.update_cookies`), a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash, the counters of `render_stats()` | robots.txt, filters, retries, limits |
 
 Who owns what:
 
 - `AsyncCrawler` creates the shared objects — `SemaphoreManager`,
-  `RateLimiter`, `RetryStrategy`, `CircuitBreaker`, `HttpTransport`,
+  `RateLimiter`, `RetryStrategy`, `CircuitBreaker`, `HttpTransport`
+  (wrapped in a `BrowserTransport` with `rendering`),
   `Fetcher`, `HTMLParser`, `CrawlerStats` — and exposes some of them as
   its attributes (`rate_limiter`, `circuit_breaker`, `stats` ...). The
   settings and the components of a crawler are read-only, as the layers

@@ -11,7 +11,7 @@ listed in the [API reference](api.md#internals).
   by **reason to change**: how bytes are fetched, how one URL is fetched
   politely, how a crawl walks a site, what the user calls.
 - The layers here, from the bottom:
-  - **HTTP** (`HttpTransport`): one GET, no redirects.
+  - **HTTP** (a `Transport`, such as `HttpTransport`): one GET, no redirects.
   - **Request** (`Fetcher`): robots.txt, rate limit, circuit breaker, retries, redirects.
   - **Crawl** (`CrawlRun`): queue, filters, limits, deferred pages, counters.
   - **Facade** (`AsyncCrawler`): the public API.
@@ -20,8 +20,20 @@ listed in the [API reference](api.md#internals).
   share one request path, and the robots.txt and sitemap downloads go
   through it as well.
 - A feature then lands in one layer:
-  - proxies and cookies change the HTTP session;
-  - rendering JavaScript in a headless browser is a second transport with the same contract;
+  - proxies and cookies change the HTTP session: the transport picks the
+    proxy of every request and tells the pool how it went, and the
+    request layer sees only the class of the error (`ProxyNetworkError`
+    is retried, `NoProxyError` is not), never a proxy;
+  - rendering JavaScript in a headless browser is a second transport with
+    the same contract (`BrowserTransport`), a wrapper of the first: the
+    page is downloaded as before and only then handed to the browser. A
+    page that goes to another URL on its own comes back as a redirect, so
+    the request layer checks robots.txt, the filters and the redirect
+    limit for it as for any redirect; the transport never calls up to ask.
+    The response names the proxy it came through, so the browser renders
+    the page through the same one, and the cookies the page set go back
+    into the cookie jar of the first transport, which stays the one the
+    crawler keeps;
   - a crawl shared by several machines replaces the queue and the set of seen URLs of the crawl layer.
 
 ## Contracts between layers
@@ -35,10 +47,13 @@ listed in the [API reference](api.md#internals).
   and as **results** above it (`FetchResult.error`). A crawl worker has to
   go on after any failure, so it should not have to catch exceptions.
 - **Add an abstraction when the second implementation comes.** With one
-  transport, a `Protocol` would be a guess at the interface. The contract
-  is written in the docstring, and the `Protocol` (structural typing, no
-  base class to inherit) comes with the browser transport, shaped by what
-  both need.
+  transport, a `Protocol` would be a guess at the interface, so the
+  contract lived in the docstring of `HttpTransport`. The `Protocol`
+  (`Transport`: structural typing, no base class to inherit) is made for
+  the browser transport, shaped by what both need: `get()`, `close()`,
+  `reset_stats()`, `cookies()` and `update_cookies()` (the browser gives
+  back the cookies its pages set). The request layer knows only
+  `Transport`; the facade builds the transports and knows what they are.
 
 ## State of a unit of work
 

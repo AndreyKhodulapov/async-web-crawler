@@ -132,6 +132,39 @@ def test_long_chart_label_is_kept_whole_in_the_table():
     assert len(CHART.findall(html)) == 1
 
 
+def test_html_report_lists_the_proxies():
+    proxies = {
+        "http://user:***@proxy-1.example:3128": {"state": "out", "requests": 1200, "failures": 3, "times_removed": 1},
+        "http://<b>proxy-2</b>:3128": {"state": "active", "requests": 7, "failures": 0, "times_removed": 0},
+    }
+    html = render_html(empty_stats() | {"proxies": proxies})
+
+    assert "<h2>Proxies</h2>" in html
+    assert "<b>" not in html
+    assert cells(html) == [
+        *("http://user:***@proxy-1.example:3128", "1,200", "3", "1", "out of rotation"),
+        *("http://<b>proxy-2</b>:3128", "7", "0", "0", "active"),
+    ]
+
+
+def test_html_report_without_proxies_has_no_table_of_them(stats):
+    assert "Proxies" not in render_html(stats.get_stats())
+
+
+def test_html_report_shows_the_rendering():
+    rendering = {"rendered": 1200, "failed": 3, "avg_render_time": 0.84}
+    html = render_html(empty_stats() | {"rendering": rendering})
+
+    assert (
+        '<h2>Rendering</h2>\n<dl class="summary"><div><dt>Pages rendered</dt><dd>1,200</dd></div>'
+        "<div><dt>Failed</dt><dd>3</dd></div><div><dt>Average render time</dt><dd>840 ms</dd></div></dl>"
+    ) in html
+
+
+def test_html_report_without_rendering_does_not_mention_it(stats):
+    assert "Rendering" not in render_html(stats.get_stats())
+
+
 def test_html_report_of_an_empty_crawl_has_no_charts():
     html = render_html(empty_stats())
 

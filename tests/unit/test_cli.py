@@ -37,6 +37,11 @@ def test_options_are_shaped_like_the_configuration():
             "--output", "pages.jsonl",
             "--output", "sqlite:///pages.db",
             "--overwrite",
+            "--cookies-file", "cookies.txt",
+            "--save-cookies", "saved.txt",
+            "--proxy", "http://user:secret@proxy-1.example:3128",
+            "--proxy", "http://proxy-2.example:3128",
+            "--render",
             "--no-respect-robots",
             "--no-same-domain-only",
             "--rate-limit", "2.5",
@@ -52,6 +57,12 @@ def test_options_are_shaped_like_the_configuration():
         "crawler": {"max_pages": 7, "max_depth": 0, "respect_robots": False, "rate_limit": 2.5},
         "filters": {"same_domain_only": False},
         "storage": {"outputs": ["pages.jsonl", "sqlite:///pages.db"], "overwrite": True},
+        "session": {"cookies_file": "cookies.txt", "save_cookies": "saved.txt"},
+        "proxy": {
+            "urls": ["http://user:secret@proxy-1.example:3128", "http://proxy-2.example:3128"],
+            "from_env": False,
+        },
+        "rendering": {"mode": "always", "include": []},
         "report": {"stats_json": "stats.json", "html": "report.html"},
         "logging": {"level": "DEBUG", "file": "crawler.log"},
     }
@@ -78,6 +89,61 @@ def test_overwrite_wins_over_the_file(option, expected, tmp_path):
 
     assert build_config(parse_args(["--config", config, option])).storage.overwrite is expected
     assert build_config(parse_args(["--config", config])).storage.overwrite is not expected
+
+
+def test_cookie_options_keep_the_rest_of_the_session_of_the_file(tmp_path):
+    config = write_config(
+        tmp_path,
+        {
+            "urls": ["https://example.com/"],
+            "session": {"save_cookies": "file.txt", "headers": {"Accept-Language": "en"}},
+        },
+    )
+
+    session = build_config(parse_args(["--config", config, "--save-cookies", "flag.txt"])).session
+
+    assert (session.save_cookies, session.headers) == ("flag.txt", {"Accept-Language": "en"})
+
+
+@pytest.mark.parametrize("section", [{"urls": ["http://file.example:3128"]}, {"from_env": True}])
+def test_proxy_option_replaces_the_proxies_of_the_file_and_keeps_the_rest(section, tmp_path):
+    config = write_config(
+        tmp_path, {"urls": ["https://example.com/"], "proxy": section | {"rotation": "per_request", "cooldown": 5}}
+    )
+
+    proxy = build_config(parse_args(["--config", config, "--proxy", "http://flag.example:3128"])).proxy
+
+    assert (proxy.urls, proxy.from_env) == (("http://flag.example:3128",), False)
+    assert (proxy.rotation, proxy.cooldown) == ("per_request", 5.0)
+
+
+def test_render_renders_every_page_and_keeps_the_rest_of_the_section_of_the_file(tmp_path):
+    config = write_config(
+        tmp_path,
+        {"urls": ["https://example.com/"], "rendering": {"mode": "patterns", "include": ["/app/"], "timeout": 5}},
+    )
+
+    rendering = build_config(parse_args(["--config", config, "--render"])).rendering
+
+    assert (rendering.mode, rendering.include, rendering.timeout) == ("always", (), 5.0)
+    assert build_config(parse_args(["--config", config])).rendering.mode == "patterns"
+
+
+@pytest.mark.parametrize(
+    "url, problem",
+    [
+        ("socks5://user:pr0xyp4ss@proxy.example:1080", "SOCKS proxies are not supported"),
+        ("http://user:pr0xyp4ss@proxy.example", "the proxy URL needs a port"),
+    ],
+)
+def test_invalid_proxy_is_an_error_of_the_option_without_the_password(url, problem, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["--proxy", url])
+
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert f"argument --proxy: {problem}" in err
+    assert "pr0xyp4ss" not in err
 
 
 def test_crawl_stays_on_the_start_hosts_by_default():
@@ -354,3 +420,33 @@ def test_exit_code_follows_the_run(outcome, code, monkeypatch, capsys):
     assert main.main(["--urls", "https://example.com/", "--no-progress"]) == code
     assert seen == {"urls": ("https://example.com/",), "progress": False}
     assert capsys.readouterr().err == (f"error: {outcome}\n" if isinstance(outcome, OSError | StorageError) else "")
+
+
+def test_rendering_without_chromium_exits_with_2_before_anything_runs(tmp_path, monkeypatch, capsys):
+    async def browser_problem():
+        return "Chromium is not installed; run: playwright install chromium"
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main, "browser_problem", browser_problem)
+    monkeypatch.setattr(main, "AdvancedCrawler", None)  # would fail if called
+
+    assert main.main(["--urls", "https://example.com/", "--render", "--output", "pages.jsonl", "--no-progress"]) == 2
+
+    assert capsys.readouterr().err == (
+        "error: Invalid configuration: rendering.mode: Chromium is not installed; run: playwright install chromium\n"
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_chromium_is_not_looked_for_without_rendering(monkeypatch):
+    async def browser_problem():
+        raise AssertionError("looked for Chromium")
+
+    class Crawler:
+        def __init__(self, config):
+            raise StorageError("stops the run here")
+
+    monkeypatch.setattr(main, "browser_problem", browser_problem)
+    monkeypatch.setattr(main, "AdvancedCrawler", Crawler)
+
+    assert main.main(["--urls", "https://example.com/", "--no-progress"]) == 1

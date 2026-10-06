@@ -3,12 +3,16 @@
 
 PYTHON ?= .venv/bin/python
 
-.PHONY: test test-all lint format db check
+.PHONY: install test test-all lint format db check
+
+install:  # the crawler, the tools of development and the browser that renders JavaScript
+	$(PYTHON) -m pip install -e . -r requirements-dev.txt
+	$(PYTHON) -m playwright install chromium
 
 test:  # the default tests: unit and integration, no internet or database needed
 	$(PYTHON) -m pytest -q
 
-test-all:  # every test, the network and postgres ones too
+test-all:  # every test, the network, postgres and browser ones too
 	$(PYTHON) -m pytest -q -m ""
 
 lint:

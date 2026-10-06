@@ -63,6 +63,41 @@ filters:
                        exe, dmg, iso,
                        css, js]
 
+# Cookies and headers of the requests. Their values are secrets: they stay
+# out of the log, the summary and the reports, so keep this file private too.
+session:
+  keep_cookies: true    # send back the cookies sites set; false keeps none, so no site can keep a session
+  # Cookies sent from the first request, each to its own domain only:
+  # example.com is that host, .example.com the host and its subdomains.
+  cookies: []           # e.g. [{name: sessionid, value: "...", domain: example.com, path: /, secure: true}]
+  cookies_file: null    # e.g. cookies.txt, in the Netscape format browser extensions and curl -c export
+  save_cookies: null    # e.g. cookies.txt; written after the crawl, readable by its owner only
+  # Sent with every request to every host, robots.txt and redirects to other
+  # sites included; User-Agent, Cookie and Host have keys of their own.
+  headers: {}           # e.g. {Accept-Language: en, Authorization: "Bearer ..."}
+
+# Proxies the requests go through; without any, requests go directly.
+# robots.txt, rate limits and max_per_domain still go by the host of the site.
+proxy:
+  urls: []              # e.g. ["http://user:password@proxy-1.example:3128", "http://proxy-2.example:3128"]
+  rotation: per_host    # per_host: a host always goes through one proxy; per_request: the proxies take turns
+  from_env: false       # true takes HTTP_PROXY, HTTPS_PROXY and NO_PROXY instead of urls
+  max_failures: 3       # failures in a row that take a proxy out of rotation
+  cooldown: 60.0        # seconds a proxy stays out of rotation
+
+# Pages rendered in a headless Chromium, for sites whose links and text
+# JavaScript makes. Needs playwright install chromium.
+# The page itself is downloaded as without a browser; the browser loads its
+# scripts, styles and data, which robots.txt is not asked about.
+rendering:
+  mode: "off"           # always: every HTML page; patterns: the pages of include; quote "off"
+  include: []           # with mode: patterns, e.g. ['^https://example\.com/app/']
+  wait_until: load      # load, domcontentloaded or networkidle (no request for half a second)
+  wait_for: null        # a CSS selector to wait for after that, e.g. "#content"
+  timeout: 30.0         # the browser's time for a page, the waits included
+  max_open_pages: 2     # pages rendered at once; a browser tab takes 50 to 100 MB
+  block_resources: [image, font, media]  # requests the browser does not make
+
 # Where the crawled pages are saved: files, by extension (.jsonl, .json,
 # .csv, .db), or database URLs (sqlite:///pages.db, postgresql://...).
 storage:
