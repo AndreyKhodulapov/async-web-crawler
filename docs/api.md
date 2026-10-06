@@ -472,9 +472,9 @@ HTTP to SOCKS, does instead.
 
 With `Rendering`, HTML pages are rendered in a headless Chromium before
 they are parsed, so the links and the text that JavaScript makes are
-found. It needs `pip install -e ".[js]"` and `playwright install
-chromium`; Playwright is imported when the first page is rendered, so the
-crawler works without it until then.
+found. It needs the browser of Playwright, `playwright install chromium`;
+Playwright is imported when the first page is rendered, so the crawler
+works without the browser until then.
 
 ```python
 from crawler import AsyncCrawler, Rendering

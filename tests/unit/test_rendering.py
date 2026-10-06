@@ -262,7 +262,7 @@ class TestRenderErrors:
         monkeypatch.setitem(sys.modules, "playwright.async_api", None)
         renderer = Renderer(Rendering(), user_agent="TestBot/1.0")
 
-        with pytest.raises(RenderError, match=r'Playwright is not installed; run: pip install -e "\.\[js\]"'):
+        with pytest.raises(RenderError, match=r"Playwright is not installed; run: pip install -e \.$"):
             await renderer.render(URL, page(URL, "page"))
         with pytest.raises(RenderError, match="Playwright is not installed"):
             await renderer.render(URL, page(URL, "page"))
@@ -301,7 +301,7 @@ class TestInstallation:
     async def test_without_playwright_the_command_to_install_it(self, monkeypatch) -> None:
         monkeypatch.setitem(sys.modules, "playwright", None)  # find_spec() takes it for a missing package
 
-        assert playwright_problem() == 'Playwright is not installed; run: pip install -e ".[js]"'
+        assert playwright_problem() == "Playwright is not installed; run: pip install -e ."
         assert await browser_problem() == playwright_problem()
 
     async def test_without_chromium_the_command_to_install_it(self, monkeypatch, tmp_path) -> None:

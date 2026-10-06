@@ -8,3 +8,4 @@ aiosqlite>=0.20
 asyncpg>=0.30
 matplotlib>=3.9
 PyYAML>=6
+playwright>=1.45

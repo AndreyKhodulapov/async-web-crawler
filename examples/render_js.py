@@ -1,7 +1,7 @@
 """Example: what JavaScript adds to a page, once rendered in a headless browser.
 
 Usage:
-    pip install -e ".[js]"                              # once: the crawler and Playwright
+    pip install -e .                                    # once: the crawler and Playwright
     playwright install chromium                         # once: the browser
     python examples/render_js.py                        # https://quotes.toscrape.com/js/
     python examples/render_js.py https://example.com/app/

@@ -84,8 +84,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--render",
         action="store_true",
         help="render every HTML page in a headless Chromium, so that links JavaScript makes are found; "
-        'in place of rendering.mode and rendering.include of the configuration. Needs pip install -e ".[js]" '
-        "and playwright install chromium",
+        "in place of rendering.mode and rendering.include of the configuration. Needs playwright install chromium",
     )
     parser.add_argument(
         "--respect-robots",

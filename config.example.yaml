@@ -86,7 +86,7 @@ proxy:
   cooldown: 60.0        # seconds a proxy stays out of rotation
 
 # Pages rendered in a headless Chromium, for sites whose links and text
-# JavaScript makes. Needs pip install -e ".[js]" and playwright install chromium.
+# JavaScript makes. Needs playwright install chromium.
 # The page itself is downloaded as without a browser; the browser loads its
 # scripts, styles and data, which robots.txt is not asked about.
 rendering:

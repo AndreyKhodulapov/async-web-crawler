@@ -10,10 +10,6 @@ readme = "README.md"
 requires-python = ">=3.11"
 dynamic = ["dependencies"]
 
-[project.optional-dependencies]
-# Rendering of JavaScript in a headless browser; then: playwright install chromium
-js = ["playwright>=1.45"]
-
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
 

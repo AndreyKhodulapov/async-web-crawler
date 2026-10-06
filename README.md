@@ -38,7 +38,7 @@ configuration file, by command-line options, or from Python.
   `NO_PROXY` of the environment; a proxy that keeps failing is taken out
   of rotation for a while without blocking the sites behind it; requests
   and failures per proxy in the summary and the reports, passwords hidden
-- **JavaScript rendering** in a headless Chromium (Playwright, optional):
+- **JavaScript rendering** in a headless Chromium (Playwright):
   every HTML page or those matching patterns, waiting for an event or a
   CSS selector; the page itself downloaded as without a browser, images
   and fonts not loaded, navigations of a page checked against robots.txt
@@ -84,17 +84,14 @@ Python 3.11+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e .                       # the crawler and its dependencies
+pip install -e .                       # the crawler and its dependencies, Playwright among them
 pip install -r requirements-dev.txt    # test and lint tools, for development
+playwright install chromium            # the browser that renders JavaScript pages
 ```
 
-Rendering JavaScript pages needs Playwright and its Chromium (about
-600 MB on disk), which the crawler does without otherwise:
-
-```bash
-pip install -e ".[js]"
-playwright install chromium
-```
+`make install` runs the three commands in `.venv`. The Chromium of
+Playwright is a download of its own (about 600 MB on disk); only
+rendering needs it, the crawler does without it otherwise.
 
 ## Quick start
 
@@ -475,6 +472,7 @@ ruff check src tests        # lint
 The [Makefile](Makefile) keeps these commands short, with the tools of `.venv`:
 
 ```bash
+make install                # the crawler, the tools and the Chromium of Playwright
 make test                   # the default tests
 make test-all               # every test, network, postgres and browser too
 make lint                   # ruff check and a format check
@@ -535,7 +533,7 @@ examples/
 └── urls.txt                # a list of start URLs for --urls-file
 config.example.yaml         # every configuration key with its default
 docker-compose.yml          # PostgreSQL for the crawler and its tests
-Makefile                    # test, lint and database commands
+Makefile                    # install, test, lint and database commands
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests

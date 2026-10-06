@@ -988,7 +988,7 @@ class TestRendering:
         monkeypatch.setitem(sys.modules, "playwright", None)  # find_spec() takes it for a missing package
 
         assert problems({"rendering": section}) == [
-            'rendering.mode: Playwright is not installed; run: pip install -e ".[js]"'
+            "rendering.mode: Playwright is not installed; run: pip install -e ."
         ]
 
     def test_off_needs_no_playwright(self, monkeypatch):

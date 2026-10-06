@@ -304,15 +304,15 @@ rendering:
   wait_for: "#content"
 ```
 
-Rendering needs the extra `js` and the browser of Playwright:
+Rendering needs the browser of Playwright, a download of its own:
 
 ```bash
-pip install -e ".[js]"
 playwright install chromium
 ```
 
-Without the package, a `mode` other than `"off"` is a configuration
-error with the command to install it. Without Chromium, the command line
+Playwright comes with the crawler; in an environment without the package,
+a `mode` other than `"off"` is a configuration error with the command to
+install it. Without Chromium, the command line
 stops before the crawl with the other command and exit code 2; from
 Python, every page to render fails with `RenderError` that says the same.
 `--render` on the command line sets `mode: always` and clears `include`,

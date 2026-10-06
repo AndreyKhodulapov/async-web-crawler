@@ -304,11 +304,11 @@ async def js_page(request: web.Request) -> web.Response:
 
 @pytest.fixture(scope="session")
 def chromium() -> None:
-    """Skips the test unless Playwright and its Chromium are installed (see the js extra)."""
+    """Skips the test unless Playwright and its Chromium are installed (see `make install`)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        pytest.skip('Playwright is not installed: pip install -e ".[js]"')
+        pytest.skip("Playwright is not installed: pip install -e .")
     with sync_playwright() as playwright:
         executable = playwright.chromium.executable_path
     if not os.path.exists(executable):

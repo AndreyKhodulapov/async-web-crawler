@@ -1,8 +1,8 @@
 """Rendering of pages in a headless browser: a transport that runs the JavaScript of HTML pages.
 
-Playwright is an optional dependency (`pip install -e ".[js]"`, then
-`playwright install chromium`): it is imported when the first page is
-rendered, so the crawler works without it as long as nothing is.
+Playwright comes with the crawler, its browser is a download of its own
+(`playwright install chromium`). Playwright is imported when the first
+page is rendered, so the crawler works without both as long as nothing is.
 """
 
 import asyncio
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-INSTALL_PACKAGE = 'pip install -e ".[js]"'
+INSTALL_PACKAGE = "pip install -e ."
 INSTALL_BROWSER = "playwright install chromium"
 _NO_PLAYWRIGHT = f"Playwright is not installed; run: {INSTALL_PACKAGE}"
 _NO_CHROMIUM = f"Chromium is not installed; run: {INSTALL_BROWSER}"
