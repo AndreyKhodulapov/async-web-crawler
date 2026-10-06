@@ -63,6 +63,19 @@ def gaps(times: list[float]) -> list[float]:
     return [later - earlier for earlier, later in itertools.pairwise(times)]
 
 
+@pytest.fixture
+def held_hosts(monkeypatch) -> list[str]:
+    """The hosts a crawl() holds back in its frontier: none, as the rate limiter, the circuit breaker and robots.txt of the one process hold them back."""
+    held: list[str] = []
+
+    class Recording(MemoryFrontier):
+        async def hold_host(self, host, seconds, reason):
+            held.append(host)
+
+    monkeypatch.setattr("crawler.client.MemoryFrontier", Recording)
+    return held
+
+
 class TestRateLimit:
     async def test_requests_to_one_host_are_spaced_out(self, url, site):
         paths = ["/site/", "/site/a.html", "/site/b.html", "/site/c.html", "/site/a/deeper.html"]
@@ -189,7 +202,7 @@ class TestRobots:
             assert await crawler.fetch_url(url("/site/"))
         assert site.hits["/robots.txt"] == 2
 
-    async def test_crawl_waits_for_robots_txt_that_is_down_for_a_moment(self, url, site, caplog):
+    async def test_crawl_waits_for_robots_txt_that_is_down_for_a_moment(self, url, site, caplog, held_hosts):
         # robots.txt answers 503 to the first download (one attempt and three
         # retries), then it is back: the pages of the site wait out the TTL
         # instead of ending the crawl unreachable, with nothing fetched.
@@ -210,6 +223,7 @@ class TestRobots:
         assert stats.unreachable == 0
         deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred ")]
         assert deferred == [f"Deferred {url('/site/')} for 0.1s: robots.txt is unreachable (HTTP 503)"]
+        assert held_hosts == []
 
     async def test_crawl_gives_up_on_a_site_whose_robots_txt_stays_down(self, url, site, caplog):
         caplog.set_level(logging.INFO, logger="crawler")
@@ -426,20 +440,13 @@ class TestRetryAfter:
         assert set(pages) == {url("/overloaded/1/2"), url("/site/a.html"), other_host}
         assert crawler.crawl_stats().requests == 4
 
-    async def test_crawl_of_one_process_holds_back_no_host_in_its_frontier(self, url, site, monkeypatch):
+    async def test_crawl_of_one_process_holds_back_no_host_in_its_frontier(self, url, site, held_hosts):
         # The rate limiter of the one process holds the host back; the page is put off as before.
-        held = []
-
-        class Recording(MemoryFrontier):
-            async def hold_host(self, host, seconds, reason):
-                held.append(host)
-
-        monkeypatch.setattr("crawler.client.MemoryFrontier", Recording)
         options = {"max_concurrent": 1, "max_depth": 0, "retry_strategy": RetryStrategy(max_retries=1, max_delay=0.5)}
         async with polite(**options) as crawler:
             pages = await crawler.crawl([url("/overloaded/1/1"), url("/site/a.html")])
 
-        assert held == []
+        assert held_hosts == []
         assert set(pages) == {url("/overloaded/1/1"), url("/site/a.html")}
         assert site.hits["/overloaded/1/1"] == 2
 
@@ -477,7 +484,7 @@ class TestCircuitBreaker:
             assert await crawler.fetch_url(url("/flaky/3"))
         assert site.hits["/flaky/3"] == 5
 
-    async def test_crawl_puts_off_the_pages_of_a_blocked_host_until_it_recovers(self, url, site):
+    async def test_crawl_puts_off_the_pages_of_a_blocked_host_until_it_recovers(self, url, site, held_hosts):
         # 503 the first 4 times, then pages; no retries, so every page is one request.
         blocked = [url(f"/flaky/4?page={page}") for page in range(6)]
         other_host = url("/site/b.html", "localhost")
@@ -501,6 +508,7 @@ class TestCircuitBreaker:
         assert site.hits["/flaky/4"] == 7
         assert crawler.circuit_breaker.get_stats()["127.0.0.1"].times_opened == 2
         assert crawler.crawl_stats().requests == 8
+        assert held_hosts == []
 
     async def test_one_broken_page_does_not_open_the_circuit(self, url, site):
         # The review's probe: one page answers 503 every time and is retried

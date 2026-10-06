@@ -466,6 +466,9 @@ class CrawlRun:
             await self._frontier.finish(page, Outcome.UNREACHABLE, reason)
             return
         if result.error is not None:
+            # The circuit of the host may have opened on this failure: a
+            # failed probe opens it again, and its page fails rather than waits.
+            await self._hold_open_circuit(result.error.url)
             await self._fail_page(page, result.error, result)
             return
         if url in self._start_urls and result.redirected and skip_reason is None:
@@ -709,11 +712,23 @@ class CrawlRun:
         with the page, and made again when it comes back. Returns False
         when the site is given up (see `_robots_wait`), and the caller
         marks the page unreachable.
+
+        In a frontier shared by several processes, the site is held back
+        for all of them while its robots.txt is known to be unreachable. A
+        download still under way holds back the page alone: robots.txt may
+        well be read, and the other processes download their own.
         """
         delay = self._robots_wait(refusal.url)
         if delay is None:
             return False
-        await self._put_off_page(page, delay, refusal.message, uncount=requested)
+        assert self.robots is not None  # it refused the URL
+        if self.robots.unreachable_for(refusal.url) > 0:
+            reason = self._unreachable_reason(refusal)
+            await self._put_off_for_host(
+                page, refusal.url, delay, refusal.message, uncount=requested, hold_reason=reason
+            )
+        else:
+            await self._put_off_page(page, delay, refusal.message, uncount=requested)
         return True
 
     def _unreachable_reason(self, refusal: RobotsUnreachableError) -> str:
@@ -740,26 +755,48 @@ class CrawlRun:
         await self._frontier.put_back(page, delay, uncount=uncount)
 
     async def _put_off_for_host(
-        self, page: FrontierPage, url: str, delay: float, reason: str, *, uncount: bool
+        self,
+        page: FrontierPage,
+        url: str,
+        delay: float,
+        reason: str,
+        *,
+        uncount: bool,
+        hold_reason: str | None = None,
     ) -> None:
         """Put a page of the crawl off while the host of `url` is held back, for `delay` seconds.
 
         `url` is the page's own or the target of its redirect. In a frontier
         shared by several processes the host is held back for all of them
-        instead, and the page goes back without a delay of its own: it
-        comes back with the host, however long the others hold it. The
-        fetcher has told the frontier of its holds already; this one is for
-        a page taken before the hold reached the frontier, so it keeps the
-        reason the fetcher gave.
+        too, for `hold_reason`. None keeps the reason the fetcher gave: it
+        has told the frontier of its holds already, and this one is for a
+        page taken before the hold reached the frontier. A page of the host
+        goes back without a delay of its own: it comes back with the host,
+        however long the others hold it. A page that redirects to the host
+        waits out the delay itself, as its own host is not held back: it
+        would be handed out at once and redirect to the held one again.
         """
         if not self._frontier.shared:
             await self._put_off_page(page, delay, reason, uncount=uncount)
             return
         host = get_host(url)
         assert host is not None  # a URL without a host is not requested
-        await self._fetcher.tell_host_held(host, delay, None)
+        await self._fetcher.tell_host_held(host, delay, hold_reason)
         logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
-        await self._frontier.put_back(page, uncount=uncount)
+        await self._frontier.put_back(page, 0.0 if host == get_host(page.url) else delay, uncount=uncount)
+
+    async def _hold_open_circuit(self, url: str) -> None:
+        """In a frontier shared by several processes, hold the host of `url` back for all of them while its circuit is open here.
+
+        For a page that fails while the circuit is open, as one put off
+        holds the host back (see `_defer_or_fail`). The breaker of each
+        process is its own: the others would ask the host on otherwise.
+        """
+        if not self._frontier.shared or (probe_in := self.circuit_breaker.probe_in(url)) == 0:
+            return
+        host = get_host(url)
+        assert host is not None  # a URL without a host has no circuit
+        await self._fetcher.tell_host_held(host, probe_in, self.circuit_breaker.refusal(url))
 
     def _outwaits_retries(self, error: FetchError | None) -> bool:
         """Whether `error` carries a Retry-After too long for the retry strategy, so the request was not retried.
@@ -841,12 +878,18 @@ class CrawlRun:
         answered with the page; given up on, it stays counted if it was
         `requested`. Returns whether the page was put off rather than
         failed.
+
+        In a frontier shared by several processes, the host is held back
+        for all of them until the probe is due. A probe in flight holds
+        back the page alone: when it ends is not known, and the circuits
+        of the other processes are their own.
         """
         host = get_host(refusal.url)
         assert host is not None  # a URL without a host has no circuit
         opened = self.circuit_breaker.times_opened(host)
         if opened >= self.MAX_CIRCUIT_OPENINGS:
             logger.info("Gave up on %s: circuit breaker of %s opened %d times", page.url, host, opened)
+            await self._hold_open_circuit(refusal.url)
             uncount = counted and not requested
             if result is not None and result.error is not None and result.error is not refusal:
                 await self._fail_page(page, result.error, result, uncount=uncount)
@@ -855,8 +898,12 @@ class CrawlRun:
             return False
         # Back when the probe may go; a page refused while the probe is in
         # flight comes back a second later.
-        delay = self.circuit_breaker.probe_in(refusal.url) or 1.0
-        await self._put_off_page(page, delay, refusal.message, uncount=counted)
+        if (probe_in := self.circuit_breaker.probe_in(refusal.url)) > 0:
+            await self._put_off_for_host(
+                page, refusal.url, probe_in, refusal.message, uncount=counted, hold_reason=refusal.message
+            )
+        else:
+            await self._put_off_page(page, 1.0, refusal.message, uncount=counted)
         return True
 
 

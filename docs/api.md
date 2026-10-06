@@ -954,7 +954,11 @@ A host that asks one worker to wait (Retry-After), or makes it pause before
 a retry (HTTP 429, a timeout), is left alone by all of them for as long:
 the fetcher tells `on_host_held`, and the crawl holds the host back in the
 frontier (`Frontier.hold_host`, done only by a frontier that is `shared`).
-The page put off comes back with its host, without a delay of its own. A
+So is a host whose circuit has opened in one worker, until its probe is
+due, and one whose robots.txt one worker found unreachable, until it is
+downloaded again; the breaker and robots.txt stay each worker's own. The
+page put off comes back with its host, without a delay of its own; a page
+that redirects to the held host waits as long itself. A
 worker that took a page of the host before the hold reached the database
 may still send one request for it. If the hold cannot be written, a warning
 is logged and the host is held back by the worker that was answered only.

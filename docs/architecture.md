@@ -168,8 +168,28 @@ run against it; what it adds is what sharing needs.
   of the hold, never back (`greatest`), with the reason in `hold_reason`,
   and `take` hands out no page of the host until then. A page put off for
   its host goes back without a delay of its own and comes back with the
-  host, however long another worker holds it meanwhile. The host may have
-  no row yet (the target of a redirect): the hold makes one.
+  host, however long another worker holds it meanwhile. A page that
+  redirects to a held host waits out the hold itself: its own host is
+  not held back, and it would be handed out at once and redirect to the
+  held one again. The host may have no row yet (the target of a
+  redirect): the hold makes one.
+  - A host whose circuit has opened, or whose robots.txt is unreachable,
+    is held back the same way, by the crawl: until the probe is due, or
+    until robots.txt is downloaded again. So a host that is down costs a
+    few log lines and statements, not one per page of it every second: its
+    pages stay in the queue. A circuit opened again by a failed probe holds
+    the host back again, although its page fails rather than waits.
+  - Only a hold of a known length goes to the database. A page refused
+    while the probe of the host is in flight, or while its robots.txt is
+    being downloaded, is put off on its own: when that ends is not known,
+    and robots.txt may well be read.
+  - The circuit breaker and robots.txt are each worker's own. A worker
+    knows of a host that is down from the hold alone; once it ends, the
+    first worker that takes a page of the host asks it, with a closed
+    circuit or a probe of its own: one or two requests from several
+    workers where a local crawl sends one probe. robots.txt is downloaded
+    by every worker, and held back for by host, though it belongs to an
+    origin (`http` and `https` of a host are one host here).
   - The pages of the host that are already taken are not called back. A
     worker that took one before the hold reached the database knows of
     the hold from its own rate limiter and puts the page back, holding

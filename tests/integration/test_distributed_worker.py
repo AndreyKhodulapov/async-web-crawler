@@ -3,12 +3,22 @@
 import asyncio
 import json
 import logging
+from collections import Counter
+from collections.abc import Awaitable, Callable
 
 import asyncpg
 import pytest
 from helpers import POSTGRES_DSN, UNTHROTTLED, drop_frontier_tables, make_config, urlset
 
-from crawler import AdvancedCrawler, AsyncCrawler, ConfigError, CrawlerConfig, JobError, PostgresFrontier
+from crawler import (
+    AdvancedCrawler,
+    AsyncCrawler,
+    ConfigError,
+    CrawlerConfig,
+    JobError,
+    PostgresFrontier,
+    RobotsParser,
+)
 from crawler.distributed import create_job, run_worker
 
 pytestmark = pytest.mark.postgres
@@ -66,6 +76,20 @@ async def run_workers(config: CrawlerConfig, count: int, **options) -> list[dict
             for number in range(count)
         )
     )
+
+
+async def run_worker_until(config: CrawlerConfig, done: Callable[[], Awaitable[bool]], *, then: float = 0.0) -> None:
+    """Run a worker until `done` says so and `then` seconds more, then stop it: the next one knows of what it did from the database alone."""
+    worker = asyncio.create_task(run_worker(config, "test", worker="first", configure_logging=False))
+    try:
+        async with asyncio.timeout(5):
+            while not await done():
+                await asyncio.sleep(0.02)
+        await asyncio.sleep(then)
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
 
 
 def saved_urls(directory) -> list[str]:
@@ -154,7 +178,7 @@ async def test_requests_to_a_host_are_spaced_out_by_all_workers_together(url, si
     assert times[-1] - times[0] >= 4 * 0.2
 
 
-def held_job(url, first: str, **sections) -> tuple[list[str], list[str], CrawlerConfig]:
+def held_job(url, first: str, *, crawler: dict | None = None, **sections) -> tuple[list[str], list[str], CrawlerConfig]:
     """A job whose first page, `first`, asks its host to wait; the URLs of that host, those of another one and the job.
 
     A page of a host is taken every 0.5 s, and the first request of a
@@ -164,7 +188,7 @@ def held_job(url, first: str, **sections) -> tuple[list[str], list[str], Crawler
     """
     held = [url(first), url("/site/a.html"), url("/site/b.html")]
     other = [url(f"/wide/{n}", "localhost") for n in range(1, 5)]
-    crawler = {"max_depth": 0, "rate_limit": 2.0}
+    crawler = {"max_depth": 0, "rate_limit": 2.0, **(crawler or {})}
     return held, other, make_config(urls=[*held, *other], crawler=crawler, **sections)
 
 
@@ -183,14 +207,11 @@ async def test_host_that_asked_to_wait_is_left_alone_by_the_next_worker(url, sit
     held, other, job = held_job(url, first, retry=retry)
     await create_job(job, "test", dsn=POSTGRES_DSN)
     config = worker_config()
-    asked = asyncio.create_task(run_worker(config, "test", worker="asked", configure_logging=False))
-    async with asyncio.timeout(5):
-        while not (site.hits[first] and await state_of(held[0]) != "leased"):
-            await asyncio.sleep(0.02)
-    asked.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await asked
 
+    async def asked() -> bool:
+        return site.hits[first] > 0 and await state_of(held[0]) != "leased"
+
+    await run_worker_until(config, asked)
     await run_worker(config, "test", worker="next", configure_logging=False)
 
     asked = next(moment for path, moment in site.log if path == first)
@@ -246,6 +267,179 @@ async def test_page_whose_host_asked_to_wait_goes_back_without_a_time_of_its_own
     assert 55 < row["left"] <= 60
     assert row["hold_reason"] == "HTTP 429 Too Many Requests, Retry-After 60s"
     assert site.hits["/busy/60"] == 1
+
+
+def failing_job(url, fails: int, cooldown: float) -> tuple[list[str], list[str], CrawlerConfig]:
+    """A job whose host 127.0.0.1 answers 503 to its first `fails` requests; the URLs of that host, those of another one and the job.
+
+    Two failures open the circuit of a worker for `cooldown` seconds. A
+    page of a host is taken every 0.5 s, as in `held_job`.
+    """
+    failing = [url(f"/flaky/{fails}?page={n}") for n in range(5)]
+    other = [url(f"/wide/{n}", "localhost") for n in range(1, 5)]
+    job = make_config(
+        urls=[*failing, *other],
+        crawler={"max_depth": 0, "rate_limit": 2.0},
+        circuit_breaker={"failure_threshold": 0.5, "min_requests": 2, "cooldown": cooldown},
+    )
+    return failing, other, job
+
+
+async def test_open_circuit_holds_its_host_back_for_the_next_worker(url, site):
+    # The second page opens the circuit of the first worker, which stops
+    # then: the circuit of the next one is closed, it knows of the hold
+    # from the database alone.
+    failing, other, job = failing_job(url, fails=2, cooldown=2.0)
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+    config = worker_config()
+
+    async def opened() -> bool:
+        return site.hits["/flaky/2"] == 2 and not set(failing) & await urls_in("leased")
+
+    await run_worker_until(config, opened)
+    await run_worker(config, "test", worker="next", configure_logging=False)
+
+    opened_at = [moment for path, moment in site.log if path == "/flaky/2"][1]
+    later = [moment for path, moment in site.log if path == "/flaky/2" and moment > opened_at]
+    # The page that opened the circuit, put off, and the three others.
+    assert len(later) == 4
+    assert all(moment - opened_at >= 2 - EPSILON for moment in later)
+    assert any(path.startswith("/wide/") and moment - opened_at < 2 for path, moment in site.log)
+    assert await urls_in("failed") == {failing[0]}
+    assert await urls_in("processed") == {*failing[1:], *other}
+
+
+async def test_failed_probe_holds_the_host_back_again(url, site):
+    # The probe, the third request, fails too: its page fails with its
+    # error, and the circuit opens again for another second.
+    failing, other, job = failing_job(url, fails=3, cooldown=1.0)
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+    config = worker_config()
+
+    async def probed() -> bool:
+        return len(set(failing) & await urls_in("failed")) == 2 and not set(failing) & await urls_in("leased")
+
+    await run_worker_until(config, probed)
+    await run_worker(config, "test", worker="next", configure_logging=False)
+
+    probe = [moment for path, moment in site.log if path == "/flaky/3"][2]
+    later = [moment for path, moment in site.log if path == "/flaky/3" and moment > probe]
+    assert len(later) == 3
+    assert all(moment - probe >= 1 - EPSILON for moment in later)
+    failed = await urls_in("failed")
+    assert len(failed) == 2
+    assert await urls_in("processed") == {*failing, *other} - failed
+
+
+async def test_unreachable_robots_txt_holds_its_host_back_for_the_next_worker(url, site, monkeypatch):
+    # robots.txt of 127.0.0.1 answers 503 once and is downloaded again 2 s
+    # later: the next worker, which has not downloaded it yet, waits as long.
+    monkeypatch.setattr(RobotsParser, "UNREACHABLE_TTL", 2.0)
+    site.robots, site.robots_failures_by_host = "", {"127.0.0.1": 1}
+    held, other, job = held_job(url, "/site/", crawler={"respect_robots": True})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+    config = worker_config()
+
+    async def refused() -> bool:
+        return site.robots_hits["127.0.0.1"] == 1 and not set(held) & await urls_in("leased")
+
+    await run_worker_until(config, refused)
+    await run_worker(config, "test", worker="next", configure_logging=False)
+
+    first = next(moment for path, moment in site.log if path == "/robots.txt")
+    later = [moment for path, moment in site.log if path.startswith("/site/")]
+    assert len(later) == 3
+    assert all(moment - first >= 2 - EPSILON for moment in later)
+    assert any(path.startswith("/wide/") and moment - first < 2 for path, moment in site.log)
+    assert site.robots_hits["127.0.0.1"] == 2
+    assert await urls_in("processed") == {*held, *other}
+
+
+def count_calls(monkeypatch, cls: type, name: str, calls: Counter[str]) -> None:
+    """Count the calls of the method `name` of `cls` in `calls`."""
+    method = getattr(cls, name)
+
+    async def counted(self, *args, **kwargs):
+        calls[name] += 1
+        return await method(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, name, counted)
+
+
+@pytest.mark.parametrize("pages", [10, 200])
+async def test_pages_of_a_host_with_an_open_circuit_cost_no_more_the_more_there_are(
+    url, site, monkeypatch, caplog, pages
+):
+    # The first failure opens the circuit for a minute; the two tasks of
+    # the worker send the first two pages together. The pages taken before
+    # the hold reached the database are put off, at most two per task,
+    # then the host is handed out no more.
+    caplog.set_level(logging.INFO, logger="crawler")
+    calls: Counter[str] = Counter()
+    count_calls(monkeypatch, PostgresFrontier, "put_back", calls)
+    count_calls(monkeypatch, PostgresFrontier, "hold_host", calls)
+    job = make_config(
+        urls=[url(f"/flaky/1000?page={n}") for n in range(pages)],
+        crawler={"max_depth": 0},
+        circuit_breaker={"failure_threshold": 0.5, "min_requests": 1, "cooldown": 60},
+    )
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    async def opened() -> bool:
+        return site.hits["/flaky/1000"] > 0
+
+    await run_worker_until(worker_config(crawler={"max_concurrent": 2}), opened, then=0.5)
+
+    deferred = [record for record in caplog.records if record.getMessage().startswith("Deferred ")]
+    assert site.hits["/flaky/1000"] <= 2
+    assert 0 < len(deferred) <= 4
+    assert calls["put_back"] <= 4
+    assert 0 < calls["hold_host"] <= 4
+
+
+@pytest.mark.parametrize(
+    ("start", "sections", "reason"),
+    [
+        (
+            "/site/to-busy",
+            {"retry": {"max_retries": 1, "max_delay": 0.5}},
+            "HTTP 429 Too Many Requests, Retry-After 60s",
+        ),
+        (
+            "/site/to-flaky",
+            {"circuit_breaker": {"failure_threshold": 0.5, "min_requests": 1, "cooldown": 60}},
+            "circuit breaker of localhost is open",
+        ),
+        ("/site/to-other-host", {"crawler": {"respect_robots": True}}, "robots.txt is unreachable (HTTP 503)"),
+    ],
+)
+async def test_page_that_redirects_to_a_held_host_waits_as_long_on_its_own(
+    url, site, monkeypatch, start, sections, reason
+):
+    # Its own host is not held back: without a time of its own, the page
+    # would be handed out at once and redirect to the held host again.
+    monkeypatch.setattr(RobotsParser, "UNREACHABLE_TTL", 60.0)
+    site.robots, site.robots_failures_by_host = "", {"localhost": 100}
+    await create_job(make_config(urls=[url(start)], **sections), "test", dsn=POSTGRES_DSN)
+
+    async def put_off() -> bool:
+        return site.hits[start] == 1 and await state_of(url(start)) == "queued"
+
+    await run_worker_until(worker_config(), put_off)
+
+    (page,) = await fetch(
+        "SELECT extract(epoch FROM not_before - now()) AS left FROM frontier WHERE url = $1", url(start)
+    )
+    holds = {
+        row["host"]: row
+        for row in await fetch(
+            "SELECT host, hold_reason, extract(epoch FROM next_allowed_at - now()) AS left FROM hosts"
+        )
+    }
+    assert 55 < page["left"] <= 60
+    assert holds["localhost"]["hold_reason"].startswith(reason)
+    assert 55 < holds["localhost"]["left"] <= 60
+    assert holds["127.0.0.1"]["hold_reason"] is None
 
 
 async def test_job_sections_of_the_configuration_of_a_worker_give_way_to_those_of_the_job(url, site, caplog):

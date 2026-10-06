@@ -47,7 +47,9 @@ from crawler import (
     UnexpectedError,
 )
 from crawler.crawl_run import CrawlRun
+from crawler.frontier import FrontierPage
 from crawler.frontier import Outcome as PageOutcome
+from crawler.urls import get_host
 
 
 class FakeResponse:
@@ -1342,6 +1344,96 @@ class TestCrawlHeldBackHost:
         assert set(crawler.processed_urls) == {"http://a/1", "http://a/2"}
         warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert not [message for message in warnings if "put off" in message]
+
+
+class SharedMemoryFrontier(MemoryFrontier):
+    """A `MemoryFrontier` that says it is shared by several processes, as one in a database is.
+
+    It keeps the holds it is told of in `holds`, and a page put back while
+    its host is held comes back when the hold ends, as a frontier in a
+    database hands it out.
+    """
+
+    shared = True
+
+    def __init__(self, **options) -> None:
+        super().__init__(**options)
+        self.holds: list[tuple[str, float, str | None]] = []
+        self._held_until: dict[str, float] = {}
+
+    async def hold_host(self, host: str, seconds: float, reason: str | None) -> None:
+        self.holds.append((host, seconds, reason))
+        self._held_until[host] = max(self._held_until.get(host, 0.0), time.monotonic() + seconds)
+
+    async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool) -> None:
+        held = self._held_until.get(get_host(page.url) or "", 0.0) - time.monotonic()
+        await super().put_back(page, max(delay, held), uncount=uncount)
+
+
+class TestCrawlSharedFrontier:
+    """Hosts held back for every process of a shared frontier: only for as long as is known."""
+
+    async def test_page_refused_while_the_probe_is_in_flight_does_not_hold_the_host(
+        self, make_crawler, fake_session, caplog
+    ):
+        # a/0 and a/1 open the circuit for 0.05 s, which holds the host back.
+        # Then one of them is the probe, slow to answer; the other, refused
+        # meanwhile, comes back a second later on its own: when the probe
+        # ends is not known, the host is not held for it.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(
+            max_concurrent=2,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+
+        async def slow_page() -> FakeResponse:
+            await asyncio.sleep(0.2)
+            return FakeResponse()
+
+        for page in ("http://a/0", "http://a/1"):
+            fake_session.routes[page] = [aiohttp.ClientConnectionError("refused"), slow_page]
+        frontier = SharedMemoryFrontier()
+
+        pages = await crawler.crawl_frontier(frontier, ["http://a/0", "http://a/1"])
+
+        assert set(pages) == {"http://a/0", "http://a/1"}
+        assert frontier.holds
+        for host, seconds, reason in frontier.holds:
+            assert host == "a"
+            assert 0 < seconds <= 0.05
+            assert reason is not None and reason.startswith("circuit breaker of a is open")
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred ")]
+        assert (
+            sum(
+                message.endswith("for 1.0s: circuit breaker of a is half-open, waiting for the probe request")
+                for message in deferred
+            )
+            == 1
+        )
+
+    async def test_page_refused_while_robots_txt_is_downloaded_does_not_hold_the_host(
+        self, make_crawler, fake_session, caplog
+    ):
+        # The download takes longer than a page waits for it: the page comes
+        # back on its own, as robots.txt may well be read.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(max_depth=0, respect_robots=True)
+        crawler.ROBOTS_POLL = 0.05
+
+        async def slow_robots() -> FakeResponse:
+            await asyncio.sleep(0.2)
+            return FakeResponse(b"", content_type="text/plain")
+
+        fake_session.routes["http://a/robots.txt"] = slow_robots
+        frontier = SharedMemoryFrontier()
+
+        pages = await crawler.crawl_frontier(frontier, ["http://a/1"])
+
+        assert list(pages) == ["http://a/1"]
+        assert frontier.holds == []
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred ")]
+        assert deferred and all(message.endswith("robots.txt is being downloaded") for message in deferred)
 
 
 class TestCrawlStorage:
