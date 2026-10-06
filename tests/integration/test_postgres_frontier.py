@@ -315,6 +315,61 @@ class TestHosts:
         assert await still_waiting(frontier.take())
 
 
+async def host_of(host: str) -> asyncpg.Record:
+    """The hold of a host: seconds left until it may be asked again, and why."""
+    (row,) = await fetch(
+        "SELECT extract(epoch FROM next_allowed_at - now()) AS left, hold_reason FROM hosts WHERE host = $1", host
+    )
+    return row
+
+
+class TestHoldHost:
+    async def test_held_host_hands_out_no_page_to_any_worker_until_its_time(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.seed(["http://a/1", "http://a/2", "http://b/1"])
+        page = await take(first)
+
+        await first.hold_host("a", 0.5, "HTTP 429 Too Many Requests, Retry-After 1s")
+        await first.put_back(page, uncount=False)
+
+        assert first.shared
+        assert await take(second) == FrontierPage("http://b/1", 0)
+        assert await still_waiting(second.take(), 0.3)
+        # The page put back is queued after the other page of its host.
+        assert await take(second) == FrontierPage("http://a/2", 0)
+        assert (await host_of("a"))["hold_reason"] == "HTTP 429 Too Many Requests, Retry-After 1s"
+
+    async def test_hold_is_never_shortened_and_keeps_the_reason_of_the_one_that_ends_last(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://a/1"])
+
+        await frontier.hold_host("a", 60, "long")
+        await frontier.hold_host("a", 0.1, "short")
+        held = await host_of("a")
+        assert 59 < held["left"] <= 60
+        assert held["hold_reason"] == "long"
+
+        # A hold that does not say why keeps the reason it extends.
+        await frontier.hold_host("a", 120, None)
+        held = await host_of("a")
+        assert 119 < held["left"] <= 120
+        assert held["hold_reason"] == "long"
+
+        await frontier.hold_host("a", 180, "longer")
+        assert (await host_of("a"))["hold_reason"] == "longer"
+
+    async def test_host_held_before_any_of_its_pages_is_queued_holds_them(self, open_frontier):
+        # The target of a redirect may ask to wait before a link to it is found.
+        frontier = await open_frontier("worker")
+
+        await frontier.hold_host("a", 60, "HTTP 429 Too Many Requests, Retry-After 60s")
+        await frontier.add(["http://a/1"], depth=1)
+
+        assert await still_waiting(frontier.take())
+        (row,) = await fetch("SELECT accepted FROM hosts WHERE host = 'a'")
+        assert row["accepted"] == 1
+
+
 class TestMaxPages:
     async def test_max_pages_holds_for_all_workers_together(self, open_frontier):
         workers = [await open_frontier(f"worker-{i}", max_pages=5) for i in range(2)]

@@ -55,12 +55,15 @@ CREATE TABLE IF NOT EXISTS frontier (
 )
 """
 
-# Rate limit of a host for all the workers together.
+# Rate limit of a host for all the workers together. A host held back,
+# e.g. after a Retry-After, keeps the reason of the hold that ends last; it
+# says why the host waits while `next_allowed_at` is ahead.
 _HOSTS = """
 CREATE TABLE IF NOT EXISTS hosts (
     job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
     host TEXT NOT NULL,
     next_allowed_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
+    hold_reason TEXT,
     accepted INTEGER NOT NULL DEFAULT 0,
     requested INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (job, host)

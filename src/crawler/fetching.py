@@ -49,7 +49,10 @@ class Fetcher:
     outcome in its `FetchResult`. The requests are sent by `transport` (see `Transport`).
 
     `robots` and `sitemaps` download through it. `errors` and `retries`
-    count the attempts since the last `reset_stats()`.
+    count the attempts since the last `reset_stats()`. A host held back
+    after a Retry-After, or for the pause before a retry that the whole
+    host waits out, is told to `on_host_held`, if it is set: the crawl of
+    several processes holds the host back in all of them.
     """
 
     MAX_TIMEOUT_GROWTH = 4.0
@@ -84,6 +87,8 @@ class Fetcher:
         self._user_agent = user_agent
         self.errors = ErrorTracker()
         self.retries = 0
+        # Called with the host, the seconds it is held back for and why; see tell_host_held.
+        self.on_host_held: Callable[[str, float, str | None], Awaitable[None]] | None = None
         self._closed = False
 
     @property
@@ -268,7 +273,9 @@ class Fetcher:
                     logger.warning(
                         "%s asked to wait %gs (Retry-After), waiting %gs", host, error.retry_after, self.max_retry_after
                     )
-                self.rate_limiter.penalize(host, min(error.retry_after, self.max_retry_after))
+                seconds = min(error.retry_after, self.max_retry_after)
+                self.rate_limiter.penalize(host, seconds)
+                await self.tell_host_held(host, seconds, f"{error.message}, Retry-After {error.retry_after:g}s")
             return last, attempts
         return result, attempts
 
@@ -290,6 +297,21 @@ class Fetcher:
         host = get_host(error.url)
         assert host is not None  # an invalid URL fails with an error that is not retried
         self.rate_limiter.penalize(host, delay)
+        await self.tell_host_held(host, delay, f"{error.message}, pause before a retry")
+
+    async def tell_host_held(self, host: str, seconds: float, reason: str | None) -> None:
+        """Tell `on_host_held`, if it is set, that `host` is held back for `seconds` from now, and why.
+
+        `reason` may be None when the caller does not know it. A failure to
+        tell is logged: the host is held back in this process all the same,
+        and the request goes on.
+        """
+        if self.on_host_held is None:
+            return
+        try:
+            await self.on_host_held(host, seconds, reason)
+        except Exception:
+            logger.warning("Could not tell the other workers that %s is held back", host, exc_info=True)
 
     def _timeout_for(self, retries: int) -> aiohttp.ClientTimeout:
         """Timeouts of a request after `retries` failed attempts."""

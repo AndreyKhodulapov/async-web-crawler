@@ -155,6 +155,9 @@ class CrawlRun:
             # other processes that wait for it are not kept waiting by the buffer.
             self.storage.on_settled = self._frontier.saved
             self._frontier.on_waiting = self._flush_storage
+        if self._frontier.shared:
+            # A host held back by this process is held back by the others too.
+            self._fetcher.on_host_held = self._frontier.hold_host
         try:
             await self.seed(
                 start_urls, url_filter=url_filter, sitemap_urls=sitemap_urls, robots_sitemaps=robots_sitemaps
@@ -167,6 +170,8 @@ class CrawlRun:
             if self.storage is not None:
                 self.storage.on_settled = None
                 self._frontier.on_waiting = None
+            if self._frontier.shared:
+                self._fetcher.on_host_held = None
             self._crawl_finished = time.perf_counter()
             self.stats.finish()
             # A site given up on is given up for this crawl only: a
@@ -373,8 +378,7 @@ class CrawlRun:
                 # meanwhile instead of waiting in the rate limiter.
                 if (penalty := self._penalty_left(url)) > self.MIN_PENALTY_TO_DEFER:
                     self._warn_once_held_back(url, penalty)
-                    logger.info("Deferred %s for %.1fs: its host is held back", url, penalty)
-                    await frontier.put_back(page, penalty, uncount=False)
+                    await self._put_off_for_host(page, url, penalty, "its host is held back", uncount=False)
                     continue
                 # robots.txt and the circuit breaker are checked before the
                 # page counts toward max_pages: a refused page costs no request.
@@ -735,6 +739,28 @@ class CrawlRun:
         logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
         await self._frontier.put_back(page, delay, uncount=uncount)
 
+    async def _put_off_for_host(
+        self, page: FrontierPage, url: str, delay: float, reason: str, *, uncount: bool
+    ) -> None:
+        """Put a page of the crawl off while the host of `url` is held back, for `delay` seconds.
+
+        `url` is the page's own or the target of its redirect. In a frontier
+        shared by several processes the host is held back for all of them
+        instead, and the page goes back without a delay of its own: it
+        comes back with the host, however long the others hold it. The
+        fetcher has told the frontier of its holds already; this one is for
+        a page taken before the hold reached the frontier, so it keeps the
+        reason the fetcher gave.
+        """
+        if not self._frontier.shared:
+            await self._put_off_page(page, delay, reason, uncount=uncount)
+            return
+        host = get_host(url)
+        assert host is not None  # a URL without a host is not requested
+        await self._fetcher.tell_host_held(host, delay, None)
+        logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
+        await self._frontier.put_back(page, uncount=uncount)
+
     def _outwaits_retries(self, error: FetchError | None) -> bool:
         """Whether `error` carries a Retry-After too long for the retry strategy, so the request was not retried.
 
@@ -766,7 +792,7 @@ class CrawlRun:
         self._page_waits[url] += 1
         delay = self._penalty_left(error.url) or 1.0
         # The request was answered, but not with the page: it is not a page requested.
-        await self._put_off_page(page, delay, error.message, uncount=True)
+        await self._put_off_for_host(page, error.url, delay, error.message, uncount=True)
         self._warn_once_held_back(error.url, delay)
         return True
 

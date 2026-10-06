@@ -452,3 +452,15 @@ class TestScope:
             await frontier.widen_scope(host, on_host(host))
 
         assert frontier.scope_hosts() == ["b", "a"]
+
+
+class TestHoldHost:
+    async def test_frontier_of_one_process_is_not_shared_and_holds_no_host(self):
+        # Its host is held back by the rate limiter of the one process.
+        frontier = MemoryFrontier()
+        await frontier.seed(["http://a/1"])
+
+        await frontier.hold_host("a", 60, "HTTP 429 Too Many Requests, Retry-After 60s")
+
+        assert not frontier.shared
+        assert await take(frontier) == FrontierPage("http://a/1", 0)

@@ -16,6 +16,8 @@ pytestmark = pytest.mark.postgres
 SITEMAP = "/sitemaps/sitemap.xml"
 # The page /wide/0 and the 50 pages it links to.
 WIDE_PAGES = 51
+# Requests are logged by the site as they arrive, holds are kept by the clock of the database.
+EPSILON = 0.05
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +36,11 @@ async def fetch(query: str, *parameters: object) -> list[asyncpg.Record]:
 async def job_state() -> str:
     (job,) = await fetch("SELECT state FROM crawl_jobs")
     return job["state"]
+
+
+async def state_of(url: str) -> str:
+    (row,) = await fetch("SELECT state FROM frontier WHERE url = $1", url)
+    return row["state"]
 
 
 async def urls_in(state: str) -> set[str]:
@@ -145,6 +152,100 @@ async def test_requests_to_a_host_are_spaced_out_by_all_workers_together(url, si
     # starts a little after its page is taken, the first of a worker later,
     # as it opens connections: up to an interval is allowed for it.
     assert times[-1] - times[0] >= 4 * 0.2
+
+
+def held_job(url, first: str, **sections) -> tuple[list[str], list[str], CrawlerConfig]:
+    """A job whose first page, `first`, asks its host to wait; the URLs of that host, those of another one and the job.
+
+    A page of a host is taken every 0.5 s, and the first request of a
+    worker comes up to 0.2 s after its page: the hold reaches the database
+    before any worker may take the next page of the host. The two hosts
+    are one server: the paths tell their requests apart.
+    """
+    held = [url(first), url("/site/a.html"), url("/site/b.html")]
+    other = [url(f"/wide/{n}", "localhost") for n in range(1, 5)]
+    crawler = {"max_depth": 0, "rate_limit": 2.0}
+    return held, other, make_config(urls=[*held, *other], crawler=crawler, **sections)
+
+
+@pytest.mark.parametrize(
+    ("first", "retry", "fails"),
+    [
+        # Not retried: the page fails, and its host is held back all the same.
+        ("/busy/2", {}, True),
+        # Too long to retry: the page goes back and comes back with its host.
+        ("/overloaded/1/2", {"max_retries": 1, "max_delay": 0.5}, False),
+    ],
+)
+async def test_host_that_asked_to_wait_is_left_alone_by_the_next_worker(url, site, first, retry, fails):
+    # The worker that was asked to wait stops once it has put the page off
+    # or failed it: the next one knows of the hold from the database alone.
+    held, other, job = held_job(url, first, retry=retry)
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+    config = worker_config()
+    asked = asyncio.create_task(run_worker(config, "test", worker="asked", configure_logging=False))
+    async with asyncio.timeout(5):
+        while not (site.hits[first] and await state_of(held[0]) != "leased"):
+            await asyncio.sleep(0.02)
+    asked.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asked
+
+    await run_worker(config, "test", worker="next", configure_logging=False)
+
+    asked = next(moment for path, moment in site.log if path == first)
+    later = [moment for path, moment in site.log if path in (first, "/site/a.html", "/site/b.html") and moment > asked]
+    assert len(later) == (2 if fails else 3)
+    assert all(moment - asked >= 2 - EPSILON for moment in later)
+    # The other host is crawled meanwhile.
+    assert any(path.startswith("/wide/") and moment - asked < 2 for path, moment in site.log)
+    assert await urls_in("failed") == ({held[0]} if fails else set())
+    assert await urls_in("processed") == {*held[fails:], *other}
+
+
+async def test_pause_before_a_retry_holds_the_host_back_for_every_worker(url, site):
+    # HTTP 429 without a wait asked for: the retry waits 1..2 s, and the
+    # workers that would ask the host wait as long. One page at a time: the
+    # worker that waits to retry takes no other page meanwhile.
+    first = "/overloaded/1/0"
+    held, other, job = held_job(url, first, retry={"max_retries": 1, "base_delay": 2.0, "max_delay": 2.0})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    await run_workers(worker_config(crawler={"max_concurrent": 1}), 2)
+
+    asked, retried = [moment for path, moment in site.log if path == first]
+    assert retried - asked >= 1 - EPSILON
+    later = [moment for path, moment in site.log if path.startswith("/site/")]
+    assert len(later) == 2
+    assert all(moment >= retried - EPSILON for moment in later)
+    assert await urls_in("processed") == {*held, *other}
+
+
+async def test_page_whose_host_asked_to_wait_goes_back_without_a_time_of_its_own(url, site):
+    # The host is held back instead, with the reason it asked to wait for.
+    job = make_config(urls=[url("/busy/60")], retry={"max_retries": 1, "max_delay": 0.5})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+    worker = asyncio.create_task(run_worker(worker_config(), "test", worker="w", configure_logging=False))
+    query = (
+        "SELECT f.state, f.not_before <= now() AS at_once, h.hold_reason, extract(epoch FROM h.next_allowed_at - now()) AS left"
+        " FROM frontier AS f JOIN hosts AS h USING (job, host)"
+    )
+    try:
+        async with asyncio.timeout(5):
+            while True:
+                (row,) = await fetch(query)
+                if site.hits["/busy/60"] and row["state"] == "queued" and row["hold_reason"] is not None:
+                    break
+                await asyncio.sleep(0.02)
+    finally:
+        worker.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await worker
+
+    assert row["at_once"]
+    assert 55 < row["left"] <= 60
+    assert row["hold_reason"] == "HTTP 429 Too Many Requests, Retry-After 60s"
+    assert site.hits["/busy/60"] == 1
 
 
 async def test_job_sections_of_the_configuration_of_a_worker_give_way_to_those_of_the_job(url, site, caplog):

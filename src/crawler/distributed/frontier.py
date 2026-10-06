@@ -159,6 +159,20 @@ FROM unnest($2::text[], $3::int[]) AS page (host, uncounted)
 WHERE hosts.job = $1 AND hosts.host = page.host
 """
 
+# A host held back until a moment no earlier than the one it has; the
+# reason is that of the later one, or the one it has if none is given. The
+# host may have no pages yet: the target of a redirect, say.
+_HOLD_HOST = """
+INSERT INTO hosts AS h (job, host, next_allowed_at, hold_reason)
+VALUES ($1, $2, now() + make_interval(secs => $3), $4)
+ON CONFLICT (job, host) DO UPDATE
+SET next_allowed_at = greatest(h.next_allowed_at, excluded.next_allowed_at),
+    hold_reason = CASE
+        WHEN excluded.next_allowed_at >= h.next_allowed_at THEN coalesce(excluded.hold_reason, h.hold_reason)
+        ELSE h.hold_reason
+    END
+"""
+
 # A worker that stops puts its pages in progress back; those pending their
 # save stay leased until their lease expires.
 _PUT_BACK_ALL = """
@@ -210,7 +224,8 @@ class PostgresFrontier(Frontier):
     expired `max_attempts` times: at least once, not exactly once. A page
     processed with `pending_save` is `saving`, leased all the same, until
     `saved`. A host has one page taken every `host_interval` seconds,
-    whichever worker takes it. Once nothing is left to hand out and no page
+    whichever worker takes it, and none while it is held back by
+    `hold_host`. Once nothing is left to hand out and no page
     is in progress, the job is finished; so it is once max_pages pages are
     requested and done.
 
@@ -223,6 +238,8 @@ class PostgresFrontier(Frontier):
     inserts new rows only; `take` and the taking back of expired leases
     skip the rows other workers hold (see docs/architecture.md).
     """
+
+    shared = True
 
     def __init__(
         self,
@@ -596,6 +613,11 @@ class PostgresFrontier(Frontier):
 
     def scope_hosts(self) -> list[str]:
         return list(self._scope_hosts)
+
+    async def hold_host(self, host: str, seconds: float, reason: str | None) -> None:
+        # A statement of its own: it locks the host alone, so it may wait
+        # for a take() or admit() that holds it, but takes part in no deadlock.
+        await self._pool.execute(_HOLD_HOST, self.job_id, host, float(seconds), reason)
 
     def stats(self) -> FrontierStats:
         return self._stats

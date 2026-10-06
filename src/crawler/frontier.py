@@ -76,6 +76,9 @@ class Frontier(ABC):
 
     # Room for the pages that do not count toward max_pages, such as those robots.txt disallows.
     FRONTIER_FACTOR = 3
+    # Whether other processes take pages of this frontier too: what holds a
+    # host back in one of them is then told to the frontier, see `hold_host`.
+    shared = False
 
     def __init__(
         self,
@@ -197,6 +200,16 @@ class Frontier(ABC):
 
         Those of other processes become known once `take` hands out a page
         after them, so that the filters are brought up to date before it is crawled.
+        """
+
+    async def hold_host(self, host: str, seconds: float, reason: str | None) -> None:
+        """Hand out no page of `host` for `seconds` from now, to any process, e.g. after a Retry-After.
+
+        A hold never shortens one in place. `reason` says why, for the
+        report of the crawl: it is that of the hold that ends last; None
+        keeps the reason of the hold this one extends. A frontier of one
+        process does nothing: its host is held back by the rate limiter of
+        that process, and its pages are put off with a delay of their own.
         """
 
     async def close(self) -> None:

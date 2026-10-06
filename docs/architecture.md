@@ -99,7 +99,8 @@ run against it; what it adds is what sharing needs.
   they are checked against: pages requested, pages unfinished, links
   dropped), `frontier` (every URL of a job once: the primary key
   `(job, url)` is the deduplication), `hosts` (when a host may be
-  requested next, how many of its pages were accepted and requested),
+  requested next and, if it is held back, why; how many of its pages
+  were accepted and requested),
   `job_scope` and `out_of_scope` (below). Workers take the limits from
   the job, not from their own configuration, so that they all count
   against the same ones.
@@ -158,6 +159,33 @@ run against it; what it adds is what sharing needs.
   holds: it takes a page of another host. The order is breadth-first
   among the ready hosts: a page at depth 2 of a ready host comes before
   one at depth 1 of a host that has to wait.
+- **A host held back is held back for all workers.** A host that asks
+  to wait (Retry-After), or answers so that the whole host waits out the
+  pause before a retry (HTTP 429, a timeout), is held back in the rate
+  limiter of the worker that was answered, as in a local crawl; with a
+  shared frontier the fetcher also tells it to `on_host_held`, and the
+  crawl calls `hold_host`. That moves `hosts.next_allowed_at` to the end
+  of the hold, never back (`greatest`), with the reason in `hold_reason`,
+  and `take` hands out no page of the host until then. A page put off for
+  its host goes back without a delay of its own and comes back with the
+  host, however long another worker holds it meanwhile. The host may have
+  no row yet (the target of a redirect): the hold makes one.
+  - The pages of the host that are already taken are not called back. A
+    worker that took one before the hold reached the database knows of
+    the hold from its own rate limiter and puts the page back, holding
+    the host again in case its hold is the first to arrive (with no
+    reason, so the one the fetcher gave stays). Another worker that took
+    one knows nothing of it and sends the request: at most one request
+    per page in progress, whatever the length of the queue.
+  - `take` cannot undo a hold: it moves `next_allowed_at` on only for a
+    host its condition finds ready, and locks the row of the host in the
+    same statement. A row changed after the snapshot of the statement is
+    checked against the condition again before it is locked (READ
+    COMMITTED), so a hold that commits in between takes the host out of
+    the statement. A stress check of 1500 holds made alongside a `take`
+    of the same host found none undone.
+  - A hold that cannot reach the database is logged: the host stays held
+    back in the worker that was answered, and the crawl goes on.
 - **Locks in one order, and no waits where the order cannot be kept.**
   Every operation on a page locks the row of the page, then the job,
   then the host; adding links locks the job first and only inserts new

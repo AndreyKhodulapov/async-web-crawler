@@ -13,6 +13,7 @@ from crawler import (
     AsyncCrawler,
     CircuitBreaker,
     CircuitOpenError,
+    MemoryFrontier,
     RetryStrategy,
     RobotsDisallowedError,
     RobotsParser,
@@ -424,6 +425,23 @@ class TestRetryAfter:
         assert crawler.failed_urls == {}
         assert set(pages) == {url("/overloaded/1/2"), url("/site/a.html"), other_host}
         assert crawler.crawl_stats().requests == 4
+
+    async def test_crawl_of_one_process_holds_back_no_host_in_its_frontier(self, url, site, monkeypatch):
+        # The rate limiter of the one process holds the host back; the page is put off as before.
+        held = []
+
+        class Recording(MemoryFrontier):
+            async def hold_host(self, host, seconds, reason):
+                held.append(host)
+
+        monkeypatch.setattr("crawler.client.MemoryFrontier", Recording)
+        options = {"max_concurrent": 1, "max_depth": 0, "retry_strategy": RetryStrategy(max_retries=1, max_delay=0.5)}
+        async with polite(**options) as crawler:
+            pages = await crawler.crawl([url("/overloaded/1/1"), url("/site/a.html")])
+
+        assert held == []
+        assert set(pages) == {url("/overloaded/1/1"), url("/site/a.html")}
+        assert site.hits["/overloaded/1/1"] == 2
 
     async def test_crawl_gives_up_on_a_page_that_keeps_asking_to_wait(self, url, site):
         # Retry-After of 2 s is too long to retry and capped to 0.05 s of
