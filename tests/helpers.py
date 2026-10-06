@@ -11,7 +11,8 @@ from types import ModuleType
 
 import asyncpg
 
-from crawler import CircuitBreaker, CrawlerConfig, DataStorage, PageRecord, RetryStrategy
+from crawler import CircuitBreaker, CrawlerConfig, DataStorage, Frontier, PageRecord, RetryStrategy
+from crawler.distributed.schema import create_schema
 from demo_site import free_port
 
 BOT = "TestBot/1.0 (+https://example.com/bot)"
@@ -54,7 +55,36 @@ async def drop_frontier_tables() -> None:
     connection = await asyncpg.connect(POSTGRES_DSN)
     try:
         await connection.execute(
-            "DROP TABLE IF EXISTS hosts, frontier, crawl_jobs; DROP SEQUENCE IF EXISTS frontier_seq"
+            "DROP TABLE IF EXISTS out_of_scope, job_scope, hosts, frontier, crawl_jobs;"
+            " DROP SEQUENCE IF EXISTS frontier_seq"
+        )
+    finally:
+        await connection.close()
+
+
+async def make_job(
+    name: str = "test",
+    *,
+    max_pages: int | None = None,
+    max_pages_per_host: int | None = None,
+    frontier_factor: int = Frontier.FRONTIER_FACTOR,
+    state: str = "running",
+) -> None:
+    """Make the tables of `PostgresFrontier` and a job with these limits, unless one of that name exists.
+
+    The job is ready for its workers, as `create_job` leaves it, but empty and without a configuration.
+    """
+    connection = await asyncpg.connect(POSTGRES_DSN)
+    try:
+        await create_schema(connection)
+        await connection.execute(
+            "INSERT INTO crawl_jobs (name, max_pages, max_pages_per_host, frontier_factor, state)"
+            " VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name) DO NOTHING",
+            name,
+            max_pages,
+            max_pages_per_host,
+            frontier_factor,
+            state,
         )
     finally:
         await connection.close()

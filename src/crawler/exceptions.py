@@ -28,7 +28,8 @@ they are not about the request itself, and none is retried.
 `NoProxyError`: they say nothing about the site.
 
 `StorageError` is not about a URL at all: it reports a failure to save the
-pages already crawled.
+pages already crawled. Nor is `JobError`, about a crawl job of distributed
+workers.
 """
 
 from collections.abc import Sequence
@@ -180,6 +181,10 @@ class UnexpectedError(FetchError):
 
 class StorageError(Exception):
     """Crawled pages could not be written to a storage, or the storage is closed."""
+
+
+class JobError(Exception):
+    """A crawl job cannot be created, resumed or joined: its name is taken, there is no such job, or its configuration differs."""
 
 
 class ConfigError(ValueError):

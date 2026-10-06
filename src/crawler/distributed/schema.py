@@ -1,4 +1,4 @@
-"""The tables of a distributed crawl in PostgreSQL, made by the first worker that connects."""
+"""The tables of distributed crawl jobs in PostgreSQL, made by the first process that connects."""
 
 import asyncpg
 from asyncpg.pool import PoolConnectionProxy
@@ -9,11 +9,15 @@ Connection = asyncpg.Connection | PoolConnectionProxy
 # Any number of its own: workers that connect at once make the tables one after another.
 _SCHEMA_LOCK = 0x63726177
 
-# A job is one crawl: its limits and the counts the limits are checked against.
+# A job is one crawl: its settings, its limits and the counts the limits
+# are checked against. It is seeding until its start URLs and sitemaps are
+# queued; workers take no page of it meanwhile. `scope_version` tells the
+# workers that a host joined the scope of the crawl.
 _JOBS = """
 CREATE TABLE IF NOT EXISTS crawl_jobs (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
+    config JSONB NOT NULL DEFAULT '{}',
     max_pages INTEGER,
     max_pages_per_host INTEGER,
     frontier_factor INTEGER NOT NULL,
@@ -22,7 +26,8 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
     over_host_limit INTEGER NOT NULL DEFAULT 0,
     links_dropped INTEGER NOT NULL DEFAULT 0,
     links_dropped_by_host INTEGER NOT NULL DEFAULT 0,
-    state TEXT NOT NULL DEFAULT 'running',
+    scope_version INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'seeding' CHECK (state IN ('seeding', 'running', 'finished')),
     started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     finished_at TIMESTAMPTZ
 )
@@ -62,6 +67,28 @@ CREATE TABLE IF NOT EXISTS hosts (
 )
 """
 
+# Hosts a start URL redirected to, which the filters of every worker let through.
+_SCOPE = """
+CREATE TABLE IF NOT EXISTS job_scope (
+    job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
+    host TEXT NOT NULL,
+    position BIGINT GENERATED ALWAYS AS IDENTITY,
+    PRIMARY KEY (job, host)
+)
+"""
+
+# Sitemap pages of hosts out of the scope, held until a start URL brings
+# their host in. Not in the frontier: they are not seen, and are queued
+# as any page found.
+_OUT_OF_SCOPE = """
+CREATE TABLE IF NOT EXISTS out_of_scope (
+    job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
+    url TEXT NOT NULL,
+    position BIGINT GENERATED ALWAYS AS IDENTITY,
+    PRIMARY KEY (job, url)
+)
+"""
+
 _STATEMENTS = (
     _JOBS,
     "CREATE SEQUENCE IF NOT EXISTS frontier_seq",
@@ -73,6 +100,8 @@ _STATEMENTS = (
     # Leases that expire.
     "CREATE INDEX IF NOT EXISTS frontier_leased ON frontier (job, lease_until) WHERE state IN ('leased', 'saving')",
     _HOSTS,
+    _SCOPE,
+    _OUT_OF_SCOPE,
 )
 
 

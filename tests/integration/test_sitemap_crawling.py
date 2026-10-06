@@ -1,12 +1,13 @@
 """Integration tests: crawls that take their pages from sitemaps served by a local aiohttp server."""
 
+import asyncio
 import gzip
 import logging
 
 import pytest
 from helpers import BOT, UNTHROTTLED, index, urlset
 
-from crawler import AsyncCrawler, RetryStrategy, SitemapParser
+from crawler import AsyncCrawler, MemoryFrontier, RetryStrategy, SitemapParser
 
 SITEMAP = "/sitemaps/sitemap.xml"
 
@@ -368,3 +369,35 @@ async def test_invalid_sitemap_arguments_are_rejected(url, site):
         with pytest.raises(ValueError, match="robots_sitemaps needs"):
             await crawler.crawl([url("/site/")], robots_sitemaps=True)
     assert site.hits.total() == 0
+
+
+class TestSeed:
+    async def test_seed_queues_the_start_urls_and_the_sitemap_pages_without_crawling_them(self, url, site):
+        site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"), url("/site/c.html", "localhost"))}
+        frontier = MemoryFrontier()
+        async with make_crawler() as crawler:
+            failed = await crawler.seed(
+                frontier, [url("/site/b.html")], sitemap_urls=[url(SITEMAP), url("/sitemaps/missing.xml")]
+            )
+
+        assert list(failed) == [url("/sitemaps/missing.xml")]
+        assert frontier.queue.get_stats()["queued"] == 3
+        assert not any(path.startswith("/site/") for path in site.hits)
+
+    async def test_pages_out_of_scope_are_held_in_the_frontier(self, url, site):
+        site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"), url("/site/c.html", "localhost"))}
+        frontier = MemoryFrontier()
+        async with make_crawler() as crawler:
+            await crawler.seed(frontier, [url("/site/b.html")], sitemap_urls=[url(SITEMAP)], same_domain_only=True)
+
+        assert frontier.queue.get_stats()["queued"] == 2
+        assert await frontier.widen_scope("localhost", lambda page: True) == 1
+
+    async def test_seed_while_a_crawl_runs_is_refused(self, url, site):
+        site.latency = 0.3
+        async with make_crawler() as crawler:
+            crawl = asyncio.create_task(crawler.crawl([url("/site/b.html")]))
+            await asyncio.sleep(0.1)
+            with pytest.raises(RuntimeError, match="already running"):
+                await crawler.seed(MemoryFrontier(), [url("/site/a.html")])
+            await crawl

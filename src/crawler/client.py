@@ -689,12 +689,95 @@ class AsyncCrawler:
             RuntimeError: another crawl is running on this crawler.
             StorageError: the storage cannot be opened; nothing is requested.
         """
-        if isinstance(start_urls, str):
-            raise TypeError(f"expected a list of start URLs, got a string: {start_urls!r}")
         if max_pages < 1:
             raise ValueError(f"max_pages must be >= 1, got {max_pages}")
         if max_pages_per_host is not None and max_pages_per_host < 1:
             raise ValueError(f"max_pages_per_host must be >= 1 or None, got {max_pages_per_host}")
+        start_urls, sitemap_urls = self._crawl_urls(start_urls, sitemap_urls, robots_sitemaps)
+        self._check_idle()
+        if self.storage is not None:
+            # Before anything is requested: a storage that cannot be
+            # written to is found out now, not a batch of pages later.
+            # The crawler is taken while it opens: another crawl() may
+            # start meanwhile, and the run starts only after it.
+            self._starting = True
+            try:
+                await self.storage.open()
+            finally:
+                self._starting = False
+
+        url_filter = self._url_filter(
+            start_urls + sitemap_urls,
+            same_domain_only=same_domain_only,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+            exclude_extensions=exclude_extensions,
+        )
+        self._frontier = MemoryFrontier(
+            max_pages=max_pages, max_pages_per_host=max_pages_per_host, frontier_factor=self.FRONTIER_FACTOR
+        )
+        self._run = self._new_run(self._frontier)
+        return await self._run.run(
+            start_urls,
+            url_filter=url_filter,
+            sitemap_urls=sitemap_urls,
+            robots_sitemaps=robots_sitemaps,
+        )
+
+    async def seed(
+        self,
+        frontier: Frontier,
+        start_urls: Iterable[str],
+        *,
+        same_domain_only: bool = False,
+        include_patterns: Iterable[str] = (),
+        exclude_patterns: Iterable[str] = (),
+        exclude_extensions: Iterable[str] = (),
+        sitemap_urls: Iterable[str] = (),
+        robots_sitemaps: bool = False,
+    ) -> dict[str, str]:
+        """Queue the start URLs and the pages of the sitemaps in `frontier`, as crawl() does first; crawl nothing.
+
+        This fills a frontier that others crawl, such as the frontier of a
+        job that distributed workers share. The arguments are those of
+        crawl(), and its rules for sitemaps apply: they are read only until
+        the frontier is full, and their pages must pass the filters. Under
+        `same_domain_only`, the pages of hosts out of scope are held in the
+        frontier for a start URL that redirects to their host (see
+        `Frontier.hold_out_of_scope`). Returns the sitemaps that could not
+        be read, with the reasons.
+
+        Raises:
+            TypeError: as crawl().
+            ValueError: as crawl(), but for the limits, which are those of the frontier.
+            RuntimeError: a crawl is running on this crawler.
+        """
+        start_urls, sitemap_urls = self._crawl_urls(start_urls, sitemap_urls, robots_sitemaps)
+        self._check_idle()
+        url_filter = self._url_filter(
+            start_urls + sitemap_urls,
+            same_domain_only=same_domain_only,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+            exclude_extensions=exclude_extensions,
+        )
+        run = self._new_run(frontier)
+        # The crawler is taken while it reads the sitemaps: they share its rate limits and robots.txt.
+        self._starting = True
+        try:
+            await run.seed(
+                start_urls, url_filter=url_filter, sitemap_urls=sitemap_urls, robots_sitemaps=robots_sitemaps
+            )
+        finally:
+            self._starting = False
+        return run.failed_sitemaps
+
+    def _crawl_urls(
+        self, start_urls: Iterable[str], sitemap_urls: Iterable[str], robots_sitemaps: bool
+    ) -> tuple[list[str], list[str]]:
+        """The start URLs and the sitemap URLs of a crawl as lists, checked as crawl() says."""
+        if isinstance(start_urls, str):
+            raise TypeError(f"expected a list of start URLs, got a string: {start_urls!r}")
         start_urls = list(start_urls)
         invalid = [url for url in start_urls if not is_valid_http_url(url)]
         if invalid:
@@ -707,35 +790,28 @@ class AsyncCrawler:
             raise ValueError(f"invalid sitemap URLs: {', '.join(map(repr, invalid))}")
         if robots_sitemaps and self.robots is None:
             raise ValueError("robots_sitemaps needs a crawler that reads robots.txt (respect_robots=True)")
+        return start_urls, sitemap_urls
+
+    def _check_idle(self) -> None:
         if self._run.running or self._starting:
             raise RuntimeError("a crawl is already running on this crawler")
-        if self.storage is not None:
-            # Before anything is requested: a storage that cannot be
-            # written to is found out now, not a batch of pages later.
-            # The crawler is taken while it opens: another crawl() may
-            # start meanwhile, and the run starts only after it.
-            self._starting = True
-            try:
-                await self.storage.open()
-            finally:
-                self._starting = False
 
-        url_filter = UrlFilter(
-            allowed_hosts={get_host(url) for url in start_urls + sitemap_urls} if same_domain_only else None,
+    def _url_filter(
+        self,
+        scope_urls: list[str],
+        *,
+        same_domain_only: bool,
+        include_patterns: Iterable[str],
+        exclude_patterns: Iterable[str],
+        exclude_extensions: Iterable[str],
+    ) -> UrlFilter:
+        """The filter of the links of a crawl; under `same_domain_only`, the hosts of `scope_urls` are its scope."""
+        return UrlFilter(
+            allowed_hosts={get_host(url) for url in scope_urls} if same_domain_only else None,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             exclude_extensions=exclude_extensions,
             max_url_length=self.MAX_URL_LENGTH,
-        )
-        self._frontier = MemoryFrontier(
-            max_pages=max_pages, max_pages_per_host=max_pages_per_host, frontier_factor=self.FRONTIER_FACTOR
-        )
-        self._run = self._new_run(self._frontier)
-        return await self._run.run(
-            start_urls,
-            url_filter=url_filter,
-            sitemap_urls=sitemap_urls,
-            robots_sitemaps=robots_sitemaps,
         )
 
     def _new_run(self, frontier: Frontier) -> CrawlRun:

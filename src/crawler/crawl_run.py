@@ -100,7 +100,7 @@ class CrawlRun:
         self._frontier = frontier
         self.processed_urls: dict[str, ParsedPage] = {}
         self._start_urls: set[str] = set()
-        self._sitemap_pages_out_of_scope: list[str] = []
+        self._scope_synced = 0  # hosts of Frontier.scope_hosts() the filter has
         self._redirect_sources: dict[str, str] = {}  # redirect target -> the page that led to it
         self._failed_sitemaps: dict[str, str] = {}
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
@@ -141,7 +141,6 @@ class CrawlRun:
         self.circuit_breaker.reset_stats()
         if self.robots is not None:
             self.robots.forget_outages()
-        self._start_urls = set(await self._frontier.seed(start_urls))
 
         logger.info(
             "Crawl started: %d start URLs, max_depth=%d, max_pages=%s",
@@ -155,8 +154,9 @@ class CrawlRun:
             # A page saved is done in the frontier once its record is written.
             self.storage.on_settled = self._frontier.saved
         try:
-            if sitemap_urls or robots_sitemaps:
-                await self._queue_sitemap_pages(sitemap_urls, start_urls if robots_sitemaps else [], url_filter)
+            await self.seed(
+                start_urls, url_filter=url_filter, sitemap_urls=sitemap_urls, robots_sitemaps=robots_sitemaps
+            )
             async with asyncio.TaskGroup() as group:
                 for _ in range(self.max_concurrent):
                     group.create_task(self._crawl_worker(url_filter))
@@ -196,6 +196,18 @@ class CrawlRun:
             )
         return self.processed_urls
 
+    async def seed(
+        self, start_urls: list[str], *, url_filter: UrlFilter, sitemap_urls: list[str], robots_sitemaps: bool
+    ) -> None:
+        """Queue the start URLs, then the pages of the sitemaps, as `run` does before the first page is taken.
+
+        Called alone, it fills a frontier that others crawl, such as that of
+        a job in a database. A start URL seeded already is not queued again.
+        """
+        self._start_urls = set(await self._frontier.seed(start_urls))
+        if sitemap_urls or robots_sitemaps:
+            await self._queue_sitemap_pages(sitemap_urls, start_urls if robots_sitemaps else [], url_filter)
+
     async def _queue_sitemap_pages(self, sitemap_urls: list[str], robots_of: list[str], url_filter: UrlFilter) -> None:
         """Queue the pages listed in `sitemap_urls` and in the sitemaps robots.txt of the sites of `robots_of` names.
 
@@ -232,31 +244,36 @@ class CrawlRun:
         )
 
     async def _queue_sitemap_batch(self, pages: list[str], url_filter: UrlFilter) -> int:
-        """Queue the sitemap pages that pass the filter; the number queued."""
-        allowed = []
-        for page in pages:
-            if url_filter.allows(page):
-                allowed.append(page)
-            # Hosts join the scope only under `same_domain_only`.
-            elif url_filter.allowed_hosts is not None:
-                self._sitemap_pages_out_of_scope.append(page)
-        return await self._frontier.add(allowed, depth=0)
-
-    async def _queue_sitemap_pages_in_scope(self, url_filter: UrlFilter) -> None:
-        """Queue the sitemap pages that the filter let through once a start URL redirected to their host.
+        """Queue the sitemap pages that pass the filter; the number queued.
 
         The sitemaps are read before the first page, when only the hosts of
         the start URLs are known: the pages of "example.com" are out of
-        scope until "example.org" redirects there.
+        scope until "example.org" redirects there, so the frontier holds
+        them until then (see `_widen_scope`).
         """
-        in_scope, out_of_scope = [], []
-        for page in self._sitemap_pages_out_of_scope:
-            if url_filter.allows(page):
-                in_scope.append(page)
-            else:
-                out_of_scope.append(page)
-        self._sitemap_pages_out_of_scope = out_of_scope
-        await self._frontier.add(in_scope, depth=0)
+        allowed, turned_away = [], []
+        for page in pages:
+            (allowed if url_filter.allows(page) else turned_away).append(page)
+        # Hosts join the scope only under `same_domain_only`.
+        if turned_away and url_filter.allowed_hosts is not None:
+            await self._frontier.hold_out_of_scope(turned_away)
+        return await self._frontier.add(allowed, depth=0)
+
+    async def _widen_scope(self, final_url: str, url_filter: UrlFilter) -> None:
+        """Bring the host a start URL redirected to into the scope, with the sitemap pages held for it."""
+        host = get_host(final_url)
+        if url_filter.allowed_hosts is None or host is None or host in url_filter.allowed_hosts:
+            return
+        url_filter.allow_host(host)
+        await self._frontier.widen_scope(host, url_filter.allows)
+
+    def _sync_scope(self, url_filter: UrlFilter) -> None:
+        """Let through the hosts other processes brought into the scope of a shared frontier."""
+        hosts = self._frontier.scope_hosts()
+        if len(hosts) != self._scope_synced:
+            for host in hosts:
+                url_filter.allow_host(host)
+            self._scope_synced = len(hosts)
 
     async def _sitemaps_in_robots(self, url: str) -> list[str]:
         """The sitemaps that robots.txt of the site of `url` names; none if it cannot be read.
@@ -346,6 +363,7 @@ class CrawlRun:
         frontier = self._frontier
         while (page := await frontier.take()) is not None:
             url = page.url
+            self._sync_scope(url_filter)
             try:
                 # A host that asked to wait (Retry-After) or waits out the
                 # pause before a retry: the worker takes pages of other hosts
@@ -449,8 +467,7 @@ class CrawlRun:
             # only passed through (a consent page) do not. A page from a
             # sitemap has depth 0 too, but is filtered like a link.
             assert result.final_url is not None
-            url_filter.allow_host_of(result.final_url)
-            await self._queue_sitemap_pages_in_scope(url_filter)
+            await self._widen_scope(result.final_url, url_filter)
         if skip_reason is None and not is_html_content_type(result.content_type):
             # A link without a file extension may still lead to a PDF or an
             # image. Not a failure: the page is fine, just not one to parse.

@@ -94,14 +94,41 @@ the frontier of one crawl job, shared by workers in other processes or
 on other machines. It keeps the contract, and the same contract tests
 run against it; what it adds is what sharing needs.
 
-- **Three tables**, made by the first worker that connects:
-  `crawl_jobs` (the limits of a job and the counts they are checked
-  against: pages requested, pages unfinished, links dropped), `frontier`
-  (every URL of a job once: the primary key `(job, url)` is the
-  deduplication) and `hosts` (when a host may be requested next, how
-  many of its pages were accepted and requested). Workers of an
-  existing job take its limits from the database, not from their own
-  configuration, so that they all count against the same ones.
+- **Tables**, made by the first process that connects: `crawl_jobs`
+  (the part of the configuration a job keeps, its limits and the counts
+  they are checked against: pages requested, pages unfinished, links
+  dropped), `frontier` (every URL of a job once: the primary key
+  `(job, url)` is the deduplication), `hosts` (when a host may be
+  requested next, how many of its pages were accepted and requested),
+  `job_scope` and `out_of_scope` (below). Workers take the limits from
+  the job, not from their own configuration, so that they all count
+  against the same ones.
+- **A job is created, then seeded.** `create_job` makes the row of the
+  job, `seeding`, and fills it the way a local crawl starts: the start
+  URLs, then the sitemaps read until the frontier is full, by a
+  `CrawlRun` that crawls nothing (`seed`). Sitemaps are read once, by
+  the process that creates the job, not by every worker. `take` hands out
+  nothing while the job is seeding, so workers may start at any time: one
+  that started early would crawl a start URL that redirects before the
+  sitemap pages it brings into the scope are held. A worker never makes a
+  job: one started with a mistyped name fails instead of crawling an
+  empty one.
+- **The scope is the job's.** Under `same_domain_only`, a start URL that
+  redirects ("example.org" to "example.com") brings its target host into
+  the crawl, and with it the sitemap pages of that host, read before any
+  page was fetched. One worker crawls the start URL, all of them filter
+  links: the host goes to `job_scope` and bumps the version of the scope
+  in the job row, which `take` returns with every page. A worker that
+  sees a new version reads the hosts before it crawls the page, so no
+  links of the new host are filtered out by a worker that has not heard
+  of it yet. The sitemap pages out of scope wait in `out_of_scope`, not
+  in `frontier`: they are not seen, and once their host joins they are
+  added as any page found, with the bounds checked.
+- **A job ends by itself.** A worker that finds nothing to hand out and
+  nothing to wait for marks the job `finished`, if no page of any worker
+  is in progress or pending its save; so does one that closes after its
+  last pages are saved. A job that reached `max_pages` is finished with
+  pages left in the queue, as a local crawl ends.
 - **A page is leased, not handed over.** `take` makes it `leased` until
   `lease_until`, and a heartbeat renews the leases of the worker's pages.
   A worker that is killed renews nothing: its pages go back to the queue

@@ -12,6 +12,7 @@ from crawler.circuit_breaker import CircuitBreaker
 from crawler.client import AsyncCrawler
 from crawler.config import CrawlerConfig, load_config
 from crawler.exceptions import ConfigError
+from crawler.frontier import Frontier
 from crawler.models import ParsedPage
 from crawler.report import render_html, render_json
 from crawler.retry import RetryStrategy
@@ -178,9 +179,8 @@ class AdvancedCrawler:
                 of another layout, the database cannot be reached); nothing
                 is requested.
         """
+        self.check_start()
         config = self.config
-        if not config.urls and not config.sitemaps.urls:
-            raise ConfigError(["urls: nothing to crawl, give start URLs here or sitemaps in sitemaps.urls"])
         pages = await self.crawler.crawl(
             config.urls,
             max_pages=config.crawler.max_pages,
@@ -195,6 +195,33 @@ class AdvancedCrawler:
         self.write_reports()
         self.save_cookies()
         return pages
+
+    async def seed(self, frontier: Frontier, *, sitemaps: bool = True) -> dict[str, str]:
+        """Queue the start URLs and the pages of the sitemaps of the configuration in `frontier`; crawl nothing.
+
+        Without `sitemaps`, the sitemaps are not read. Returns the sitemaps
+        that could not be read, with the reasons; see `AsyncCrawler.seed`.
+
+        Raises:
+            ConfigError: as crawl().
+        """
+        self.check_start()
+        config = self.config
+        return await self.crawler.seed(
+            frontier,
+            config.urls,
+            same_domain_only=config.filters.same_domain_only,
+            include_patterns=config.filters.include,
+            exclude_patterns=config.filters.exclude,
+            exclude_extensions=config.filters.exclude_extensions,
+            sitemap_urls=config.sitemaps.urls if sitemaps else (),
+            robots_sitemaps=config.sitemaps.from_robots and sitemaps,
+        )
+
+    def check_start(self) -> None:
+        """Raises ConfigError if the configuration has neither start URLs nor sitemaps."""
+        if not self.config.urls and not self.config.sitemaps.urls:
+            raise ConfigError(["urls: nothing to crawl, give start URLs here or sitemaps in sitemaps.urls"])
 
     def write_reports(self) -> list[Path]:
         """Write the statistics to the files of the `report` section; return those written.

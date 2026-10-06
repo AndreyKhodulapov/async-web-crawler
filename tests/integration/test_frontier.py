@@ -4,7 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import pytest
-from helpers import POSTGRES_DSN, drop_frontier_tables
+from helpers import POSTGRES_DSN, drop_frontier_tables, make_job
 
 from crawler import Admission, Frontier, FrontierPage, FrontierStats, MemoryFrontier, Outcome, PostgresFrontier
 
@@ -23,7 +23,8 @@ async def make_frontier(request) -> AsyncGenerator[FrontierFactory, None]:
 
     async def make_frontier(**limits) -> Frontier:
         if request.param == "postgres":
-            frontier = await PostgresFrontier.open(POSTGRES_DSN, job="test", **limits)
+            await make_job(**limits)
+            frontier = await PostgresFrontier.open(POSTGRES_DSN, job="test")
         else:
             frontier = MemoryFrontier(**limits)
         opened.append(frontier)
@@ -90,6 +91,15 @@ class TestSeed:
         assert len(seeded) == 4
         assert (await current_stats(frontier)).queued == 4
         assert await frontier.full()
+
+    async def test_start_urls_seeded_again_are_returned_but_not_queued_again(self, frontier):
+        await frontier.seed(["http://site/a"])
+        await frontier.finish(await take(frontier), Outcome.PROCESSED)
+
+        seeded = await frontier.seed(["http://site/a", "http://site/b"])
+
+        assert seeded == ["http://site/a", "http://site/b"]
+        assert await drain(frontier) == ["http://site/b"]
 
 
 class TestAdd:
@@ -397,3 +407,48 @@ class TestBounds:
 
         assert await frontier.add(["http://site/", "http://site/new"], depth=1) == 0
         assert (await current_stats(frontier)).links_dropped == 1
+
+
+def on_host(host: str) -> Callable[[str], bool]:
+    """A filter that lets through the URLs of `host` only."""
+    return lambda url: f"//{host}/" in url
+
+
+class TestScope:
+    async def test_pages_held_out_of_scope_are_neither_queued_nor_seen(self, frontier):
+        await frontier.hold_out_of_scope(["http://other/a"])
+
+        assert await frontier.take() is None
+        assert await frontier.add(["http://other/a"], depth=1) == 1
+
+    async def test_widening_the_scope_queues_the_pages_held_that_the_filter_lets_through(self, frontier):
+        await frontier.hold_out_of_scope(["http://other/a", "http://third/c", "http://other/b"])
+
+        assert await frontier.widen_scope("other", on_host("other")) == 2
+
+        assert await drain(frontier) == ["http://other/a", "http://other/b"]
+        # The page of the third host is still held.
+        assert await frontier.widen_scope("third", on_host("third")) == 1
+        assert await take(frontier) == FrontierPage("http://third/c", 0)
+
+    async def test_page_held_is_queued_once(self, frontier):
+        await frontier.hold_out_of_scope(["http://other/a", "http://other/a"])
+
+        assert await frontier.widen_scope("other", on_host("other")) == 1
+        assert await frontier.widen_scope("other", on_host("other")) == 0
+
+    async def test_pages_brought_into_the_scope_keep_to_the_bounds(self, make_frontier):
+        frontier = await make_frontier(max_pages=1, frontier_factor=1)
+        await frontier.add(["http://site/a"], depth=1)
+        await frontier.hold_out_of_scope(["http://other/a"])
+
+        assert await frontier.widen_scope("other", on_host("other")) == 0
+        assert (await current_stats(frontier)).links_dropped == 1
+
+    async def test_scope_hosts_are_listed_once_in_the_order_brought_in(self, frontier):
+        assert frontier.scope_hosts() == []
+
+        for host in ("b", "a", "b"):
+            await frontier.widen_scope(host, on_host(host))
+
+        assert frontier.scope_hosts() == ["b", "a"]

@@ -12,9 +12,9 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import asyncpg
 import pytest
-from helpers import POSTGRES_DSN, drop_frontier_tables
+from helpers import POSTGRES_DSN, drop_frontier_tables, make_job
 
-from crawler import Admission, FrontierPage, Outcome, PostgresFrontier
+from crawler import Admission, FrontierPage, JobError, Outcome, PostgresFrontier
 
 pytestmark = pytest.mark.postgres
 
@@ -30,9 +30,15 @@ async def open_frontier() -> AsyncGenerator[FrontierOpener, None]:
     await drop_frontier_tables()
     opened = []
 
-    async def open_frontier(worker: str, **options) -> PostgresFrontier:
-        options = {"job": "test", "poll_interval": 0.02, **options}
-        frontier = await PostgresFrontier.open(POSTGRES_DSN, worker=worker, **options)
+    async def open_frontier(worker: str, *, job: str = "test", **options) -> PostgresFrontier:
+        """A worker of `job`, made with the limits among `options` unless it exists."""
+        limits = {
+            key: options.pop(key) for key in ("max_pages", "max_pages_per_host", "frontier_factor") if key in options
+        }
+        await make_job(job, **limits)
+        frontier = await PostgresFrontier.open(
+            POSTGRES_DSN, job=job, worker=worker, **{"poll_interval": 0.02, **options}
+        )
         opened.append(frontier)
         return frontier
 
@@ -54,6 +60,11 @@ async def row_of(url: str) -> asyncpg.Record:
     return row
 
 
+async def job_state(name: str = "test") -> str:
+    (row,) = await fetch("SELECT state FROM crawl_jobs WHERE name = $1", name)
+    return row["state"]
+
+
 async def take(frontier: PostgresFrontier) -> FrontierPage:
     page = await frontier.take()
     assert page is not None
@@ -70,17 +81,26 @@ async def still_waiting(take: Awaitable[FrontierPage | None], seconds: float = 0
 
 
 class TestJob:
-    async def test_workers_opening_at_once_make_the_tables_and_the_job_once(self, open_frontier):
-        await asyncio.gather(*(open_frontier(f"worker-{i}") for i in range(4)))
+    async def test_worker_of_a_job_that_does_not_exist_fails(self, open_frontier):
+        await make_job("other")
 
-        assert len(await fetch("SELECT id FROM crawl_jobs")) == 1
+        with pytest.raises(JobError, match='no crawl job named "test"'):
+            await PostgresFrontier.open(POSTGRES_DSN, job="test")
 
-    async def test_worker_of_an_existing_job_keeps_its_limits(self, open_frontier):
-        await open_frontier("first", max_pages=5, max_pages_per_host=2, frontier_factor=4)
+    async def test_workers_opening_at_once_make_the_tables_once(self, open_frontier):
+        results = await asyncio.gather(
+            *(PostgresFrontier.open(POSTGRES_DSN, job="test") for _ in range(4)), return_exceptions=True
+        )
 
-        second = await open_frontier("second", max_pages=50)
+        assert all(isinstance(result, JobError) for result in results)
+        assert await fetch("SELECT id FROM crawl_jobs") == []
 
-        assert (second.max_pages, second.max_pages_per_host, second.frontier_factor) == (5, 2, 4)
+    async def test_worker_takes_the_limits_of_its_job(self, open_frontier):
+        await make_job(max_pages=5, max_pages_per_host=2, frontier_factor=4)
+
+        frontier = await open_frontier("worker")
+
+        assert (frontier.max_pages, frontier.max_pages_per_host, frontier.frontier_factor) == (5, 2, 4)
 
     async def test_jobs_have_frontiers_of_their_own(self, open_frontier):
         first = await open_frontier("worker", job="first")
@@ -335,6 +355,124 @@ class TestWaiting:
         await busy.finish(page, Outcome.FAILED, "NetworkError: boom")
 
         assert await asyncio.wait_for(waiter, 5) is None
+
+
+class TestSeeding:
+    async def test_no_page_is_handed_out_while_the_job_is_seeding(self, open_frontier):
+        await make_job(state="seeding")
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+
+        waiter = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0.2)
+        assert not waiter.done()
+        await fetch("UPDATE crawl_jobs SET state = 'running'")
+
+        assert await asyncio.wait_for(waiter, 5) == FrontierPage("http://site/", 0)
+
+    async def test_seeding_job_is_waited_for_with_nothing_queued(self, open_frontier):
+        await make_job(state="seeding")
+        frontier = await open_frontier("worker")
+
+        assert await still_waiting(frontier.take())
+        assert await job_state() == "seeding"
+
+
+class TestScopeOfTheJob:
+    async def test_worker_learns_of_a_host_another_brought_into_the_scope_with_its_next_page(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.seed(["http://site/a", "http://site/b"])
+
+        await first.widen_scope("other", lambda url: True)
+
+        assert second.scope_hosts() == []
+        await take(second)
+        assert second.scope_hosts() == ["other"]
+
+    async def test_new_worker_knows_the_scope_of_the_job(self, open_frontier):
+        first = await open_frontier("first")
+        await first.widen_scope("other", lambda url: True)
+
+        second = await open_frontier("second")
+
+        assert second.scope_hosts() == ["other"]
+
+    async def test_pages_held_are_queued_once_when_two_workers_widen_the_scope_at_once(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.hold_out_of_scope([f"http://other/{i}" for i in range(20)])
+
+        queued = await asyncio.gather(
+            first.widen_scope("other", lambda url: True), second.widen_scope("other", lambda url: True)
+        )
+
+        assert sum(queued) == 20
+        assert len(await fetch("SELECT url FROM frontier WHERE state = 'queued'")) == 20
+        assert await fetch("SELECT url FROM out_of_scope") == []
+
+
+class TestEnd:
+    async def test_job_is_finished_once_every_page_is_done(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/a", "http://site/b"])
+        await frontier.finish(await take(frontier), Outcome.PROCESSED)
+        await frontier.finish(await take(frontier), Outcome.FAILED, "NetworkError: boom")
+
+        assert await frontier.take() is None
+
+        (job,) = await fetch("SELECT state, finished_at FROM crawl_jobs")
+        assert job["state"] == "finished"
+        assert job["finished_at"] is not None
+
+    async def test_job_is_finished_once_max_pages_are_requested_with_pages_left_in_the_queue(self, open_frontier):
+        frontier = await open_frontier("worker", max_pages=1)
+        await frontier.seed([f"http://site/{i}" for i in range(3)])
+        page = await take(frontier)
+        assert await frontier.admit(page) is Admission.ADMITTED
+        await frontier.finish(page, Outcome.PROCESSED)
+
+        assert await frontier.take() is None
+
+        assert await job_state() == "finished"
+        assert len(await fetch("SELECT url FROM frontier WHERE state = 'queued'")) == 2
+
+    async def test_pages_held_out_of_scope_do_not_hold_the_end(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.hold_out_of_scope(["http://other/a"])
+
+        assert await frontier.take() is None
+        assert await job_state() == "finished"
+
+    async def test_job_is_not_finished_while_another_worker_has_a_page(self, open_frontier):
+        busy, other = await open_frontier("busy"), await open_frontier("other")
+        await busy.seed(["http://site/"])
+        page = await take(busy)
+
+        assert await still_waiting(other.take())
+        assert await job_state() == "running"
+        await busy.finish(page, Outcome.PROCESSED)
+        assert await other.take() is None
+        assert await job_state() == "finished"
+
+    async def test_job_is_finished_at_close_once_its_last_pages_are_saved(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+        await frontier.finish(await take(frontier), Outcome.PROCESSED, pending_save=True)
+        assert await frontier.take() is None
+        assert await job_state() == "running"
+
+        await frontier.saved(["http://site/"])
+        await frontier.close()
+
+        assert await job_state() == "finished"
+
+    async def test_job_is_not_finished_at_close_while_pages_wait_for_their_save(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+        await frontier.finish(await take(frontier), Outcome.PROCESSED, pending_save=True)
+
+        await frontier.close()
+
+        assert await job_state() == "running"
 
 
 class TestResume:

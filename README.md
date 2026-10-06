@@ -522,10 +522,11 @@ src/
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
     ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats, ProxyStats, RenderStats
-    ├── exceptions.py       # FetchError hierarchy, StorageError, ConfigError
+    ├── exceptions.py       # FetchError hierarchy, StorageError, JobError, ConfigError
     ├── distributed/
     │   ├── frontier.py     # PostgresFrontier: the frontier of a crawl job shared by workers — leases, heartbeat, host turns
-    │   └── schema.py       # the tables crawl_jobs, frontier and hosts, made by the first worker
+    │   ├── job.py          # create_job: a crawl job created, seeded, resumed or restarted
+    │   └── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, job_scope, out_of_scope
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes
         ├── json_file.py    # JSONStorage: JSON Lines or an indented array
@@ -547,7 +548,7 @@ tests/
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
 ├── unit/                   # links of the documentation, parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, logging, progress, filters, storages, client
-└── integration/            # local HTTP server, databases, the frontier in memory and in PostgreSQL; live tests marked `network`, PostgreSQL ones `postgres`
+└── integration/            # local HTTP server, databases, the frontier in memory and in PostgreSQL, crawl jobs; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── api.md                  # API reference
 ├── configuration.md        # configuration guide: every key, validation, recipes

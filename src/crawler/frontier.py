@@ -4,7 +4,7 @@ import enum
 import logging
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -90,7 +90,11 @@ class Frontier(ABC):
 
     @abstractmethod
     async def seed(self, urls: Iterable[str]) -> list[str]:
-        """Accept the start URLs at depth 0, whatever the bounds; the URLs accepted, in the form the frontier keeps them."""
+        """Accept the start URLs at depth 0, whatever the bounds; the valid ones, in the form the frontier keeps them.
+
+        A start URL accepted before, by this process or another one, is
+        returned too, though it is not queued again.
+        """
 
     @abstractmethod
     async def add(self, urls: Iterable[str], *, depth: int) -> int:
@@ -164,6 +168,31 @@ class Frontier(ABC):
     def stats(self) -> FrontierStats:
         """The counts of pages by state, as this process knows them; does not wait, so progress can be shown at any time."""
 
+    @abstractmethod
+    async def hold_out_of_scope(self, urls: Iterable[str]) -> None:
+        """Keep pages the filters turned away, such as those of a sitemap on a host out of the scope of the crawl.
+
+        A start URL may redirect to their host later and bring it into the
+        scope, see `widen_scope`. They are not accepted, nor seen.
+        """
+
+    @abstractmethod
+    async def widen_scope(self, host: str, allows: Callable[[str], bool]) -> int:
+        """Bring `host` into the scope of the crawl; the number of pages held out of scope it queued.
+
+        The pages held that `allows` lets through now are accepted at
+        depth 0, as far as the bounds allow, and are not held any more; the
+        others stay held. The host is listed by `scope_hosts`.
+        """
+
+    @abstractmethod
+    def scope_hosts(self) -> list[str]:
+        """The hosts `widen_scope` brought into the scope, in order, as far as this process knows them.
+
+        Those of other processes become known once `take` hands out a page
+        after them, so that the filters are brought up to date before it is crawled.
+        """
+
     async def close(self) -> None:
         """Release what the frontier holds, such as its connections; a frontier in memory holds nothing."""
 
@@ -193,15 +222,19 @@ class MemoryFrontier(Frontier):
         self._over_host_limit = 0
         self._links_dropped = 0
         self._links_dropped_by_host = 0
+        self._out_of_scope: list[str] = []
+        self._scope_hosts: list[str] = []
 
     async def seed(self, urls: Iterable[str]) -> list[str]:
-        seeded = []
+        seeded: dict[str, None] = {}
         for url in urls:
             form = queue_form(url)
-            if form is not None and self.queue.add_url(form, priority=0, depth=0):
-                seeded.append(form)
-        self._host_queued.update(get_host(url) for url in seeded)
-        return seeded
+            if form is None or form in seeded:
+                continue
+            seeded[form] = None
+            if self.queue.add_url(form, priority=0, depth=0):
+                self._host_queued[get_host(form)] += 1
+        return list(seeded)
 
     async def add(self, urls: Iterable[str], *, depth: int) -> int:
         return sum(self._add(url, depth) for url in urls)
@@ -280,6 +313,21 @@ class MemoryFrontier(Frontier):
 
     async def full(self) -> bool:
         return self._full()
+
+    async def hold_out_of_scope(self, urls: Iterable[str]) -> None:
+        self._out_of_scope.extend(urls)
+
+    async def widen_scope(self, host: str, allows: Callable[[str], bool]) -> int:
+        if host not in self._scope_hosts:
+            self._scope_hosts.append(host)
+        in_scope, out_of_scope = [], []
+        for url in self._out_of_scope:
+            (in_scope if allows(url) else out_of_scope).append(url)
+        self._out_of_scope = out_of_scope
+        return await self.add(in_scope, depth=0)
+
+    def scope_hosts(self) -> list[str]:
+        return list(self._scope_hosts)
 
     def stats(self) -> FrontierStats:
         counts = self.queue.get_stats()

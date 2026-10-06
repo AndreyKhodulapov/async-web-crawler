@@ -8,11 +8,12 @@ import os
 import secrets
 import socket
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import asyncpg
 
 from crawler.distributed.schema import Connection, create_schema
+from crawler.exceptions import JobError
 from crawler.frontier import Admission, Frontier, FrontierPage, FrontierStats, Outcome
 from crawler.queue import queue_form
 from crawler.urls import get_host
@@ -25,7 +26,9 @@ logger = logging.getLogger(__name__)
 # snapshot of the statement: another worker may have taken it since, and
 # may hold its row, waiting for the host this one holds. So its row is
 # locked skipping, never waited for, and is leased only if still queued;
-# otherwise nothing is taken and the worker looks again.
+# otherwise nothing is taken and the worker looks again. Nothing is handed
+# out while the job is seeding. The version of the scope comes along, so
+# that the worker learns of a host that joined it before it crawls the page.
 _TAKE = """
 WITH page AS (
     SELECT h.host, p.url
@@ -38,7 +41,9 @@ WITH page AS (
         LIMIT 1
     ) AS p
     WHERE h.job = $1 AND h.next_allowed_at <= now()
-        AND NOT EXISTS (SELECT FROM crawl_jobs AS j WHERE j.id = $1 AND j.requested >= j.max_pages)
+        AND NOT EXISTS (
+            SELECT FROM crawl_jobs AS j WHERE j.id = $1 AND (j.requested >= j.max_pages OR j.state = 'seeding')
+        )
     ORDER BY p.depth, p.seq
     LIMIT 1
     FOR UPDATE OF h SKIP LOCKED
@@ -60,12 +65,13 @@ WITH page AS (
     FROM leased
     WHERE h.job = $1 AND h.host = leased.host
 )
-SELECT url, depth FROM leased
+SELECT url, depth, (SELECT scope_version FROM crawl_jobs WHERE id = $1) AS scope_version FROM leased
 """
 
 # What a worker that got no page waits for, if for anything.
 _WAIT_STATE = """
 SELECT
+    j.state = 'seeding' AS seeding,
     j.max_pages IS NOT NULL AND j.requested >= j.max_pages AS closed,
     EXISTS (
         SELECT FROM hosts AS h
@@ -118,6 +124,19 @@ WHERE f.job = $1 AND f.url = expired.url
 RETURNING f.url, f.state, expired.state AS was, expired.worker, expired.host, expired.counted
 """
 
+# The job is over: no page is in progress or pending its save, and none is
+# left to hand out, or max_pages is reached.
+_FINISH_JOB = """
+UPDATE crawl_jobs AS j SET state = 'finished', finished_at = now()
+WHERE j.id = $1 AND j.state = 'running'
+    AND NOT EXISTS (SELECT FROM frontier WHERE job = $1 AND state IN ('leased', 'saving'))
+    AND (
+        j.max_pages IS NOT NULL AND j.requested >= j.max_pages
+        OR NOT EXISTS (SELECT FROM frontier WHERE job = $1 AND state = 'queued')
+    )
+RETURNING true
+"""
+
 _INSERT = """
 INSERT INTO frontier (job, url, host, depth, state)
 SELECT $1, page.url, page.host, $4, 'queued'
@@ -168,16 +187,18 @@ class _OverHostLimit(Exception):
 class PostgresFrontier(Frontier):
     """A `Frontier` in a PostgreSQL database, shared by the workers of one job.
 
-    Each worker opens its own with `open`, under the same job name; the
-    first one makes the tables and the job, and the limits of an existing
-    job are kept. A page goes from `queued` to `leased`, taken by one
+    Each worker opens its own with `open`, under the name of a job made by
+    `create_job`, whose limits it takes. No page is handed out while the
+    job is seeding. A page goes from `queued` to `leased`, taken by one
     worker until `lease_until`; the worker renews the leases of its pages
     every `heartbeat_seconds`. A page whose lease expires, because its
     worker stopped, is queued again and uncounted, and fails once it has
     expired `max_attempts` times: at least once, not exactly once. A page
     processed with `pending_save` is `saving`, leased all the same, until
     `saved`. A host has one page taken every `host_interval` seconds,
-    whichever worker takes it.
+    whichever worker takes it. Once nothing is left to hand out and no page
+    is in progress, the job is finished; so it is once max_pages pages are
+    requested and done.
 
     Times are those of the database clock. `take` waits by polling, at
     least every `poll_interval` seconds, and at once after an operation of
@@ -193,6 +214,7 @@ class PostgresFrontier(Frontier):
         self,
         pool: asyncpg.Pool,
         *,
+        job: str,
         job_id: int,
         worker: str,
         max_pages: int | None,
@@ -205,6 +227,7 @@ class PostgresFrontier(Frontier):
         poll_interval: float,
     ) -> None:
         super().__init__(max_pages=max_pages, max_pages_per_host=max_pages_per_host, frontier_factor=frontier_factor)
+        self.job = job
         self.job_id = job_id
         self.worker = worker
         self.lease_seconds = float(lease_seconds)
@@ -222,6 +245,8 @@ class PostgresFrontier(Frontier):
         # worker: one at a time, or two of them may deadlock.
         self._rows_lock = asyncio.Lock()
         self._stats = FrontierStats()
+        self._scope_version = 0
+        self._scope_hosts: list[str] = []
         self._drop_logged = False
         self._heartbeat: asyncio.Task[None] | None = None
         self._closed = False
@@ -233,9 +258,6 @@ class PostgresFrontier(Frontier):
         *,
         job: str,
         worker: str | None = None,
-        max_pages: int | None = None,
-        max_pages_per_host: int | None = None,
-        frontier_factor: int = Frontier.FRONTIER_FACTOR,
         lease_seconds: float = 60.0,
         heartbeat_seconds: float = 20.0,
         max_attempts: int = 3,
@@ -243,32 +265,29 @@ class PostgresFrontier(Frontier):
         poll_interval: float = 1.0,
         pool_size: int = 10,
     ) -> "PostgresFrontier":
-        """Connect a worker to the job named `job`, making the tables and the job if they are missing.
+        """Connect a worker to the job named `job`; the limits are those of the job.
 
-        The limits are those of a new job; an existing one keeps its own.
         `worker` names this worker in the database; by default it is made
         of the host name, the process id and a random part.
+
+        Raises:
+            JobError: there is no job of that name.
         """
         pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_size)
         try:
             async with pool.acquire() as connection:
                 await create_schema(connection)
-                await connection.execute(
-                    "INSERT INTO crawl_jobs (name, max_pages, max_pages_per_host, frontier_factor)"
-                    " VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
-                    job,
-                    max_pages,
-                    max_pages_per_host,
-                    frontier_factor,
-                )
                 row = await connection.fetchrow(
                     "SELECT id, max_pages, max_pages_per_host, frontier_factor FROM crawl_jobs WHERE name = $1", job
                 )
+            if row is None:
+                raise JobError(f'There is no crawl job named "{job}"')
         except BaseException:
             await pool.close()
             raise
         frontier = cls(
             pool,
+            job=job,
             job_id=row["id"],
             worker=worker or f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(2)}",
             max_pages=row["max_pages"],
@@ -281,6 +300,8 @@ class PostgresFrontier(Frontier):
             poll_interval=poll_interval,
         )
         await frontier.refresh_stats()
+        async with pool.acquire() as connection:
+            await frontier._read_scope(connection)
         frontier._heartbeat = asyncio.create_task(frontier._beat())
         return frontier
 
@@ -291,57 +312,66 @@ class PostgresFrontier(Frontier):
             inserted = await self._insert(connection, pages, depth=0)
             await self._count_accepted(connection, inserted)
         self._wakeup.set()
-        return list(inserted)
+        return list(pages)
 
     async def add(self, urls: Iterable[str], *, depth: int) -> int:
         pages = _pages_of(urls)
         if not pages:
             return 0
         async with self._pool.acquire() as connection, connection.transaction():
-            # One worker adds at a time: the bounds are checked against counts no one else changes meanwhile.
-            job = await connection.fetchrow(
-                "SELECT requested, unfinished FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id
+            accepted, dropped, accepted_by_host = await self._add(connection, pages, depth=depth)
+        self._added(accepted, dropped, accepted_by_host)
+        return accepted
+
+    async def _add(
+        self, connection: Connection, pages: dict[str, str], *, depth: int
+    ) -> tuple[int, int, dict[str, int]]:
+        """Accept the pages found at `depth`, as far as the bounds allow, in the transaction of `connection`.
+
+        Returns the number accepted, the number dropped as the frontier is
+        full, and the pages accepted by host since the job began, for `_added`.
+        """
+        # One worker adds at a time: the bounds are checked against counts no one else changes meanwhile.
+        job = await connection.fetchrow(
+            "SELECT requested, unfinished FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id
+        )
+        if self._closed_at(job["requested"]):
+            return 0, 0, {}
+        seen = {
+            row["url"]
+            for row in await connection.fetch(
+                "SELECT url FROM frontier WHERE job = $1 AND url = ANY($2::text[])", self.job_id, list(pages)
             )
-            if self._closed_at(job["requested"]):
-                return 0
-            seen = {
-                row["url"]
-                for row in await connection.fetch(
-                    "SELECT url FROM frontier WHERE job = $1 AND url = ANY($2::text[])", self.job_id, list(pages)
-                )
-            }
-            host_accepted = dict(
-                await connection.fetch(
-                    "SELECT host, accepted FROM hosts WHERE job = $1 AND host = ANY($2::text[])",
-                    self.job_id,
-                    list(set(pages.values())),
-                )
+        }
+        host_accepted = dict(
+            await connection.fetch(
+                "SELECT host, accepted FROM hosts WHERE job = $1 AND host = ANY($2::text[])",
+                self.job_id,
+                list(set(pages.values())),
             )
-            room = None if self._max_queued is None else self._max_queued - job["unfinished"] - job["requested"]
-            chosen: dict[str, str] = {}
-            dropped = dropped_by_host = 0
-            for url, host in pages.items():
-                accepted = host_accepted.get(host, 0)
-                if self._max_host_queued is not None and accepted >= self._max_host_queued:
-                    if url not in seen:
-                        dropped_by_host += 1
-                    continue
-                if room is not None and room <= 0:
-                    if url not in seen:
-                        dropped += 1
-                    continue
-                if url in seen:
-                    continue
-                chosen[url] = host
-                host_accepted[host] = accepted + 1
-                if room is not None:
-                    room -= 1
-            inserted = await self._insert(connection, chosen, depth=depth)
-            accepted_by_host = await self._count_accepted(connection, inserted, dropped, dropped_by_host)
-        self._log_bounds(dropped, accepted_by_host)
-        if inserted:
-            self._wakeup.set()
-        return len(inserted)
+        )
+        room = None if self._max_queued is None else self._max_queued - job["unfinished"] - job["requested"]
+        chosen: dict[str, str] = {}
+        dropped = dropped_by_host = 0
+        for url, host in pages.items():
+            accepted = host_accepted.get(host, 0)
+            if self._max_host_queued is not None and accepted >= self._max_host_queued:
+                if url not in seen:
+                    dropped_by_host += 1
+                continue
+            if room is not None and room <= 0:
+                if url not in seen:
+                    dropped += 1
+                continue
+            if url in seen:
+                continue
+            chosen[url] = host
+            host_accepted[host] = accepted + 1
+            if room is not None:
+                room -= 1
+        inserted = await self._insert(connection, chosen, depth=depth)
+        accepted_by_host = await self._count_accepted(connection, inserted, dropped, dropped_by_host)
+        return len(inserted), dropped, accepted_by_host
 
     async def take(self) -> FrontierPage | None:
         while True:
@@ -352,11 +382,14 @@ class PostgresFrontier(Frontier):
                 row = await connection.fetchrow(_TAKE, self.job_id, self.worker, self.lease_seconds, self.host_interval)
                 if row is not None:
                     self._held.add(row["url"])
+                    if row["scope_version"] != self._scope_version:
+                        await self._read_scope(connection)
                     return FrontierPage(row["url"], row["depth"])
                 state = await connection.fetchrow(_WAIT_STATE, self.job_id, self.worker)
-            delay = self._delay(state)
-            if delay is None:
-                return None
+                delay = self._delay(state)
+                if delay is None:
+                    await self._finish_job(connection)
+                    return None
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(delay):
                     await self._wakeup.wait()
@@ -505,6 +538,46 @@ class PostgresFrontier(Frontier):
         job = await self._pool.fetchrow("SELECT requested, unfinished FROM crawl_jobs WHERE id = $1", self.job_id)
         return not self._closed_at(job["requested"]) and job["unfinished"] + job["requested"] >= self._max_queued
 
+    async def hold_out_of_scope(self, urls: Iterable[str]) -> None:
+        urls = list(dict.fromkeys(urls))
+        if urls:
+            await self._pool.execute(
+                "INSERT INTO out_of_scope (job, url) SELECT $1, page.url"
+                " FROM unnest($2::text[]) WITH ORDINALITY AS page (url, position) ORDER BY page.position"
+                " ON CONFLICT DO NOTHING",
+                self.job_id,
+                urls,
+            )
+
+    async def widen_scope(self, host: str, allows: Callable[[str], bool]) -> int:
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                # The job first, as every addition locks it: the pages held are queued by one worker at a time.
+                await connection.execute("SELECT FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id)
+                added = await connection.fetchval(
+                    "INSERT INTO job_scope (job, host) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING true",
+                    self.job_id,
+                    host,
+                )
+                if added:
+                    await connection.execute(
+                        "UPDATE crawl_jobs SET scope_version = scope_version + 1 WHERE id = $1", self.job_id
+                    )
+                held = await connection.fetch(
+                    "SELECT url FROM out_of_scope WHERE job = $1 ORDER BY position", self.job_id
+                )
+                in_scope = [row["url"] for row in held if allows(row["url"])]
+                await connection.execute(
+                    "DELETE FROM out_of_scope WHERE job = $1 AND url = ANY($2::text[])", self.job_id, in_scope
+                )
+                accepted, dropped, accepted_by_host = await self._add(connection, _pages_of(in_scope), depth=0)
+            await self._read_scope(connection)
+        self._added(accepted, dropped, accepted_by_host)
+        return accepted
+
+    def scope_hosts(self) -> list[str]:
+        return list(self._scope_hosts)
+
     def stats(self) -> FrontierStats:
         return self._stats
 
@@ -540,6 +613,7 @@ class PostgresFrontier(Frontier):
 
         Pages pending their save stay leased: their records may still be
         written, and if not, the pages come back once the leases expire.
+        The job is finished if this worker had its last pages.
         """
         if self._closed:
             return
@@ -549,9 +623,12 @@ class PostgresFrontier(Frontier):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._heartbeat
         try:
-            async with self._rows_lock, self._pool.acquire() as connection, connection.transaction():
-                rows = await connection.fetch(_PUT_BACK_ALL, self.job_id, self.worker)
-                await self._uncount_all(connection, [row["host"] for row in rows if row["counted"]])
+            async with self._rows_lock, self._pool.acquire() as connection:
+                async with connection.transaction():
+                    rows = await connection.fetch(_PUT_BACK_ALL, self.job_id, self.worker)
+                    await self._uncount_all(connection, [row["host"] for row in rows if row["counted"]])
+                # The last pages of the job may have been pending their save until now.
+                await self._finish_job(connection)
         finally:
             self._held.clear()
             self._counted.clear()
@@ -611,6 +688,21 @@ class PostgresFrontier(Frontier):
             else:
                 logger.warning("Lease of %s by %s expired: the page is queued again", row["url"], row["worker"])
 
+    async def _read_scope(self, connection: Connection) -> None:
+        """Learn the hosts brought into the scope of the job, and the version of the scope they make."""
+        row = await connection.fetchrow(
+            "SELECT scope_version,"
+            " array(SELECT host FROM job_scope WHERE job = $1 ORDER BY position) AS hosts"
+            " FROM crawl_jobs WHERE id = $1",
+            self.job_id,
+        )
+        self._scope_version, self._scope_hosts = row["scope_version"], list(row["hosts"])
+
+    async def _finish_job(self, connection: Connection) -> None:
+        """Mark the job finished if nothing is left to do in it."""
+        if await connection.fetchval(_FINISH_JOB, self.job_id):
+            logger.info("Crawl job %s is finished", self.job)
+
     async def _lock_leased(self, connection: Connection, page: FrontierPage) -> None:
         """Lock the row of a page leased to this worker; raises _LeaseLost if it is not leased to it any more."""
         leased = await connection.fetchval(
@@ -663,6 +755,8 @@ class PostgresFrontier(Frontier):
     def _delay(self, state: asyncpg.Record) -> float | None:
         """How long `take` waits before it looks again; None if there is nothing left to wait for."""
         due = self.poll_interval if state["due"] is None else min(max(float(state["due"]), 0.0), self.poll_interval)
+        if state["seeding"]:
+            return self.poll_interval
         if state["closed"]:
             # Pages other workers counted may go back under the limit; this
             # worker's own pages come back only by its own hand, as in memory.
@@ -684,6 +778,12 @@ class PostgresFrontier(Frontier):
     def _release(self, page: FrontierPage) -> None:
         self._held.discard(page.url)
         self._counted.discard(page.url)
+
+    def _added(self, accepted: int, dropped: int, accepted_by_host: dict[str, int]) -> None:
+        """Tell of the bounds an addition reached, and wake the waiting workers if pages were accepted; after it commits."""
+        self._log_bounds(dropped, accepted_by_host)
+        if accepted:
+            self._wakeup.set()
 
     def _log_bounds(self, dropped: int, accepted_by_host: dict[str, int]) -> None:
         if dropped and not self._drop_logged:

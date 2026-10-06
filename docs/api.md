@@ -19,6 +19,7 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Crawling](#crawling) | `crawl()`: depth, filters, sitemaps, state of a crawl |
 | [Page statistics](#page-statistics) | `CrawlerStats`, export to JSON and HTML |
 | [AdvancedCrawler](#advancedcrawler) | the crawler set up by a configuration |
+| [Crawl jobs](#crawl-jobs) | `create_job`: a crawl in PostgreSQL that workers share |
 | [Live progress](#live-progress) | `show_progress`, `ProgressTracker` |
 | [Configuration](#configuration) | `load_config`, `load_urls`, `CrawlerConfig` |
 | [Logging](#logging) | `configure_logging` |
@@ -681,6 +682,15 @@ does, and so do the sitemaps that such a robots.txt names under `robots_sitemaps
 page is fetched after that wait, so that a crawl fed by sitemaps alone does
 not end empty after a 503 of a few seconds.
 
+`seed(frontier, start_urls, ...)` does this first step alone: it queues the
+start URLs and the pages of the sitemaps in a `Frontier` and crawls nothing.
+It takes the arguments of `crawl()` but for the limits, which are those of
+the frontier, and returns the sitemaps that could not be read. It is how a
+crawl job of distributed workers is filled, see [Crawl jobs](#crawl-jobs).
+Under `same_domain_only`, the sitemap pages of hosts out of scope are held
+in the frontier (`hold_out_of_scope`); a start URL that redirects to their
+host brings them in (`widen_scope`), whichever process crawls it.
+
 `crawl()` returns every parsed page, so it holds them all in memory until
 it ends. A large crawl that saves its pages to a storage does not need
 that: `AsyncCrawler(storage=..., keep_pages=False)` lets a page go once it
@@ -722,7 +732,8 @@ After a crawl, and during one, the crawler exposes its state:
 The building blocks can be used on their own: `CrawlerQueue` (priorities,
 deduplication, completion detection), `MemoryFrontier` (a `CrawlerQueue`
 with the limits on the pages of a crawl), `PostgresFrontier` (the same
-contract in PostgreSQL, shared by the workers of a job), `SemaphoreManager` (global and
+contract in PostgreSQL, shared by the workers of a job made by
+`create_job`, see [Crawl jobs](#crawl-jobs)), `SemaphoreManager` (global and
 per-domain limits), `RateLimiter`, `RobotsParser`, `SitemapParser`, `RetryStrategy`,
 `CircuitBreaker` and `UrlFilter`.
 
@@ -807,6 +818,8 @@ asyncio.run(main())
 | `AdvancedCrawler(config, configure_logging=True)` | takes a `CrawlerConfig`; the defaults without one |
 | `AdvancedCrawler.from_config(path, overrides, configure_logging=True)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
 | `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section and the cookies of `session.save_cookies`; returns the pages by URL |
+| `await seed(frontier, sitemaps=True)` | queues the start URLs and the pages of the sitemaps of the configuration in `frontier` without crawling them, see `AsyncCrawler.seed`; `sitemaps=False` leaves the sitemaps unread |
+| `check_start()` | raises `ConfigError` if the configuration has neither `urls` nor `sitemaps.urls`; `crawl()` and `seed()` call it |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
 | `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report; with rendering, `rendering`: `{rendered, failed, avg_render_time}` (see `render_stats()` in [Rendering](#rendering)), also in the JSON and the HTML report |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
@@ -832,6 +845,45 @@ crawl = asyncio.create_task(crawler.crawl())
 await show_progress(crawler.crawler, crawl, crawler.config.crawler.max_pages)
 pages = await crawl
 ```
+
+## Crawl jobs
+
+A crawl job is one crawl in PostgreSQL that workers in other processes,
+or on other machines, share: its frontier, its limits and its scope are
+in the database (see [architecture.md](architecture.md#the-frontier-in-a-database)).
+`create_job` creates and seeds it:
+
+```python
+from crawler import load_config
+from crawler.distributed import JobMode, PostgresFrontier, create_job
+
+dsn = "postgresql://crawler:crawler@localhost/crawler"
+failed_sitemaps = await create_job(load_config("config.yaml"), "shop", dsn=dsn)
+
+frontier = await PostgresFrontier.open(dsn, job="shop")   # a worker of the job
+```
+
+| Name | What it is |
+|------|------------|
+| `create_job(config, name, *, dsn, mode=JobMode.NEW)` | makes the tables if they are missing, creates the job and seeds it with the start URLs and the sitemaps of `config` (see `seed` in [Crawling](#crawling)); returns the sitemaps that could not be read |
+| `JobMode.NEW` | the name must be free, or `JobError` is raised |
+| `JobMode.RESUME` | goes on with the job of that name: its start URLs are seeded again (only those never queued are), a finished job runs again, the sitemaps are not read again unless the seeding did not finish; `config` must not differ from that of the job, or `JobError` names the keys that do |
+| `JobMode.RESTART` | deletes the job and its pages, then creates it anew |
+| `job_config(config)` | the part of a configuration the job keeps and every worker shares: the sections of `JOB_SECTIONS` (`urls`, `sitemaps`, `crawler`, `retry`, `circuit_breaker`, `filters`, `rendering`) without `crawler.max_concurrent` |
+| `PostgresFrontier.open(dsn, *, job, worker=None, ...)` | connects a worker to the job, with the limits of the job; `JobError` if there is no such job |
+
+A job is `seeding` while `create_job` fills it: workers started meanwhile
+wait, and take its first page once it is `running`. Once nothing is left
+to hand out and no page is in progress or pending its save, or once
+`max_pages` pages are requested and done, it is `finished`. A job whose
+seeding failed stays `seeding`; resumed, it is seeded again. The sitemaps
+are read with the session and the proxies of the configuration given to
+`create_job`; its storage is not opened.
+
+The other sections of a configuration, `session`, `proxy`, `storage`,
+`logging` and `report`, and `crawler.max_concurrent`, are those of each
+worker; the secrets of a configuration (cookies, headers, the passwords of
+proxies) are all in them, so the job keeps none.
 
 ## Live progress
 
@@ -1112,9 +1164,10 @@ and may change. A layer calls only the one below it.
 | Layer | Module | Class | Responsible for | Knows nothing of |
 |-------|--------|-------|-----------------|------------------|
 | Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
-| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: what is done with every page its `Frontier` hands out — filters, depth, sitemaps read before the first page until the frontier is full, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched, how the pages are kept |
-| Crawl, frontier | `frontier.py` | `Frontier`, `MemoryFrontier` | `Frontier` is the contract the crawl layer takes its pages through: the queue and the URLs seen (`mark_seen` checks and remembers in one call), the outcomes of the pages (a page saved is done once the storage reports its record written: `pending_save`, `saved`), `max_pages` and `max_pages_per_host` counted as pages are admitted and uncounted when they go back unanswered, the bound of `FRONTIER_FACTOR`. `MemoryFrontier` keeps them in memory, in a `CrawlerQueue` | how a page is fetched or what is done with it |
-| Crawl, shared frontier | `distributed/frontier.py`, `distributed/schema.py` | `PostgresFrontier` | a `Frontier` in PostgreSQL that the workers of one job share: the tables made by the first worker, the limits of the job kept in the database, pages leased to a worker and renewed by its heartbeat, an expired lease queued again and uncounted (failed after `max_attempts`), pages `saving` until `saved`, one turn of a host for all workers (`next_allowed_at`, `FOR UPDATE SKIP LOCKED`), waiting by polling, the stats as a snapshot of the job (`refresh_stats()`), `close()` putting the pages in progress back | what is done with a page; when a job is created or over |
+| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: what is done with every page its `Frontier` hands out — filters, depth, the seeding (`seed`: the start URLs, then the sitemaps read before the first page until the frontier is full, also alone for `AsyncCrawler.seed`), the scope a redirecting start URL widens and the hosts other processes brought into it, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched, how the pages are kept |
+| Crawl, frontier | `frontier.py` | `Frontier`, `MemoryFrontier` | `Frontier` is the contract the crawl layer takes its pages through: the queue and the URLs seen (`mark_seen` checks and remembers in one call), the outcomes of the pages (a page saved is done once the storage reports its record written: `pending_save`, `saved`), `max_pages` and `max_pages_per_host` counted as pages are admitted and uncounted when they go back unanswered, the bound of `FRONTIER_FACTOR`, the scope (sitemap pages held out of it: `hold_out_of_scope`; a host brought in: `widen_scope`, `scope_hosts`). `MemoryFrontier` keeps them in memory, in a `CrawlerQueue` | how a page is fetched or what is done with it |
+| Crawl, shared frontier | `distributed/frontier.py`, `distributed/schema.py` | `PostgresFrontier` | a `Frontier` in PostgreSQL that the workers of one job share: the limits and the scope of the job kept in the database, nothing handed out while the job is seeding, the job finished by the worker that finds nothing left, pages leased to a worker and renewed by its heartbeat, an expired lease queued again and uncounted (failed after `max_attempts`), pages `saving` until `saved`, one turn of a host for all workers (`next_allowed_at`, `FOR UPDATE SKIP LOCKED`), waiting by polling, the stats as a snapshot of the job (`refresh_stats()`), `close()` putting the pages in progress back | what is done with a page; how a job is created |
+| Crawl jobs | `distributed/job.py` | `create_job`, `JobMode`, `job_config` | a job created, resumed or restarted, its part of the configuration kept, its seeding through `AdvancedCrawler.seed` | how its pages are crawled |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
 | HTTP | `transport.py` | `Transport`, `HttpTransport` | `Transport` is the contract the request layer sends through; `HttpTransport` makes a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
 | HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, with the proxy their document came through (`Response.proxy`), a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a context per proxy, the cookies kept in step with those of `HttpTransport` (`CookieSync`, `Transport.update_cookies`), a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash, the counters of `render_stats()` | robots.txt, filters, retries, limits |
