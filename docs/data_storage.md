@@ -137,6 +137,15 @@ blocking the event loop, losing pages or writing them twice.
   "written": the record may sit in the buffer, and one failed flush is many
   pages. Count what the storage has actually written out and derive the
   failures from that.
+- **Tell the caller what is stored.** A crawl whose queue outlives the
+  process (a shared queue, a resumed crawl) must not count a page done
+  while its record is in the buffer. The storage reports the URLs of
+  every batch written, and of the records dropped, to a callback
+  (`on_settled`); the records still in the buffer, and those lost when a
+  failed close gives up on them, are not reported, so their pages are
+  crawled again. `CompositeStorage` reports a record once every one of its
+  storages has settled it. A failure of the callback is logged, not
+  raised: the records are written all the same.
 - **Close in `finally`**: flush, then release the file or the connection
   even if the flush failed. Make `close` idempotent. An async generator that
   holds a cursor must be closed too (`contextlib.aclosing`), or a reader that

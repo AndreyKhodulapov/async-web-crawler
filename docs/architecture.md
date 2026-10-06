@@ -67,6 +67,24 @@ listed in the [API reference](api.md#internals).
   the process knows without asking. It is an ABC, not a `Protocol`: the
   implementations share the limits they are made with. The contract
   tests run against every implementation.
+- Two more points of that contract come from the database one, though
+  the frontier in memory has no use for them:
+  - "is this URL seen" and "remember it" are one call, `mark_seen`, that
+    tells whether the URL was new. In memory two calls cannot interleave
+    with another worker; in a database they can, and two workers would
+    both follow a redirect to the same page. One `INSERT ... ON CONFLICT`
+    answers both questions at once;
+  - a page is **done only once it is stored**. The storage writes in
+    batches, so a page processed may wait in its buffer: a process that
+    stops then leaves it done in a shared queue with no record, and the
+    next run never fetches it again. The crawl finishes such a page with
+    `pending_save`; the storage reports the records it has written (or
+    dropped as ones no write can take) through `on_settled`, and the
+    crawl passes them on to `Frontier.saved`. Until then the database
+    frontier keeps the page leased, and hands it out again if the lease
+    runs out. The storage knows nothing of the frontier: a callback of
+    URLs is all it offers, so any storage works, not only a table in the
+    same database as the queue.
 
 ## State of a unit of work
 

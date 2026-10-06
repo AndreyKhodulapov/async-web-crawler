@@ -151,6 +151,9 @@ class CrawlRun:
         )
         self._crawl_started, self._crawl_finished = time.perf_counter(), None
         self.stats.start()
+        if self.storage is not None:
+            # A page saved is done in the frontier once its record is written.
+            self.storage.on_settled = self._frontier.saved
         try:
             if sitemap_urls or robots_sitemaps:
                 await self._queue_sitemap_pages(sitemap_urls, start_urls if robots_sitemaps else [], url_filter)
@@ -159,6 +162,8 @@ class CrawlRun:
                     group.create_task(self._crawl_worker(url_filter))
             await self._flush_storage()
         finally:
+            if self.storage is not None:
+                self.storage.on_settled = None
             self._crawl_finished = time.perf_counter()
             self.stats.finish()
             # A site given up on is given up for this crawl only: a
@@ -477,7 +482,8 @@ class CrawlRun:
             return
         if self.keep_pages:
             self.processed_urls[url] = parsed
-        await self._frontier.finish(page, Outcome.PROCESSED)
+        # With a storage, the page is done once its record is written (see run).
+        await self._frontier.finish(page, Outcome.PROCESSED, pending_save=self.storage is not None)
         self.stats.record_page(url, status=result.status, elapsed=result.elapsed)
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(parsed["links"]), queued)
         if self.storage is not None:
@@ -538,9 +544,8 @@ class CrawlRun:
         # Compared without tracking parameters, as the queue keeps URLs.
         page = strip_tracking_params(target)
         if page != url and self._redirect_sources.get(page) != url:
-            if await self._frontier.is_seen(page):
+            if not await self._frontier.mark_seen(page):
                 return f"redirected to a page already seen: {target}"
-            await self._frontier.mark_seen(page)
             self._redirect_sources[page] = url
         return None
 

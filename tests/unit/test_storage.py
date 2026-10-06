@@ -377,3 +377,80 @@ class TestCooldown:
     def test_negative_cooldown_is_refused(self):
         with pytest.raises(ValueError, match="cooldown"):
             MemoryStorage(cooldown=-1)
+
+
+class TestSettled:
+    @staticmethod
+    def listened(storage: DataStorage) -> list[list[str]]:
+        """The URLs `on_settled` is called with, a list per call."""
+        calls: list[list[str]] = []
+
+        async def on_settled(urls: list[str]) -> None:
+            calls.append(urls)
+
+        storage.on_settled = on_settled
+        return calls
+
+    async def test_urls_of_a_written_batch_are_reported(self):
+        storage = MemoryStorage(batch_size=2)
+        calls = self.listened(storage)
+
+        await save_pages(storage, "a")
+        assert calls == []
+        await save_pages(storage, "b")
+
+        assert calls == [["a", "b"]]
+
+    async def test_records_of_a_failed_write_are_reported_once_written(self):
+        storage = MemoryStorage(batch_size=2, failures=[OSError("disk full")] * 4)
+        calls = self.listened(storage)
+        with pytest.raises(StorageError):
+            await save_pages(storage, "a", "b")
+        assert calls == []
+
+        await storage.flush()
+
+        assert calls == [["a", "b"]]
+
+    async def test_records_dropped_are_reported_with_those_written(self):
+        names = [f"page-{number}" for number in range(4)]
+        storage = MemoryStorage(batch_size=4, refused={"page-1"})
+        calls = self.listened(storage)
+
+        with pytest.raises(ValueError):
+            await save_pages(storage, *names)
+
+        # Written one by one: each is settled once written or dropped.
+        assert calls == [[name] for name in names]
+
+    async def test_batch_of_one_record_dropped_is_reported(self):
+        storage = MemoryStorage(batch_size=1, refused={"a"})
+        calls = self.listened(storage)
+
+        with pytest.raises(ValueError):
+            await save_pages(storage, "a")
+
+        assert calls == [["a"]]
+
+    async def test_records_lost_at_close_are_not_reported(self):
+        storage = MemoryStorage(batch_size=2, failures=[OSError("disk full")] * 4)
+        calls = self.listened(storage)
+        await save_pages(storage, "a")
+
+        with pytest.raises(StorageError):
+            await storage.close()
+
+        assert calls == []
+
+    async def test_error_of_the_listener_is_logged_and_the_write_goes_on(self, caplog):
+        storage = MemoryStorage(batch_size=1)
+
+        async def on_settled(urls: list[str]) -> None:
+            raise RuntimeError("frontier is down")
+
+        storage.on_settled = on_settled
+        with caplog.at_level(logging.ERROR, logger="crawler.storage"):
+            await save_pages(storage, "a", "b")
+
+        assert storage.urls == [["a"], ["b"]]
+        assert "Failed to report 1 records settled by MemoryStorage" in caplog.text

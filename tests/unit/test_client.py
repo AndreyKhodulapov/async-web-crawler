@@ -27,6 +27,7 @@ from crawler import (
     HTMLParser,
     HTTPStatusError,
     InvalidURLError,
+    MemoryFrontier,
     NetworkError,
     NoProxyError,
     ParseError,
@@ -46,6 +47,7 @@ from crawler import (
     UnexpectedError,
 )
 from crawler.crawl_run import CrawlRun
+from crawler.frontier import Outcome as PageOutcome
 
 
 class FakeResponse:
@@ -1396,6 +1398,49 @@ class TestCrawlStorage:
         await first
         assert fake_session.requested == ["http://a/1"]
         assert crawler.processed_urls.keys() == {"http://a/1"}
+
+    @staticmethod
+    def recording_frontier(monkeypatch) -> list[tuple[str, ...]]:
+        """The pages the crawl finishes as processed, and those it reports saved, in order."""
+        events: list[tuple[str, ...]] = []
+
+        class Recording(MemoryFrontier):
+            async def finish(self, page, outcome, reason=None, *, uncount=False, pending_save=False):
+                if outcome is PageOutcome.PROCESSED:
+                    events.append(("pending save" if pending_save else "processed", page.url))
+                await super().finish(page, outcome, reason, uncount=uncount, pending_save=pending_save)
+
+            async def saved(self, urls):
+                events.append(("saved", *urls))
+
+        monkeypatch.setattr("crawler.client.MemoryFrontier", Recording)
+        return events
+
+    async def test_pages_are_reported_saved_to_the_frontier_once_written(self, make_crawler, fake_session, monkeypatch):
+        events = self.recording_frontier(monkeypatch)
+        storage = MemoryStorage(batch_size=2)
+        crawler = make_crawler(storage=storage, max_concurrent=1, max_depth=1)
+        fake_session.routes["http://a/1"] = FakeResponse(b'<a href="http://a/2">2</a><a href="http://a/3">3</a>')
+
+        await crawler.crawl(["http://a/1"])
+
+        assert events == [
+            ("pending save", "http://a/1"),
+            ("pending save", "http://a/2"),
+            ("saved", "http://a/1", "http://a/2"),
+            ("pending save", "http://a/3"),
+            ("saved", "http://a/3"),  # the last batch, flushed at the end of the crawl
+        ]
+        # The storage reports to the frontier of its crawl only.
+        assert storage.on_settled is None
+
+    async def test_without_a_storage_pages_are_processed_at_once(self, make_crawler, fake_session, monkeypatch):
+        events = self.recording_frontier(monkeypatch)
+        crawler = make_crawler(max_depth=0)
+
+        await crawler.crawl(["http://a/1"])
+
+        assert events == [("processed", "http://a/1")]
 
 
 class TestCrawlScope:

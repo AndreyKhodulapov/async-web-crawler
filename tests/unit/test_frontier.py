@@ -85,7 +85,7 @@ class TestAdd:
     async def test_tracking_parameters_are_dropped(self, frontier):
         assert await frontier.add(["http://site/a?id=1&utm_source=mail"], depth=0) == 1
         assert await frontier.add(["http://site/a?fbclid=x&id=1"], depth=0) == 0
-        assert await frontier.is_seen("http://site/a?id=1&gclid=y")
+        assert not await frontier.mark_seen("http://site/a?id=1&gclid=y")
         assert await take(frontier) == FrontierPage("http://site/a?id=1", 0)
 
     async def test_page_keeps_its_depth(self, frontier):
@@ -95,6 +95,14 @@ class TestAdd:
     async def test_url_marked_seen_is_not_accepted(self, frontier):
         await frontier.mark_seen("http://site/redirect-target")
         assert await frontier.add(["http://site/redirect-target"], depth=0) == 0
+
+    async def test_mark_seen_tells_whether_the_url_is_new(self, frontier):
+        await frontier.add(["http://site/page"], depth=0)
+
+        assert await frontier.mark_seen("http://site/target")
+        assert not await frontier.mark_seen("http://site/target?utm_source=x")
+        assert not await frontier.mark_seen("http://site/page")
+        assert not await frontier.mark_seen("not a url")
 
     async def test_forgotten_url_is_accepted_again_unless_it_was_accepted(self, frontier):
         await frontier.mark_seen("http://site/redirect-target")
@@ -185,6 +193,18 @@ class TestOutcomes:
         stats = frontier.stats()
         assert (stats.queued, stats.in_progress) == (1, 0)
         assert (stats.processed, stats.failed, stats.skipped, stats.blocked, stats.unreachable) == (1, 1, 1, 1, 1)
+
+    async def test_page_processed_pending_its_save_is_processed(self, frontier):
+        await frontier.seed(["http://site/a"])
+        page = await take(frontier)
+
+        await frontier.finish(page, Outcome.PROCESSED, pending_save=True)
+
+        # The worker that saves it is not kept waiting for its own save.
+        assert await frontier.take() is None
+        assert frontier.stats().processed == 1
+        await frontier.saved([page.url])
+        assert (frontier.stats().processed, frontier.stats().in_progress) == (1, 0)
 
     async def test_pending_or_processed_urls(self, frontier):
         await frontier.seed([f"http://site/{name}" for name in "abcd"])
@@ -322,7 +342,7 @@ class TestBounds:
         assert await frontier.full()
         assert frontier.stats().links_dropped == 3
         # Not remembered: a page found again once there is room is accepted then.
-        assert not await frontier.is_seen("http://site/4")
+        assert await frontier.mark_seen("http://site/4")
 
     async def test_pages_requested_take_room_in_the_frontier(self, make_frontier):
         frontier = make_frontier(max_pages=2, frontier_factor=1)

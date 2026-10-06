@@ -995,6 +995,13 @@ All of them share the behavior of `DataStorage`:
 - `read()` iterates over the saved records, oldest first, without loading
   them all; `pending` and `written` count the records in the buffer and those
   written out.
+- `on_settled`, if set, is awaited with the URLs of the records written
+  out, and of those dropped, after every write. Records still in the buffer
+  are reported once a later write takes them; those lost when `close()`
+  cannot write them are not. `crawl()` sets it for its run, so that a page
+  is done in its frontier only once its record is stored (see
+  `Frontier.saved`), and clears it at the end. An error of the callback is
+  logged and does not fail the write.
 
 A database storage creates its table on `open()` or the first use (`init_db()`), with
 `url` unique and indexes on `crawled_at` and `status_code`. A batch is one
@@ -1105,7 +1112,7 @@ and may change. A layer calls only the one below it.
 |-------|--------|-------|-----------------|------------------|
 | Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
 | Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: what is done with every page its `Frontier` hands out — filters, depth, sitemaps read before the first page until the frontier is full, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched, how the pages are kept |
-| Crawl, frontier | `frontier.py` | `Frontier`, `MemoryFrontier` | `Frontier` is the contract the crawl layer takes its pages through: the queue and the URLs seen, the outcomes of the pages, `max_pages` and `max_pages_per_host` counted as pages are admitted and uncounted when they go back unanswered, the bound of `FRONTIER_FACTOR`. `MemoryFrontier` keeps them in memory, in a `CrawlerQueue` | how a page is fetched or what is done with it |
+| Crawl, frontier | `frontier.py` | `Frontier`, `MemoryFrontier` | `Frontier` is the contract the crawl layer takes its pages through: the queue and the URLs seen (`mark_seen` checks and remembers in one call), the outcomes of the pages (a page saved is done once the storage reports its record written: `pending_save`, `saved`), `max_pages` and `max_pages_per_host` counted as pages are admitted and uncounted when they go back unanswered, the bound of `FRONTIER_FACTOR`. `MemoryFrontier` keeps them in memory, in a `CrawlerQueue` | how a page is fetched or what is done with it |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
 | HTTP | `transport.py` | `Transport`, `HttpTransport` | `Transport` is the contract the request layer sends through; `HttpTransport` makes a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
 | HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, with the proxy their document came through (`Response.proxy`), a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a context per proxy, the cookies kept in step with those of `HttpTransport` (`CookieSync`, `Transport.update_cookies`), a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash, the counters of `render_stats()` | robots.txt, filters, retries, limits |

@@ -60,7 +60,9 @@ class Frontier(ABC):
     A page is accepted once, under the normalized form of its URL (see
     `queue_form`), and handed out by `take` lowest depth first:
     breadth-first. A page taken is finished with `finish` or goes back with
-    `put_back`. Before it is requested it must be admitted: `admit` counts
+    `put_back`. A page processed whose record is still to be written by
+    the storage is finished with `pending_save` and reported with `saved`
+    once it is. Before it is requested it must be admitted: `admit` counts
     it toward `max_pages` and `max_pages_per_host`. A page that goes back
     unanswered, or is given up before its request, can be uncounted, so
     that it costs nothing of the limits until it is taken again.
@@ -116,20 +118,35 @@ class Frontier(ABC):
 
     @abstractmethod
     async def finish(
-        self, page: FrontierPage, outcome: Outcome, reason: str | None = None, *, uncount: bool = False
+        self,
+        page: FrontierPage,
+        outcome: Outcome,
+        reason: str | None = None,
+        *,
+        uncount: bool = False,
+        pending_save: bool = False,
     ) -> None:
         """Record the outcome of a page taken; `reason` for all but `Outcome.PROCESSED`.
 
         With `uncount`, the page is uncounted from the limits: it was admitted, but nothing was sent.
+        With `pending_save`, a page processed is done only once `saved`
+        reports its record written: a frontier shared by several processes
+        hands it out again if this one stops before that. The page counts as
+        processed all the same, and `take` does not wait for it.
         """
 
     @abstractmethod
-    async def is_seen(self, url: str) -> bool:
-        """Whether a URL was accepted or remembered with `mark_seen`."""
+    async def saved(self, urls: Iterable[str]) -> None:
+        """The records of these pages, finished with `pending_save`, are written, or dropped as ones no write can take."""
 
     @abstractmethod
-    async def mark_seen(self, url: str) -> None:
-        """Remember a URL without accepting it, e.g. the target of a redirect."""
+    async def mark_seen(self, url: str) -> bool:
+        """Remember a URL without accepting it, e.g. the target of a redirect; False if it was seen already.
+
+        A URL is seen once accepted or remembered. An invalid one is never
+        remembered and gives False. Checking and remembering are one step,
+        so that two workers cannot both take a URL for new.
+        """
 
     @abstractmethod
     async def forget(self, url: str) -> None:
@@ -216,8 +233,16 @@ class MemoryFrontier(Frontier):
             self.queue.requeue(page.url, priority=page.depth)
 
     async def finish(
-        self, page: FrontierPage, outcome: Outcome, reason: str | None = None, *, uncount: bool = False
+        self,
+        page: FrontierPage,
+        outcome: Outcome,
+        reason: str | None = None,
+        *,
+        uncount: bool = False,
+        pending_save: bool = False,
     ) -> None:
+        # One process: a page whose save is pending is done already, as it
+        # cannot be handed out to another one.
         if uncount:
             self._uncount(page)
         if outcome is Outcome.PROCESSED:
@@ -235,11 +260,14 @@ class MemoryFrontier(Frontier):
             case Outcome.UNREACHABLE:
                 self.queue.mark_unreachable(page.url, reason)
 
-    async def is_seen(self, url: str) -> bool:
-        return self.queue.is_seen(url)
+    async def saved(self, urls: Iterable[str]) -> None:
+        pass
 
-    async def mark_seen(self, url: str) -> None:
+    async def mark_seen(self, url: str) -> bool:
+        if queue_form(url) is None or self.queue.is_seen(url):
+            return False
         self.queue.mark_seen(url)
+        return True
 
     async def forget(self, url: str) -> None:
         self.queue.forget(url)

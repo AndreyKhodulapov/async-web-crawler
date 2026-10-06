@@ -1,6 +1,7 @@
 """Storage that keeps every page in several storages at once."""
 
 import asyncio
+from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 
 from crawler.exceptions import StorageError
@@ -21,8 +22,9 @@ class CompositeStorage(DataStorage):
     those that failed.
 
     A page counts as `written` once every storage has written it, and as
-    `pending` while any of them still buffers it. `read` gives the records
-    of the first storage.
+    `pending` while any of them still buffers it, and is reported to
+    `on_settled` once every storage has written or dropped it. `read` gives
+    the records of the first storage.
     """
 
     def __init__(self, *storages: DataStorage) -> None:
@@ -30,6 +32,9 @@ class CompositeStorage(DataStorage):
             raise ValueError("CompositeStorage needs at least one storage")
         super().__init__()
         self.storages = storages
+        self._settled: Counter[str] = Counter()  # by URL, the storages that have settled its record
+        for storage in storages:
+            storage.on_settled = self._settle_in_one
 
     @property
     def pending(self) -> int:
@@ -50,6 +55,15 @@ class CompositeStorage(DataStorage):
 
     async def close(self) -> None:
         await self._for_each(lambda storage: storage.close(), "close")
+
+    async def _settle_in_one(self, urls: list[str]) -> None:
+        """A storage has settled these records: those settled by all of them are reported."""
+        self._settled.update(urls)
+        settled = [url for url in urls if self._settled[url] == len(self.storages)]
+        for url in settled:
+            del self._settled[url]
+        if settled and self.on_settled is not None:
+            await self.on_settled(settled)
 
     async def _for_each(self, call: Callable[[DataStorage], Awaitable[None]], action: str) -> None:
         outcomes = await asyncio.gather(*(call(storage) for storage in self.storages), return_exceptions=True)

@@ -5,7 +5,7 @@ import contextlib
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import ClassVar, Self
@@ -52,6 +52,13 @@ class DataStorage(ABC):
     A subclass implements `_write_batch`, `_read` and `_close`, and lists in
     `WRITE_ERRORS` the exceptions its writes fail with; `_open_storage`
     does what the first write would otherwise do to open the storage.
+
+    `on_settled`, if set, is called with the URLs of the records settled:
+    written, or dropped as ones no write can take. A crawl uses it to mark
+    its pages done once they are stored. Records that stay in the buffer
+    after a failed write are reported once a later write takes them, and
+    those lost when `close` cannot write them are not reported. An error
+    of `on_settled` is logged and does not fail the write.
     """
 
     WRITE_ERRORS: ClassVar[tuple[type[Exception], ...]] = (OSError,)
@@ -78,6 +85,7 @@ class DataStorage(ABC):
         self._lock = asyncio.Lock()
         self._closed = False
         self._written = 0
+        self.on_settled: Callable[[list[str]], Awaitable[None]] | None = None
 
     @property
     def pending(self) -> int:
@@ -192,6 +200,7 @@ class DataStorage(ABC):
             if len(batch) == 1:
                 self._buffer = []
                 self._log_dropped(batch[0], error)
+                await self._settle(batch)
                 raise
             await self._write_one_by_one(error)
             return
@@ -199,6 +208,7 @@ class DataStorage(ABC):
         self._paused_until = 0.0
         self._written += len(batch)
         logger.debug("Wrote %d records to %s", len(batch), type(self).__name__)
+        await self._settle(batch)
 
     async def _write_with_retries(self, records: list[PageRecord]) -> None:
         await self.retry_strategy.run(
@@ -241,10 +251,20 @@ class DataStorage(ABC):
             # Gone from the buffer as soon as it is written or dropped, so
             # that a cancelled flush does not write it twice.
             self._buffer = self._buffer[1:]
+            await self._settle([record])
         self._paused_until = 0.0
         if first_error is not None:
             raise first_error
         logger.warning("%s wrote its records one by one: none of them failed on its own", type(self).__name__)
+
+    async def _settle(self, records: Sequence[PageRecord]) -> None:
+        """Report the records written or dropped to `on_settled`; its error is logged, not raised."""
+        if self.on_settled is None:
+            return
+        try:
+            await self.on_settled([record["url"] for record in records])
+        except Exception:
+            logger.exception("Failed to report %d records settled by %s", len(records), type(self).__name__)
 
     def _log_dropped(self, record: PageRecord, error: Exception) -> None:
         logger.error("Dropped the record of %s: %s cannot write it: %s", record["url"], type(self).__name__, error)
