@@ -585,13 +585,15 @@ class AsyncCrawler:
         opened, on its own failure or on those of other requests in
         flight: the breaker refused the retries it would have had, so it
         is requested again when the host may be probed, uncounted
-        meanwhile, rather than failed. The probe itself is such a retry: a
+        meanwhile, rather than failed; so is a page whose redirect leads to
+        a host the breaker refuses. The probe itself is such a retry: a
         page whose probe failed fails with its error, and so does one with
         an error never retried, such as HTTP 501. Once
         the circuit of a host has opened `MAX_CIRCUIT_OPENINGS` times in
         the crawl, its refused pages go to `failed_urls` with
         `CircuitOpenError`, so a host that stays down holds the crawl for
-        about two cooldowns of the breaker. A page whose host is held back
+        about two cooldowns of the breaker; those that were requested count
+        toward `max_pages`. A page whose host is held back
         for longer than `MIN_PENALTY_TO_DEFER` seconds, by a Retry-After or
         the pause before the retry of a request that found the host
         overloaded (HTTP 429, a timeout), is put off until the host may be

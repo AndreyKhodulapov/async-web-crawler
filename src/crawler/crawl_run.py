@@ -468,13 +468,13 @@ class CrawlRun:
         if (refusal := self._circuit_refusal(result)) is not None:
             # The circuit of the host, or of the host a redirect leads to,
             # opened while the request waited for its turn or was in flight.
-            if refusal is not result.error:
-                # The request was answered, but not with the page: it is not a page requested.
-                self._uncount_page(url, queue)
-            elif not sent:
+            # A request was sent if it failed with its own error, or if it
+            # was answered with a redirect whose target was refused.
+            requested = sent or refusal is not result.error
+            if not requested:
                 # Nothing was sent: the page costs nothing of the limits.
                 self._uncount_page(url, queue)
-            if not self._defer_or_fail(url, queue, refusal, result):
+            if not self._defer_or_fail(url, queue, refusal, result, requested=requested):
                 self._forget_redirects(url, targets, queue)
             return
         if self._outwaits_retries(result.error) and self._wait_for_host(url, queue, result.error):
@@ -843,15 +843,24 @@ class CrawlRun:
         return None if message is None else CircuitOpenError(error.url, message)
 
     def _defer_or_fail(
-        self, url: str, queue: CrawlerQueue, refusal: CircuitOpenError, result: FetchResult | None = None
+        self,
+        url: str,
+        queue: CrawlerQueue,
+        refusal: CircuitOpenError,
+        result: FetchResult | None = None,
+        *,
+        requested: bool = False,
     ) -> bool:
         """Put off a page the circuit breaker refused until its host may be probed, or give up on it.
 
         The host is that of the refusal: the page may redirect to another
         one. `result` is that of the page's request, if one was made: a
         page given up on fails with the error of its request, if it got
-        one, else with the refusal. Returns whether the page was put off
-        rather than failed.
+        one, else with the refusal. With `requested`, the page was
+        requested: put off, it is uncounted from the limits until it is
+        taken again, as the request was not answered with the page; given
+        up on, it counts. Returns whether the page was put off rather than
+        failed.
         """
         host = get_host(refusal.url)
         assert host is not None  # a URL without a host has no circuit
@@ -866,8 +875,7 @@ class CrawlRun:
         # Back when the probe may go; a page refused while the probe is in
         # flight comes back a second later.
         delay = self.circuit_breaker.probe_in(refusal.url) or 1.0
-        logger.info("Deferred %s for %.1fs: %s", url, delay, refusal.message)
-        queue.defer(url, delay, priority=queue.depth(url))
+        self._put_off_page(url, queue, delay, refusal.message, requested=requested)
         return True
 
 

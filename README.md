@@ -279,7 +279,11 @@ storages. All of it is described in the [API reference](docs/api.md).
   `noindex`, one that is a variant of another page by its canonical URL.
   So `--max-pages 100` may save fewer than 100 pages; the summary shows how
   many were skipped and why. Pages that robots.txt disallows are not
-  requested and do not count.
+  requested and do not count. A page put off after its request (a
+  Retry-After too long to retry, a circuit breaker that opened, a redirect
+  to a host that cannot be asked yet) counts once, when it is crawled, but
+  is requested each time it comes back, so a crawl may send more than
+  `max_pages` page requests.
 - **A site is a host name.** `same_domain_only` keeps the crawl on the
   start hosts and their subdomains, `www.example.com` and `example.com`
   being one host. There is no public suffix list: a start URL on

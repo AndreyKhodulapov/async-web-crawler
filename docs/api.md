@@ -257,15 +257,17 @@ not put off again, so that one broken page does not probe a healthy host
 until it is given up. A page with an error that is never retried, such as
 HTTP 501, fails at once too: the breaker took nothing from it. So the pages of
 a host that went down for a moment are fetched once it is back, even when
-the page refused was the last one `max_pages` allowed. A page refused
-before its request does not count toward `max_pages`, and neither does one
-put off after its request failed, until it is taken again; one whose redirect
-target is refused has sent its request, so it counts, and counts again
-when it is taken again. After the circuit of a host has opened
+the page refused was the last one `max_pages` allowed. A page put off
+does not count toward `max_pages` until it is taken again, whether it was
+refused before its request, failed with it, or was refused at the target of
+its redirect: the request was not answered with the page, which is
+requested again when it comes back. After the circuit of a host has opened
 `AsyncCrawler.MAX_CIRCUIT_OPENINGS` (3) times in the crawl, no more probes
 are sent: its remaining pages go to `failed_urls`, with `CircuitOpenError`
 if they were never requested and with the error of their request if they
 were, and a host that stays down holds the crawl for about two cooldowns.
+A page given up on counts toward `max_pages` if its request was sent, as
+any page that failed does.
 
 The same goes for a host held back longer than
 `AsyncCrawler.MIN_PENALTY_TO_DEFER` (1 second), by a Retry-After or the

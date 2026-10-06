@@ -1150,6 +1150,100 @@ class TestCrawlBlockedHost:
         assert crawler.circuit_breaker.times_opened("a") == 2
         assert crawler.circuit_breaker.state("a") is CircuitState.CLOSED
 
+    @staticmethod
+    def give_up_at_once(monkeypatch, fake_session, **options) -> AsyncCrawler:
+        """A crawler that gives a host up the first time its circuit opens."""
+
+        class OneOpening(AsyncCrawler):
+            MAX_CIRCUIT_OPENINGS = 1
+
+        crawler = OneOpening(**{**UNTHROTTLED, **options})
+        monkeypatch.setattr(crawler._fetcher._transport, "_create_session", lambda: fake_session)
+        return crawler
+
+    async def test_page_refused_at_its_redirect_target_is_uncounted_until_taken_again(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            max_concurrent=1,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+        fake_session.routes["http://b/down"] = aiohttp.ClientConnectionError("refused")
+        fake_session.routes["http://a/1"] = FakeResponse(status=302, location="http://b/1")
+        await crawler.fetch_result("http://b/down")
+
+        # a/1 is requested, its redirect to b is refused: it is put off
+        # like a page refused before its request, and a/2 takes its place.
+        await crawler.crawl(["http://a/1", "http://a/2"], max_pages=2)
+
+        assert fake_session.requested == ["http://b/down", "http://a/1", "http://a/2", "http://a/1", "http://b/1"]
+        assert crawler.processed_urls.keys() == {"http://a/2", "http://a/1"}
+        assert crawler.crawl_stats().queued == 0
+
+    async def test_pages_that_redirect_to_a_host_that_stays_down_all_get_an_outcome(self, make_crawler, fake_session):
+        # The review's probe: every link of a site redirects to a host that
+        # answers 503. Counted again each time they came back, the pages put
+        # off would use up max_pages and be left in the queue, neither
+        # crawled nor failed.
+        crawler = make_crawler(max_concurrent=1, circuit_breaker=CircuitBreaker(min_requests=3, cooldown=0.3))
+        pages = [f"http://a/{page}" for page in range(12)]
+        fake_session.routes["http://a/"] = FakeResponse("".join(f'<a href="{page}">' for page in pages).encode())
+        for page in range(12):
+            fake_session.routes[f"http://a/{page}"] = FakeResponse(status=302, location=f"http://b/{page}")
+            fake_session.routes[f"http://b/{page}"] = FakeResponse(status=503)
+
+        await crawler.crawl(["http://a/"], max_pages=13)
+
+        assert crawler.processed_urls.keys() == {"http://a/"}
+        assert crawler.failed_urls.keys() == set(pages)
+        assert crawler.crawl_stats().queued == 0
+        assert crawler.circuit_breaker.times_opened("b") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
+
+    async def test_page_given_up_at_its_redirect_target_counts_toward_max_pages(self, monkeypatch, fake_session):
+        crawler = self.give_up_at_once(
+            monkeypatch,
+            fake_session,
+            max_concurrent=1,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=60),
+        )
+        # Its 501 opens the circuit of b in the crawl, and fails at once: no retry was refused.
+        fake_session.routes["http://b/down"] = FakeResponse(status=501)
+        fake_session.routes["http://a/1"] = FakeResponse(status=302, location="http://b/1")
+
+        # a/1 has sent its request and is not put off: it counts, so a/3 is not requested.
+        await crawler.crawl(["http://b/down", "http://a/1", "http://a/2", "http://a/3"], max_pages=3)
+
+        assert fake_session.requested == ["http://b/down", "http://a/1", "http://a/2"]
+        assert crawler.failed_urls.keys() == {"http://b/down", "http://a/1"}
+        assert crawler.failed_urls["http://a/1"].startswith("CircuitOpenError")
+        assert crawler.processed_urls.keys() == {"http://a/2"}
+        assert crawler.crawl_stats().queued == 1
+
+    async def test_page_in_flight_given_up_counts_toward_max_pages(self, monkeypatch, fake_session):
+        crawler = self.give_up_at_once(
+            monkeypatch,
+            fake_session,
+            max_concurrent=2,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=60),
+        )
+        for page in ("http://a/0", "http://a/1"):
+            fake_session.routes[page] = FakeResponse(status=503)
+        fake_session.latency = 0.01
+
+        # Both requests fail together and open the circuit, which takes
+        # the retry of the first; the host is given up, and the pages fail
+        # with their own error. They were requested, so c/1 is not.
+        await crawler.crawl(["http://a/0", "http://a/1", "http://c/1"], max_pages=2)
+
+        assert fake_session.requested == ["http://a/0", "http://a/1"]
+        assert crawler.failed_urls == {
+            "http://a/0": "TransientHTTPError: HTTP 503 Error",
+            "http://a/1": "TransientHTTPError: HTTP 503 Error",
+        }
+        assert crawler.crawl_stats().queued == 1
+
 
 class TestCrawlHeldBackHost:
     async def test_long_retry_after_is_a_warning_once_per_host(self, make_crawler, fake_session, caplog):
@@ -1404,23 +1498,6 @@ class TestCrawlDuplicates:
 
         assert crawler.skipped_urls == {"http://a/list?page=2": "duplicate of http://a/list"}
         assert crawler.processed_urls.keys() == {"http://a/list"}
-
-    async def test_page_refused_at_its_redirect_target_counts_toward_max_pages(self, make_crawler, fake_session):
-        crawler = make_crawler(
-            max_concurrent=1,
-            max_depth=0,
-            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
-        )
-        fake_session.routes["http://b/down"] = aiohttp.ClientConnectionError("refused")
-        fake_session.routes["http://a/1"] = FakeResponse(status=302, location="http://b/1")
-        await crawler.fetch_result("http://b/down")
-
-        # a/1 is requested, its redirect to b is refused: the request to a was sent all the same.
-        await crawler.crawl(["http://a/1", "http://a/2"], max_pages=2)
-
-        assert fake_session.requested == ["http://b/down", "http://a/1", "http://a/2"]
-        assert crawler.processed_urls.keys() == {"http://a/2"}
-        assert crawler.crawl_stats().queued == 1
 
 
 class TestCrawlPageStats:
