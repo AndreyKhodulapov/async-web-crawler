@@ -143,6 +143,13 @@ run against it; what it adds is what sharing needs.
   worker crawls them again. `take` waits for the `saving` pages of other
   workers (they may come back) but not for its own: the buffer is
   written after the last page is taken, and waiting for it would never end.
+  Nor would two workers that wait for the `saving` pages of each other,
+  each with its own in its buffer, as the heartbeats keep the leases: the
+  first run of workers with a storage hung so. So before `take` waits for
+  the pages of others with nothing queued, it calls `on_waiting`, and the
+  crawl writes out the buffer of its storage. It is not called while a
+  worker only waits for the turn of a host: the batches of the storage
+  would shrink to a page.
 - **A host has one turn for all workers.** `take` picks the ready host
   with the shallowest page, locks the host row with
   `FOR UPDATE SKIP LOCKED` and moves its `next_allowed_at` on by the
@@ -169,7 +176,22 @@ run against it; what it adds is what sharing needs.
   once. `LISTEN/NOTIFY` could wake it on the operations of others; it
   is worth it only if the measurements show the polls cost too much.
 - **Times are those of the database**: one clock for all workers, so a
-  host interval holds whatever the clocks of the machines say.
+  host interval holds whatever the clocks of the machines say. The
+  interval is held as pages are taken: a request starts a little after
+  its page is taken, the first of a worker later, as it opens its
+  connections, so two requests of different workers may come closer than
+  the interval, while the rate of a host holds over any run of them.
+- **A worker is a crawl of the frontier.** `run_worker` reads the part of
+  the configuration the job keeps, puts the worker's own sections over it
+  (the database, the session, the proxies, the storage, the log, the
+  reports, `max_concurrent`), opens a `PostgresFrontier` and runs the
+  same `CrawlRun` as a local crawl through `crawl_frontier`, which reads
+  no sitemaps. The interval of a host is that of the rate limit of the
+  job (`host_interval`); each worker keeps its own requests apart too. Its
+  files have `{worker}` in their names, as two workers may save one page.
+  The order at the end matters: the storage writes its buffer and the
+  pages are `saved`, then the frontier is closed (its leases put back,
+  the job finished if nothing is left), then the crawler.
 - **The stats are a snapshot.** Counting every state change in the job
   row would make that row the one every worker of the job writes on
   every page. Instead the heartbeat (and `refresh_stats()`) counts the

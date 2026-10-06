@@ -192,7 +192,7 @@ class TestSaveErrors:
         assert (stats.processed, stats.saved, stats.save_failed) == (5, 0, 5)
         assert "Failed to save " in caplog.text
         assert "failed to write 2 records: disk full" in caplog.text
-        assert "Failed to save the last pages of the crawl" in caplog.text
+        assert "Failed to save the pages the storage buffers" in caplog.text
         assert "Failed to close MemoryStorage" in caplog.text
         assert storage.released == 1
 

@@ -123,7 +123,7 @@ async def _prepare_job(
                 raise JobError(f'A crawl job named "{name}" exists already: resume or restart it') from None
             logger.info("Crawl job %s is created", name)
             return True
-        differences = _differences(json.loads(row["config"]), settings)
+        differences = config_differences(json.loads(row["config"]), settings)
         if differences:
             raise JobError(
                 f'The configuration differs from that of crawl job "{name}" in: {", ".join(differences)}; '
@@ -137,7 +137,7 @@ async def _prepare_job(
         return False
 
 
-def _differences(stored: Any, given: Any, path: str = "") -> list[str]:
+def config_differences(stored: Any, given: Any, path: str = "") -> list[str]:
     """The keys, such as "crawler.max_pages", whose values differ between two configurations."""
     if not isinstance(stored, dict) or not isinstance(given, dict):
         return [] if stored == given else [path]
@@ -145,5 +145,5 @@ def _differences(stored: Any, given: Any, path: str = "") -> list[str]:
     return [
         difference
         for key in keys
-        for difference in _differences(stored.get(key), given.get(key), f"{path}.{key}" if path else key)
+        for difference in config_differences(stored.get(key), given.get(key), f"{path}.{key}" if path else key)
     ]

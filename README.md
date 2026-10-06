@@ -526,7 +526,8 @@ src/
     ├── distributed/
     │   ├── frontier.py     # PostgresFrontier: the frontier of a crawl job shared by workers — leases, heartbeat, host turns
     │   ├── job.py          # create_job: a crawl job created, seeded, resumed or restarted
-    │   └── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, job_scope, out_of_scope
+    │   ├── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, job_scope, out_of_scope
+    │   └── worker.py       # run_worker: a worker of a crawl job, its configuration and its files
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes
         ├── json_file.py    # JSONStorage: JSON Lines or an indented array
@@ -548,7 +549,7 @@ tests/
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
 ├── unit/                   # links of the documentation, parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, logging, progress, filters, storages, client
-└── integration/            # local HTTP server, databases, the frontier in memory and in PostgreSQL, crawl jobs; live tests marked `network`, PostgreSQL ones `postgres`
+└── integration/            # local HTTP server, databases, the frontier in memory and in PostgreSQL, crawl jobs and their workers; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── api.md                  # API reference
 ├── configuration.md        # configuration guide: every key, validation, recipes

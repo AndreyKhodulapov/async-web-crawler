@@ -76,6 +76,19 @@ async def test_crawl_by_a_configuration_file(url, site, tmp_path):
     assert "127.0.0.1" in report
 
 
+async def test_local_crawl_writes_the_files_of_worker_local(url, tmp_path):
+    config = make_config(
+        urls=[url("/site/b.html")],
+        storage={"outputs": [str(tmp_path / "pages-{worker}.jsonl")]},
+        report={"stats_json": str(tmp_path / "stats-{worker}.json")},
+    )
+    async with AdvancedCrawler(config, configure_logging=False) as crawler:
+        await crawler.crawl()
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["pages-local.jsonl", "stats-local.json"]
+    assert crawler.reports == [tmp_path / "stats-local.json"]
+
+
 async def test_overrides_win_over_the_file(url, tmp_path):
     config_file = tmp_path / "config.json"
     config_file.write_text(json.dumps(FAST_CONFIG | {"urls": [url("/site/")]}), encoding="utf-8")

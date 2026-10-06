@@ -393,6 +393,21 @@ class TestSeed:
         assert frontier.queue.get_stats()["queued"] == 2
         assert await frontier.widen_scope("localhost", lambda page: True) == 1
 
+    async def test_crawl_of_a_seeded_frontier_is_that_of_crawl_without_reading_the_sitemaps_again(self, url, site):
+        site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"), url("/site/c.html", "localhost"))}
+        start, options = [url("/site/to-other-host")], {"sitemap_urls": [url(SITEMAP)], "same_domain_only": True}
+        async with make_crawler(max_depth=1) as crawler:
+            expected = set(await crawler.crawl(start, **options))
+            frontier = MemoryFrontier()
+            await crawler.seed(frontier, start, **options)
+            site.hits.clear()
+
+            pages = await crawler.crawl_frontier(frontier, start, **options)
+
+        assert set(pages) == expected
+        assert site.hits[SITEMAP] == 0
+        assert crawler.visited_urls == frontier.queue.visited
+
     async def test_seed_while_a_crawl_runs_is_refused(self, url, site):
         site.latency = 0.3
         async with make_crawler() as crawler:

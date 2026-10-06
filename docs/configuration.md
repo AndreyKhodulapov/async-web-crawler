@@ -393,6 +393,13 @@ Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
 | `pages.db`, `pages.sqlite`, `pages.sqlite3` | SQLite |
 | `sqlite:///pages.db`, `postgresql://user:password@host:5432/database` | the database of the URL |
 
+`{worker}` in a file name, such as `pages-{worker}.jsonl`, is the name of
+the worker of a crawl job, and `local` in a crawl of its own; so it is in
+`logging.file`, the files of `report` and `session.save_cookies`. A worker
+refuses a file of the storage, SQLite included, without it: workers write
+side by side, and one page may be saved by two of them (see
+[Crawl jobs](api.md#crawl-jobs)).
+
 ### `logging`
 
 See [Logging](api.md#logging).
@@ -415,6 +422,20 @@ Files the statistics are written to after the crawl; see
 | `html` | string or `null` | `null` | an HTML report with tables and charts |
 | `title` | string | `Crawl report` | the title of the HTML report |
 | `top_domains` | whole number, >= 1 | `10` | hosts listed in the statistics |
+
+### `distributed`
+
+The database of the crawl jobs and how a worker holds its pages; see
+[Crawl jobs](api.md#crawl-jobs). Each worker has its own section: it is not
+a part of the job, and a crawl of its own ignores it.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `database_url` | string or `null` | `null` | `postgresql://user:password@host:5432/database`; `null` takes the one of `CRAWLER_DATABASE_URL`. A secret: never shown in messages |
+| `lease_seconds` | number, > 0 | `60.0` | a page of a worker that stopped is crawled again after this long |
+| `heartbeat_seconds` | number, > 0 | `20.0` | how often a worker renews the leases of its pages; less than `lease_seconds` |
+| `max_attempts` | whole number, >= 1 | `3` | leases of a page that may expire before it fails |
+| `poll_interval` | number, > 0 | `1.0` | how often a worker with no page looks for one at least |
 
 ## Validation
 

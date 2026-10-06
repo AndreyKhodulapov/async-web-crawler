@@ -19,7 +19,7 @@ see the [configuration guide](configuration.md); for the command line, the
 | [Crawling](#crawling) | `crawl()`: depth, filters, sitemaps, state of a crawl |
 | [Page statistics](#page-statistics) | `CrawlerStats`, export to JSON and HTML |
 | [AdvancedCrawler](#advancedcrawler) | the crawler set up by a configuration |
-| [Crawl jobs](#crawl-jobs) | `create_job`: a crawl in PostgreSQL that workers share |
+| [Crawl jobs](#crawl-jobs) | `create_job`, `run_worker`: a crawl in PostgreSQL that workers share |
 | [Live progress](#live-progress) | `show_progress`, `ProgressTracker` |
 | [Configuration](#configuration) | `load_config`, `load_urls`, `CrawlerConfig` |
 | [Logging](#logging) | `configure_logging` |
@@ -691,6 +691,15 @@ Under `same_domain_only`, the sitemap pages of hosts out of scope are held
 in the frontier (`hold_out_of_scope`); a start URL that redirects to their
 host brings them in (`widen_scope`), whichever process crawls it.
 
+`crawl_frontier(frontier, start_urls, ...)` is the second step: it crawls
+the pages of a frontier that `seed()` filled, by the rules of `crawl()`,
+until `take` hands out no page, and leaves the frontier open. It takes the
+arguments `seed()` was given, but for `robots_sitemaps`: the sitemaps are
+not read again, and under `same_domain_only` `sitemap_urls` only give
+their hosts to the scope. The start URLs are queued again, which queues
+only those the frontier has not seen. This is how a worker of a crawl job
+crawls (see `run_worker` in [Crawl jobs](#crawl-jobs)).
+
 `crawl()` returns every parsed page, so it holds them all in memory until
 it ends. A large crawl that saves its pages to a storage does not need
 that: `AsyncCrawler(storage=..., keep_pages=False)` lets a page go once it
@@ -728,6 +737,11 @@ After a crawl, and during one, the crawler exposes its state:
 | `error_stats()` | `ErrorStats`, see [Error statistics](#error-statistics) |
 | `rate_limiter.get_stats()` | `RateStats`, with requests, interval and average gap per host |
 | `circuit_breaker.get_stats()` | `{host: CircuitStats}`, see [Circuit breaker](#circuit-breaker) |
+
+After `crawl_frontier()` on a frontier that keeps the pages elsewhere, such
+as `PostgresFrontier`, `visited_urls`, `failed_urls`, `skipped_urls`,
+`blocked_urls`, `unreachable_urls` and `url_depths` are empty: the outcomes
+are in the frontier.
 
 The building blocks can be used on their own: `CrawlerQueue` (priorities,
 deduplication, completion detection), `MemoryFrontier` (a `CrawlerQueue`
@@ -815,11 +829,12 @@ asyncio.run(main())
 
 | Member | What it does |
 |--------|--------------|
-| `AdvancedCrawler(config, configure_logging=True)` | takes a `CrawlerConfig`; the defaults without one |
+| `AdvancedCrawler(config, configure_logging=True, worker="local")` | takes a `CrawlerConfig`; the defaults without one. `worker` stands for `{worker}` in the paths of the files written (`config.for_worker(worker)`) |
 | `AdvancedCrawler.from_config(path, overrides, configure_logging=True)` | reads a YAML or a JSON file, see the [configuration guide](configuration.md) |
 | `await crawl()` | crawls the start URLs and the sitemaps of the configuration, saves the pages, writes the reports of the `report` section and the cookies of `session.save_cookies`; returns the pages by URL |
+| `await crawl_frontier(frontier)` | crawls the pages of `frontier`, which `seed()` filled, as `crawl()` crawls those of the configuration, see `AsyncCrawler.crawl_frontier`; writes the reports and the cookies as `crawl()` does |
 | `await seed(frontier, sitemaps=True)` | queues the start URLs and the pages of the sitemaps of the configuration in `frontier` without crawling them, see `AsyncCrawler.seed`; `sitemaps=False` leaves the sitemaps unread |
-| `check_start()` | raises `ConfigError` if the configuration has neither `urls` nor `sitemaps.urls`; `crawl()` and `seed()` call it |
+| `check_start()` | raises `ConfigError` if the configuration has neither `urls` nor `sitemaps.urls`; `crawl()`, `crawl_frontier()` and `seed()` call it |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
 | `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report; with rendering, `rendering`: `{rendered, failed, avg_render_time}` (see `render_stats()` in [Rendering](#rendering)), also in the JSON and the HTML report |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
@@ -828,6 +843,9 @@ asyncio.run(main())
 | `reports` | the report files the latest `write_reports()` wrote |
 | `save_cookies()`, `cookie_file` | writes the cookies to `session.save_cookies` and returns the file, `None` without one or when it cannot be written (logged); `crawl()` calls it, call it yourself after a crawl that was cancelled. `cookie_file` is the file it wrote |
 
+`{worker}` in a path of the storage, the log, the reports or
+`session.save_cookies`, such as `pages-{worker}.jsonl`, is "local" in a
+crawl of its own and the name of the worker in a worker of a crawl job.
 Directories of the log, the reports and the files of the storage are created
 if they are missing. A configuration with neither `urls` nor `sitemaps.urls`
 makes `crawl()` raise `ConfigError`. A report that cannot be written is
@@ -860,7 +878,24 @@ from crawler.distributed import JobMode, PostgresFrontier, create_job
 dsn = "postgresql://crawler:crawler@localhost/crawler"
 failed_sitemaps = await create_job(load_config("config.yaml"), "shop", dsn=dsn)
 
-frontier = await PostgresFrontier.open(dsn, job="shop")   # a worker of the job
+frontier = await PostgresFrontier.open(dsn, job="shop")   # a worker of the job, by hand
+```
+
+A worker takes no more than the name of the job and a configuration of its
+own; run as many as you like, in other processes or on other machines:
+
+```python
+from crawler import CrawlerConfig
+from crawler.distributed import run_worker
+
+config = CrawlerConfig.from_dict(
+    {
+        "crawler": {"max_concurrent": 20},
+        "storage": {"outputs": ["out/pages-{worker}.jsonl"]},
+        "distributed": {"database_url": dsn},
+    }
+)
+stats = await run_worker(config, "shop")
 ```
 
 | Name | What it is |
@@ -871,6 +906,8 @@ frontier = await PostgresFrontier.open(dsn, job="shop")   # a worker of the job
 | `JobMode.RESTART` | deletes the job and its pages, then creates it anew |
 | `job_config(config)` | the part of a configuration the job keeps and every worker shares: the sections of `JOB_SECTIONS` (`urls`, `sitemaps`, `crawler`, `retry`, `circuit_breaker`, `filters`, `rendering`) without `crawler.max_concurrent` |
 | `PostgresFrontier.open(dsn, *, job, worker=None, ...)` | connects a worker to the job, with the limits of the job; `JobError` if there is no such job |
+| `run_worker(config, job, *, worker=None, configure_logging=True)` | crawls the pages of the job with `AdvancedCrawler.crawl_frontier` until none is left, then closes the frontier and the crawler; returns the statistics of this worker (`AdvancedCrawler.get_stats()`) |
+| `host_interval(config.crawler)` | the seconds between two pages of a host that the workers of a job take: `1 / rate_limit` or `min_delay`, whichever is longer, with `per_domain_rate`; 0 without it |
 
 A job is `seeding` while `create_job` fills it: workers started meanwhile
 wait, and take its first page once it is `running`. Once nothing is left
@@ -881,9 +918,37 @@ are read with the session and the proxies of the configuration given to
 `create_job`; its storage is not opened.
 
 The other sections of a configuration, `session`, `proxy`, `storage`,
-`logging` and `report`, and `crawler.max_concurrent`, are those of each
-worker; the secrets of a configuration (cookies, headers, the passwords of
-proxies) are all in them, so the job keeps none.
+`logging`, `report` and `distributed`, and `crawler.max_concurrent`, are
+those of each worker; the secrets of a configuration (cookies, headers, the
+passwords of proxies and of the database) are all in them, so the job keeps
+none. Each worker has its own cookies and proxies.
+
+`run_worker` takes the part of the job from the database. A key of that
+part that the configuration of the worker sets otherwise is ignored, and
+the keys are named in one warning; a worker can be given the file the job
+was created with. The database is `distributed.database_url`, or the one of
+`CRAWLER_DATABASE_URL`; without either, `ConfigError`. `worker` names the
+worker in the database and in its files; by default it is made of the host
+name, the process id and a random part. The pages are not kept in memory
+whatever `crawler.keep_pages` says: they go to the storage of the worker
+(a warning is logged if it has none).
+
+A page is crawled at least once, not exactly once: the page of a worker
+that stopped goes back to the queue once its lease expires, and another
+worker crawls it again. So a database storage, which keeps a row per URL,
+suits workers best. Files are each worker's own: every file of the
+storage, SQLite databases included, must have `{worker}` in its name, or
+`run_worker` raises `ConfigError`; a page may then be in the files of two
+workers. The log and the reports of a worker without `{worker}` in their
+names are written over by the last worker.
+
+The workers ask a host together at the rate of the job: the frontier hands
+out a page of a host every `host_interval` seconds, whichever worker takes
+it, and each worker keeps its own requests apart as well. With
+`per_domain_rate: false` the rate for all hosts together is that of each
+worker. A worker with nothing to take, while other workers still crawl,
+writes out the pages its storage buffers before it waits: they may wait
+for those in turn (see `on_waiting` of `Frontier.take`).
 
 ## Live progress
 
@@ -1164,10 +1229,10 @@ and may change. A layer calls only the one below it.
 | Layer | Module | Class | Responsible for | Knows nothing of |
 |-------|--------|-------|-----------------|------------------|
 | Facade | `client.py` | `AsyncCrawler` | the public API: checks the arguments, builds the layers and shares them, parses pages (at most `max_parsing` at once), keeps the latest crawl for its properties, closes the session and the storage | how a request or a crawl is made |
-| Crawl | `crawl_run.py` | `CrawlRun` | one `crawl()` call: what is done with every page its `Frontier` hands out — filters, depth, the seeding (`seed`: the start URLs, then the sitemaps read before the first page until the frontier is full, also alone for `AsyncCrawler.seed`), the scope a redirecting start URL widens and the hosts other processes brought into it, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched, how the pages are kept |
-| Crawl, frontier | `frontier.py` | `Frontier`, `MemoryFrontier` | `Frontier` is the contract the crawl layer takes its pages through: the queue and the URLs seen (`mark_seen` checks and remembers in one call), the outcomes of the pages (a page saved is done once the storage reports its record written: `pending_save`, `saved`), `max_pages` and `max_pages_per_host` counted as pages are admitted and uncounted when they go back unanswered, the bound of `FRONTIER_FACTOR`, the scope (sitemap pages held out of it: `hold_out_of_scope`; a host brought in: `widen_scope`, `scope_hosts`). `MemoryFrontier` keeps them in memory, in a `CrawlerQueue` | how a page is fetched or what is done with it |
+| Crawl | `crawl_run.py` | `CrawlRun` | one crawl, of `crawl()` or `crawl_frontier()`: what is done with every page its `Frontier` hands out — filters, depth, the seeding (`seed`: the start URLs, then the sitemaps read before the first page until the frontier is full, also alone for `AsyncCrawler.seed`), the scope a redirecting start URL widens and the hosts other processes brought into it, pages put off while robots.txt, a Retry-After or an open circuit holds their host back, duplicates, saving pages, the counters of `crawl_stats()` | how a URL is fetched, how the pages are kept |
+| Crawl, frontier | `frontier.py` | `Frontier`, `MemoryFrontier` | `Frontier` is the contract the crawl layer takes its pages through: the queue and the URLs seen (`mark_seen` checks and remembers in one call), the outcomes of the pages (a page saved is done once the storage reports its record written: `pending_save`, `saved`), `max_pages` and `max_pages_per_host` counted as pages are admitted and uncounted when they go back unanswered, the bound of `FRONTIER_FACTOR`, the scope (sitemap pages held out of it: `hold_out_of_scope`; a host brought in: `widen_scope`, `scope_hosts`), `on_waiting` for the buffer of the storage before a wait for other processes. `MemoryFrontier` keeps them in memory, in a `CrawlerQueue` | how a page is fetched or what is done with it |
 | Crawl, shared frontier | `distributed/frontier.py`, `distributed/schema.py` | `PostgresFrontier` | a `Frontier` in PostgreSQL that the workers of one job share: the limits and the scope of the job kept in the database, nothing handed out while the job is seeding, the job finished by the worker that finds nothing left, pages leased to a worker and renewed by its heartbeat, an expired lease queued again and uncounted (failed after `max_attempts`), pages `saving` until `saved`, one turn of a host for all workers (`next_allowed_at`, `FOR UPDATE SKIP LOCKED`), waiting by polling, the stats as a snapshot of the job (`refresh_stats()`), `close()` putting the pages in progress back | what is done with a page; how a job is created |
-| Crawl jobs | `distributed/job.py` | `create_job`, `JobMode`, `job_config` | a job created, resumed or restarted, its part of the configuration kept, its seeding through `AdvancedCrawler.seed` | how its pages are crawled |
+| Crawl jobs | `distributed/job.py`, `distributed/worker.py` | `create_job`, `JobMode`, `job_config`, `run_worker` | a job created, resumed or restarted, its part of the configuration kept, its seeding through `AdvancedCrawler.seed`; a worker: the configuration of the job with its own, `{worker}` in its files, the interval of a host, its crawl through `AdvancedCrawler.crawl_frontier` | how a page is crawled |
 | Request | `fetching.py` | `Fetcher` | one URL fetched politely: robots.txt, the circuit breaker, the rate limit and the concurrency limits, retries with growing timeouts, redirects one hop at a time, Retry-After; every outcome reported in a `FetchResult` | the queue of a crawl |
 | HTTP | `transport.py` | `Transport`, `HttpTransport` | `Transport` is the contract the request layer sends through; `HttpTransport` makes a single GET without redirects over one aiohttp session: TLS with the system and certifi CAs, rotating User-Agents, the cookies and headers, the proxy of the request and its outcome told to the `ProxyPool`, the size limit of a body, decoding; every failure raised as a `FetchError` | robots.txt, retries, limits |
 | HTTP, rendered | `rendering.py` | `BrowserTransport`, `Renderer` | `BrowserTransport` is a `Transport` over `HttpTransport`: it hands the HTML pages that `Rendering` names to the `Renderer`, with the proxy their document came through (`Response.proxy`), a page that goes elsewhere on its own back as a redirect, and checks the size of the rendered HTML. `Renderer` runs one headless Chromium: launches it for the first page, a context per proxy, the cookies kept in step with those of `HttpTransport` (`CookieSync`, `Transport.update_cookies`), a tab per page within `max_open_pages`, the routing of the browser's requests, the waits, the errors of Playwright as `FetchError`s, one restart after a crash, the counters of `render_stats()` | robots.txt, filters, retries, limits |

@@ -6,6 +6,7 @@ pending their save, the host interval and the limits held by all workers togethe
 """
 
 import asyncio
+import functools
 import itertools
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -244,6 +245,32 @@ class TestPendingSave:
         await closing.close()
 
         assert (await row_of(page.url))["state"] == "saving"
+
+    async def test_workers_that_wait_for_the_saves_of_each_other_write_their_own_first(self, open_frontier):
+        workers = [await open_frontier("first"), await open_frontier("second")]
+        await workers[0].seed(["http://site/a", "http://site/b"])
+        for worker in workers:
+            page = await take(worker)
+            await worker.finish(page, Outcome.PROCESSED, pending_save=True)
+            # As the run of a crawl does: its storage writes the buffer and reports the pages saved.
+            worker.on_waiting = functools.partial(worker.saved, [page.url])
+
+        assert await asyncio.wait_for(asyncio.gather(*(worker.take() for worker in workers)), 5) == [None, None]
+        assert await job_state() == "finished"
+
+    async def test_worker_waiting_for_a_host_is_not_asked_to_write(self, open_frontier):
+        busy, other = await open_frontier("busy", host_interval=60), await open_frontier("other", host_interval=60)
+        await busy.seed(["http://site/a", "http://site/b"])
+        await take(busy)
+        calls = []
+
+        async def on_waiting() -> None:
+            calls.append(True)
+
+        other.on_waiting = on_waiting
+
+        assert await still_waiting(other.take())
+        assert calls == []
 
     async def test_saved_settles_only_the_pages_of_its_worker(self, open_frontier):
         saving, other = await open_frontier("saving"), await open_frontier("other")

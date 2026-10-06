@@ -151,8 +151,10 @@ class CrawlRun:
         self._crawl_started, self._crawl_finished = time.perf_counter(), None
         self.stats.start()
         if self.storage is not None:
-            # A page saved is done in the frontier once its record is written.
+            # A page saved is done in the frontier once its record is written;
+            # other processes that wait for it are not kept waiting by the buffer.
             self.storage.on_settled = self._frontier.saved
+            self._frontier.on_waiting = self._flush_storage
         try:
             await self.seed(
                 start_urls, url_filter=url_filter, sitemap_urls=sitemap_urls, robots_sitemaps=robots_sitemaps
@@ -164,6 +166,7 @@ class CrawlRun:
         finally:
             if self.storage is not None:
                 self.storage.on_settled = None
+                self._frontier.on_waiting = None
             self._crawl_finished = time.perf_counter()
             self.stats.finish()
             # A site given up on is given up for this crawl only: a
@@ -634,9 +637,9 @@ class CrawlRun:
         try:
             await self.storage.flush()
         except StorageError as error:
-            logger.error("Failed to save the last pages of the crawl: %s", error)
+            logger.error("Failed to save the pages the storage buffers: %s", error)
         except Exception:
-            logger.exception("Unexpected error while saving the last pages of the crawl")
+            logger.exception("Unexpected error while saving the pages the storage buffers")
 
     def _check_probes_left(self, url: str) -> CircuitOpenError | None:
         """In a crawl, a host whose circuit has opened `MAX_CIRCUIT_OPENINGS` times gets no more probes.

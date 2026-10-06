@@ -176,6 +176,20 @@ RETURNING mine.host, mine.counted
 _RETRY_DELAY = 0.005
 
 
+def _waits_for_others(state: asyncpg.Record) -> bool:
+    """Whether a worker that got no page waits for the pages of other workers alone, see `_WAIT_STATE`."""
+    if state["seeding"]:
+        return False
+    if state["closed"]:
+        return state["others_counted"]
+    return state["others_busy"] and not state["queued"]
+
+
+def worker_name() -> str:
+    """A name for a worker, unlike that of any other: the host name, the process id and a random part."""
+    return f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(2)}"
+
+
 class _LeaseLost(Exception):
     """The page is no longer leased to this worker: the lease expired and the page went back to the queue."""
 
@@ -289,7 +303,7 @@ class PostgresFrontier(Frontier):
             pool,
             job=job,
             job_id=row["id"],
-            worker=worker or f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(2)}",
+            worker=worker or worker_name(),
             max_pages=row["max_pages"],
             max_pages_per_host=row["max_pages_per_host"],
             frontier_factor=row["frontier_factor"],
@@ -390,6 +404,11 @@ class PostgresFrontier(Frontier):
                 if delay is None:
                     await self._finish_job(connection)
                     return None
+            if self.on_waiting is not None and _waits_for_others(state):
+                # Two workers, each with pages pending their save, would
+                # otherwise wait for each other for good: the heartbeat
+                # renews the leases of those pages.
+                await self.on_waiting()
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(delay):
                     await self._wakeup.wait()

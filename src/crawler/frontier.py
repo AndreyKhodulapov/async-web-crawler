@@ -4,7 +4,7 @@ import enum
 import logging
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -87,6 +87,8 @@ class Frontier(ABC):
         self.max_pages = max_pages
         self.max_pages_per_host = max_pages_per_host
         self.frontier_factor = frontier_factor
+        # Called by `take` before it waits for the pages of other processes.
+        self.on_waiting: Callable[[], Awaitable[None]] | None = None
 
     @abstractmethod
     async def seed(self, urls: Iterable[str]) -> list[str]:
@@ -105,7 +107,11 @@ class Frontier(ABC):
         """The next page to crawl; None once nothing is left to do or the frontier stops handing pages out.
 
         Waits while nothing is queued but pages in progress may find new
-        ones, or pages put off are to come back.
+        ones, or pages put off are to come back. A frontier shared by
+        several processes calls `on_waiting`, if it is set, before it waits
+        for pages that other processes hold, with nothing queued: the caller
+        writes out the records its storage buffers, whose pages the others
+        wait for in turn. A frontier of one process never calls it.
         """
 
     @abstractmethod

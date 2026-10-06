@@ -46,6 +46,10 @@ class AdvancedCrawler:
     are the report files the latest crawl wrote, `cookie_file` the file the
     cookies were saved to.
 
+    "{worker}" in the paths of the files written, such as
+    "pages-{worker}.jsonl", is `worker`: "local" for a crawl of its own,
+    the name of the worker for a worker of a crawl job (see
+    `CrawlerConfig.for_worker`); `config` keeps the paths with it replaced.
     Directories of the log, the reports and the files of the storage are
     created if they are missing. Logging is set up when the crawler is
     made and reset by `close()`; it belongs to the whole process, so with
@@ -54,14 +58,16 @@ class AdvancedCrawler:
     `logging` section is ignored: for a program that sets up logging itself.
     """
 
-    def __init__(self, config: CrawlerConfig | None = None, *, configure_logging: bool = True) -> None:
+    def __init__(
+        self, config: CrawlerConfig | None = None, *, configure_logging: bool = True, worker: str = "local"
+    ) -> None:
         """
         Raises:
             ConfigError: `session.cookies_file` cannot be read, or is not a cookies.txt file;
                 with `proxy.from_env`, a variable is not the URL of a proxy.
             OSError: a directory cannot be created, or the log file cannot be opened.
         """
-        self.config = config = CrawlerConfig() if config is None else config
+        self.config = config = (CrawlerConfig() if config is None else config).for_worker(worker)
         options = config.crawler
         cookies = config.session.initial_cookies()
         proxies = config.proxy.build()
@@ -191,6 +197,33 @@ class AdvancedCrawler:
             exclude_extensions=config.filters.exclude_extensions,
             sitemap_urls=config.sitemaps.urls,
             robots_sitemaps=config.sitemaps.from_robots,
+        )
+        self.write_reports()
+        self.save_cookies()
+        return pages
+
+    async def crawl_frontier(self, frontier: Frontier) -> dict[str, ParsedPage]:
+        """Crawl the pages of `frontier`, which seed() filled, as crawl() crawls those of the configuration.
+
+        The limits are those of the frontier, and the sitemaps are not read
+        again; see `AsyncCrawler.crawl_frontier`. The reports and the
+        cookies are written afterwards, as crawl() writes them. The
+        frontier is left open.
+
+        Raises:
+            ConfigError: as crawl().
+            StorageError: as crawl().
+        """
+        self.check_start()
+        config = self.config
+        pages = await self.crawler.crawl_frontier(
+            frontier,
+            config.urls,
+            same_domain_only=config.filters.same_domain_only,
+            include_patterns=config.filters.include,
+            exclude_patterns=config.filters.exclude,
+            exclude_extensions=config.filters.exclude_extensions,
+            sitemap_urls=config.sitemaps.urls,
         )
         self.write_reports()
         self.save_cookies()
