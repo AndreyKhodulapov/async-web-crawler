@@ -2,6 +2,7 @@
 
 import csv
 import json
+import socket
 import sqlite3
 from urllib.parse import urlsplit
 
@@ -14,6 +15,25 @@ from demo_main import parse_args, run_crawl, run_errors, run_save
 
 # Start page, 8 articles and the three pages a retry makes good.
 SAVED_PATHS = {"/", *(f"/articles/{number}" for number in range(1, 9)), "/flaky", "/rate-limited", "/slow"}
+
+
+@pytest.fixture(autouse=True)
+def localhost_is_the_loopback(monkeypatch):
+    """`localhost` is 127.0.0.1 and ::1 only, whatever the hosts file of the machine adds to them.
+
+    The server that is down of the demo site is a closed port of `localhost`.
+    An address of another network does not refuse the connection: it times
+    out, and the demo takes minutes and meets other errors.
+    """
+    resolve = socket.getaddrinfo
+
+    def loopback_only(host, *args, **kwargs):
+        found = resolve(host, *args, **kwargs)
+        if host == "localhost":
+            found = [address for address in found if address[4][0] in ("127.0.0.1", "::1")]
+        return found
+
+    monkeypatch.setattr(socket, "getaddrinfo", loopback_only)
 
 
 async def test_crawl_reports_errors_and_circuit_breaker(url, tmp_path, capsys):

@@ -370,7 +370,7 @@ async with AsyncCrawler(cookies=cookies, headers={"Accept-Language": "en"}) as c
 | `AsyncCrawler(headers=)` | headers sent with every request to every host; `User-Agent`, `Cookie`, `Host` and `Proxy-Authorization` are refused (`ValueError`) |
 | `AsyncCrawler(cookies=)` | `http.cookiejar.Cookie` objects sent from the first request, each to its own domain |
 | `AsyncCrawler(keep_cookies=False)` | no cookies sent or kept (aiohttp's `DummyCookieJar`); with `cookies` it is a `ValueError` |
-| `export_cookies()` | the cookies the crawler keeps, those sites set included, as `http.cookiejar.Cookie`; also after `close()`. A cookie is for its host only if aiohttp sends it so: aiohttp marks a host and a name, not a path, and keeps the mark when the host sets the cookie again for its subdomains, so a browser may keep it for more hosts |
+| `export_cookies()` | the cookies the crawler keeps, those sites set included, as `http.cookiejar.Cookie`; also after `close()`. A cookie is for its host only if aiohttp sends it so: a cookie set without `Domain`, until the host sets it again with one |
 | `make_cookie(name, value, domain, path=, secure=, expires=, http_only=)` | a cookie; `example.com` is that host only, `.example.com` also its subdomains |
 | `load_cookies_file(path)` | the cookies of a Netscape `cookies.txt` file; expired ones are left out, session ones kept, those the crawler cannot send (of an IP address, with an invalid name) left out with a warning. A malformed file raises `ValueError` whose message does not quote it |
 | `save_cookies_file(cookies, path)` | writes a `cookies.txt` file with mode `0600`, session cookies included; an existing file is replaced whole, so it gets that mode too |

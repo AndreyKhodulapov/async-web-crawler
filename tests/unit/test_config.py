@@ -711,6 +711,14 @@ class TestSession:
             "session.cookies[0].value: must be printable ASCII without spaces, quotes, commas, semicolons or backslashes"
         )
 
+    def test_a_cookie_given_as_a_string_is_not_shown(self):
+        assert problems({"session": {"cookies": ["sid=s3cr3t"]}}) == [
+            "session.cookies[0]: expected a mapping of keys to values"
+        ]
+
+    def test_cookies_given_as_a_string_are_not_shown(self):
+        assert problems({"session": {"cookies": "sid=s3cr3t"}}) == ["session.cookies: expected a list"]
+
     def test_value_of_the_wrong_type_is_not_shown(self):
         found = problems(
             {

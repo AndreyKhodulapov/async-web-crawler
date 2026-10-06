@@ -556,7 +556,7 @@ def _build(section: type, mapping: Any, path: str, problems: list[str]) -> Any:
     if mapping is None and path and not required:  # a section with every key commented out
         return section()
     if not isinstance(mapping, Mapping):
-        problems.append(f"{path or 'the top level'}: expected a mapping of keys to values, got {_show(mapping)}")
+        problems.append(f"{path or 'the top level'}: expected a mapping of keys to values{_got(mapping, {}, section)}")
         return _INVALID if required else section()
     hints = get_type_hints(section)
     values = {}
@@ -591,12 +591,12 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
     if get_origin(hint) is Mapping:
         return _convert_mapping(value, hint, limits, path, problems)
     if get_origin(hint) is tuple:
+        item_hint = get_args(hint)[0]
         if not isinstance(value, list):
-            problems.append(f"{path}: expected a list{_got(value, limits)}")
+            section = item_hint if dataclasses.is_dataclass(item_hint) else None
+            problems.append(f"{path}: expected a list{_got(value, limits, section)}")
             return _INVALID
-        items = [
-            _convert(item, get_args(hint)[0], limits, f"{path}[{index}]", problems) for index, item in enumerate(value)
-        ]
+        items = [_convert(item, item_hint, limits, f"{path}[{index}]", problems) for index, item in enumerate(value)]
         return _INVALID if any(item is _INVALID for item in items) else tuple(items)
     expected = {int: "a whole number", float: "a number", bool: "true or false", str: "a string"}[hint]
     # True is an int in Python, but "max_pages: yes" is a mistake.
@@ -624,9 +624,16 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
     return value
 
 
-def _got(value: Any, limits: Mapping[str, Any]) -> str:
-    """The end of a message about a value: the value, unless it is a secret."""
-    return "" if "secret" in limits else f", got {_show(value)}"
+def _got(value: Any, limits: Mapping[str, Any], section: type | None = None) -> str:
+    """The end of a message about a value: the value, unless it is a secret.
+
+    Neither is a value given in place of a `section` with a secret key,
+    such as a cookie written as one string.
+    """
+    secret = "secret" in limits or (
+        section is not None and any("secret" in item.metadata for item in dataclasses.fields(section))
+    )
+    return "" if secret else f", got {_show(value)}"
 
 
 def _convert_mapping(value: Any, hint: Any, limits: Mapping[str, Any], path: str, problems: list[str]) -> Any:

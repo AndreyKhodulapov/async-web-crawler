@@ -187,11 +187,9 @@ class CookieJar(aiohttp.CookieJar):
     A cookies.txt file says whether a cookie is for its host only and when
     it expires. Whether it is for its host only is what aiohttp says when it
     sends the cookie, so that the file and the browser get what the crawler
-    does: aiohttp marks by host and name, not by path, and keeps a mark once
-    given even when the host sets the cookie again for its subdomains, so
-    it may differ from what a browser would keep (RFC 6265). aiohttp keeps
-    no expiry date where it can be read, so the jar turns a Max-Age into an
-    Expires date as the cookie arrives.
+    does: aiohttp marks a cookie by its domain, path and name, as browsers
+    do (RFC 6265). aiohttp keeps no expiry date where it can be read, so
+    the jar turns a Max-Age into an Expires date as the cookie arrives.
     """
 
     def update_cookies(self, cookies: LooseCookies, response_url: URL = URL()) -> None:  # noqa: B008, as aiohttp has it
@@ -209,12 +207,6 @@ class CookieJar(aiohttp.CookieJar):
                 cookie["max-age"] = ""
             received.append((name, cookie))
         super().update_cookies(received, response_url)
-
-    def _host_only(self) -> frozenset[tuple[str, str]] | set[tuple[str, str]]:
-        """The (host, name) of the cookies aiohttp sends to their host only."""
-        if hasattr(aiohttp.CookieJar, "host_only_cookies"):
-            return self.host_only_cookies
-        return self._host_only_cookies  # before aiohttp made it public, as late as 3.10
 
     def add(self, cookies: Iterable[Cookie]) -> None:
         """Add cookies of `http.cookiejar`, such as those of `load_cookies_file()`."""
@@ -244,14 +236,16 @@ class CookieJar(aiohttp.CookieJar):
     def export(self) -> list[Cookie]:
         """The cookies kept, expired ones left out, as `http.cookiejar` cookies."""
         cookies = []
-        host_only = self._host_only()
+        host_only = self.host_only_cookies
         for morsel in self:
             host = morsel["domain"]
+            # As aiohttp keys its marks: the path without the "/" at its end.
+            marked = (host, morsel["path"].rstrip("/"), morsel.key) in host_only
             cookies.append(
                 make_cookie(
                     morsel.key,
                     morsel.value,
-                    host if (host, morsel.key) in host_only else f".{host}",
+                    host if marked else f".{host}",
                     path=morsel["path"] or "/",
                     secure=bool(morsel["secure"]),
                     expires=http2time(morsel["expires"]) if morsel["expires"] else None,

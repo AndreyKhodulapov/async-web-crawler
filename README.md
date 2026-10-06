@@ -240,7 +240,7 @@ PYTHONPATH=src python examples/advanced_usage.py   # the same without `pip insta
 
 [examples/render_js.py](examples/render_js.py) shows what rendering adds
 to a page: it downloads one without and with the browser and prints the
-text and the links of both (needs the extra `js` and Chromium):
+text and the links of both (needs the Chromium of Playwright):
 
 ```bash
 python examples/render_js.py                                   # https://quotes.toscrape.com/js/

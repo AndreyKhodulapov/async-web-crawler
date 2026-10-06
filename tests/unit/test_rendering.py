@@ -608,6 +608,67 @@ class TestCookiesOfAContext:
         assert [cookie.value for cookie in jar.cookies()] == ["browser"]
 
 
+class TestCookiesAfterAPage:
+    def make_renderer(self, jar: JarTransport, context: CookieContext) -> Renderer:
+        """A renderer with one context, whose pages set a cookie as they load."""
+        renderer = Renderer(DEFAULT, user_agent="TestBot/1.0", cookies=jar)
+        sync = CookieSync()
+
+        async def get_context(url, proxy):
+            return context, sync
+
+        async def load_page(page, url, tab):
+            context.set("sid", "secret-value")
+            return Rendered("<p>page</p>")
+
+        renderer._get_context = get_context  # type: ignore[method-assign]
+        renderer._load = load_page  # type: ignore[method-assign]
+        return renderer
+
+    async def test_the_cookies_a_page_set_go_to_the_jar(self) -> None:
+        pytest.importorskip("playwright")
+        jar = JarTransport([])
+
+        await self.make_renderer(jar, TabCookieContext()).render(URL, page(URL, "page"))
+
+        assert [(cookie.name, cookie.value) for cookie in jar.cookies()] == [("sid", "secret-value")]
+
+    async def test_a_jar_that_fails_to_take_them_is_a_warning_and_the_page_is_kept(self, caplog) -> None:
+        pytest.importorskip("playwright")
+
+        class BrokenJar(JarTransport):
+            def update_cookies(self, changed, removed) -> None:
+                raise ValueError("cannot keep sid=secret-value")
+
+        renderer = self.make_renderer(BrokenJar([]), TabCookieContext())
+
+        with caplog.at_level(logging.WARNING, logger="crawler.rendering"):
+            rendered = await renderer.render(URL, page(URL, "page"))
+
+        assert rendered.content == "<p>page</p>"
+        assert f"Failed to keep the cookies the browser has after {URL}: ValueError" in caplog.text
+        assert "secret-value" not in caplog.text
+
+    async def test_a_browser_gone_after_the_page_is_no_warning(self, caplog) -> None:
+        pytest.importorskip("playwright")
+        context = TabCookieContext()
+        renderer = self.make_renderer(JarTransport([]), context)
+        load = renderer._load
+
+        async def load_and_crash(page, url, tab):
+            rendered = await load(page, url, tab)
+            context.closed = True
+            return rendered
+
+        renderer._load = load_and_crash  # type: ignore[method-assign]
+
+        with caplog.at_level(logging.WARNING, logger="crawler.rendering"):
+            rendered = await renderer.render(URL, page(URL, "page"))
+
+        assert rendered.content == "<p>page</p>"
+        assert caplog.text == ""
+
+
 class FakeContext:
     closed = False
 
@@ -696,6 +757,10 @@ class TabContext:
 
     async def close(self) -> None:
         pass
+
+
+class TabCookieContext(CookieContext, TabContext):
+    """A context that keeps cookies and whose tabs do nothing."""
 
 
 class TestRenderStats:

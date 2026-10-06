@@ -563,10 +563,20 @@ class Renderer:
                     self._tabs.pop(page, None)
                     with contextlib.suppress(Exception):
                         await page.close()
-                # The cookies a page set before it failed are kept as well. A browser
-                # that crashed meanwhile has failed the page already.
-                with contextlib.suppress(Exception):
-                    await (context.close() if sync is None else self._take_cookies(context, sync))
+                if sync is None:
+                    with contextlib.suppress(Exception):
+                        await context.close()
+                else:
+                    # The cookies a page set before it failed are kept as well.
+                    try:
+                        await self._take_cookies(context, sync)
+                    except PlaywrightError:
+                        pass  # a browser that crashed meanwhile has failed the page already
+                    except Exception as error:  # noqa: BLE001 - not a failure of the page
+                        # The text of the error may hold a cookie.
+                        logger.warning(
+                            "Failed to keep the cookies the browser has after %s: %s", url, type(error).__name__
+                        )
 
     async def _send_cookies(self, context: "BrowserContext", sync: CookieSync) -> None:
         """Give the context the cookies the crawler has changed since the last time.

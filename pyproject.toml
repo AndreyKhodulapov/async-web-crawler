@@ -25,7 +25,7 @@ addopts = "-m 'not network and not postgres and not browser'"
 markers = [
     "network: tests that require real internet access (deselected by default)",
     "postgres: tests that require a PostgreSQL server, see docker-compose.yml (deselected by default)",
-    "browser: tests that require Playwright and Chromium, see the js extra (deselected by default)",
+    "browser: tests that require Playwright and Chromium, see `make install` (deselected by default)",
 ]
 
 [tool.ruff]

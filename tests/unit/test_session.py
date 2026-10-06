@@ -181,12 +181,21 @@ class TestCookieJar:
             [("sid=1", "http://example.com/")],
             [("sid=1", "http://example.com/"), ("wide=2; Domain=example.com", "http://example.com/")],
             [("sid=1", "http://a.example.com/"), ("sid=2; Domain=example.com", "http://a.example.com/")],
-            # aiohttp keeps the mark of the host in these, unlike a browser: so does the export.
+            # The host sets the cookie again for its subdomains: it is for its host only no more.
             [("sid=1", "http://example.com/"), ("sid=2; Domain=example.com", "http://example.com/")],
             [("sid=1", "http://example.com/"), ("sid=2; Domain=example.com", "http://www.example.com/")],
             [("a=1; Path=/x", "http://example.com/x"), ("a=2; Domain=example.com; Path=/y", "http://example.com/y")],
+            [("sid=1; Path=/app/", "http://example.com/app/")],
         ],
-        ids=["host only", "domain", "parent domain", "host again", "subdomain for the host", "two paths"],
+        ids=[
+            "host only",
+            "domain",
+            "parent domain",
+            "host again",
+            "subdomain for the host",
+            "two paths",
+            "path with a slash at its end",
+        ],
     )
     async def test_a_cookie_is_exported_for_the_hosts_the_crawler_sends_it_to(self, steps):
         jar = CookieJar()
@@ -257,12 +266,23 @@ class TestCookieJar:
 
         jar.remove([make_cookie("sid", "any value", "example.com"), make_cookie("wide", "", ".example.org")])
 
-        # aiohttp marks a cookie for its host only by host and name: the one of /app loses it with that of /.
+        # The cookie of /app stays for its host only: that of / takes no mark of another path with it.
         assert summary(jar.export()) == [
-            (".example.com", "/app", "sid", "2", False),
             ("example.com", "/", "other", "4", False),
+            ("example.com", "/app", "sid", "2", False),
         ]
-        assert sent(jar, "http://sub.example.com/app/page") == {"sid": "2"}
+        assert sent(jar, "http://example.com/app/page") == {"sid": "2", "other": "4"}
+        assert sent(jar, "http://sub.example.com/app/page") == {}
+
+    async def test_a_cookie_added_for_the_subdomains_replaces_the_one_of_the_host(self):
+        jar = CookieJar()
+        set_cookie(jar, "sid=1", "http://example.com/")
+
+        # As when the JavaScript of a rendered page sets it with `domain=example.com`.
+        jar.add([make_cookie("sid", "2", ".example.com")])
+
+        assert summary(jar.export()) == [(".example.com", "/", "sid", "2", False)]
+        assert sent(jar, "http://sub.example.com/") == {"sid": "2"}
 
 
 def make_transport(**options) -> HttpTransport:
