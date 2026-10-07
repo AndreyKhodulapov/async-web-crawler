@@ -5,7 +5,7 @@ import dataclasses
 import enum
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import asyncpg
@@ -14,7 +14,8 @@ from crawler.advanced import AdvancedCrawler
 from crawler.config import CrawlerConfig, StorageOptions
 from crawler.distributed.frontier import PostgresFrontier
 from crawler.distributed.schema import Connection, create_schema
-from crawler.exceptions import FrontierError, JobError
+from crawler.exceptions import ConfigError, FrontierError, JobError
+from crawler.queue import queue_form
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +67,12 @@ async def create_job(
         JobError: with `JobMode.NEW`, the name is taken; with
             `JobMode.RESUME`, there is no such job, or `config` differs from
             that of the job in its part.
-        ConfigError: as `AdvancedCrawler.seed`; nothing is created.
+        ConfigError: as `AdvancedCrawler.seed`, or a start URL is longer
+            than the frontier keeps (`PostgresFrontier.MAX_URL_LENGTH`);
+            nothing is created.
         FrontierError: the database cannot be reached or failed an operation.
     """
+    _check_start_urls(config.urls)
     settings = job_config(config)
     # The storage is that of a worker, not of the job.
     async with AdvancedCrawler(
@@ -95,6 +99,18 @@ async def create_job(
         # Before the crawler is closed, which resets the logging it set up.
         logger.info("Crawl job %s is seeded: %d pages queued", name, frontier.stats().queued)
     return failed
+
+
+def _check_start_urls(urls: Iterable[str]) -> None:
+    """Raises ConfigError if a start URL is too long for the frontier, which would leave it out."""
+    limit = PostgresFrontier.MAX_URL_LENGTH
+    problems = [
+        f"urls[{index}]: a crawl job keeps URLs of up to {limit} characters, got {len(form)}"
+        for index, url in enumerate(urls)
+        if (form := queue_form(url)) is not None and len(form) > limit
+    ]
+    if problems:
+        raise ConfigError(problems)
 
 
 @contextlib.contextmanager

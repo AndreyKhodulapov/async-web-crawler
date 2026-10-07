@@ -16,7 +16,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import asyncpg
 import pytest
-from helpers import POSTGRES_DSN, DatabaseLink, drop_frontier_tables, make_job
+from helpers import POSTGRES_DSN, DatabaseLink, drop_frontier_tables, long_url, make_job
 
 from crawler import Admission, FrontierPage, GivenUp, HostFailures, JobError, Outcome, PostgresFrontier
 
@@ -149,6 +149,46 @@ class TestDeduplication:
         await asyncio.gather(*(crawl(frontier) for frontier in workers for _ in range(3)))
 
         assert sorted(taken) == sorted(f"http://site/{i}" for i in range(30))
+
+
+class TestLongUrls:
+    """A URL is a key of the database, which holds about 2.7 KB: a frontier keeps none longer than MAX_URL_LENGTH."""
+
+    async def test_url_of_max_length_is_kept(self, open_frontier):
+        frontier = await open_frontier("worker")
+        page, target = long_url(length=PostgresFrontier.MAX_URL_LENGTH), long_url("http://site/b", length=2048)
+
+        assert await frontier.seed([page]) == [page]
+        assert await frontier.mark_seen(target, page)
+
+        assert not await frontier.mark_seen(target, "http://site/other")
+        assert {row["url"] for row in await fetch("SELECT url FROM frontier")} == {page, target}
+
+    async def test_redirect_target_too_long_is_new_and_not_remembered(self, open_frontier):
+        frontier = await open_frontier("worker")
+        target = long_url()
+
+        assert await frontier.mark_seen(target, "http://site/a")
+        assert await frontier.mark_seen(target, "http://site/b")
+        await frontier.forget(target, "http://site/a")
+        assert not await frontier.is_pending_or_processed(target)
+
+        assert await fetch("SELECT url FROM frontier") == []
+
+    async def test_pages_too_long_are_not_queued(self, open_frontier):
+        frontier = await open_frontier("worker")
+
+        assert await frontier.seed(["http://site/a", long_url()]) == ["http://site/a"]
+        assert await frontier.add(["http://site/b", long_url("http://site/b")], depth=1) == 1
+
+        assert {row["url"] for row in await fetch("SELECT url FROM frontier")} == {"http://site/a", "http://site/b"}
+
+    async def test_pages_too_long_are_not_held_out_of_scope(self, open_frontier):
+        frontier = await open_frontier("worker")
+
+        await frontier.hold_out_of_scope(["http://other/a", long_url("http://other/")])
+
+        assert [row["url"] for row in await fetch("SELECT url FROM out_of_scope")] == ["http://other/a"]
 
 
 class TestJobLock:

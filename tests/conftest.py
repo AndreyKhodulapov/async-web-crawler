@@ -11,6 +11,7 @@ import certifi
 import pytest
 import trustme
 from aiohttp import web
+from helpers import long_url
 from pages import ENCODING_PAGES, JS_PAGES, JS_SCRIPT, SITE_HEADERS, SITE_PAGES, fixture_html
 from proxy_server import ProxyServer
 
@@ -262,6 +263,8 @@ async def site_page(request: web.Request) -> web.Response:
         raise web.HTTPFound("/site/missing.html")
     if request.path == "/site/to-other-host":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/")
+    if request.path == "/site/to-sign-in":
+        raise web.HTTPFound(long_url("/site/c.html"))
     if request.path == "/site/to-busy":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/busy/60")
     if request.path == "/site/to-overloaded":

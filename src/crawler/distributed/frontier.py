@@ -233,10 +233,19 @@ class PostgresFrontier(Frontier):
     An operation fails with one of `ERRORS` when the database cannot be
     reached or refuses it; it is not tried again: the worker stops, and
     its pages come back to the others once their leases expire.
+
+    A URL is a key of the database, and a key holds about 2.7 KB: a URL
+    longer than `MAX_URL_LENGTH` is never kept. `seed`, `add` and
+    `hold_out_of_scope` leave it out, and `mark_seen` takes it for new
+    without remembering it, so a start URL may redirect to a sign-in page
+    with a long token in its query, and that target alone is not deduplicated.
     """
 
     shared = True
     ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+    # As long as a link the crawler follows (AsyncCrawler.MAX_URL_LENGTH);
+    # a key of an index holds 2704 bytes, the job and the header included.
+    MAX_URL_LENGTH = 2048
 
     def __init__(
         self,
@@ -345,13 +354,13 @@ class PostgresFrontier(Frontier):
         return frontier
 
     async def seed(self, urls: Iterable[str]) -> list[str]:
-        pages = _pages_of(urls)
+        pages = self._pages_of(urls)
         await self._add(self._pool, pages, depth=0, bounded=False)
         self._wakeup.set()
         return list(pages)
 
     async def add(self, urls: Iterable[str], *, depth: int) -> int:
-        pages = _pages_of(urls)
+        pages = self._pages_of(urls)
         if not pages:
             return 0
         accepted, dropped, accepted_by_host = await self._add(self._pool, pages, depth=depth)
@@ -505,6 +514,9 @@ class PostgresFrontier(Frontier):
         form = queue_form(url)
         if form is None:
             return False
+        if len(form) > self.MAX_URL_LENGTH:
+            # Not a key the database can hold: new every time, as seen nowhere.
+            return True
         # A row seen from the same page is updated to itself, so that it is returned.
         new = await self._pool.fetchval(
             "INSERT INTO frontier AS f (job, url, host, state, seen_from) VALUES ($1, $2, $3, 'seen', $4)"
@@ -542,7 +554,8 @@ class PostgresFrontier(Frontier):
         return not self._closed_at(job["requested"]) and job["unfinished"] + job["requested"] >= self._max_queued
 
     async def hold_out_of_scope(self, urls: Iterable[str]) -> None:
-        urls = list(dict.fromkeys(urls))
+        # A URL too long to keep is turned away by the filter whatever the scope.
+        urls = [url for url in dict.fromkeys(urls) if len(url) <= self.MAX_URL_LENGTH]
         if urls:
             await self._pool.execute(
                 "INSERT INTO out_of_scope (job, url) SELECT $1, page.url"
@@ -573,7 +586,7 @@ class PostgresFrontier(Frontier):
                 await connection.execute(
                     "DELETE FROM out_of_scope WHERE job = $1 AND url = ANY($2::text[])", self.job_id, in_scope
                 )
-                accepted, dropped, accepted_by_host = await self._add(connection, _pages_of(in_scope), depth=0)
+                accepted, dropped, accepted_by_host = await self._add(connection, self._pages_of(in_scope), depth=0)
             await self._read_scope(connection)
         self._added(accepted, dropped, accepted_by_host)
         return accepted
@@ -762,6 +775,21 @@ class PostgresFrontier(Frontier):
         """Whether `requested` pages reach max_pages: no page is handed out or accepted until one is uncounted."""
         return self.max_pages is not None and requested >= self.max_pages
 
+    def _pages_of(self, urls: Iterable[str]) -> dict[str, str]:
+        """The URLs in the form the frontier keeps them, each with its host; invalid ones, repeats and those too long left out."""
+        pages = {}
+        for url in urls:
+            form = queue_form(url)
+            if form is None or form in pages:
+                continue
+            if len(form) > self.MAX_URL_LENGTH:
+                logger.debug("Not queued, longer than %d characters: %s", self.MAX_URL_LENGTH, form)
+                continue
+            host = get_host(form)
+            assert host is not None  # a valid URL has a host
+            pages[form] = host
+        return pages
+
     def _check_held(self, page: FrontierPage) -> None:
         if page.url not in self._held:
             raise ValueError(f"{page.url} is not in progress")
@@ -821,18 +849,6 @@ async def _keep_session(connection: asyncpg.Connection) -> None:
     locks, cursors or LISTEN).
     A transaction left open is still rolled back.
     """
-
-
-def _pages_of(urls: Iterable[str]) -> dict[str, str]:
-    """The URLs in the form the frontier keeps them, each with its host; invalid ones and repeats left out."""
-    pages = {}
-    for url in urls:
-        form = queue_form(url)
-        if form is not None and form not in pages:
-            host = get_host(form)
-            assert host is not None  # a valid URL has a host
-            pages[form] = host
-    return pages
 
 
 def _log_lease_lost(page: FrontierPage) -> None:

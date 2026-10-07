@@ -146,6 +146,20 @@ async def test_start_url_that_redirects_to_another_host_brings_it_into_scope_for
     assert await fetch("SELECT url FROM out_of_scope") == []
 
 
+async def test_start_url_that_redirects_to_a_url_too_long_for_the_database_is_crawled(url, site):
+    # A sign-in page with a token in its query: the frontier cannot remember it, the page is crawled all the same.
+    job = make_config(urls=[url("/site/to-sign-in")])
+    expected = await local_crawl(job)
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    (stats,) = await run_workers(worker_config(), 1)
+
+    assert url("/site/to-sign-in") in expected
+    assert await urls_in("processed") == expected
+    assert stats["successful"] == len(expected)
+    assert await job_state() == "finished"
+
+
 async def test_workers_stop_at_max_pages_of_the_job_and_it_is_finished(url, site):
     await create_job(make_config(urls=[url("/wide/0")], crawler={"max_pages": 5}), "test", dsn=POSTGRES_DSN)
 

@@ -560,6 +560,11 @@ storages. All of it is described in the [API reference](docs/api.md).
   status codes, errors by class, hosts and workers. The retries, the
   requests per proxy and the pages rendered are counted by each worker,
   in its own statistics and reports.
+- **URLs of up to 2048 characters.** A URL is a key in the database:
+  `job create` refuses a longer start URL, and a longer target of a
+  redirect of a start URL, such as a sign-in page with a token, is
+  followed but not remembered, so two start URLs that lead there both
+  crawl it.
 - **A worker polls.** With nothing to take, it sleeps until the next
   page or host is due, `poll_interval` (1 s) at most, and asks the
   database again: a page another worker queues meanwhile waits for that

@@ -7,7 +7,7 @@ import typing
 
 import asyncpg
 import pytest
-from helpers import POSTGRES_DSN, DatabaseLink, drop_frontier_tables, index, make_config, urlset
+from helpers import POSTGRES_DSN, DatabaseLink, drop_frontier_tables, index, long_url, make_config, urlset
 
 from crawler import AsyncCrawler, ConfigError, CrawlerConfig, FrontierError, JobError, SitemapParser
 from crawler.distributed import JOB_SECTIONS, JobMode, create_job, job_config
@@ -136,6 +136,13 @@ async def test_job_created_with_logging_logs_by_its_configuration(url, tmp_path)
 async def test_job_without_start_urls_or_sitemaps_is_not_created():
     with pytest.raises(ConfigError, match="nothing to crawl"):
         await create_job(make_config(), "test", dsn=POSTGRES_DSN)
+
+    assert (await fetch("SELECT to_regclass('crawl_jobs') AS table"))[0]["table"] is None
+
+
+async def test_job_with_a_start_url_too_long_for_the_database_is_not_created():
+    with pytest.raises(ConfigError, match=r"urls\[1\]: a crawl job keeps URLs of up to 2048 characters, got 4000"):
+        await create_job(make_config(urls=["http://site/", long_url()]), "test", dsn=POSTGRES_DSN)
 
     assert (await fetch("SELECT to_regclass('crawl_jobs') AS table"))[0]["table"] is None
 

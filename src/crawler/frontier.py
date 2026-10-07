@@ -203,6 +203,8 @@ class Frontier(ABC):
         so that two workers cannot both take a URL for new. A URL the page
         `source` remembered gives True to that page again: one put back
         after it followed the redirect follows it again, whoever takes it.
+        A frontier that cannot keep a URL, one too long for a database,
+        gives True every time and remembers nothing.
         """
 
     @abstractmethod

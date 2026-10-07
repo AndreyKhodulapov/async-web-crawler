@@ -4,6 +4,7 @@ import asyncio
 import base64
 import importlib.util
 import os
+import random
 from collections.abc import AsyncIterator, Collection, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -174,6 +175,16 @@ def index(*locations: str) -> bytes:
     return (
         f'<?xml version="1.0" encoding="UTF-8"?><sitemapindex xmlns="{SITEMAP_NAMESPACE}">{entries}</sitemapindex>'
     ).encode()
+
+
+def long_url(start: str = "http://site/", length: int = 4000) -> str:
+    """A URL of `length` characters with a token in its query, as a sign-in page gets one.
+
+    The token is random bytes, which PostgreSQL cannot compress: a URL of
+    4000 characters is too long for a key of its index (about 2.7 KB).
+    """
+    url = f"{start}?token="
+    return url + random.Random(length).randbytes(length).hex()[: length - len(url)]
 
 
 class FakeClock:
