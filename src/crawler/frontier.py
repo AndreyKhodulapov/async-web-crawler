@@ -39,6 +39,14 @@ class Admission(enum.Enum):
     OVER_HOST_LIMIT = "over max_pages_per_host"
 
 
+class GivenUp(NamedTuple):
+    """How a page of a host given up is finished, unrequested, see `Frontier.given_up`."""
+
+    outcome: Outcome
+    reason: str
+    error: str | None = None  # the class of the error, for an outcome of failed
+
+
 @dataclass(frozen=True)
 class FrontierStats:
     queued: int = 0  # deferred pages included
@@ -163,6 +171,9 @@ class Frontier(ABC):
         *,
         uncount: bool = False,
         pending_save: bool = False,
+        status: int | None = None,
+        elapsed: float | None = None,
+        error: str | None = None,
     ) -> None:
         """Record the outcome of a page taken; `reason` for all but `Outcome.PROCESSED`.
 
@@ -171,6 +182,12 @@ class Frontier(ABC):
         reports its record written: a frontier shared by several processes
         hands it out again if this one stops before that. The page counts as
         processed all the same, and `take` does not wait for it.
+
+        `status` and `elapsed` are those of the response, if there was one,
+        and `error` the class of the error a failed page failed with. A
+        frontier shared by several processes keeps them for the statistics
+        of the whole crawl; one of a single process does not need them, as
+        the process counts its pages itself.
         """
 
     @abstractmethod
@@ -265,17 +282,17 @@ class Frontier(ABC):
         """
         return HostFailures()
 
-    async def give_up_host(self, host: str, outcome: Outcome, reason: str) -> None:
-        """Finish the pages of `host` queued, with `outcome` and `reason`, and so those accepted or put back later.
+    async def give_up_host(self, host: str, outcome: Outcome, reason: str, *, error: str | None = None) -> None:
+        """Finish the pages of `host` queued, with `outcome`, `reason` and `error`, and so those accepted or put back later.
 
         A page of the host taken later says so with `given_up`, to be
         finished without a request. The first host given up keeps its
-        outcome and reason. A frontier of one process does nothing: that
-        process refuses the pages of the host itself.
+        outcome, reason and error. A frontier of one process does nothing:
+        that process refuses the pages of the host itself.
         """
 
-    def given_up(self, page: FrontierPage) -> tuple[Outcome, str] | None:
-        """The outcome and reason a page taken is to be finished with, unrequested, as its host is given up; None if it is not."""
+    def given_up(self, page: FrontierPage) -> GivenUp | None:
+        """How a page taken is to be finished, unrequested, as its host is given up; None if it is not."""
         return None
 
     async def close(self) -> None:
@@ -365,6 +382,9 @@ class MemoryFrontier(Frontier):
         *,
         uncount: bool = False,
         pending_save: bool = False,
+        status: int | None = None,
+        elapsed: float | None = None,
+        error: str | None = None,
     ) -> None:
         # One process: a page whose save is pending is done already, as it
         # cannot be handed out to another one.

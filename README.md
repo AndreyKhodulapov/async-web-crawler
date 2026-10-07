@@ -211,12 +211,14 @@ A crawl job is one crawl that workers share through PostgreSQL (see
 [Crawl jobs](docs/api.md#crawl-jobs)): `job create` checks the
 configuration, creates the job, reads its sitemaps and queues its start
 URLs; `worker`, started in as many processes or containers as you like,
-crawls its pages until none is left.
+crawls its pages until none is left; `report` writes the statistics of
+the whole job, of all its workers, at any time.
 
 ```bash
 export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
 python src/main.py job create --config config.yaml --name books
 python src/main.py worker --job books --config worker.yaml --concurrency 20   # in each of several terminals
+python src/main.py report --job books --stats-json out/stats.json --report out/report.html
 ```
 
 | Option | Effect |
@@ -229,6 +231,9 @@ python src/main.py worker --job books --config worker.yaml --concurrency 20   # 
 | `worker --config PATH` | configuration of the worker: `distributed`, `session`, `proxy`, `storage`, `logging`, `report`; the keys of the job in it are ignored with a warning. Every file of the storage needs `{worker}` in its name, such as `pages-{worker}.jsonl` |
 | `--concurrency N` | pages crawled at a time, in place of `crawler.max_concurrent` |
 | `--name WORKER` | name of the worker in the database and for `{worker}`; by default the host name, the process id and a random part |
+| `report --job NAME` | the job to report on, finished or still running |
+| `report --stats-json PATH`, `--report PATH` | the statistics of the job as JSON, an HTML report with charts and a table of the workers; without them, `report.stats_json` and `report.html` of the configuration |
+| `report --config PATH` | configuration with the database and the `report` section (`title`, `top_domains`, the files) |
 
 The database is `distributed.database_url` of the configuration or the
 `CRAWLER_DATABASE_URL` variable; it is not an option, which would show its
@@ -240,7 +245,11 @@ or fails, or pages the storage could not save; 2 a wrong option or
 configuration. A worker stopped with Ctrl-C (130) or SIGTERM (143) writes
 what its storage buffers and its reports, and queues the pages it had in
 progress again for the other workers; `job create` stopped leaves the job
-seeding, and `--resume` seeds it again.
+seeding, and `--resume` seeds it again. `report` reads the job from the
+database: the pages of all workers, each worker's pages per second and
+state (`running`, `stopped`, or `lost` if it was killed), and prints a
+summary; it exits with 1 if there is no such job or a report cannot be
+written, with 2 if there is no file to write.
 
 ## Usage from Python
 
@@ -529,7 +538,7 @@ make db check CRAWLER_POSTGRES_PORT=55432   # the same with the server on anothe
 
 ```
 src/
-├── main.py                 # command line of the crawler: a configuration file and options over it; `job create` and `worker` commands
+├── main.py                 # command line of the crawler: a configuration file and options over it; `job create`, `worker` and `report` commands
 ├── cli_options.py          # checks of command-line values shared by main.py and demo_main.py
 ├── demo_main.py            # demo CLI: `crawl`, `errors`, `save`, `parse`, `benchmark` and `scale` commands
 ├── demo_urls.yaml          # URLs the demo commands use when none are given
@@ -566,7 +575,8 @@ src/
     ├── distributed/
     │   ├── frontier.py     # PostgresFrontier: the frontier of a crawl job shared by workers — leases, heartbeat, host turns
     │   ├── job.py          # create_job: a crawl job created, seeded, resumed or restarted
-    │   ├── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, job_scope, out_of_scope
+    │   ├── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, workers, job_scope, out_of_scope
+    │   ├── stats.py        # job_stats, export_job_stats: the statistics and reports of a crawl job, of all its workers
     │   └── worker.py       # run_worker: a worker of a crawl job, its configuration and its files
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes
@@ -589,7 +599,7 @@ tests/
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
 ├── unit/                   # links of the documentation, parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, logging, progress, filters, storages, client
-└── integration/            # local HTTP server, databases, the frontier in memory and in PostgreSQL, crawl jobs and their workers, the commands of crawl jobs in processes of their own; live tests marked `network`, PostgreSQL ones `postgres`
+└── integration/            # local HTTP server, databases, the frontier in memory and in PostgreSQL, crawl jobs, their workers and their statistics, the commands of crawl jobs in processes of their own; live tests marked `network`, PostgreSQL ones `postgres`
 docs/
 ├── api.md                  # API reference
 ├── configuration.md        # configuration guide: every key, validation, recipes

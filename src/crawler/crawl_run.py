@@ -429,7 +429,7 @@ class CrawlRun:
             try:
                 if (given_up := frontier.given_up(page)) is not None:
                     # Its host was given up for the crawl, by this process or another one.
-                    await frontier.finish(page, *given_up)
+                    await frontier.finish(page, given_up.outcome, given_up.reason, error=given_up.error)
                     continue
                 # A host that asked to wait (Retry-After) or waits out the
                 # pause before a retry: the worker takes pages of other hosts
@@ -584,7 +584,13 @@ class CrawlRun:
         if self.keep_pages:
             self.processed_urls[url] = parsed
         # With a storage, the page is done once its record is written (see run).
-        await self._frontier.finish(page, Outcome.PROCESSED, pending_save=self.storage is not None)
+        await self._frontier.finish(
+            page,
+            Outcome.PROCESSED,
+            pending_save=self.storage is not None,
+            status=result.status,
+            elapsed=result.elapsed,
+        )
         self.stats.record_page(url, status=result.status, elapsed=result.elapsed)
         logger.info("Crawled %s (depth %d): %d links, %d new queued", url, depth, len(parsed["links"]), queued)
         if self.storage is not None:
@@ -661,13 +667,12 @@ class CrawlRun:
         With `uncount`, the page counted toward the limits is uncounted: nothing was sent for it.
         """
         reason = f"{type(error).__name__}: {error.message}"
-        await self._frontier.finish(page, Outcome.FAILED, reason, uncount=uncount)
-        self.stats.record_page(
-            page.url,
-            status=None if result is None else result.status,
-            elapsed=None if result is None else result.elapsed,
-            error=type(error).__name__,
+        status = None if result is None else result.status
+        elapsed = None if result is None else result.elapsed
+        await self._frontier.finish(
+            page, Outcome.FAILED, reason, uncount=uncount, status=status, elapsed=elapsed, error=type(error).__name__
         )
+        self.stats.record_page(page.url, status=status, elapsed=elapsed, error=type(error).__name__)
 
     async def _skip_page(
         self,
@@ -685,13 +690,10 @@ class CrawlRun:
             logger.info("Skipped %s: %s", page.url, reason)
         else:
             logger.info("Skipped %s: %s; %d new links queued", page.url, reason, links_queued)
-        await self._frontier.finish(page, Outcome.SKIPPED, reason)
-        self.stats.record_page(
-            page.url,
-            status=None if result is None else result.status,
-            elapsed=None if result is None else result.elapsed,
-            skipped=True,
-        )
+        status = None if result is None else result.status
+        elapsed = None if result is None else result.elapsed
+        await self._frontier.finish(page, Outcome.SKIPPED, reason, status=status, elapsed=elapsed)
+        self.stats.record_page(page.url, status=status, elapsed=elapsed, skipped=True)
 
     async def _save_page(self, record: PageRecord) -> None:
         """Hand a page to the storage; a failure is logged and does not stop the crawl."""
@@ -806,19 +808,19 @@ class CrawlRun:
         self._crawl_failures[host] = failures
         return failures
 
-    async def _give_up_host(self, url: str, outcome: Outcome, reason: str) -> None:
+    async def _give_up_host(self, url: str, outcome: Outcome, reason: str, *, error: str | None = None) -> None:
         """In a frontier shared by several processes, give the host of `url` up for all of them, once.
 
-        Its pages are finished with `outcome` and `reason`, unrequested,
-        whichever process takes them; in a crawl of one process each page
-        is refused as it is taken.
+        Its pages are finished with `outcome`, `reason` and `error`,
+        unrequested, whichever process takes them; in a crawl of one process
+        each page is refused as it is taken.
         """
         host = get_host(url)
         assert host is not None  # a URL without a host is not requested
         if not self._frontier.shared or host in self._hosts_given_up:
             return
         self._hosts_given_up.add(host)
-        await self._frontier.give_up_host(host, outcome, reason)
+        await self._frontier.give_up_host(host, outcome, reason, error=error)
 
     def _warn_once_held_back(self, url: str, penalty: float) -> None:
         """Tell the user, once per host and crawl, about a Retry-After that holds the host back for long.
@@ -995,7 +997,9 @@ class CrawlRun:
         assert host is not None  # a URL without a host has no circuit
         opened = (await self._host_failures(url)).circuit_openings
         if opened >= self.MAX_CIRCUIT_OPENINGS:
-            await self._give_up_host(url, Outcome.FAILED, self._no_more_probes(host, opened))
+            await self._give_up_host(
+                url, Outcome.FAILED, self._no_more_probes(host, opened), error=CircuitOpenError.__name__
+            )
         else:
             await self._fetcher.tell_host_held(host, probe_in, self.circuit_breaker.refusal(url))
 
@@ -1088,7 +1092,9 @@ class CrawlRun:
         opened = (await self._host_failures(refusal.url)).circuit_openings
         if opened >= self.MAX_CIRCUIT_OPENINGS:
             logger.info("Gave up on %s: circuit breaker of %s opened %d times", page.url, host, opened)
-            await self._give_up_host(refusal.url, Outcome.FAILED, self._no_more_probes(host, opened))
+            await self._give_up_host(
+                refusal.url, Outcome.FAILED, self._no_more_probes(host, opened), error=CircuitOpenError.__name__
+            )
             uncount = counted and not requested
             if result is not None and result.error is not None and result.error is not refusal:
                 await self._fail_page(page, result.error, result, uncount=uncount)

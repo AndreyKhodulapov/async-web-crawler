@@ -37,7 +37,9 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 # sequence keeps the order pages were queued in among those of one depth.
 # `attempts` counts the leases that expired, `waits` the times the page
 # went back to wait for its host. A URL only seen, the target of a
-# redirect, keeps in `seen_from` the page whose redirect led to it.
+# redirect, keeps in `seen_from` the page whose redirect led to it. A page
+# finished keeps, for the report of the job, the status and the time of
+# its response, if it got one, and the error it failed with.
 _FRONTIER = """
 CREATE TABLE IF NOT EXISTS frontier (
     job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
@@ -55,6 +57,9 @@ CREATE TABLE IF NOT EXISTS frontier (
     waits INTEGER NOT NULL DEFAULT 0,
     counted BOOLEAN NOT NULL DEFAULT false,
     reason TEXT,
+    status INTEGER,
+    elapsed DOUBLE PRECISION,
+    error TEXT,
     seen_from TEXT,
     PRIMARY KEY (job, url)
 )
@@ -65,8 +70,8 @@ CREATE TABLE IF NOT EXISTS frontier (
 # limit of the job says. A host held back, e.g. after a Retry-After, keeps
 # the reason of the hold that ends last; it says why the host waits while
 # `next_allowed_at` is ahead. The failures of all the workers count toward
-# giving the host up; a host given up has the outcome and reason its pages
-# are finished with, unrequested.
+# giving the host up; a host given up has the outcome, reason and error its
+# pages are finished with, unrequested.
 _HOSTS = """
 CREATE TABLE IF NOT EXISTS hosts (
     job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
@@ -80,7 +85,24 @@ CREATE TABLE IF NOT EXISTS hosts (
     robots_failures INTEGER NOT NULL DEFAULT 0,
     given_up_outcome TEXT CHECK (given_up_outcome IN ('failed', 'unreachable')),
     given_up_reason TEXT,
+    given_up_error TEXT,
     PRIMARY KEY (job, host)
+)
+"""
+
+# The workers of a job, for its report: each renews its own lease while it
+# runs, as it renews those of its pages, and counts in `active_seconds` the
+# time it ran, without the pauses between its runs under one name.
+_WORKERS = """
+CREATE TABLE IF NOT EXISTS workers (
+    job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
+    worker TEXT NOT NULL,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    lease_until TIMESTAMPTZ NOT NULL,
+    stopped_at TIMESTAMPTZ,
+    active_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+    PRIMARY KEY (job, worker)
 )
 """
 
@@ -119,6 +141,7 @@ _STATEMENTS = (
     # The redirect targets of a page that failed.
     "CREATE INDEX IF NOT EXISTS frontier_seen_from ON frontier (job, seen_from) WHERE state = 'seen'",
     _HOSTS,
+    _WORKERS,
     _SCOPE,
     _OUT_OF_SCOPE,
 )

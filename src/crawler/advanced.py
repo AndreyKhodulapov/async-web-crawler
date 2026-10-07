@@ -118,10 +118,10 @@ class AdvancedCrawler:
         self._configures_logging = configure_logging
 
         for path in _storage_files(self.storage):
-            _make_directory(path)
+            make_directory(path)
         if configure_logging:
             if config.logging.file is not None:
-                _make_directory(config.logging.file)
+                make_directory(config.logging.file)
             # The last step that can fail: nothing after it can leave the log file open.
             logging_setup.configure_logging(
                 config.logging.level,
@@ -294,7 +294,7 @@ class AdvancedCrawler:
             return None
         cookies = self.crawler.export_cookies()
         try:
-            save_cookies_file(cookies, _make_directory(path))
+            save_cookies_file(cookies, make_directory(path))
         except OSError as error:
             logger.error("Failed to save the cookies to %s: %s", path, error)
             return None
@@ -324,7 +324,7 @@ class AdvancedCrawler:
         Raises:
             OSError: the file cannot be written.
         """
-        _make_directory(filename).write_text(render_json(self.get_stats()), encoding="utf-8")
+        make_directory(filename).write_text(render_json(self.get_stats()), encoding="utf-8")
 
     def export_to_html_report(self, filename: str | Path, *, title: str | None = None) -> None:
         """Write the HTML report of `get_stats()`, see `CrawlerStats.export_to_html_report`.
@@ -335,7 +335,7 @@ class AdvancedCrawler:
             OSError: the file cannot be written.
         """
         report = render_html(self.get_stats(), title=self.config.report.title if title is None else title)
-        _make_directory(filename).write_text(report, encoding="utf-8")
+        make_directory(filename).write_text(report, encoding="utf-8")
 
     async def close(self) -> None:
         """Close the crawler, write what the storage still holds and stop logging to the file. Safe to call more than once."""
@@ -359,7 +359,7 @@ def _storage_files(storage: DataStorage | None) -> list[Path]:
     return [] if path is None else [path]
 
 
-def _make_directory(file: str | Path) -> Path:
+def make_directory(file: str | Path) -> Path:
     """Create the directory of a file if it is missing; return the path of the file with `~` expanded."""
     path = Path(file).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)

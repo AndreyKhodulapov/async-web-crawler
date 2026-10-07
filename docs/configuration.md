@@ -414,7 +414,10 @@ See [Logging](api.md#logging).
 ### `report`
 
 Files the statistics are written to after the crawl; see
-[Page statistics](api.md#page-statistics).
+[Page statistics](api.md#page-statistics). A worker of a crawl job writes
+those of its own pages after its crawl; the command `report` writes those
+of the whole job by the same keys, its title followed by the name of the
+job (see [Crawl jobs](api.md#crawl-jobs)).
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
@@ -428,15 +431,15 @@ Files the statistics are written to after the crawl; see
 The database of the crawl jobs and how a worker holds its pages; see
 [Crawl jobs](api.md#crawl-jobs). Each worker has its own section: it is not
 a part of the job, and a crawl of its own ignores it. On the command line,
-`job create --config` and `worker --config` read it (see the
-[README](../README.md#crawl-jobs-on-the-command-line)); a worker needs no
-file when `CRAWLER_DATABASE_URL` is set.
+`job create --config`, `worker --config` and `report --config` read it
+(see the [README](../README.md#crawl-jobs-on-the-command-line)); a worker
+and `report` need no file when `CRAWLER_DATABASE_URL` is set.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
 | `database_url` | string or `null` | `null` | `postgresql://user:password@host:5432/database`; `null` takes the one of `CRAWLER_DATABASE_URL`. A secret: never shown in messages |
 | `lease_seconds` | number, > 0 | `60.0` | a page of a worker that stopped is crawled again after this long |
-| `heartbeat_seconds` | number, > 0 | `20.0` | how often a worker renews the leases of its pages; less than `lease_seconds` |
+| `heartbeat_seconds` | number, > 0 | `20.0` | how often a worker renews the leases of its pages and its own; less than `lease_seconds` |
 | `max_attempts` | whole number, >= 1 | `3` | leases of a page that may expire before it fails |
 | `poll_interval` | number, > 0 | `1.0` | how often a worker with no page looks for one at least |
 

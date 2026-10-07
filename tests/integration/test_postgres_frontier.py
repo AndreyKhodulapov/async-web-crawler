@@ -16,7 +16,7 @@ import asyncpg
 import pytest
 from helpers import POSTGRES_DSN, DatabaseLink, drop_frontier_tables, make_job
 
-from crawler import Admission, FrontierPage, HostFailures, JobError, Outcome, PostgresFrontier
+from crawler import Admission, FrontierPage, GivenUp, HostFailures, JobError, Outcome, PostgresFrontier
 
 pytestmark = pytest.mark.postgres
 
@@ -58,7 +58,7 @@ async def fetch(query: str, *parameters: object) -> list[asyncpg.Record]:
 
 
 async def row_of(url: str) -> asyncpg.Record:
-    (row,) = await fetch("SELECT state, worker, attempts, reason FROM frontier WHERE url = $1", url)
+    (row,) = await fetch("SELECT state, worker, attempts, reason, error FROM frontier WHERE url = $1", url)
     return row
 
 
@@ -523,11 +523,17 @@ class TestHostFailures:
         frontier = await open_frontier("worker")
         await frontier.seed(["http://a/1"])
 
-        await frontier.give_up_host("a", Outcome.FAILED, "circuit breaker of a opened 3 times")
+        await frontier.give_up_host(
+            "a", Outcome.FAILED, "circuit breaker of a opened 3 times", error="CircuitOpenError"
+        )
         await frontier.give_up_host("a", Outcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)")
 
         row = await row_of("http://a/1")
-        assert (row["state"], row["reason"]) == ("failed", "circuit breaker of a opened 3 times")
+        assert (row["state"], row["reason"], row["error"]) == (
+            "failed",
+            "circuit breaker of a opened 3 times",
+            "CircuitOpenError",
+        )
 
     async def test_page_of_a_host_given_up_is_handed_out_with_its_outcome_however_long_the_host_is_held(
         self, open_frontier
@@ -536,7 +542,7 @@ class TestHostFailures:
         await first.seed(["http://a/1", "http://a/2"])
         taken = await take(first)
         await first.hold_host("a", 60, "circuit breaker of a is open")
-        await second.give_up_host("a", Outcome.FAILED, "circuit breaker of a opened 3 times")
+        await second.give_up_host("a", Outcome.FAILED, "circuit breaker of a opened 3 times", error="CircuitOpenError")
         # Put back by its worker, which did not know the host was given up; or found later.
         await first.put_back(taken, uncount=False)
         await second.add(["http://a/3"], depth=1)
@@ -545,7 +551,7 @@ class TestHostFailures:
 
         assert [page.url for page in pages] == ["http://a/1", "http://a/3"]
         assert [second.given_up(page) for page in pages] == [
-            (Outcome.FAILED, "circuit breaker of a opened 3 times")
+            GivenUp(Outcome.FAILED, "circuit breaker of a opened 3 times", "CircuitOpenError")
         ] * 2
         # Its turn did not move: it is still held as long as it was.
         assert 59 < (await host_of("a"))["left"] <= 60

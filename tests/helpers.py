@@ -57,7 +57,7 @@ async def drop_frontier_tables() -> None:
     connection = await asyncpg.connect(POSTGRES_DSN)
     try:
         await connection.execute(
-            "DROP TABLE IF EXISTS out_of_scope, job_scope, hosts, frontier, crawl_jobs;"
+            "DROP TABLE IF EXISTS out_of_scope, job_scope, workers, hosts, frontier, crawl_jobs;"
             " DROP SEQUENCE IF EXISTS frontier_seq"
         )
     finally:

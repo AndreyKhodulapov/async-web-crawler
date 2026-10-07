@@ -1357,7 +1357,8 @@ class SharedMemoryFrontier(MemoryFrontier):
     hands it out. It counts the failures of hosts in `failures`, as other
     processes would have too, keeps what it was told in `told` (host,
     circuit openings, robots.txt failures, robots.txt read), the hosts
-    given up in `given_up_hosts` and the intervals of hosts in `intervals`.
+    given up in `given_up_hosts` (host, outcome, reason, error) and the
+    intervals of hosts in `intervals`.
     """
 
     shared = True
@@ -1368,7 +1369,7 @@ class SharedMemoryFrontier(MemoryFrontier):
         self.put_backs: list[tuple[str, bool, bool]] = []
         self.failures: dict[str, HostFailures] = {}
         self.told: list[tuple[str, int, int, bool]] = []
-        self.given_up_hosts: list[tuple[str, PageOutcome, str]] = []
+        self.given_up_hosts: list[tuple[str, PageOutcome, str, str | None]] = []
         self.intervals: list[tuple[str, float]] = []
         self._held_until: dict[str, float] = {}
 
@@ -1385,8 +1386,8 @@ class SharedMemoryFrontier(MemoryFrontier):
         )
         return self.failures[host]
 
-    async def give_up_host(self, host: str, outcome: PageOutcome, reason: str) -> None:
-        self.given_up_hosts.append((host, outcome, reason))
+    async def give_up_host(self, host: str, outcome: PageOutcome, reason: str, *, error: str | None = None) -> None:
+        self.given_up_hosts.append((host, outcome, reason, error))
 
     async def hold_host(self, host: str, seconds: float, reason: str | None) -> None:
         self.holds.append((host, seconds, reason))
@@ -1548,7 +1549,7 @@ class TestCrawlSharedFrontier:
         await crawler.crawl_frontier(frontier, ["http://a/1", "http://a/2"])
 
         assert fake_session.requested == ["http://a/robots.txt"]
-        assert frontier.given_up_hosts == [("a", PageOutcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)")]
+        assert frontier.given_up_hosts == [("a", PageOutcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)", None)]
         assert set(crawler.unreachable_urls) == {"http://a/1", "http://a/2"}
 
     async def test_robots_txt_of_a_host_that_does_not_resolve_gives_it_up_for_all_processes_at_once(
@@ -1562,7 +1563,7 @@ class TestCrawlSharedFrontier:
 
         await crawler.crawl_frontier(frontier, ["http://a/1"])
 
-        ((host, outcome, reason),) = frontier.given_up_hosts
+        ((host, outcome, reason, _),) = frontier.given_up_hosts
         assert (host, outcome) == ("a", PageOutcome.UNREACHABLE)
         assert reason.startswith("robots.txt is unreachable (DNSError: ")
         assert frontier.failures["a"] == HostFailures(robots_failures=1)
@@ -1585,7 +1586,7 @@ class TestCrawlSharedFrontier:
 
         assert fake_session.requested == ["http://a/1"]
         reason = "circuit breaker of a opened 3 times, no more probes in this crawl"
-        assert frontier.given_up_hosts == [("a", PageOutcome.FAILED, reason)]
+        assert frontier.given_up_hosts == [("a", PageOutcome.FAILED, reason, "CircuitOpenError")]
         assert frontier.told == [("a", 1, 0, False)]
         assert set(crawler.failed_urls) == {"http://a/1", "http://a/2"}
 
@@ -1762,10 +1763,10 @@ class TestCrawlSharedFrontierFailures:
         class Failing(SharedMemoryFrontier):
             ERRORS = (Unreachable,)
 
-            async def finish(self, page, outcome, reason=None, *, uncount=False, pending_save=False):
+            async def finish(self, page, outcome, reason=None, **options):
                 if page.url == "http://a/2":
                     raise Unreachable("connection refused")
-                await super().finish(page, outcome, reason, uncount=uncount, pending_save=pending_save)
+                await super().finish(page, outcome, reason, **options)
 
         storage = MemoryStorage(batch_size=10)
         crawler = make_crawler(storage=storage, max_concurrent=1, max_depth=1)
@@ -1947,10 +1948,10 @@ class TestCrawlStorage:
         events: list[tuple[str, ...]] = []
 
         class Recording(MemoryFrontier):
-            async def finish(self, page, outcome, reason=None, *, uncount=False, pending_save=False):
+            async def finish(self, page, outcome, reason=None, **options):
                 if outcome is PageOutcome.PROCESSED:
-                    events.append(("pending save" if pending_save else "processed", page.url))
-                await super().finish(page, outcome, reason, uncount=uncount, pending_save=pending_save)
+                    events.append(("pending save" if options["pending_save"] else "processed", page.url))
+                await super().finish(page, outcome, reason, **options)
 
             async def saved(self, urls):
                 events.append(("saved", *urls))

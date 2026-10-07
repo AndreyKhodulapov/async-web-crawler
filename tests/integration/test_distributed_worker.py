@@ -30,7 +30,7 @@ from crawler import (
     RobotsParser,
 )
 from crawler.config import StorageOptions
-from crawler.distributed import create_job, run_worker
+from crawler.distributed import create_job, job_stats, run_worker
 
 pytestmark = pytest.mark.postgres
 
@@ -498,6 +498,9 @@ async def test_circuit_openings_of_all_workers_give_its_host_up(url, site):
     # The page of the last opening fails with its own error.
     assert sorted(row["reason"] == reason for row in rows) == [False, True, True, True, True]
     assert await urls_in("processed") == set(other)
+    # The pages refused fail as a crawl of one process fails them.
+    errors = (await job_stats(POSTGRES_DSN, "test"))["errors"]
+    assert (errors["CircuitOpenError"], sum(errors.values())) == (4, 5)
     assert await job_state() == "finished"
 
 

@@ -100,7 +100,10 @@ run against it; what it adds is what sharing needs.
   (the part of the configuration a job keeps, its limits and the counts
   they are checked against: pages requested, pages unfinished, links
   dropped), `frontier` (every URL of a job once: the primary key
-  `(job, url)` is the deduplication), `hosts` (when a host may be
+  `(job, url)` is the deduplication; a page finished keeps its worker,
+  the status and time of its response and the class of its error, for
+  the report), `workers` (when each worker started, its lease and the
+  time it ran), `hosts` (when a host may be
   requested next, its Crawl-delay and, if it is held back, why; how many of its pages
   were accepted and requested; its failures that count toward giving it
   up, and the outcome of a host given up),
@@ -358,6 +361,22 @@ run against it; what it adds is what sharing needs.
   row would make that row the one every worker of the job writes on
   every page. Instead the heartbeat (and `refresh_stats()`) counts the
   rows of the job by state; `requested` is also taken from `admit`.
+- **The report of a job is read from its tables.** Each worker counts
+  its own pages, as a local crawl does; the job has no process that saw
+  them all. So the worker passes what `CrawlerStats` records of a page
+  (the status, the time of the response, the class of the error) to
+  `finish`, which stores it in the row of the page, and `job_stats`
+  makes the statistics of the job with a few `GROUP BY` queries in one
+  read-only snapshot (REPEATABLE READ), while the workers go on. Equal
+  counts are ordered by name in byte order (`COLLATE "C"`), as Python
+  orders them, so the statistics of a job equal those of a local crawl
+  of the same pages. The workers are rows of their own: each joins with
+  its first `take` (the process that seeds a job takes nothing and is
+  no worker), renews its lease with its heartbeat and adds the time
+  since it was last seen to `active_seconds`. A worker whose lease ran
+  out without a stop is `lost`, and the pause of a worker run again
+  under its name is not counted. Reading the report costs the workers
+  nothing: no counter is written on their path.
 
 ## State of a unit of work
 
