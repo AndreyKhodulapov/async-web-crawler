@@ -169,7 +169,9 @@ JSON Lines; `docker compose stop worker` puts their pages back in the
 queue, and a worker the database failed is started again (up to 5
 times). The job is made once: to crawl it anew, `docker compose run --rm
 job job create --config /config/job.yaml --name books --restart`.
-`CRAWLER_JOB` names another job; `CRAWLER_POSTGRES_PORT` moves
+`CRAWLER_JOB` names another job; `CRAWLER_TARGET=js` builds and runs the
+image with Chromium, which the workers of a job that renders its pages
+need (without it they stop with exit code 2); `CRAWLER_POSTGRES_PORT` moves
 the port of PostgreSQL on the host if 5432 is taken; on Linux, create
 `./out` first and export `CRAWLER_USER=$(id -u):$(id -g)`. The recipe in
 the [configuration guide](docs/configuration.md#recipes) explains the
@@ -252,7 +254,7 @@ rendered, 1 failed, average 0.84s` (the average of the rendered ones).
 | 1 | no page was fetched, some could not be saved, or a directory, the log file, an output file or the database could not be opened; an output that cannot be opened is reported before anything is requested |
 | 2 | wrong options or configuration; nothing was requested or written |
 | 130 | interrupted with Ctrl-C |
-| 143 | stopped with SIGTERM (`docker stop`, systemd) |
+| 143 | stopped with SIGTERM (`docker stop`, systemd); not on Windows, where SIGTERM ends the process at once |
 
 A crawl interrupted with Ctrl-C or stopped with SIGTERM stops its requests,
 saves the pages fetched by then, writes the reports of them and prints the
@@ -302,7 +304,8 @@ progress line; at the end it prints a summary of the pages it crawled
 itself and exits with 0, even when the other workers crawled the rest.
 Exit code 1 is a job that does not exist, a database that cannot be reached
 or fails, or pages the storage could not save; 2 a wrong option or
-configuration. A worker stopped with Ctrl-C (130) or SIGTERM (143) writes
+configuration, or a job that renders its pages where Chromium is not
+installed (the worker takes none of them). A worker stopped with Ctrl-C (130) or SIGTERM (143) writes
 what its storage buffers and its reports, and queues the pages it had in
 progress again for the other workers; `job create` stopped leaves the job
 seeding, and `--resume` seeds it again. `report` reads the job from the

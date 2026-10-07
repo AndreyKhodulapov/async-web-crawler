@@ -59,11 +59,11 @@ def worker_file(tmp_path: Path, **sections) -> str:
     return write_yaml(tmp_path / "worker.yaml", data)
 
 
-async def start(tmp_path: Path, *argv: str) -> asyncio.subprocess.Process:
-    """The command line in a process of its own, with the database of the tests in CRAWLER_DATABASE_URL."""
+async def start(tmp_path: Path, *argv: str, env: dict[str, str] | None = None) -> asyncio.subprocess.Process:
+    """The command line in a process of its own, with the database of the tests in CRAWLER_DATABASE_URL and `env`."""
     return await asyncio.create_subprocess_exec(
         sys.executable, str(Path(main.__file__)), *argv,
-        cwd=tmp_path, env={**os.environ, "CRAWLER_DATABASE_URL": POSTGRES_DSN},
+        cwd=tmp_path, env={**os.environ, "CRAWLER_DATABASE_URL": POSTGRES_DSN, **(env or {})},
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )  # fmt: skip
 
@@ -145,6 +145,25 @@ async def test_worker_without_a_job_exits_with_1(tmp_path):
     )
 
     assert (code, errors) == (1, 'error: There is no crawl job named "missing"\n')
+
+
+async def test_worker_of_a_job_that_renders_its_pages_without_chromium_exits_with_2(url, site, tmp_path):
+    await create_job(make_config(urls=[url("/site/")], rendering={"mode": "always"}), "books", dsn=POSTGRES_DSN)
+
+    # Playwright looks for its browsers in an empty directory, as in the image without Chromium.
+    code, output, errors = await finish(
+        await start(
+            tmp_path, "worker", "--job", "books", "--config", worker_file(tmp_path),
+            env={"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path / "browsers")},
+        )
+    )  # fmt: skip
+
+    assert (code, output) == (2, "")
+    assert errors.startswith(
+        'error: Invalid configuration: crawl job "books": rendering.mode: Chromium is not installed'
+    )
+    assert site.hits.total() == 0
+    assert await urls_in("queued") == {url("/site/")}
 
 
 async def test_worker_stopped_with_sigterm_queues_its_pages_again_and_exits_with_143(url, site, tmp_path):

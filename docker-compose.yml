@@ -12,15 +12,18 @@
 #   docker compose up --scale worker=4 worker         # its workers, until no page is left
 #   docker compose run --rm job status --job books    # its progress
 #   docker compose run --rm job report --job books --report out/report.html
-# CRAWLER_JOB names another job for the workers. On Linux, create ./out
-# first and export CRAWLER_USER=$(id -u):$(id -g), so that they can write there.
+# CRAWLER_JOB names another job for the workers. CRAWLER_TARGET=js runs
+# them in the image with Chromium, for a job whose pages are rendered. On
+# Linux, create ./out first and export CRAWLER_USER=$(id -u):$(id -g), so
+# that they can write there.
 
 x-crawler: &crawler
   build:
     context: .
-    target: crawler
-  image: async-web-crawler
+    target: ${CRAWLER_TARGET:-crawler}
+  image: async-web-crawler:${CRAWLER_TARGET:-latest}
   init: true  # passes signals on and reaps the processes a browser leaves behind
+  shm_size: 1g  # Chromium needs more shared memory than the 64 MB of a container
   user: "${CRAWLER_USER:-10001:10001}"
   environment:
     CRAWLER_DATABASE_URL: postgresql://crawler:crawler@postgres:5432/crawler

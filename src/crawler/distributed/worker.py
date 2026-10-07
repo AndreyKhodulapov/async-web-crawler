@@ -15,6 +15,7 @@ from crawler.distributed.frontier import PostgresFrontier, worker_name
 from crawler.distributed.job import JOB_SECTIONS, config_differences, database_errors, job_config
 from crawler.distributed.schema import create_schema
 from crawler.exceptions import ConfigError, JobError
+from crawler.rendering import browser_problem
 from crawler.storage import storage_from_output
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,8 @@ async def run_worker(
     Raises:
         ConfigError: there is no database, a file of the storage is
             without "{worker}", or the part of the job cannot be used here,
-            such as rendering without Playwright.
+            such as rendering without Playwright or its Chromium; nothing
+            is taken.
         JobError: there is no crawl job of that name.
         FrontierError: the database cannot be reached or failed an operation.
         ValueError: `worker` cannot be a part of a file name.
@@ -81,6 +83,11 @@ async def run_worker(
     with database_errors(job):
         settings = await _job_settings(dsn, job)
     config = _worker_config(config, job, settings)
+    if config.rendering.mode != "off":
+        # Before the worker takes a page: without Chromium, every page it took would fail.
+        problem = await browser_problem()
+        if problem is not None:
+            raise ConfigError([f"rendering.mode: {problem}"], source=f'crawl job "{job}"')
     name = worker or worker_name()
     options = config.distributed
     async with AdvancedCrawler(config, configure_logging=configure_logging, worker=name) as crawler:

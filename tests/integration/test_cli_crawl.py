@@ -242,6 +242,16 @@ async def test_sigterm_stops_the_crawl_as_ctrl_c_does_and_leaves_no_handler(url,
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
 
 
+async def test_crawl_runs_where_the_event_loop_has_no_signal_handlers(url, site, config_file, monkeypatch):
+    def add_signal_handler(sig, callback, *args):
+        raise NotImplementedError  # as on Windows
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", add_signal_handler)
+
+    assert await run(build_config(parse_args(["--config", config_file(), "--max-depth", "0"])), progress=False) == 0
+    assert site.hits.total() == 1
+
+
 async def test_command_stopped_with_sigterm_saves_the_pages_and_exits_with_143(url, site, config_file, tmp_path):
     pages, stats_file = tmp_path / "pages.jsonl", tmp_path / "stats.json"
     process = await asyncio.create_subprocess_exec(

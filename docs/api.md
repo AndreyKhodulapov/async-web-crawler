@@ -954,7 +954,10 @@ was created with. The database is `distributed.database_url`, or the one of
 worker in the database and in its files; by default it is made of the host
 name, the process id and a random part. The pages are not kept in memory
 whatever `crawler.keep_pages` says: they go to the storage of the worker
-(a warning is logged if it has none).
+(a warning is logged if it has none). A job that renders its pages needs
+Chromium where its workers run: without it, `run_worker` raises
+`ConfigError` before it takes a page (`create_job` does not check, the
+workers may run elsewhere).
 
 A page is crawled at least once, not exactly once: the page of a worker
 that stopped goes back to the queue once its lease expires, and another

@@ -31,6 +31,7 @@ from crawler import (
 )
 from crawler.config import StorageOptions
 from crawler.distributed import create_job, job_stats, run_worker
+from crawler.distributed import worker as worker_module
 
 pytestmark = pytest.mark.postgres
 
@@ -836,6 +837,21 @@ async def test_connections_of_a_worker_are_those_of_its_configuration(url, site,
 
     assert [frontier._pool.get_max_size() for frontier in opened] == [2]
     assert await job_state() == "finished"
+
+
+async def test_worker_of_a_job_that_renders_its_pages_without_chromium_is_refused(url, site, monkeypatch):
+    await create_job(make_config(urls=[url("/site/")], rendering={"mode": "always"}), "test", dsn=POSTGRES_DSN)
+
+    async def browser_problem():
+        return "Chromium is not installed; run: playwright install chromium"
+
+    monkeypatch.setattr(worker_module, "browser_problem", browser_problem)
+    with pytest.raises(ConfigError, match='crawl job "test": rendering.mode: Chromium is not installed'):
+        await run_worker(worker_config(), "test", configure_logging=False)
+
+    assert site.hits.total() == 0
+    assert await urls_in("queued") == {url("/site/")}
+    assert await fetch("SELECT worker FROM workers") == []
 
 
 async def test_worker_of_a_job_that_does_not_exist_is_refused():

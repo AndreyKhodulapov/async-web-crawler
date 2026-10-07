@@ -513,7 +513,11 @@ async def run_status_command(config: CrawlerConfig, job: str, *, dsn: str, inter
 
 @contextlib.contextmanager
 def _stop_on_sigterm() -> Iterator[None]:
-    """Cancel the task running on SIGTERM, as Ctrl-C does; a second SIGTERM kills the process, as a second Ctrl-C does."""
+    """Cancel the task running on SIGTERM, as Ctrl-C does; a second SIGTERM kills the process, as a second Ctrl-C does.
+
+    On Windows nothing is done: its event loops have no signal handlers,
+    and SIGTERM there ends the process at once.
+    """
     loop, task = asyncio.get_running_loop(), asyncio.current_task()
     assert task is not None
 
@@ -521,7 +525,11 @@ def _stop_on_sigterm() -> Iterator[None]:
         loop.remove_signal_handler(signal.SIGTERM)
         task.cancel()
 
-    loop.add_signal_handler(signal.SIGTERM, stop)
+    try:
+        loop.add_signal_handler(signal.SIGTERM, stop)
+    except NotImplementedError:
+        yield
+        return
     try:
         yield
     finally:
