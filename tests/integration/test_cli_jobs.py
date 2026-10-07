@@ -1,4 +1,4 @@
-"""Integration tests: the commands `job create`, `worker` and `report` crawl a local site in processes of their own."""
+"""Integration tests: the commands `job create`, `worker`, `report` and `status` crawl a local site in processes of their own."""
 
 import asyncio
 import json
@@ -116,6 +116,14 @@ async def test_job_created_by_a_command_is_crawled_by_two_worker_processes_page_
     )
     assert sum(worker["pages"] for worker in stats["workers"].values()) == WIDE_PAGES
     assert "<h2>Workers</h2>" in (tmp_path / "out" / "report.html").read_text(encoding="utf-8")
+
+    # The job is finished: the line is printed once, with --watch too.
+    for watch in ([], ["--watch", "--interval", "0.1"]):
+        code, output, errors = await finish(await start(tmp_path, "status", "--job", "test", *watch))
+        assert code == 0, errors
+        assert output.startswith(f"[##########----------]  {WIDE_PAGES}% | {WIDE_PAGES}/100 pages, 0 failed |")
+        assert "| done | workers 0 | in progress 0 | queued 0 |" in output
+        assert output.count("\n") == 1
 
 
 async def test_job_create_with_a_name_taken_is_an_error_unless_the_job_is_resumed(url, tmp_path):

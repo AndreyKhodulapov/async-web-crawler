@@ -13,10 +13,10 @@ from crawler.distributed.schema import Connection, create_schema
 from crawler.exceptions import JobError
 from crawler.report import render_html, render_json
 
-# The states of the pages the statistics count, as `CrawlerStats` counts
-# them: a page pending its save is processed. Pages never requested, such as
+# The states of the pages finished, which the statistics count as
+# `CrawlerStats` does: a page pending its save is processed. Pages never requested, such as
 # those robots.txt disallows, are left out.
-_COUNTED = ["processed", "saving", "failed", "skipped"]
+FINISHED = ["processed", "saving", "failed", "skipped"]
 
 _JOB = """
 SELECT
@@ -125,11 +125,11 @@ async def _read_stats(connection: Connection, job: str, top_domains: int) -> dic
     if row is None:
         raise JobError(f'There is no crawl job named "{job}"')
     job_id = row["id"]
-    pages = await connection.fetchrow(_PAGES, job_id, _COUNTED)
+    pages = await connection.fetchrow(_PAGES, job_id, FINISHED)
     total = pages["successful"] + pages["failed"] + pages["skipped"]
     elapsed = float(row["elapsed"] or 0)
     workers = {}
-    for worker in await connection.fetch(_WORKERS, job_id, _COUNTED):
+    for worker in await connection.fetch(_WORKERS, job_id, FINISHED):
         worker_pages = worker["successful"] + worker["failed"] + worker["skipped"]
         active = float(worker["active_seconds"])
         workers[worker["worker"]] = {
@@ -152,9 +152,9 @@ async def _read_stats(connection: Connection, job: str, top_domains: int) -> dic
         "elapsed_seconds": elapsed,
         "pages_per_second": total / elapsed if elapsed > 0 else 0.0,
         "avg_response_time": float(pages["avg_response_time"]),
-        "status_codes": dict(await connection.fetch(_STATUS_CODES, job_id, _COUNTED)),
+        "status_codes": dict(await connection.fetch(_STATUS_CODES, job_id, FINISHED)),
         "errors": dict(await connection.fetch(_ERRORS, job_id)),
-        "top_domains": dict(await connection.fetch(_DOMAINS, job_id, _COUNTED, top_domains)),
+        "top_domains": dict(await connection.fetch(_DOMAINS, job_id, FINISHED, top_domains)),
         "started_at": _iso(row["started_at"]),
         "finished_at": _iso(row["finished_at"]),
         "queued": pages["queued"],

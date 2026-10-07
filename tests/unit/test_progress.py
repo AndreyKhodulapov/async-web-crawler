@@ -6,6 +6,7 @@ import io
 import pytest
 
 from crawler import CrawlStats, Progress, ProgressTracker, format_progress, show_progress
+from crawler.distributed import JobProgress, format_job_progress
 from crawler.progress import format_duration
 
 
@@ -166,6 +167,53 @@ class TestFormatProgress:
 
     def test_bar_is_full_only_at_100_percent(self):
         assert format_progress(make_progress(percent=99.9)).startswith("[###################-]  99%")
+
+
+def make_job_progress(**fields: object) -> JobProgress:
+    defaults = {
+        "state": "running",
+        "done": 9,
+        "total": 30,
+        "failed": 1,
+        "percent": 30.0,
+        "pages_per_second": 1.55,
+        "eta": 13.5,
+        "workers": 3,
+        "lost": 0,
+        "in_progress": 6,
+        "queued": 15,
+        "elapsed": 7.0,
+    }
+    return JobProgress(**defaults | fields)
+
+
+class TestFormatJobProgress:
+    def test_running_job(self):
+        assert format_job_progress(make_job_progress()) == (
+            "[######--------------]  30% | 9/30 pages, 1 failed | 1.6 pages/s | ETA 14s | "
+            "workers 3 | in progress 6 | queued 15 | 7s"
+        )
+
+    def test_lost_workers_are_named(self):
+        assert "| workers 2 (1 lost) |" in format_job_progress(make_job_progress(workers=2, lost=1))
+
+    def test_unknown_time_left(self):
+        assert "| ETA -- |" in format_job_progress(make_job_progress(pages_per_second=0.0, eta=None))
+
+    def test_seeding_job(self):
+        line = format_job_progress(make_job_progress(state="seeding", done=0, percent=0.0, workers=0, eta=None))
+        assert "| seeding |" in line
+        assert "ETA" not in line
+
+    def test_finished_job(self):
+        line = format_job_progress(make_job_progress(state="finished", done=30, percent=100.0, eta=0.0, workers=0))
+        assert line.startswith("[####################] 100% | 30/30 pages")
+        assert "| done |" in line
+        assert "ETA" not in line
+
+    def test_job_without_a_page_limit_has_no_bar(self):
+        line = format_job_progress(make_job_progress(total=None, percent=None, eta=None))
+        assert line.startswith("9 pages, 1 failed | 1.6 pages/s | ETA -- |")
 
 
 class FakeCrawler:

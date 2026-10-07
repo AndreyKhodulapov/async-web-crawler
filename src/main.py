@@ -10,6 +10,7 @@ Usage:
     python src/main.py job create --config config.yaml --name books
     python src/main.py worker --job books --config worker.yaml
     python src/main.py report --job books --stats-json stats.json --report report.html
+    python src/main.py status --job books --watch
 
 A crawl is set up by a configuration file (see config.example.yaml), by
 options, or by both: an option wins over the file. Logs and progress go to
@@ -19,13 +20,16 @@ A crawl job is a crawl that workers share through PostgreSQL. `job create`
 creates it by a configuration file, reads its sitemaps and queues its start
 URLs; `worker`, started in as many processes or containers as wanted, crawls
 its pages until none is left. `report` writes the statistics of the job, of
-all its workers together, to a JSON file and an HTML report, at any time.
+all its workers together, to a JSON file and an HTML report, at any time;
+`status` prints a line of its progress, updated until it is finished with
+`--watch`.
 The database is `distributed.database_url` of the configuration, or the
 CRAWLER_DATABASE_URL variable.
 
 Exit codes: 0 - the crawl ran, fetched pages and saved every page it should;
 a job was created; a worker crawled until no page of its job was left and
-saved every page it should; the reports of a job were written, 1 - no page was fetched, some could not be
+saved every page it should; the reports of a job were written; its
+progress was shown, 1 - no page was fetched, some could not be
 saved, a file or the database could not be opened or failed, or the crawl
 job is not as the command expects (the name is taken, there is none), 2 -
 wrong options or configuration, 130 - interrupted (Ctrl-C), 143 - stopped
@@ -54,20 +58,31 @@ from crawler import (
     show_progress,
 )
 from crawler.config import LOG_LEVELS
-from crawler.distributed import JobMode, create_job, export_job_stats, job_stats, run_worker
+from crawler.distributed import (
+    JobMode,
+    create_job,
+    export_job_stats,
+    format_job_progress,
+    job_progress,
+    job_stats,
+    run_worker,
+    watch_job,
+)
 from crawler.rendering import browser_problem
 from crawler.urls import hide_password
 
 # The commands of crawl jobs; without one, the arguments are those of a crawl of its own.
-COMMANDS = ("job", "worker", "report")
+COMMANDS = ("job", "worker", "report", "status")
+# Seconds between the updates of `status --watch`.
+WATCH_INTERVAL = 2.0
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Crawl websites: follow links from start URLs, save the pages, report statistics.",
         epilog="An option left out keeps the value of the configuration file, or the default without a file. "
-        "A crawl that workers share is run by the commands job create, worker and report: "
-        "see job create --help, worker --help and report --help.",
+        "A crawl that workers share is run by the commands job create, worker, report and status: "
+        "see job create --help, worker --help, report --help and status --help.",
     )
     parser.add_argument("--config", metavar="PATH", help="configuration file, YAML or JSON; see config.example.yaml")
     parser.add_argument(
@@ -217,7 +232,28 @@ def parse_command_args(argv: list[str]) -> argparse.Namespace:
     )
     report.add_argument("--stats-json", metavar="PATH", help="write the statistics of the job to a JSON file")
     report.add_argument("--report", metavar="PATH", help="write an HTML report with charts and the workers")
-    return parser.parse_args(argv)
+    status = commands.add_parser(
+        "status",
+        help="show the progress of a crawl job: percent, speed, time left, workers",
+        epilog="The speed is that of the last 30 seconds, the time left what the pages left to max_pages take at "
+        "that speed. With --watch the line is updated until the job is finished; Ctrl-C stops watching. The "
+        "database is distributed.database_url of the configuration, or the CRAWLER_DATABASE_URL variable.",
+    )
+    status.add_argument("--job", required=True, metavar="NAME", help="name of the crawl job")
+    status.add_argument(
+        "--config", metavar="PATH", help="configuration file, YAML or JSON: the database is read from it"
+    )
+    status.add_argument("--watch", action="store_true", help="update the line until the job is finished")
+    status.add_argument(
+        "--interval",
+        type=positive(float),
+        metavar="SECONDS",
+        help=f"seconds between the updates of --watch (default: {WATCH_INTERVAL:g})",
+    )
+    args = parser.parse_args(argv)
+    if args.command == "status" and args.interval is not None and not args.watch:
+        status.error("argument --interval: only with --watch")
+    return args
 
 
 def start_urls(args: argparse.Namespace) -> list[str] | None:
@@ -455,6 +491,23 @@ async def run_report_command(config: CrawlerConfig, job: str, *, dsn: str) -> in
     return 0
 
 
+async def run_status_command(config: CrawlerConfig, job: str, *, dsn: str, interval: float | None) -> int:
+    """Print the progress line of the crawl job `job`, every `interval` seconds until it is finished if given.
+
+    Returns the exit code.
+
+    Raises:
+        JobError: there is no crawl job of that name.
+        FrontierError: the database cannot be reached or failed.
+    """
+    if interval is None:
+        print(format_job_progress(await job_progress(dsn, job)))
+    else:
+        with _stop_on_sigterm():
+            await watch_job(dsn, job, interval=interval)
+    return 0
+
+
 @contextlib.contextmanager
 def _stop_on_sigterm() -> Iterator[None]:
     """Cancel the task running on SIGTERM, as Ctrl-C does; a second SIGTERM kills the process, as a second Ctrl-C does."""
@@ -497,6 +550,10 @@ def run_command(args: argparse.Namespace) -> int:
         elif args.command == "report":
             config = _report_config(args)
             command = run_report_command(config, args.job, dsn=config.distributed.dsn())
+        elif args.command == "status":
+            config = CrawlerConfig() if args.config is None else load_config(args.config)
+            interval = (WATCH_INTERVAL if args.interval is None else args.interval) if args.watch else None
+            command = run_status_command(config, args.job, dsn=config.distributed.dsn(), interval=interval)
         else:
             overrides = {} if args.concurrency is None else {"crawler": {"max_concurrent": args.concurrency}}
             config = CrawlerConfig.from_dict(overrides) if args.config is None else load_config(args.config, overrides)

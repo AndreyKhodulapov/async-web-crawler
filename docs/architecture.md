@@ -102,7 +102,8 @@ run against it; what it adds is what sharing needs.
   dropped), `frontier` (every URL of a job once: the primary key
   `(job, url)` is the deduplication; a page finished keeps its worker,
   the status and time of its response and the class of its error, for
-  the report), `workers` (when each worker started, its lease and the
+  the report, and the moment it was finished, for the speed of the
+  job), `workers` (when each worker started, its lease and the
   time it ran), `hosts` (when a host may be
   requested next, its Crawl-delay and, if it is held back, why; how many of its pages
   were accepted and requested; its failures that count toward giving it
@@ -390,6 +391,15 @@ run against it; what it adds is what sharing needs.
   out without a stop is `lost`, and the pause of a worker run again
   under its name is not counted. Reading the report costs the workers
   nothing: no counter is written on their path.
+- **The speed of a job is read from when its pages finished.** The local
+  progress line measures its speed between the snapshots it took over
+  the last seconds; `status` is one query by a process that saw nothing
+  before, and the average since the first worker started counts the
+  pauses of a job stopped and resumed. So `finish` stamps the row of a
+  page with `finished_at`, and `job_progress` counts the pages requested
+  and finished in the last 30 seconds (of the job, if it has ended). A
+  job no worker runs has a speed of 0 and no time left, instead of the
+  average of a crawl long gone.
 
 ## State of a unit of work
 

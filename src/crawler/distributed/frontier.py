@@ -128,6 +128,7 @@ WITH expired AS (
     SET state = CASE WHEN f.attempts + 1 >= $2 THEN 'failed' ELSE 'queued' END,
         reason = CASE WHEN f.attempts + 1 >= $2 THEN format('lease expired %s times', f.attempts + 1) END,
         error = CASE WHEN f.attempts + 1 >= $2 THEN 'LeaseExpired' END,
+        finished_at = CASE WHEN f.attempts + 1 >= $2 THEN now() END,
         status = NULL,
         elapsed = NULL,
         attempts = f.attempts + 1,
@@ -233,7 +234,7 @@ RETURNING true
 # was followed before the page went back, may be queued again.
 _FINISH_HOST_PAGES = """
 WITH finished AS (
-    UPDATE frontier SET state = $3, reason = $4, error = $5
+    UPDATE frontier SET state = $3, reason = $4, error = $5, finished_at = now()
     WHERE job = $1 AND host = $2 AND state = 'queued'
     RETURNING url
 ), unseen AS (
@@ -318,9 +319,10 @@ class PostgresFrontier(Frontier):
     by the worker that takes them. Once nothing is left to hand out and no page
     is in progress, the job is finished; so it is once max_pages pages are
     requested and done. A page finished keeps the status and time of its
-    response and the class of its error, and a worker joins the table of
-    workers with its first `take` and counts its time there, for the
-    report of the job (see `job_stats`).
+    response, the class of its error and the moment it was finished, and
+    a worker joins the table of workers with its first `take` and counts
+    its time there, for the report and the progress of the job (see
+    `job_stats` and `job_progress`).
 
     Times are those of the database clock. `take` waits by polling, at
     least every `poll_interval` seconds, and at once after an operation of
@@ -626,7 +628,7 @@ class PostgresFrontier(Frontier):
                 await connection.execute(
                     "UPDATE frontier SET state = $3, reason = $4, counted = counted AND NOT $5,"
                     " lease_until = CASE WHEN $3 = 'saving' THEN lease_until END,"
-                    " status = $6, elapsed = $7, error = $8"
+                    " status = $6, elapsed = $7, error = $8, finished_at = now()"
                     " WHERE job = $1 AND url = $2",
                     self.job_id,
                     page.url,

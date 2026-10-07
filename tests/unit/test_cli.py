@@ -10,7 +10,7 @@ import yaml
 
 import main
 from crawler import ConfigError, CrawlerConfig, FrontierError, JobError, StorageError
-from crawler.distributed import JobMode
+from crawler.distributed import JobMode, JobProgress, format_job_progress
 from crawler.stats import CrawlerStats
 from main import build_config, config_overrides, parse_args, parse_command_args
 
@@ -462,7 +462,9 @@ def test_help_of_a_crawl_names_the_commands_of_crawl_jobs(capsys):
     with pytest.raises(SystemExit):
         parse_args(["--help"])
 
-    assert "job create --help, worker --help and report --help" in " ".join(capsys.readouterr().out.split())
+    assert "job create --help, worker --help, report --help and status --help" in " ".join(
+        capsys.readouterr().out.split()
+    )
 
 
 def test_job_create_takes_a_configuration_and_a_name():
@@ -504,6 +506,9 @@ def test_worker_takes_a_job_and_optionally_the_rest():
         ["worker", "--job", "books", "--urls", "https://example.com/"],
         ["report"],
         ["report", "--job", "books", "--html", "report.html"],
+        ["status"],
+        ["status", "--job", "books", "--interval", "5"],
+        ["status", "--job", "books", "--watch", "--interval", "0"],
     ],
 )
 def test_invalid_commands_are_usage_errors(argv, monkeypatch, capsys):
@@ -576,6 +581,7 @@ def test_job_create_names_the_sitemaps_it_could_not_read(tmp_path, monkeypatch, 
         ["job", "create", "--config", "{path}", "--name", "books"],
         ["worker", "--job", "books", "--config", "{path}"],
         ["report", "--job", "books", "--config", "{path}", "--report", "report.html"],
+        ["status", "--job", "books", "--config", "{path}"],
     ],
 )
 def test_command_without_a_database_exits_with_2_before_anything_runs(command, tmp_path, monkeypatch, capsys):
@@ -583,6 +589,7 @@ def test_command_without_a_database_exits_with_2_before_anything_runs(command, t
     monkeypatch.setattr(main, "create_job", None)  # would fail if called
     monkeypatch.setattr(main, "AdvancedCrawler", None)
     monkeypatch.setattr(main, "job_stats", None)
+    monkeypatch.setattr(main, "job_progress", None)
     path = write_config(tmp_path, {"urls": ["https://example.com/"]})
 
     assert main.main([part.replace("{path}", path) for part in command]) == 2
@@ -800,3 +807,86 @@ def test_summary_of_a_report_counts_the_pages_of_all_workers(tmp_path, monkeypat
     assert "Pages: 5 (4 successful, 1 failed, 0 skipped)" in summary
     assert "Workers: w-1 (running, 4 pages, 2.0 pages/s), w-2 (lost, 1 pages, 0.5 pages/s)\n" in summary
     assert "Left: 7 pages queued, 2 in progress\n" in summary
+
+
+def job_progress_of(**changes):
+    fields = {
+        "state": "running",
+        "done": 30,
+        "total": 100,
+        "failed": 2,
+        "percent": 30.0,
+        "pages_per_second": 5.0,
+        "eta": 14.0,
+        "workers": 2,
+        "lost": 0,
+        "in_progress": 4,
+        "queued": 66,
+        "elapsed": 6.0,
+    }
+    return JobProgress(**fields | changes)
+
+
+def test_status_takes_a_job_and_optionally_watches():
+    args = parse_command_args(["status", "--job", "books"])
+    assert (args.command, args.job, args.config, args.watch, args.interval) == ("status", "books", None, False, None)
+
+    args = parse_command_args(["status", "--job", "books", "--config", "c.yaml", "--watch", "--interval", "0.5"])
+    assert (args.config, args.watch, args.interval) == ("c.yaml", True, 0.5)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code"),
+    [
+        (job_progress_of(), 0),
+        (JobError('There is no crawl job named "books"'), 1),
+        (FrontierError("the database of crawl job books failed: OSError: refused"), 1),
+        (KeyboardInterrupt(), 130),
+    ],
+)
+def test_status_prints_the_progress_line_of_the_job(outcome, code, monkeypatch, capsys):
+    seen = {}
+
+    async def job_progress(dsn, job):
+        seen.update(dsn=dsn, job=job)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(main, "job_progress", job_progress)
+    monkeypatch.setattr(main, "watch_job", None)  # would fail if called
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)
+
+    assert main.main(["status", "--job", "books"]) == code
+
+    assert seen == {"dsn": DSN, "job": "books"}
+    captured = capsys.readouterr()
+    assert captured.out == (f"{format_job_progress(outcome)}\n" if code == 0 else "")
+    assert captured.err == (f"error: {outcome}\n" if code == 1 else "")
+
+
+@pytest.mark.parametrize(
+    ("options", "interval", "outcome", "code"),
+    [
+        ([], 2.0, None, 0),
+        (["--interval", "0.5"], 0.5, None, 0),
+        ([], 2.0, JobError('There is no crawl job named "books"'), 1),
+        ([], 2.0, KeyboardInterrupt(), 130),
+        ([], 2.0, asyncio.CancelledError(), 143),
+    ],
+)
+def test_status_watch_follows_the_job_until_it_is_finished(options, interval, outcome, code, tmp_path, monkeypatch):
+    seen = {}
+
+    async def watch_job(dsn, job, *, interval):
+        seen.update(dsn=dsn, job=job, interval=interval)
+        if outcome is not None:
+            raise outcome
+
+    monkeypatch.setattr(main, "watch_job", watch_job)
+    monkeypatch.setattr(main, "job_progress", None)  # would fail if called
+    path = write_config(tmp_path, {"distributed": {"database_url": DSN}})
+
+    assert main.main(["status", "--job", "books", "--config", path, "--watch", *options]) == code
+
+    assert seen == {"dsn": DSN, "job": "books", "interval": interval}

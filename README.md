@@ -212,12 +212,14 @@ A crawl job is one crawl that workers share through PostgreSQL (see
 configuration, creates the job, reads its sitemaps and queues its start
 URLs; `worker`, started in as many processes or containers as you like,
 crawls its pages until none is left; `report` writes the statistics of
-the whole job, of all its workers, at any time.
+the whole job, of all its workers, at any time; `status` shows how far it
+has got.
 
 ```bash
 export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
 python src/main.py job create --config config.yaml --name books
 python src/main.py worker --job books --config worker.yaml --concurrency 20   # in each of several terminals
+python src/main.py status --job books --watch
 python src/main.py report --job books --stats-json out/stats.json --report out/report.html
 ```
 
@@ -234,6 +236,9 @@ python src/main.py report --job books --stats-json out/stats.json --report out/r
 | `report --job NAME` | the job to report on, finished or still running |
 | `report --stats-json PATH`, `--report PATH` | the statistics of the job as JSON, an HTML report with charts and a table of the workers; without them, `report.stats_json` and `report.html` of the configuration |
 | `report --config PATH` | configuration with the database and the `report` section (`title`, `top_domains`, the files) |
+| `status --job NAME` | print a line of the progress of the job: percent of `max_pages`, speed, time left, workers |
+| `status --watch` | update the line until the job is finished; `--interval SECONDS` between the updates (default 2) |
+| `status --config PATH` | configuration with the database |
 
 The database is `distributed.database_url` of the configuration or the
 `CRAWLER_DATABASE_URL` variable; it is not an option, which would show its
@@ -249,7 +254,18 @@ seeding, and `--resume` seeds it again. `report` reads the job from the
 database: the pages of all workers, each worker's pages per second and
 state (`running`, `stopped`, or `lost` if it was killed), and prints a
 summary; it exits with 1 if there is no such job or a report cannot be
-written, with 2 if there is no file to write.
+written, with 2 if there is no file to write. `status` prints the line of
+the whole job to stdout:
+
+```
+[########------------]  40% | 400/1000 pages, 3 failed | 12.5 pages/s | ETA 48s | workers 3 (1 lost) | in progress 12 | queued 350 | 32s
+```
+
+The speed is that of the pages finished in the last 30 seconds, by any
+worker, so it falls to 0 while no worker runs; `seeding` and `done` stand
+for the time left before the first worker can start and after the end.
+With `--watch` the line is redrawn in place in a terminal, or printed
+again in a pipe, until the job is finished; Ctrl-C stops watching (130).
 
 ## Usage from Python
 
@@ -575,6 +591,7 @@ src/
     ├── distributed/
     │   ├── frontier.py     # PostgresFrontier: the frontier of a crawl job shared by workers — leases, heartbeat, host turns
     │   ├── job.py          # create_job: a crawl job created, seeded, resumed or restarted
+    │   ├── progress.py     # job_progress, watch_job: the progress line of a crawl job, of all its workers
     │   ├── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, workers, job_scope, out_of_scope
     │   ├── stats.py        # job_stats, export_job_stats: the statistics and reports of a crawl job, of all its workers
     │   └── worker.py       # run_worker: a worker of a crawl job, its configuration and its files

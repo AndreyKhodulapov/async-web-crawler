@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 # went back to wait for its host. A URL only seen, the target of a
 # redirect, keeps in `seen_from` the page whose redirect led to it. A page
 # finished keeps, for the report of the job, the status and the time of
-# its response, if it got one, and the error it failed with.
+# its response, if it got one, and the error it failed with; and, for
+# the speed of the job, the moment it was finished.
 _FRONTIER = """
 CREATE TABLE IF NOT EXISTS frontier (
     job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS frontier (
     status INTEGER,
     elapsed DOUBLE PRECISION,
     error TEXT,
+    finished_at TIMESTAMPTZ,
     seen_from TEXT,
     PRIMARY KEY (job, url)
 )

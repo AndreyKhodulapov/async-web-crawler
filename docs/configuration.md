@@ -431,9 +431,10 @@ job (see [Crawl jobs](api.md#crawl-jobs)).
 The database of the crawl jobs and how a worker holds its pages; see
 [Crawl jobs](api.md#crawl-jobs). Each worker has its own section: it is not
 a part of the job, and a crawl of its own ignores it. On the command line,
-`job create --config`, `worker --config` and `report --config` read it
-(see the [README](../README.md#crawl-jobs-on-the-command-line)); a worker
-and `report` need no file when `CRAWLER_DATABASE_URL` is set.
+`job create --config`, `worker --config`, `report --config` and
+`status --config` read it (see the
+[README](../README.md#crawl-jobs-on-the-command-line)); a worker,
+`report` and `status` need no file when `CRAWLER_DATABASE_URL` is set.
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
