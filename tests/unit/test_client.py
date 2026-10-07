@@ -24,6 +24,7 @@ from crawler import (
     DNSError,
     FetchResult,
     FetchTimeoutError,
+    HostFailures,
     HTMLParser,
     HTTPStatusError,
     InvalidURLError,
@@ -1352,7 +1353,10 @@ class SharedMemoryFrontier(MemoryFrontier):
     It keeps the holds it is told of in `holds` and the pages put back in
     `put_backs` (URL, uncount, waited), and a page put back while its host
     is held comes back when the hold ends, as a frontier in a database
-    hands it out.
+    hands it out. It counts the failures of hosts in `failures`, as other
+    processes would have too, keeps what it was told in `told` (host,
+    circuit openings, robots.txt failures, robots.txt read) and the hosts
+    given up in `given_up_hosts`.
     """
 
     shared = True
@@ -1361,7 +1365,23 @@ class SharedMemoryFrontier(MemoryFrontier):
         super().__init__(**options)
         self.holds: list[tuple[str, float, str | None]] = []
         self.put_backs: list[tuple[str, bool, bool]] = []
+        self.failures: dict[str, HostFailures] = {}
+        self.told: list[tuple[str, int, int, bool]] = []
+        self.given_up_hosts: list[tuple[str, PageOutcome, str]] = []
         self._held_until: dict[str, float] = {}
+
+    async def count_host_failures(
+        self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
+    ) -> HostFailures:
+        self.told.append((host, circuit_openings, robots_failures, robots_read))
+        known = self.failures.get(host, HostFailures())
+        self.failures[host] = HostFailures(
+            known.circuit_openings + circuit_openings, (0 if robots_read else known.robots_failures) + robots_failures
+        )
+        return self.failures[host]
+
+    async def give_up_host(self, host: str, outcome: PageOutcome, reason: str) -> None:
+        self.given_up_hosts.append((host, outcome, reason))
 
     async def hold_host(self, host: str, seconds: float, reason: str | None) -> None:
         self.holds.append((host, seconds, reason))
@@ -1491,6 +1511,105 @@ class TestCrawlSharedFrontier:
         assert set(pages) == {"http://c/1"}
         assert frontier.put_backs == []
         assert fake_session.requested.count("http://c/1") == 1
+
+    async def test_robots_txt_read_after_it_failed_counts_its_failures_in_the_crawl_from_zero(
+        self, make_crawler, fake_session
+    ):
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = [
+            FakeResponse(status=503),
+            FakeResponse(b"", content_type="text/plain"),
+        ]
+        frontier = SharedMemoryFrontier()
+
+        pages = await crawler.crawl_frontier(frontier, ["http://a/1"])
+
+        assert list(pages) == ["http://a/1"]
+        assert frontier.told == [("a", 0, 1, False), ("a", 0, 0, True)]
+        assert frontier.failures["a"] == HostFailures()
+
+    async def test_robots_txt_that_failed_in_other_processes_too_gives_its_host_up_for_all_of_them(
+        self, make_crawler, fake_session
+    ):
+        # The other processes have downloaded it MAX_ROBOTS_RETRIES times:
+        # one more failure here is the last the crawl waits for.
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(status=503)
+        frontier = SharedMemoryFrontier()
+        frontier.failures["a"] = HostFailures(robots_failures=AsyncCrawler.MAX_ROBOTS_RETRIES)
+
+        await crawler.crawl_frontier(frontier, ["http://a/1", "http://a/2"])
+
+        assert fake_session.requested == ["http://a/robots.txt"]
+        assert frontier.given_up_hosts == [("a", PageOutcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)")]
+        assert set(crawler.unreachable_urls) == {"http://a/1", "http://a/2"}
+
+    async def test_robots_txt_of_a_host_that_does_not_resolve_gives_it_up_for_all_processes_at_once(
+        self, make_crawler, fake_session
+    ):
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        fake_session.routes["http://a/robots.txt"] = aiohttp.ClientConnectorDNSError(
+            MagicMock(), socket.gaierror("Name or service not known")
+        )
+        frontier = SharedMemoryFrontier()
+
+        await crawler.crawl_frontier(frontier, ["http://a/1"])
+
+        ((host, outcome, reason),) = frontier.given_up_hosts
+        assert (host, outcome) == ("a", PageOutcome.UNREACHABLE)
+        assert reason.startswith("robots.txt is unreachable (DNSError: ")
+        assert frontier.failures["a"] == HostFailures(robots_failures=1)
+
+    async def test_circuit_that_opened_in_other_processes_too_gives_its_host_up_for_all_of_them(
+        self, make_crawler, fake_session
+    ):
+        # The circuits of the other processes have opened twice: the first
+        # failure here opens it the third time, and a/2 is not requested.
+        crawler = make_crawler(
+            max_concurrent=1,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.2),
+        )
+        fake_session.routes["http://a/1"] = aiohttp.ClientConnectionError("refused")
+        frontier = SharedMemoryFrontier()
+        frontier.failures["a"] = HostFailures(circuit_openings=AsyncCrawler.MAX_CIRCUIT_OPENINGS - 1)
+
+        await crawler.crawl_frontier(frontier, ["http://a/1", "http://a/2"])
+
+        assert fake_session.requested == ["http://a/1"]
+        reason = "circuit breaker of a opened 3 times, no more probes in this crawl"
+        assert frontier.given_up_hosts == [("a", PageOutcome.FAILED, reason)]
+        assert frontier.told == [("a", 1, 0, False)]
+        assert set(crawler.failed_urls) == {"http://a/1", "http://a/2"}
+
+    async def test_crawl_of_one_process_tells_its_frontier_of_no_failure_of_a_host(
+        self, make_crawler, fake_session, monkeypatch
+    ):
+        # The counts of its own breaker and robots.txt are those of the crawl.
+        told = []
+
+        async def tell(self, host, *args, **kwargs):
+            told.append(host)
+
+        monkeypatch.setattr(MemoryFrontier, "count_host_failures", tell)
+        monkeypatch.setattr(MemoryFrontier, "give_up_host", tell)
+        crawler = make_crawler(
+            respect_robots=True,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.05),
+        )
+        fake_session.routes["http://a/robots.txt"] = aiohttp.ClientConnectorDNSError(
+            MagicMock(), socket.gaierror("Name or service not known")
+        )
+        fake_session.routes["http://b/1"] = aiohttp.ClientConnectionError("refused")
+
+        await crawler.crawl(["http://a/1", "http://b/1"])
+
+        assert set(crawler.unreachable_urls) == {"http://a/1"}
+        assert set(crawler.failed_urls) == {"http://b/1"}
+        assert told == []
 
     async def test_crawl_of_one_process_waits_in_the_rate_limiter(self, make_crawler, fake_session, caplog):
         # Its frontier is not shared: the page waits for the host as before.

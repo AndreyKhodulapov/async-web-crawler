@@ -14,7 +14,7 @@ import asyncpg
 
 from crawler.distributed.schema import Connection, create_schema
 from crawler.exceptions import JobError
-from crawler.frontier import Admission, Frontier, FrontierPage, FrontierStats, Outcome
+from crawler.frontier import Admission, Frontier, FrontierPage, FrontierStats, HostFailures, Outcome
 from crawler.queue import queue_form
 from crawler.urls import get_host
 
@@ -29,9 +29,11 @@ logger = logging.getLogger(__name__)
 # otherwise nothing is taken and the worker looks again. Nothing is handed
 # out while the job is seeding. The version of the scope comes along, so
 # that the worker learns of a host that joined it before it crawls the page.
+# A host given up is ready however long it is held back, and keeps its
+# turn: its pages come with the outcome to finish them with, unrequested.
 _TAKE = """
 WITH page AS (
-    SELECT h.host, p.url
+    SELECT h.host, h.given_up_outcome, h.given_up_reason, p.url
     FROM hosts AS h
     CROSS JOIN LATERAL (
         SELECT f.url, f.depth, f.seq
@@ -40,7 +42,7 @@ WITH page AS (
         ORDER BY f.depth, f.seq
         LIMIT 1
     ) AS p
-    WHERE h.job = $1 AND h.next_allowed_at <= now()
+    WHERE h.job = $1 AND (h.next_allowed_at <= now() OR h.given_up_outcome IS NOT NULL)
         AND NOT EXISTS (
             SELECT FROM crawl_jobs AS j WHERE j.id = $1 AND (j.requested >= j.max_pages OR j.state = 'seeding')
         )
@@ -63,9 +65,17 @@ WITH page AS (
     UPDATE hosts AS h
     SET next_allowed_at = now() + make_interval(secs => $4)
     FROM leased
-    WHERE h.job = $1 AND h.host = leased.host
+    WHERE h.job = $1 AND h.host = leased.host AND h.given_up_outcome IS NULL
 )
-SELECT url, depth, waits, (SELECT scope_version FROM crawl_jobs WHERE id = $1) AS scope_version FROM leased
+SELECT
+    leased.url,
+    leased.depth,
+    leased.waits,
+    page.given_up_outcome,
+    page.given_up_reason,
+    (SELECT scope_version FROM crawl_jobs WHERE id = $1) AS scope_version
+FROM leased
+JOIN page ON page.url = leased.url
 """
 
 # What a worker that got no page waits for, if for anything.
@@ -75,7 +85,7 @@ SELECT
     j.max_pages IS NOT NULL AND j.requested >= j.max_pages AS closed,
     EXISTS (
         SELECT FROM hosts AS h
-        WHERE h.job = $1 AND h.next_allowed_at <= now() AND EXISTS (
+        WHERE h.job = $1 AND (h.next_allowed_at <= now() OR h.given_up_outcome IS NOT NULL) AND EXISTS (
             SELECT FROM frontier AS f
             WHERE f.job = $1 AND f.host = h.host AND f.state = 'queued' AND f.not_before <= now()
         )
@@ -91,7 +101,7 @@ SELECT
         (SELECT min(not_before) FROM frontier WHERE job = $1 AND state = 'queued' AND not_before > now()),
         (
             SELECT min(h.next_allowed_at) FROM hosts AS h
-            WHERE h.job = $1 AND h.next_allowed_at > now() AND EXISTS (
+            WHERE h.job = $1 AND h.next_allowed_at > now() AND h.given_up_outcome IS NULL AND EXISTS (
                 SELECT FROM frontier AS f WHERE f.job = $1 AND f.host = h.host AND f.state = 'queued'
             )
         ),
@@ -173,6 +183,37 @@ SET next_allowed_at = greatest(h.next_allowed_at, excluded.next_allowed_at),
     END
 """
 
+# The failures of a host one worker saw, added to those of the job; with
+# $5, robots.txt was read since the failures counted, which start from
+# zero. The host may have no pages yet: the target of a redirect, say.
+_COUNT_FAILURES = """
+INSERT INTO hosts AS h (job, host, circuit_openings, robots_failures)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (job, host) DO UPDATE
+SET circuit_openings = h.circuit_openings + excluded.circuit_openings,
+    robots_failures = CASE WHEN $5::boolean THEN 0 ELSE h.robots_failures END + excluded.robots_failures
+RETURNING circuit_openings, robots_failures
+"""
+
+# A host given up, unless it was already: the first outcome and reason stay.
+_GIVE_UP_HOST = """
+INSERT INTO hosts AS h (job, host, given_up_outcome, given_up_reason)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (job, host) DO UPDATE
+SET given_up_outcome = excluded.given_up_outcome, given_up_reason = excluded.given_up_reason
+WHERE h.given_up_outcome IS NULL
+RETURNING true
+"""
+
+_FINISH_HOST_PAGES = """
+WITH finished AS (
+    UPDATE frontier SET state = $3, reason = $4
+    WHERE job = $1 AND host = $2 AND state = 'queued'
+    RETURNING url
+)
+SELECT count(*) FROM finished
+"""
+
 # A worker that stops puts its pages in progress back; those pending their
 # save stay leased until their lease expires.
 _PUT_BACK_ALL = """
@@ -225,7 +266,9 @@ class PostgresFrontier(Frontier):
     processed with `pending_save` is `saving`, leased all the same, until
     `saved`. A host has one page taken every `host_interval` seconds,
     whichever worker takes it, and none while it is held back by
-    `hold_host`. Once nothing is left to hand out and no page
+    `hold_host`. The failures of a host count over the whole job; a host
+    given up has its pages finished, those queued at once and the others
+    by the worker that takes them. Once nothing is left to hand out and no page
     is in progress, the job is finished; so it is once max_pages pages are
     requested and done.
 
@@ -235,8 +278,9 @@ class PostgresFrontier(Frontier):
     heartbeat and by `refresh_stats`; `requested` is also brought up to
     date by `admit`. Workers never deadlock: an operation on a page locks
     its row, then the job, then the host; adding links locks the job and
-    inserts new rows only; `take` and the taking back of expired leases
-    skip the rows other workers hold (see docs/architecture.md).
+    inserts new rows only; giving a host up locks the job, the host, then
+    its pages queued; `take` and the taking back of expired leases skip
+    the rows other workers hold (see docs/architecture.md).
     """
 
     shared = True
@@ -270,6 +314,7 @@ class PostgresFrontier(Frontier):
         self._max_queued = None if max_pages is None else frontier_factor * max_pages
         self._max_host_queued = None if max_pages_per_host is None else frontier_factor * max_pages_per_host
         self._held: dict[str, int] = {}  # pages taken and not finished, with their waits
+        self._given_up: dict[str, tuple[Outcome, str]] = {}  # pages held whose host is given up
         self._counted: set[str] = set()  # pages held and counted toward the limits
         self._wakeup = asyncio.Event()
         # The heartbeat, saved and close each change many rows of this
@@ -413,6 +458,8 @@ class PostgresFrontier(Frontier):
                 row = await connection.fetchrow(_TAKE, self.job_id, self.worker, self.lease_seconds, self.host_interval)
                 if row is not None:
                     self._held[row["url"]] = row["waits"]
+                    if row["given_up_outcome"] is not None:
+                        self._given_up[row["url"]] = (Outcome(row["given_up_outcome"]), row["given_up_reason"])
                     if row["scope_version"] != self._scope_version:
                         await self._read_scope(connection)
                     return FrontierPage(row["url"], row["depth"])
@@ -624,6 +671,35 @@ class PostgresFrontier(Frontier):
         # for a take() or admit() that holds it, but takes part in no deadlock.
         await self._pool.execute(_HOLD_HOST, self.job_id, host, float(seconds), reason)
 
+    async def count_host_failures(
+        self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
+    ) -> HostFailures:
+        # A statement of its own on the host alone, as in hold_host.
+        row = await self._pool.fetchrow(
+            _COUNT_FAILURES, self.job_id, host, circuit_openings, robots_failures, robots_read
+        )
+        return HostFailures(row["circuit_openings"], row["robots_failures"])
+
+    async def give_up_host(self, host: str, outcome: Outcome, reason: str) -> None:
+        async with self._pool.acquire() as connection, connection.transaction():
+            # The job before the host, as a page in progress is finished:
+            # see the order of the locks in the docstring of the class.
+            await connection.execute("SELECT FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id)
+            if not await connection.fetchval(_GIVE_UP_HOST, self.job_id, host, outcome.value, reason):
+                return
+            finished = await connection.fetchval(_FINISH_HOST_PAGES, self.job_id, host, outcome.value, reason)
+            await connection.execute(
+                "UPDATE crawl_jobs SET unfinished = unfinished - $2 WHERE id = $1", self.job_id, finished
+            )
+        logger.warning(
+            "Gave up on %s for the whole job: %s; %d pages queued are %s", host, reason, finished, outcome.value
+        )
+        self._wakeup.set()
+
+    def given_up(self, page: FrontierPage) -> tuple[Outcome, str] | None:
+        self._check_held(page)
+        return self._given_up.get(page.url)
+
     def stats(self) -> FrontierStats:
         return self._stats
 
@@ -677,6 +753,7 @@ class PostgresFrontier(Frontier):
                 await self._finish_job(connection)
         finally:
             self._held.clear()
+            self._given_up.clear()
             self._counted.clear()
             self._wakeup.set()
             await self._pool.close()
@@ -823,6 +900,7 @@ class PostgresFrontier(Frontier):
 
     def _release(self, page: FrontierPage) -> None:
         self._held.pop(page.url, None)
+        self._given_up.pop(page.url, None)
         self._counted.discard(page.url)
 
     def _added(self, accepted: int, dropped: int, accepted_by_host: dict[str, int]) -> None:

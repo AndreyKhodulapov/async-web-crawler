@@ -16,6 +16,7 @@ from crawler import (
     ConfigError,
     CrawlerConfig,
     JobError,
+    Outcome,
     PostgresFrontier,
     RobotsParser,
 )
@@ -353,6 +354,87 @@ async def test_unreachable_robots_txt_holds_its_host_back_for_the_next_worker(ur
     assert any(path.startswith("/wide/") and moment - first < 2 for path, moment in site.log)
     assert site.robots_hits["127.0.0.1"] == 2
     assert await urls_in("processed") == {*held, *other}
+
+
+async def given_up(host: str) -> tuple[str | None, str | None]:
+    (row,) = await fetch("SELECT given_up_outcome, given_up_reason FROM hosts WHERE host = $1", host)
+    return row["given_up_outcome"], row["given_up_reason"]
+
+
+async def test_circuit_openings_of_all_workers_give_its_host_up(url, site):
+    # 127.0.0.1 fails every request, and the first failure opens the
+    # circuit of a worker. Each worker stops after its circuit opened once;
+    # the third opening, by the last one, gives the host up for the job.
+    failing = [url(f"/flaky/1000?page={n}") for n in range(5)]
+    other = [url(f"/wide/{n}", "localhost") for n in range(1, 5)]
+    job = make_config(
+        urls=[*failing, *other],
+        crawler={"max_depth": 0},
+        retry={"max_retries": 0},
+        circuit_breaker={"failure_threshold": 0.5, "min_requests": 1, "cooldown": 0.5},
+    )
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+    config = worker_config(crawler={"max_concurrent": 1})
+
+    for opened in range(1, AsyncCrawler.MAX_CIRCUIT_OPENINGS):
+
+        async def put_off(opened: int = opened) -> bool:
+            return site.hits["/flaky/1000"] == opened and not set(failing) & await urls_in("leased")
+
+        await run_worker_until(config, put_off)
+    await run_worker(config, "test", worker="last", configure_logging=False)
+
+    assert site.hits["/flaky/1000"] == AsyncCrawler.MAX_CIRCUIT_OPENINGS
+    reason = "circuit breaker of 127.0.0.1 opened 3 times, no more probes in this crawl"
+    assert await given_up("127.0.0.1") == ("failed", reason)
+    assert await urls_in("failed") == set(failing)
+    rows = await fetch("SELECT reason FROM frontier WHERE state = 'failed'")
+    # The page of the last opening fails with its own error.
+    assert sorted(row["reason"] == reason for row in rows) == [False, True, True, True, True]
+    assert await urls_in("processed") == set(other)
+    assert await job_state() == "finished"
+
+
+async def test_failed_downloads_of_robots_txt_by_all_workers_give_its_host_up(url, site, monkeypatch):
+    # robots.txt of 127.0.0.1 always answers 503. The first worker
+    # downloads it twice and stops; the next one twice more: the crawl
+    # waits for MAX_ROBOTS_RETRIES downloads after the first, whoever made them.
+    monkeypatch.setattr(RobotsParser, "UNREACHABLE_TTL", 0.3)
+    site.robots, site.robots_failures_by_host = "", {"127.0.0.1": 1000}
+    held, other, job = held_job(url, "/site/", crawler={"respect_robots": True})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+    config = worker_config(crawler={"max_concurrent": 1})
+
+    async def put_off_twice() -> bool:
+        return site.robots_hits["127.0.0.1"] == 2 and not set(held) & await urls_in("leased")
+
+    await run_worker_until(config, put_off_twice)
+    await run_worker(config, "test", worker="next", configure_logging=False)
+
+    assert site.robots_hits["127.0.0.1"] == 1 + AsyncCrawler.MAX_ROBOTS_RETRIES
+    assert not [path for path, _ in site.log if path.startswith("/site/")]
+    assert await given_up("127.0.0.1") == ("unreachable", "robots.txt is unreachable (HTTP 503)")
+    assert await urls_in("unreachable") == set(held)
+    assert await urls_in("processed") == set(other)
+
+
+async def test_page_of_a_host_given_up_found_later_is_finished_without_a_request(url, site):
+    await create_job(
+        make_config(urls=[url("/wide/1", "localhost")], crawler={"max_depth": 0}), "test", dsn=POSTGRES_DSN
+    )
+    frontier = await PostgresFrontier.open(POSTGRES_DSN, job="test", worker="seeder")
+    try:
+        await frontier.give_up_host("127.0.0.1", Outcome.FAILED, "circuit breaker of 127.0.0.1 opened 3 times")
+        await frontier.add([url("/site/a.html")], depth=1)
+    finally:
+        await frontier.close()
+
+    await run_worker(worker_config(), "test", worker="worker", configure_logging=False)
+
+    assert site.hits["/site/a.html"] == 0
+    (row,) = await fetch("SELECT state, reason FROM frontier WHERE url = $1", url("/site/a.html"))
+    assert (row["state"], row["reason"]) == ("failed", "circuit breaker of 127.0.0.1 opened 3 times")
+    assert await urls_in("processed") == {url("/wide/1", "localhost")}
 
 
 def count_calls(monkeypatch, cls: type, name: str, calls: Counter[str]) -> None:

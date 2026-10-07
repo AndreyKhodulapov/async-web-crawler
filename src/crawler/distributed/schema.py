@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS frontier (
 
 # Rate limit of a host for all the workers together. A host held back,
 # e.g. after a Retry-After, keeps the reason of the hold that ends last; it
-# says why the host waits while `next_allowed_at` is ahead.
+# says why the host waits while `next_allowed_at` is ahead. The failures
+# of all the workers count toward giving the host up; a host given up has
+# the outcome and reason its pages are finished with, unrequested.
 _HOSTS = """
 CREATE TABLE IF NOT EXISTS hosts (
     job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
@@ -69,6 +71,10 @@ CREATE TABLE IF NOT EXISTS hosts (
     hold_reason TEXT,
     accepted INTEGER NOT NULL DEFAULT 0,
     requested INTEGER NOT NULL DEFAULT 0,
+    circuit_openings INTEGER NOT NULL DEFAULT 0,
+    robots_failures INTEGER NOT NULL DEFAULT 0,
+    given_up_outcome TEXT CHECK (given_up_outcome IN ('failed', 'unreachable')),
+    given_up_reason TEXT,
     PRIMARY KEY (job, host)
 )
 """

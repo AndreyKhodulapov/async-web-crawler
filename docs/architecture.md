@@ -100,7 +100,8 @@ run against it; what it adds is what sharing needs.
   dropped), `frontier` (every URL of a job once: the primary key
   `(job, url)` is the deduplication), `hosts` (when a host may be
   requested next and, if it is held back, why; how many of its pages
-  were accepted and requested),
+  were accepted and requested; its failures that count toward giving it
+  up, and the outcome of a host given up),
   `job_scope` and `out_of_scope` (below). Workers take the limits from
   the job, not from their own configuration, so that they all count
   against the same ones.
@@ -190,6 +191,26 @@ run against it; what it adds is what sharing needs.
     workers where a local crawl sends one probe. robots.txt is downloaded
     by every worker, and held back for by host, though it belongs to an
     origin (`http` and `https` of a host are one host here).
+  - Giving a host up is the job's. The circuit openings of all workers
+    and their failed downloads of robots.txt count together in `hosts`.
+    A worker tells the database of the failures it has not told yet, in
+    one statement that adds them and returns the counts of the job; of
+    the workers that fail at once, one sees a count reach
+    `MAX_CIRCUIT_OPENINGS` or pass `MAX_ROBOTS_RETRIES`, and gives the
+    host up (`give_up_host`). A host name that does not resolve is given
+    up at its first failure. The queued pages of the host are finished
+    in one statement, failed or unreachable with the reason; a page of it
+    handed out later (put back, its lease expired, a link found since)
+    comes with that outcome, whatever the hold, and is finished without a
+    request. robots.txt read counts its failures from zero again: the
+    worker that read it says so when it sees a page of the host allowed,
+    or with its next failure; a read at the target of a redirect goes
+    unseen until then.
+  - The pages of a host that other workers have in progress when it is
+    given up are not called back: each costs at most one request. A
+    worker follows a redirect to a host given up for as long as its own
+    breaker and robots.txt let it: the database is not asked at every
+    redirect.
   - The pages of the host that are already taken are not called back. A
     worker that took one before the hold reached the database knows of
     the hold from its own rate limiter and puts the page back, holding
@@ -226,14 +247,17 @@ run against it; what it adds is what sharing needs.
 - **Locks in one order, and no waits where the order cannot be kept.**
   Every operation on a page locks the row of the page, then the job,
   then the host; adding links locks the job first and only inserts new
-  rows. `take` reads its page from the snapshot of its statement: another
+  rows. Giving a host up locks the job, the host, then its queued pages:
+  a worker that holds a page of the host waits for the job before it
+  locks anything else, and the page it holds is not queued in the
+  snapshot of the statement, which does not wait for it. `take` reads its page from the snapshot of its statement: another
   worker may have taken the page since and hold its row while it waits
   for the host `take` holds. So `take` locks the row of the page skipping
   too, and looks again a moment later if it was taken. The expired
   leases are taken back skipping the rows other workers hold. The stress
   check that found this deadlock (32 tasks in 4 workers, pages put off,
   given up and uncounted at random) now ends with the counts of the job
-  equal to those of its rows.
+  equal to those of its rows, and so does one that gives hosts up meanwhile.
 - **Waiting is polling.** A worker with nothing to take asks the
   database what it waits for: a page put off, a host's turn, a lease of
   another worker that may expire, and sleeps until the nearest of them,

@@ -15,7 +15,7 @@ import asyncpg
 import pytest
 from helpers import POSTGRES_DSN, drop_frontier_tables, make_job
 
-from crawler import Admission, FrontierPage, JobError, Outcome, PostgresFrontier
+from crawler import Admission, FrontierPage, HostFailures, JobError, Outcome, PostgresFrontier
 
 pytestmark = pytest.mark.postgres
 
@@ -385,6 +385,83 @@ class TestHoldHost:
         assert await still_waiting(frontier.take())
         (row,) = await fetch("SELECT accepted FROM hosts WHERE host = 'a'")
         assert row["accepted"] == 1
+
+
+class TestHostFailures:
+    async def test_failures_of_a_host_told_by_workers_add_up_over_the_job(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.seed(["http://a/1"])
+
+        assert await first.count_host_failures("a", circuit_openings=1) == HostFailures(1, 0)
+        assert await second.count_host_failures("a", circuit_openings=1, robots_failures=2) == HostFailures(2, 2)
+        # The target of a redirect may fail before any page of it is queued.
+        assert await second.count_host_failures("b", robots_failures=1) == HostFailures(0, 1)
+
+    async def test_robots_txt_read_counts_its_failures_from_zero(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.count_host_failures("a", circuit_openings=1, robots_failures=3)
+
+        failures = await second.count_host_failures("a", robots_failures=1, robots_read=True)
+
+        # The circuit openings stay.
+        assert failures == HostFailures(1, 1)
+
+    async def test_host_given_up_has_its_pages_queued_finished_and_the_job_may_end(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.seed(["http://a/1", "http://a/2", "http://a/3", "http://b/1"])
+        taken = await take(first)
+        assert taken.url == "http://a/1"
+
+        await second.give_up_host("a", Outcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)")
+
+        assert (await row_of("http://a/2"))["state"] == "unreachable"
+        assert (await row_of("http://a/3"))["reason"] == "robots.txt is unreachable (HTTP 503)"
+        # A page in progress is left to its worker.
+        assert (await row_of("http://a/1"))["state"] == "leased"
+        await first.finish(taken, Outcome.PROCESSED)
+        await second.finish(await take(second), Outcome.PROCESSED)
+        assert await second.take() is None
+        assert await job_state() == "finished"
+        (job,) = await fetch("SELECT unfinished FROM crawl_jobs")
+        assert job["unfinished"] == 0
+
+    async def test_host_given_up_keeps_the_outcome_it_was_first_given_up_with(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://a/1"])
+
+        await frontier.give_up_host("a", Outcome.FAILED, "circuit breaker of a opened 3 times")
+        await frontier.give_up_host("a", Outcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)")
+
+        row = await row_of("http://a/1")
+        assert (row["state"], row["reason"]) == ("failed", "circuit breaker of a opened 3 times")
+
+    async def test_page_of_a_host_given_up_is_handed_out_with_its_outcome_however_long_the_host_is_held(
+        self, open_frontier
+    ):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.seed(["http://a/1", "http://a/2"])
+        taken = await take(first)
+        await first.hold_host("a", 60, "circuit breaker of a is open")
+        await second.give_up_host("a", Outcome.FAILED, "circuit breaker of a opened 3 times")
+        # Put back by its worker, which did not know the host was given up; or found later.
+        await first.put_back(taken, uncount=False)
+        await second.add(["http://a/3"], depth=1)
+
+        pages = [await take(second), await take(second)]
+
+        assert [page.url for page in pages] == ["http://a/1", "http://a/3"]
+        assert [second.given_up(page) for page in pages] == [
+            (Outcome.FAILED, "circuit breaker of a opened 3 times")
+        ] * 2
+        # Its turn did not move: it is still held as long as it was.
+        assert 59 < (await host_of("a"))["left"] <= 60
+
+    async def test_page_of_a_host_not_given_up_is_handed_out_without_an_outcome(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://a/1"])
+        await frontier.count_host_failures("a", circuit_openings=2)
+
+        assert frontier.given_up(await take(frontier)) is None
 
 
 class TestMaxPages:

@@ -25,7 +25,7 @@ from crawler.exceptions import (
 )
 from crawler.fetching import Fetcher
 from crawler.filters import UrlFilter
-from crawler.frontier import Admission, Frontier, FrontierPage, Outcome
+from crawler.frontier import Admission, Frontier, FrontierPage, HostFailures, Outcome
 from crawler.models import CrawlStats, FetchResult, PageRecord, ParsedPage
 from crawler.parser import is_html_content_type
 from crawler.queue import queue_form
@@ -106,6 +106,10 @@ class CrawlRun:
         self._redirect_sources: dict[str, str] = {}  # redirect target -> the page that led to it
         self._failed_sitemaps: dict[str, str] = {}
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
+        # In a shared frontier: the failures of a host this process told it of, and the counts of the crawl it answered.
+        self._failures_told: dict[str, HostFailures] = {}
+        self._crawl_failures: dict[str, HostFailures] = {}
+        self._hosts_given_up: set[str] = set()  # hosts this process gave up in a shared frontier
         self._pages_to_save = 0
         self._written_before = 0
         self._pending_before = 0
@@ -374,6 +378,10 @@ class CrawlRun:
             url = page.url
             self._sync_scope(url_filter)
             try:
+                if (given_up := frontier.given_up(page)) is not None:
+                    # Its host was given up for the crawl, by this process or another one.
+                    await frontier.finish(page, *given_up)
+                    continue
                 # A host that asked to wait (Retry-After) or waits out the
                 # pause before a retry: the worker takes pages of other hosts
                 # meanwhile instead of waiting in the rate limiter.
@@ -390,6 +398,10 @@ class CrawlRun:
                     or await self._fetcher.check_robots(url, wait=self.ROBOTS_POLL)
                     or self._fetcher.check_circuit(url)
                 )
+                if frontier.shared:
+                    # robots.txt may have been read after it failed: the crawl
+                    # counts its failures from zero again.
+                    await self._host_failures(url)
                 if refusal is not None:
                     if isinstance(refusal, RobotsDisallowedError):
                         await frontier.finish(page, Outcome.BLOCKED, refusal.message)
@@ -670,7 +682,58 @@ class CrawlRun:
         opened = self.circuit_breaker.times_opened(host)
         if opened < self.MAX_CIRCUIT_OPENINGS:
             return None
-        return CircuitOpenError(url, f"circuit breaker of {host} opened {opened} times, no more probes in this crawl")
+        return CircuitOpenError(url, self._no_more_probes(host, opened))
+
+    @staticmethod
+    def _no_more_probes(host: str, opened: int) -> str:
+        return f"circuit breaker of {host} opened {opened} times, no more probes in this crawl"
+
+    async def _host_failures(self, url: str) -> HostFailures:
+        """The failures of the host of `url` that count toward giving it up; in a frontier shared by several processes, those of all of them.
+
+        This process tells the frontier of its failures it has not told
+        yet, and of robots.txt read since it told the last ones, which
+        counts them from zero. With nothing new to tell, the counts are those
+        the frontier answered last: the process whose failure brings a
+        count to a limit is the one that gives the host up (see `_give_up_host`).
+        """
+        host = get_host(url)
+        assert host is not None  # the frontier holds valid URLs only
+        here = HostFailures(
+            self.circuit_breaker.times_opened(host),
+            0 if self.robots is None else self.robots.failed_downloads(url),
+        )
+        if not self._frontier.shared:
+            return here
+        told = self._failures_told.get(host, HostFailures())
+        if here == told:
+            return self._crawl_failures.get(host, here)
+        # Told before the frontier answers: another task of this process
+        # that asks meanwhile must not tell the same failures again.
+        self._failures_told[host] = here
+        read = here.robots_failures < told.robots_failures
+        failures = await self._frontier.count_host_failures(
+            host,
+            circuit_openings=here.circuit_openings - told.circuit_openings,
+            robots_failures=here.robots_failures - (0 if read else told.robots_failures),
+            robots_read=read,
+        )
+        self._crawl_failures[host] = failures
+        return failures
+
+    async def _give_up_host(self, url: str, outcome: Outcome, reason: str) -> None:
+        """In a frontier shared by several processes, give the host of `url` up for all of them, once.
+
+        Its pages are finished with `outcome` and `reason`, unrequested,
+        whichever process takes them; in a crawl of one process each page
+        is refused as it is taken.
+        """
+        host = get_host(url)
+        assert host is not None  # a URL without a host is not requested
+        if not self._frontier.shared or host in self._hosts_given_up:
+            return
+        self._hosts_given_up.add(host)
+        await self._frontier.give_up_host(host, outcome, reason)
 
     def _warn_once_held_back(self, url: str, penalty: float) -> None:
         """Tell the user, once per host and crawl, about a Retry-After that holds the host back for long.
@@ -716,7 +779,7 @@ class CrawlRun:
         host = get_host(url)
         return 0.0 if host is None else self.rate_limiter.penalty_left(host)
 
-    def _robots_wait(self, url: str) -> float | None:
+    def _robots_wait(self, url: str, failed_downloads: int | None = None) -> float | None:
         """Seconds the crawl waits for the unreachable robots.txt of the site of `url` to be downloaded again; None to give up.
 
         A 5xx or a timeout on robots.txt is often a hiccup of a few seconds;
@@ -728,10 +791,13 @@ class CrawlRun:
         (a bad certificate, a host name that does not resolve): three
         minutes change nothing about a typo. The wait is `ROBOTS_POLL`
         when the download is due already: another task is making it, or
-        is about to, and nobody else waits for it.
+        is about to, and nobody else waits for it. `failed_downloads` are
+        those of the crawl, if not those of this process alone.
         """
         assert self.robots is not None  # asked after it refused a URL
-        if not self.robots.may_recover(url) or self.robots.failed_downloads(url) > self.MAX_ROBOTS_RETRIES:
+        if failed_downloads is None:
+            failed_downloads = self.robots.failed_downloads(url)
+        if not self.robots.may_recover(url) or failed_downloads > self.MAX_ROBOTS_RETRIES:
             # Nothing of the crawl downloads it again: a page that looks in
             # on the site later would otherwise make one more download.
             self.robots.give_up(url)
@@ -751,10 +817,14 @@ class CrawlRun:
         In a frontier shared by several processes, the site is held back
         for all of them while its robots.txt is known to be unreachable. A
         download still under way holds back the page alone: robots.txt may
-        well be read, and the other processes download their own.
+        well be read, and the other processes download their own. The
+        failed downloads of all of them count, and the site is given up
+        for all of them.
         """
-        delay = self._robots_wait(refusal.url)
+        failures = await self._host_failures(refusal.url)
+        delay = self._robots_wait(refusal.url, failures.robots_failures)
         if delay is None:
+            await self._give_up_host(refusal.url, Outcome.UNREACHABLE, self._unreachable_reason(refusal))
             return False
         assert self.robots is not None  # it refused the URL
         if self.robots.unreachable_for(refusal.url) > 0:
@@ -831,12 +901,18 @@ class CrawlRun:
         For a page that fails while the circuit is open, as one put off
         holds the host back (see `_defer_or_fail`). The breaker of each
         process is its own: the others would ask the host on otherwise.
+        Once the circuits of all of them have opened `MAX_CIRCUIT_OPENINGS`
+        times, the host is given up instead.
         """
         if not self._frontier.shared or (probe_in := self.circuit_breaker.probe_in(url)) == 0:
             return
         host = get_host(url)
         assert host is not None  # a URL without a host has no circuit
-        await self._fetcher.tell_host_held(host, probe_in, self.circuit_breaker.refusal(url))
+        opened = (await self._host_failures(url)).circuit_openings
+        if opened >= self.MAX_CIRCUIT_OPENINGS:
+            await self._give_up_host(url, Outcome.FAILED, self._no_more_probes(host, opened))
+        else:
+            await self._fetcher.tell_host_held(host, probe_in, self.circuit_breaker.refusal(url))
 
     def _outwaits_retries(self, error: FetchError | None) -> bool:
         """Whether `error` carries a Retry-After too long for the retry strategy, so the request was not retried.
@@ -919,14 +995,15 @@ class CrawlRun:
         In a frontier shared by several processes, the host is held back
         for all of them until the probe is due. A probe in flight holds
         back the page alone: when it ends is not known, and the circuits
-        of the other processes are their own.
+        of the other processes are their own. The openings of all of them
+        count, and the host is given up for all of them.
         """
         host = get_host(refusal.url)
         assert host is not None  # a URL without a host has no circuit
-        opened = self.circuit_breaker.times_opened(host)
+        opened = (await self._host_failures(refusal.url)).circuit_openings
         if opened >= self.MAX_CIRCUIT_OPENINGS:
             logger.info("Gave up on %s: circuit breaker of %s opened %d times", page.url, host, opened)
-            await self._hold_open_circuit(refusal.url)
+            await self._give_up_host(refusal.url, Outcome.FAILED, self._no_more_probes(host, opened))
             uncount = counted and not requested
             if result is not None and result.error is not None and result.error is not refusal:
                 await self._fail_page(page, result.error, result, uncount=uncount)

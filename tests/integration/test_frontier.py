@@ -6,7 +6,16 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 import pytest
 from helpers import POSTGRES_DSN, drop_frontier_tables, make_job
 
-from crawler import Admission, Frontier, FrontierPage, FrontierStats, MemoryFrontier, Outcome, PostgresFrontier
+from crawler import (
+    Admission,
+    Frontier,
+    FrontierPage,
+    FrontierStats,
+    HostFailures,
+    MemoryFrontier,
+    Outcome,
+    PostgresFrontier,
+)
 
 FrontierFactory = Callable[..., Awaitable[Frontier]]
 
@@ -476,6 +485,20 @@ class TestScope:
             await frontier.widen_scope(host, on_host(host))
 
         assert frontier.scope_hosts() == ["b", "a"]
+
+
+class TestHostFailures:
+    async def test_frontier_of_one_process_counts_no_failure_of_a_host_and_gives_none_up(self):
+        # The process refuses the pages of a host it gave up itself.
+        frontier = MemoryFrontier()
+        await frontier.seed(["http://a/1"])
+
+        assert await frontier.count_host_failures("a", circuit_openings=3, robots_failures=4) == HostFailures()
+        await frontier.give_up_host("a", Outcome.FAILED, "circuit breaker of a opened 3 times")
+
+        page = await take(frontier)
+        assert page == FrontierPage("http://a/1", 0)
+        assert frontier.given_up(page) is None
 
 
 class TestHoldHost:

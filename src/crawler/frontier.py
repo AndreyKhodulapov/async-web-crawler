@@ -54,6 +54,14 @@ class FrontierStats:
     links_dropped_by_host: int = 0  # links not queued: their host had its share queued
 
 
+@dataclass(frozen=True)
+class HostFailures:
+    """The failures of a host the crawl counts toward giving it up, see `Frontier.count_host_failures`."""
+
+    circuit_openings: int = 0
+    robots_failures: int = 0  # downloads of its robots.txt that failed since it was last read
+
+
 class Frontier(ABC):
     """The pages of one crawl to request, whoever requests them, and the limits on how many.
 
@@ -220,6 +228,36 @@ class Frontier(ABC):
         process does nothing: its host is held back by the rate limiter of
         that process, and its pages are put off with a delay of their own.
         """
+
+    async def count_host_failures(
+        self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
+    ) -> HostFailures:
+        """Add the failures of `host` a process saw to those of the crawl; the counts of the crawl after it.
+
+        `circuit_openings` counts the times its circuit opened anew,
+        `robots_failures` the downloads of its robots.txt that failed anew;
+        with `robots_read`, robots.txt was read since the failures told
+        before, and they are counted from zero. The counts are added in one
+        step: of the processes that count failures of a host at once, one
+        sees the count reach a limit, and gives the host up (see
+        `give_up_host`). A frontier of one process
+        counts nothing and returns zeros: the counts of that process are
+        those of the crawl.
+        """
+        return HostFailures()
+
+    async def give_up_host(self, host: str, outcome: Outcome, reason: str) -> None:
+        """Finish the pages of `host` queued, with `outcome` and `reason`, and so those accepted or put back later.
+
+        A page of the host taken later says so with `given_up`, to be
+        finished without a request. The first host given up keeps its
+        outcome and reason. A frontier of one process does nothing: that
+        process refuses the pages of the host itself.
+        """
+
+    def given_up(self, page: FrontierPage) -> tuple[Outcome, str] | None:
+        """The outcome and reason a page taken is to be finished with, unrequested, as its host is given up; None if it is not."""
+        return None
 
     async def close(self) -> None:
         """Release what the frontier holds, such as its connections; a frontier in memory holds nothing."""
