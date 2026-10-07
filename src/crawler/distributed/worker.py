@@ -57,7 +57,9 @@ async def run_worker(
     worker at once (`FrontierError`): what its storage buffers is written,
     and the pages it had in progress come back to the other workers once
     their leases expire. Running it again is the business of whatever
-    started it, such as a restart policy of the container.
+    started it, such as a restart policy of the container. Cancelled,
+    the worker writes what its storage buffers, queues the pages it had in
+    flight again, uncounted, closes the frontier and raises `CancelledError`.
 
     Raises:
         ConfigError: there is no database, a file of the storage is

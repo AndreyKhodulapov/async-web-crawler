@@ -906,7 +906,7 @@ stats = await run_worker(config, "shop")
 | `JobMode.RESTART` | deletes the job and its pages, then creates it anew |
 | `job_config(config)` | the part of a configuration the job keeps and every worker shares: the sections of `JOB_SECTIONS` (`urls`, `sitemaps`, `crawler`, `retry`, `circuit_breaker`, `filters`, `rendering`) without `crawler.max_concurrent` |
 | `PostgresFrontier.open(dsn, *, job, worker=None, ...)` | connects a worker to the job, with the limits of the job; `JobError` if there is no such job |
-| `run_worker(config, job, *, worker=None, configure_logging=True)` | crawls the pages of the job with `AdvancedCrawler.crawl_frontier` until none is left, then closes the frontier and the crawler; returns the statistics of this worker (`AdvancedCrawler.get_stats()`); `FrontierError` if the database fails |
+| `run_worker(config, job, *, worker=None, configure_logging=True)` | crawls the pages of the job with `AdvancedCrawler.crawl_frontier` until none is left, then closes the frontier and the crawler; returns the statistics of this worker (`AdvancedCrawler.get_stats()`); `FrontierError` if the database fails; cancelled, it writes the buffer of the storage, queues the pages it had in flight again and raises `CancelledError` |
 | `host_interval(config.crawler)` | the seconds between two pages of a host that the workers of a job take: `1 / rate_limit` or `min_delay`, whichever is longer, with `per_domain_rate`; 0 without it |
 
 A job is `seeding` while `create_job` fills it: workers started meanwhile
@@ -1006,6 +1006,13 @@ in progress come back to the other workers once their leases expire, and
 the worker is meant to be started again by whatever runs it. A failure of
 the heartbeat or of a call that only tells the others something
 (`saved`, `hold_host`, `set_host_interval`) is logged as a warning.
+
+A worker stopped, that is its task cancelled, as Ctrl-C and SIGTERM cancel
+the command line, leaves nothing to its leases: the crawl writes the buffer
+of the storage and the pages are `saved` while the frontier is still open,
+then `close` queues the pages it had in flight again, uncounted. The
+requests in flight are not finished. A buffer the storage cannot write is
+logged as an error, and its pages stay `saving` until their leases expire.
 
 ## Live progress
 

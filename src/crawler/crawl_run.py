@@ -181,6 +181,16 @@ class CrawlRun:
                 # The pages done so far are stored all the same; those in progress come back to others.
                 await self._flush_storage()
                 raise FrontierError(f"the frontier failed: {type(error).__name__}: {error}") from error
+            except asyncio.CancelledError:
+                if self.storage is not None:
+                    # Written while `on_settled` still stands: the pages of
+                    # the buffer are saved in the frontier before it is
+                    # closed, so that no other process crawls them again.
+                    logger.info(
+                        "The crawl is cancelled: writing the %d pages the storage buffers", self.storage.pending
+                    )
+                    await self._flush_storage()
+                raise
             await self._flush_storage()
             # A worker of a shared frontier stops only once the pages it did are stored.
             await self._wait_for_storage()

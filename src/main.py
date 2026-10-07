@@ -15,12 +15,16 @@ stderr, the summary to stdout.
 Exit codes: 0 - the crawl ran, fetched pages and saved every page it should,
 1 - no page was fetched, some could not be saved, or a file or the database
 could not be opened, 2 - wrong options or configuration, 130 - interrupted
-(Ctrl-C); the pages fetched by then are saved and reported.
+(Ctrl-C), 143 - stopped with SIGTERM (docker stop, systemd); the pages
+fetched by then are saved and reported.
 """
 
 import argparse
 import asyncio
+import contextlib
+import signal
 import sys
+from collections.abc import Iterator
 from typing import Any
 
 from cli_options import http_url, positive, proxy_url
@@ -233,8 +237,9 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
 
     Cancelled (Ctrl-C), it stops the crawl, writes the reports of the pages
     fetched so far, the cookies and those pages before the cancellation goes on.
-    So it does when the progress cannot be shown, e.g. stderr is a pipe
-    that was closed.
+    SIGTERM (`docker stop`, systemd) cancels it the same way; a second
+    SIGTERM kills the process. So it does when the progress cannot be
+    shown, e.g. stderr is a pipe that was closed.
 
     Raises:
         ConfigError: the file of `session.cookies_file` cannot be read, with
@@ -248,28 +253,46 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
         problem = await browser_problem()
         if problem is not None:
             raise ConfigError([f"rendering.mode: {problem}"])
-    async with AdvancedCrawler(config) as crawler:
-        crawl = asyncio.create_task(crawler.crawl())
-        try:
-            if progress:
-                await show_progress(crawler.crawler, crawl, config.crawler.max_pages)
-            await crawl
-        except BaseException as error:
-            # The crawl must stop before the crawler is closed under it.
-            crawl.cancel()
-            await asyncio.gather(crawl, return_exceptions=True)
-            if not isinstance(error, StorageError):
-                # A storage that could not be opened stopped the crawl before
-                # it requested anything: there is nothing to report.
-                crawler.write_reports()
-                crawler.save_cookies()
-            if isinstance(error, asyncio.CancelledError):
-                await crawler.close()  # writes the pages the storage still holds, so the summary counts them
-                print_summary(crawler, interrupted=True)
-            raise
-        print_summary(crawler)
-        # A page that could not be saved is a failure of the run too.
-        return 0 if crawler.get_stats()["successful"] and not crawler.crawler.crawl_stats().save_failed else 1
+    with _stop_on_sigterm():
+        async with AdvancedCrawler(config) as crawler:
+            crawl = asyncio.create_task(crawler.crawl())
+            try:
+                if progress:
+                    await show_progress(crawler.crawler, crawl, config.crawler.max_pages)
+                await crawl
+            except BaseException as error:
+                # The crawl must stop before the crawler is closed under it.
+                crawl.cancel()
+                await asyncio.gather(crawl, return_exceptions=True)
+                if not isinstance(error, StorageError):
+                    # A storage that could not be opened stopped the crawl before
+                    # it requested anything: there is nothing to report.
+                    crawler.write_reports()
+                    crawler.save_cookies()
+                if isinstance(error, asyncio.CancelledError):
+                    await crawler.close()  # writes the pages the storage still holds, so the summary counts them
+                    print_summary(crawler, interrupted=True)
+                raise
+            print_summary(crawler)
+            # A page that could not be saved is a failure of the run too.
+            return 0 if crawler.get_stats()["successful"] and not crawler.crawler.crawl_stats().save_failed else 1
+
+
+@contextlib.contextmanager
+def _stop_on_sigterm() -> Iterator[None]:
+    """Cancel the task running on SIGTERM, as Ctrl-C does; a second SIGTERM kills the process, as a second Ctrl-C does."""
+    loop, task = asyncio.get_running_loop(), asyncio.current_task()
+    assert task is not None
+
+    def stop() -> None:
+        loop.remove_signal_handler(signal.SIGTERM)
+        task.cancel()
+
+    loop.add_signal_handler(signal.SIGTERM, stop)
+    try:
+        yield
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -291,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except KeyboardInterrupt:
         return 130  # 128 + SIGINT, as a shell reports a program stopped by Ctrl-C
+    except asyncio.CancelledError:
+        return 143  # 128 + SIGTERM: only the signal cancels the run from outside
 
 
 if __name__ == "__main__":

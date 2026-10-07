@@ -1,5 +1,6 @@
 """Unit tests for the command line of the crawler: options, their priority over the configuration file, exit codes."""
 
+import asyncio
 import io
 import json
 import sys
@@ -404,6 +405,7 @@ def test_invalid_lines_of_the_urls_file_exit_with_2_before_anything_runs(tmp_pat
         (OSError("cannot open the log"), 1),
         (StorageError("pages.jsonl is not JSON Lines of this storage"), 1),
         (KeyboardInterrupt(), 130),
+        (asyncio.CancelledError(), 143),
     ],
 )
 def test_exit_code_follows_the_run(outcome, code, monkeypatch, capsys):

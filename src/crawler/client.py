@@ -742,6 +742,11 @@ class AsyncCrawler:
         after longer and longer pauses up to `MAX_STORAGE_PAUSE`, until it
         can, and the crawl does not end before it is.
 
+        Cancelled, the crawl writes what the storage buffers (one try; a
+        failure is logged) before the cancellation goes on, so that those
+        pages are `saved` in the frontier; the pages in flight are left in
+        progress for `close` of the frontier to put back.
+
         Raises:
             TypeError: as crawl().
             ValueError: as crawl(), but for the limits, which are those of the frontier.

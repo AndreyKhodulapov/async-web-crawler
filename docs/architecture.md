@@ -157,9 +157,14 @@ run against it; what it adds is what sharing needs.
   `saving`, still leased and renewed, until the storage reports its
   record written and the crawl calls `saved`. A worker killed with a
   full buffer leaves its pages `saving`; their leases expire and another
-  worker crawls them again. `take` waits for the `saving` pages of other
-  workers (they may come back) but not for its own: the buffer is
-  written after the last page is taken, and waiting for it would never end.
+  worker crawls them again. A worker stopped (its task cancelled: Ctrl-C,
+  SIGTERM) writes the buffer first, so that those pages are `saved`, then
+  closes the frontier, which queues the pages it had in flight again,
+  uncounted: nothing is left to the leases but a buffer the storage
+  cannot write, which is logged as an error. `take` waits for the
+  `saving` pages of other workers (they may come back) but not for its
+  own: the buffer is written after the last page is taken, and waiting
+  for it would never end.
   Nor would two workers that wait for the `saving` pages of each other,
   each with its own in its buffer, as the heartbeats keep the leases: the
   first run of workers with a storage hung so. So before `take` waits for
@@ -345,9 +350,10 @@ run against it; what it adds is what sharing needs.
   no sitemaps. The interval of a host is that of the rate limit of the
   job (`host_interval`) or its Crawl-delay, see above. Its
   files have `{worker}` in their names, as two workers may save one page.
-  The order at the end matters: the storage writes its buffer and the
-  pages are `saved`, then the frontier is closed (its leases put back,
-  the job finished if nothing is left), then the crawler.
+  The order at the end matters, and it is the same when the worker is
+  stopped: the storage writes its buffer and the pages are `saved`, then
+  the frontier is closed (its leases put back, the job finished if
+  nothing is left), then the crawler.
 - **The stats are a snapshot.** Counting every state change in the job
   row would make that row the one every worker of the job writes on
   every page. Instead the heartbeat (and `refresh_stats()`) counts the

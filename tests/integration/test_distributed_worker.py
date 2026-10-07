@@ -173,6 +173,65 @@ async def test_job_is_crawled_on_after_its_workers_stop(url, site):
     assert await job_state() == "finished"
 
 
+async def test_stopped_worker_writes_its_buffer_and_queues_its_pages_in_flight_again(url, site, tmp_path):
+    site.latency = 0.05
+    await create_job(make_config(urls=[url("/wide/0")]), "test", dsn=POSTGRES_DSN)
+    storage = {"outputs": [str(tmp_path / "pages-{worker}.jsonl")], "batch_size": 100}
+    config = worker_config(crawler={"max_concurrent": 2}, storage=storage)
+    stopped = asyncio.create_task(run_worker(config, "test", worker="stopped", configure_logging=False))
+    async with asyncio.timeout(5):
+        while len(await urls_in("saving")) < 5:
+            await asyncio.sleep(0.02)
+    stopped.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopped
+
+    # The pages of its buffer are written and saved; those in flight are queued again, uncounted.
+    processed = await urls_in("processed")
+    assert len(processed) >= 5
+    assert sorted(saved_urls(tmp_path)) == sorted(processed)
+    assert await urls_in("saving") == set()
+    assert await urls_in("leased") == set()
+    (job,) = await fetch("SELECT requested, state FROM crawl_jobs")
+    assert (job["requested"], job["state"]) == (len(processed), "running")
+
+    await run_worker(config, "test", worker="next", configure_logging=False)
+
+    assert len(await urls_in("processed")) == WIDE_PAGES
+    assert Counter(saved_urls(tmp_path)) == Counter(await urls_in("processed"))  # each page once
+    assert await job_state() == "finished"
+
+
+async def test_stopped_worker_whose_storage_cannot_write_leaves_its_pages_to_their_leases(url, site, monkeypatch):
+    # The other worker crawls them again once the leases expire.
+    site.latency = 0.05
+    await create_job(make_config(urls=[url("/wide/0")]), "test", dsn=POSTGRES_DSN)
+    storages: list[Unwritable] = []
+    monkeypatch.setattr(
+        StorageOptions, "build", lambda self: storages.append(Unwritable(batch_size=100)) or storages[-1]
+    )
+    config = worker_config(crawler={"max_concurrent": 2}, distributed={"lease_seconds": 0.5, "heartbeat_seconds": 0.1})
+    stopped = asyncio.create_task(run_worker(config, "test", worker="stopped", configure_logging=False))
+    async with asyncio.timeout(5):
+        while len(await urls_in("saving")) < 5:
+            await asyncio.sleep(0.02)
+    stopped.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopped
+
+    pending = await urls_in("saving")
+    assert len(pending) >= 5
+    assert storages[0].urls == []
+    monkeypatch.setattr(Unwritable, "down", False)
+
+    await run_worker(config, "test", worker="next", configure_logging=False)
+
+    assert await urls_in("processed") == {saved for batch in storages[1].urls for saved in batch}
+    assert len(await urls_in("processed")) == WIDE_PAGES
+    assert {row["url"] for row in await fetch("SELECT url FROM frontier WHERE attempts = 1")} == pending
+    assert await job_state() == "finished"
+
+
 async def test_requests_to_a_host_are_spaced_out_by_all_workers_together(url, site):
     await create_job(
         make_config(urls=[url("/wide/0")], crawler={"max_pages": 6, "rate_limit": 5.0}), "test", dsn=POSTGRES_DSN

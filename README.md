@@ -197,10 +197,13 @@ rendered, 1 failed, average 0.84s` (the average of the rendered ones).
 | 1 | no page was fetched, some could not be saved, or a directory, the log file, an output file or the database could not be opened; an output that cannot be opened is reported before anything is requested |
 | 2 | wrong options or configuration; nothing was requested or written |
 | 130 | interrupted with Ctrl-C |
+| 143 | stopped with SIGTERM (`docker stop`, systemd) |
 
-A crawl interrupted with Ctrl-C stops its requests, saves the pages fetched
-by then, writes the reports of them and prints the summary. The summary names
-the reports that were written: one that could not be is an error in the log.
+A crawl interrupted with Ctrl-C or stopped with SIGTERM stops its requests,
+saves the pages fetched by then, writes the reports of them and prints the
+summary. The summary names the reports that were written: one that could
+not be is an error in the log. A second Ctrl-C or SIGTERM kills the process
+at once, whatever is still unsaved.
 
 ## Usage from Python
 

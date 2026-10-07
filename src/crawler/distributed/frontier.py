@@ -790,6 +790,8 @@ class PostgresFrontier(Frontier):
                 async with connection.transaction():
                     rows = await connection.fetch(_PUT_BACK_ALL, self.job_id, self.worker)
                     await self._uncount_all(connection, [row["host"] for row in rows if row["counted"]])
+                if rows:
+                    logger.info("Worker %s stopped: %d pages in progress are queued again", self.worker, len(rows))
                 # The last pages of the job may have been pending their save until now.
                 await self._finish_job(connection)
         except self.ERRORS as error:

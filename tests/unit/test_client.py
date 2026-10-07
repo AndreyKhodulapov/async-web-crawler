@@ -1826,6 +1826,65 @@ class TestCrawlSharedFrontierFailures:
         assert list(crawler.failed_urls) == ["http://a/1"]
         assert list(crawler.processed_urls) == ["http://a/2"]
 
+    @staticmethod
+    def cancelled_with_a_page_in_flight(make_crawler, fake_session, storage: MemoryStorage):
+        """A crawl of a/1, done and buffered, and a/2, in flight, cancelled; the pages reported saved."""
+        saved: list[list[str]] = []
+
+        class Reporting(SharedMemoryFrontier):
+            async def saved(self, urls):
+                saved.append(list(urls))
+
+        started = asyncio.Event()
+
+        async def slow_page() -> FakeResponse:
+            started.set()
+            await asyncio.sleep(10)
+            return FakeResponse()
+
+        fake_session.routes["http://a/2"] = slow_page
+        crawler = make_crawler(storage=storage, max_concurrent=2, max_depth=0)
+
+        async def crawl() -> None:
+            task = asyncio.create_task(crawler.crawl_frontier(Reporting(), ["http://a/1", "http://a/2"]))
+            async with asyncio.timeout(2):
+                await started.wait()
+                while storage.pending < 1:
+                    await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        return crawl, saved
+
+    async def test_cancelled_worker_writes_its_buffer_and_reports_the_pages_saved(
+        self, make_crawler, fake_session, caplog
+    ):
+        caplog.set_level(logging.INFO, logger="crawler.crawl_run")
+        storage = MemoryStorage(batch_size=10)
+        crawl, saved = self.cancelled_with_a_page_in_flight(make_crawler, fake_session, storage)
+
+        await crawl()
+
+        assert storage.urls == [["http://a/1"]]
+        assert saved == [["http://a/1"]]
+        assert "The crawl is cancelled: writing the 1 pages the storage buffers" in caplog.text
+
+    async def test_cancelled_worker_whose_storage_cannot_write_stops_all_the_same(
+        self, make_crawler, fake_session, caplog
+    ):
+        # The pages of its buffer stay pending their save in the frontier.
+        caplog.set_level(logging.ERROR, logger="crawler.crawl_run")
+        storage = MemoryStorage(batch_size=10, failures=self.FAILED_WRITE)
+        crawl, saved = self.cancelled_with_a_page_in_flight(make_crawler, fake_session, storage)
+
+        await crawl()
+
+        assert storage.urls == []
+        assert storage.pending == 1
+        assert saved == []
+        assert "Failed to save the pages the storage buffers: failed to write" in caplog.text
+
 
 class TestCrawlStorage:
     async def test_the_storage_is_opened_before_the_first_request(self, make_crawler, fake_session):
