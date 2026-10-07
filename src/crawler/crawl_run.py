@@ -583,6 +583,14 @@ class CrawlRun:
             return
         if self.keep_pages:
             self.processed_urls[url] = parsed
+        # A cancellation waits for the page to be finished and handed to the
+        # storage: pending its save in the frontier without its record in the
+        # buffer, it would wait there until its lease expired, and be crawled again.
+        await _uninterrupted(self._finish_crawled(page, result, parsed, queued))
+
+    async def _finish_crawled(self, page: FrontierPage, result: FetchResult, parsed: ParsedPage, queued: int) -> None:
+        """Finish a page crawled and hand its record to the storage, if there is one."""
+        url, depth = page
         # With a storage, the page is done once its record is written (see run).
         await self._frontier.finish(
             page,
@@ -1110,6 +1118,16 @@ class CrawlRun:
         else:
             await self._put_off_page(page, 1.0, refusal.message, uncount=counted)
         return True
+
+
+async def _uninterrupted(operation: Awaitable[None]) -> None:
+    """Await `operation` to its end; a cancellation meanwhile is raised once it is over."""
+    task = asyncio.ensure_future(operation)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
 def _first_of(errors: BaseExceptionGroup, kinds: tuple[type[Exception], ...]) -> BaseException | None:

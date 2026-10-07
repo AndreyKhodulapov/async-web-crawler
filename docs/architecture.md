@@ -164,7 +164,11 @@ run against it; what it adds is what sharing needs.
   SIGTERM) writes the buffer first, so that those pages are `saved`, then
   closes the frontier, which queues the pages it had in flight again,
   uncounted: nothing is left to the leases but a buffer the storage
-  cannot write, which is logged as an error. `take` waits for the
+  cannot write, which is logged as an error. A page is made `saving` and
+  its record handed to the storage at one go, which a cancellation waits
+  for: cancelled between the two, the page would be `saving` with no
+  record in the buffer, and crawled again once its lease expired (a
+  stopped worker left one so in about one stop of six). `take` waits for the
   `saving` pages of other workers (they may come back) but not for its
   own: the buffer is written after the last page is taken, and waiting
   for it would never end.

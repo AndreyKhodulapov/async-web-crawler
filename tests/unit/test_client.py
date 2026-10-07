@@ -1886,6 +1886,33 @@ class TestCrawlSharedFrontierFailures:
         assert saved == []
         assert "Failed to save the pages the storage buffers: failed to write" in caplog.text
 
+    async def test_page_done_as_the_worker_is_cancelled_is_saved(self, make_crawler, fake_session):
+        # The crawl is cancelled once a/1 is pending its save in the frontier,
+        # before its record is handed to the storage.
+        saved: list[list[str]] = []
+
+        class Cancelling(SharedMemoryFrontier):
+            async def finish(self, page, outcome, reason=None, **options):
+                await super().finish(page, outcome, reason, **options)
+                if options.get("pending_save"):
+                    crawl.cancel()
+                    await asyncio.sleep(0)
+
+            async def saved(self, urls):
+                saved.append(list(urls))
+                await super().saved(urls)
+
+        storage = MemoryStorage(batch_size=10)
+        crawler = make_crawler(storage=storage, max_depth=0)
+        crawl = asyncio.create_task(crawler.crawl_frontier(Cancelling(), ["http://a/1"]))
+
+        with pytest.raises(asyncio.CancelledError):
+            await crawl
+
+        assert storage.urls == [["http://a/1"]]
+        assert saved == [["http://a/1"]]
+        assert crawler.crawl_stats().processed == crawler.crawl_stats().saved == 1
+
 
 class TestCrawlStorage:
     async def test_the_storage_is_opened_before_the_first_request(self, make_crawler, fake_session):
