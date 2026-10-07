@@ -74,7 +74,9 @@ listed in the [API reference](api.md#internals).
     tells whether the URL was new. In memory two calls cannot interleave
     with another worker; in a database they can, and two workers would
     both follow a redirect to the same page. One `INSERT ... ON CONFLICT`
-    answers both questions at once;
+    answers both questions at once. The call names the page whose
+    redirect led to the URL, and that page is told the URL is new
+    again (below);
   - a page is **done only once it is stored**. The storage writes in
     batches, so a page processed may wait in its buffer: a process that
     stops then leaves it done in a shared queue with no record, and the
@@ -138,6 +140,19 @@ run against it; what it adds is what sharing needs.
   `max_attempts` expiries. So a page is crawled **at least once**, not
   exactly once, and the storage must take a page twice: a table with a
   row per URL does.
+- **The target of a redirect is seen from its page.** A redirect marks
+  its target seen, so that a link to it is not crawled a second time,
+  and the row keeps the page it was seen from (`frontier.seen_from`). A
+  page may go back to the queue after it followed its redirect: the
+  host of the target asked to wait, its circuit is open, its robots.txt
+  is down, or the lease of the worker expired. Whoever takes it next
+  follows the redirect again, as `mark_seen` is true for the page that
+  marked the URL; with the source kept in the memory of one worker,
+  another one found the target seen and skipped the page, and the
+  target was never crawled. A page that fails lets its targets be
+  queued again (`forget`, by the same page only); so do the pages the
+  database fails itself, those of a host given up and those whose lease
+  expired `max_attempts` times, in the statement that fails them.
 - **Saved, then done.** A page processed with `pending_save` is
   `saving`, still leased and renewed, until the storage reports its
   record written and the crawl calls `saved`. A worker killed with a

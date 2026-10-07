@@ -170,17 +170,19 @@ class Frontier(ABC):
         """The records of these pages, finished with `pending_save`, are written, or dropped as ones no write can take."""
 
     @abstractmethod
-    async def mark_seen(self, url: str) -> bool:
-        """Remember a URL without accepting it, e.g. the target of a redirect; False if it was seen already.
+    async def mark_seen(self, url: str, source: str) -> bool:
+        """Remember a URL without accepting it, the target of a redirect of the page `source`; False if it was seen already.
 
         A URL is seen once accepted or remembered. An invalid one is never
         remembered and gives False. Checking and remembering are one step,
-        so that two workers cannot both take a URL for new.
+        so that two workers cannot both take a URL for new. A URL the page
+        `source` remembered gives True to that page again: one put back
+        after it followed the redirect follows it again, whoever takes it.
         """
 
     @abstractmethod
-    async def forget(self, url: str) -> None:
-        """Undo `mark_seen`: the URL may be accepted again. An accepted URL stays seen."""
+    async def forget(self, url: str, source: str) -> None:
+        """Undo `mark_seen` of the page `source`: the URL may be accepted again. An accepted URL stays seen."""
 
     @abstractmethod
     async def is_pending_or_processed(self, url: str) -> bool:
@@ -300,6 +302,7 @@ class MemoryFrontier(Frontier):
         self._out_of_scope: list[str] = []
         self._scope_hosts: list[str] = []
         self._waits: Counter[str] = Counter()
+        self._seen_from: dict[str, str] = {}  # URL remembered with mark_seen -> the page whose redirect led to it
 
     async def seed(self, urls: Iterable[str]) -> list[str]:
         seeded: dict[str, None] = {}
@@ -381,14 +384,21 @@ class MemoryFrontier(Frontier):
     async def saved(self, urls: Iterable[str]) -> None:
         pass
 
-    async def mark_seen(self, url: str) -> bool:
-        if queue_form(url) is None or self.queue.is_seen(url):
+    async def mark_seen(self, url: str, source: str) -> bool:
+        form = queue_form(url)
+        if form is None:
             return False
-        self.queue.mark_seen(url)
+        if self.queue.is_seen(form):
+            return self._seen_from.get(form) == source
+        self.queue.mark_seen(form)
+        self._seen_from[form] = source
         return True
 
-    async def forget(self, url: str) -> None:
-        self.queue.forget(url)
+    async def forget(self, url: str, source: str) -> None:
+        form = queue_form(url)
+        if form is not None and self._seen_from.get(form) == source:
+            del self._seen_from[form]
+            self.queue.forget(form)
 
     async def is_pending_or_processed(self, url: str) -> bool:
         return self.queue.is_pending_or_processed(url)

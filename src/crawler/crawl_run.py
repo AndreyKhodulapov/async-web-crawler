@@ -103,7 +103,6 @@ class CrawlRun:
         self.processed_urls: dict[str, ParsedPage] = {}
         self._start_urls: set[str] = set()
         self._scope_synced = 0  # hosts of Frontier.scope_hosts() the filter has
-        self._redirect_sources: dict[str, str] = {}  # redirect target -> the page that led to it
         self._failed_sitemaps: dict[str, str] = {}
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
         # In a shared frontier: the failures of a host this process told it of, and the counts of the crawl it answered.
@@ -469,8 +468,6 @@ class CrawlRun:
             max_wait=self._max_wait(page),
         )
         if isinstance(result.error, HostHeldBackError):
-            # The target was not requested: whoever takes the page again follows the redirect anew.
-            await self._forget_redirects(url, targets)
             await self._put_back_held(page, result.error, requested=sent)
             return
         if (refusal := self._circuit_refusal(result)) is not None:
@@ -604,22 +601,17 @@ class CrawlRun:
         # A page is crawled under one URL: a later link to the target is not
         # fetched, and a redirect to a page already seen is not followed.
         # The redirects of one page may lead back to it (a cookie check) or
-        # loop; they are followed up to MAX_REDIRECTS.
+        # loop; they are followed up to MAX_REDIRECTS. A page retried, or
+        # put back and taken again, follows the targets it marked as seen.
         # Compared without tracking parameters, as the queue keeps URLs.
-        page = strip_tracking_params(target)
-        if page != url and self._redirect_sources.get(page) != url:
-            if not await self._frontier.mark_seen(page):
-                return f"redirected to a page already seen: {target}"
-            self._redirect_sources[page] = url
+        if strip_tracking_params(target) != url and not await self._frontier.mark_seen(target, url):
+            return f"redirected to a page already seen: {target}"
         return None
 
     async def _forget_redirects(self, url: str, targets: Iterable[str]) -> None:
         """Let the redirect targets of the page `url` be queued again: the page failed, so they were not crawled."""
         for target in targets:
-            page = strip_tracking_params(target)
-            if self._redirect_sources.get(page) == url:
-                del self._redirect_sources[page]
-                await self._frontier.forget(page)
+            await self._frontier.forget(target, url)
 
     async def _fail_page(
         self, page: FrontierPage, error: FetchError, result: FetchResult | None = None, *, uncount: bool = False

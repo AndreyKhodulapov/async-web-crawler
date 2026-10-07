@@ -559,6 +559,24 @@ async def test_page_that_redirects_to_a_held_host_waits_as_long_on_its_own(
     assert holds["127.0.0.1"]["hold_reason"] is None
 
 
+async def test_page_put_back_after_its_redirect_follows_it_again_with_the_next_worker(url, site):
+    # The target asks to wait longer than a retry would: the page goes back
+    # with its target seen, and the next worker follows the redirect anew.
+    start, target = url("/site/to-overloaded"), "/overloaded/1/1"
+    job = make_config(urls=[start], crawler={"max_depth": 0}, retry={"max_retries": 1, "max_delay": 0.5})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    async def put_off() -> bool:
+        return site.hits[target] == 1 and await state_of(start) == "queued"
+
+    await run_worker_until(worker_config(), put_off)
+    await run_worker(worker_config(), "test", worker="next", configure_logging=False)
+
+    assert await state_of(start) == "processed"
+    assert site.hits[target] == 2
+    assert await job_state() == "finished"
+
+
 async def test_page_that_keeps_asking_to_wait_fails_after_the_waits_of_all_workers(url, site):
     # Retry-After of 2 s is too long to retry and capped to 0.2 s of
     # holding the host back. The first worker stops after the first wait:

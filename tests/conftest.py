@@ -264,6 +264,8 @@ async def site_page(request: web.Request) -> web.Response:
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/")
     if request.path == "/site/to-busy":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/busy/60")
+    if request.path == "/site/to-overloaded":
+        raise web.HTTPFound(f"http://localhost:{request.url.port}/overloaded/1/1")
     if request.path == "/site/to-flaky":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/flaky/100")
     if request.path == "/site/bounce":

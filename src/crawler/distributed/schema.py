@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS crawl_jobs (
 # Every URL of a job, once: the primary key is the deduplication. The
 # sequence keeps the order pages were queued in among those of one depth.
 # `attempts` counts the leases that expired, `waits` the times the page
-# went back to wait for its host.
+# went back to wait for its host. A URL only seen, the target of a
+# redirect, keeps in `seen_from` the page whose redirect led to it.
 _FRONTIER = """
 CREATE TABLE IF NOT EXISTS frontier (
     job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
@@ -54,6 +55,7 @@ CREATE TABLE IF NOT EXISTS frontier (
     waits INTEGER NOT NULL DEFAULT 0,
     counted BOOLEAN NOT NULL DEFAULT false,
     reason TEXT,
+    seen_from TEXT,
     PRIMARY KEY (job, url)
 )
 """
@@ -114,6 +116,8 @@ _STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS frontier_put_off ON frontier (job, not_before) WHERE state = 'queued'",
     # Leases that expire.
     "CREATE INDEX IF NOT EXISTS frontier_leased ON frontier (job, lease_until) WHERE state IN ('leased', 'saving')",
+    # The redirect targets of a page that failed.
+    "CREATE INDEX IF NOT EXISTS frontier_seen_from ON frontier (job, seen_from) WHERE state = 'seen'",
     _HOSTS,
     _SCOPE,
     _OUT_OF_SCOPE,

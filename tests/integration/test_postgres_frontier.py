@@ -126,7 +126,10 @@ class TestDeduplication:
     async def test_one_worker_takes_a_url_for_new(self, open_frontier):
         first, second = await open_frontier("first"), await open_frontier("second")
 
-        new = await asyncio.gather(first.mark_seen("http://site/target"), second.mark_seen("http://site/target"))
+        new = await asyncio.gather(
+            first.mark_seen("http://site/target", "http://site/a"),
+            second.mark_seen("http://site/target", "http://site/b"),
+        )
 
         assert sorted(new) == [False, True]
 
@@ -176,6 +179,33 @@ class TestLease:
         assert (row["state"], row["reason"]) == ("failed", "lease expired 2 times")
         await last.refresh_stats()
         assert last.stats().failed == 1
+
+    async def test_page_whose_lease_expired_follows_its_redirect_again_with_the_next_worker(self, open_frontier):
+        stopped = await open_frontier("stopped", lease_seconds=0.3, heartbeat_seconds=60)
+        alive = await open_frontier("alive")
+        await stopped.seed(["http://site/moved"])
+        page = await take(stopped)
+        assert await stopped.mark_seen("http://site/target", page.url)
+
+        assert await asyncio.wait_for(alive.take(), 5) == page
+
+        assert await alive.mark_seen("http://site/target", page.url)
+        assert not await alive.mark_seen("http://site/target", "http://site/other")
+
+    async def test_redirect_targets_of_a_page_whose_lease_expired_max_attempts_times_may_be_queued(self, open_frontier):
+        options = {"lease_seconds": 0.2, "heartbeat_seconds": 60, "max_attempts": 2}
+        first, second = await open_frontier("first", **options), await open_frontier("second", **options)
+        last = await open_frontier("last", max_attempts=2)
+        await first.seed(["http://site/moved"])
+        await first.mark_seen("http://site/target", (await take(first)).url)
+        await first.mark_seen("http://site/kept", "http://site/other")
+        await asyncio.wait_for(second.take(), 5)
+
+        assert await asyncio.wait_for(last.take(), 5) is None
+
+        assert (await row_of("http://site/moved"))["state"] == "failed"
+        assert await last.add(["http://site/target", "http://site/kept"], depth=1) == 1
+        assert (await row_of("http://site/target"))["state"] == "queued"
 
     async def test_heartbeat_keeps_the_lease_of_a_page_in_progress(self, open_frontier):
         busy = await open_frontier("busy", lease_seconds=0.3, heartbeat_seconds=0.05)
@@ -472,6 +502,21 @@ class TestHostFailures:
         assert await job_state() == "finished"
         (job,) = await fetch("SELECT unfinished FROM crawl_jobs")
         assert job["unfinished"] == 0
+
+    async def test_redirect_targets_of_the_pages_of_a_host_given_up_may_be_queued(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://a/1", "http://b/1"])
+        page = await take(frontier)
+        # Put back after its redirect was followed, e.g. to wait for the host of the target.
+        await frontier.mark_seen("http://c/target", page.url)
+        await frontier.mark_seen("http://c/kept", "http://b/1")
+        await frontier.put_back(page, uncount=False)
+
+        await frontier.give_up_host("a", Outcome.FAILED, "circuit breaker of a opened 3 times")
+
+        assert (await row_of("http://a/1"))["state"] == "failed"
+        assert await frontier.add(["http://c/target", "http://c/kept"], depth=1) == 1
+        assert (await row_of("http://c/target"))["state"] == "queued"
 
     async def test_host_given_up_keeps_the_outcome_it_was_first_given_up_with(self, open_frontier):
         frontier = await open_frontier("worker")

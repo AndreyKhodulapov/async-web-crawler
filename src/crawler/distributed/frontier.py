@@ -113,26 +113,33 @@ WHERE j.id = $1
 """
 
 # Pages whose worker stopped renewing their leases: queued again, or
-# failed after max_attempts. Rows locked by their worker are left for the next time.
+# failed after max_attempts. Rows locked by their worker are left for the
+# next time. A page failed was not crawled: the targets of its redirects
+# may be queued again, as those of a page failed by a worker.
 _RECLAIM = """
 WITH expired AS (
     SELECT url, host, state, worker, counted
     FROM frontier
     WHERE job = $1 AND state IN ('leased', 'saving') AND lease_until < now()
     FOR UPDATE SKIP LOCKED
+), reclaimed AS (
+    UPDATE frontier AS f
+    SET state = CASE WHEN f.attempts + 1 >= $2 THEN 'failed' ELSE 'queued' END,
+        reason = CASE WHEN f.attempts + 1 >= $2 THEN format('lease expired %s times', f.attempts + 1) END,
+        attempts = f.attempts + 1,
+        worker = NULL,
+        lease_until = NULL,
+        counted = false,
+        not_before = '-infinity',
+        seq = nextval('frontier_seq')
+    FROM expired
+    WHERE f.job = $1 AND f.url = expired.url
+    RETURNING f.url, f.state, expired.state AS was, expired.worker, expired.host, expired.counted
+), unseen AS (
+    DELETE FROM frontier AS s USING reclaimed AS r
+    WHERE s.job = $1 AND s.state = 'seen' AND s.seen_from = r.url AND r.state = 'failed'
 )
-UPDATE frontier AS f
-SET state = CASE WHEN f.attempts + 1 >= $2 THEN 'failed' ELSE 'queued' END,
-    reason = CASE WHEN f.attempts + 1 >= $2 THEN format('lease expired %s times', f.attempts + 1) END,
-    attempts = f.attempts + 1,
-    worker = NULL,
-    lease_until = NULL,
-    counted = false,
-    not_before = '-infinity',
-    seq = nextval('frontier_seq')
-FROM expired
-WHERE f.job = $1 AND f.url = expired.url
-RETURNING f.url, f.state, expired.state AS was, expired.worker, expired.host, expired.counted
+SELECT * FROM reclaimed
 """
 
 # The job is over: no page is in progress or pending its save, and none is
@@ -216,11 +223,15 @@ WHERE h.given_up_outcome IS NULL
 RETURNING true
 """
 
+# The pages of a host given up; the targets of their redirects, if one
+# was followed before the page went back, may be queued again.
 _FINISH_HOST_PAGES = """
 WITH finished AS (
     UPDATE frontier SET state = $3, reason = $4
     WHERE job = $1 AND host = $2 AND state = 'queued'
     RETURNING url
+), unseen AS (
+    DELETE FROM frontier WHERE job = $1 AND state = 'seen' AND seen_from IN (SELECT url FROM finished)
 )
 SELECT count(*) FROM finished
 """
@@ -605,24 +616,31 @@ class PostgresFrontier(Frontier):
         self._check_held(page)
         return self._held[page.url]
 
-    async def mark_seen(self, url: str) -> bool:
+    async def mark_seen(self, url: str, source: str) -> bool:
         form = queue_form(url)
         if form is None:
             return False
+        # A row seen from the same page is updated to itself, so that it is returned.
         new = await self._pool.fetchval(
-            "INSERT INTO frontier (job, url, host, state) VALUES ($1, $2, $3, 'seen')"
-            " ON CONFLICT DO NOTHING RETURNING true",
+            "INSERT INTO frontier AS f (job, url, host, state, seen_from) VALUES ($1, $2, $3, 'seen', $4)"
+            " ON CONFLICT (job, url) DO UPDATE SET seen_from = excluded.seen_from"
+            " WHERE f.state = 'seen' AND f.seen_from = excluded.seen_from"
+            " RETURNING true",
             self.job_id,
             form,
             get_host(form),
+            source,
         )
         return new is not None
 
-    async def forget(self, url: str) -> None:
+    async def forget(self, url: str, source: str) -> None:
         form = queue_form(url)
         if form is not None:
             await self._pool.execute(
-                "DELETE FROM frontier WHERE job = $1 AND url = $2 AND state = 'seen'", self.job_id, form
+                "DELETE FROM frontier WHERE job = $1 AND url = $2 AND state = 'seen' AND seen_from = $3",
+                self.job_id,
+                form,
+                source,
             )
 
     async def is_pending_or_processed(self, url: str) -> bool:
