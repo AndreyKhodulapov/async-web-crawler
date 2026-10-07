@@ -593,6 +593,7 @@ src/
     │   ├── frontier.py     # PostgresFrontier: the frontier of a crawl job shared by workers — leases, heartbeat, host turns
     │   ├── job.py          # create_job: a crawl job created, seeded, resumed or restarted
     │   ├── progress.py     # job_progress, watch_job: the progress line of a crawl job, of all its workers
+    │   ├── procedures.py   # PL/pgSQL functions: a page taken, admitted, put back or finished, links added, in one call each
     │   ├── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, workers, job_scope, out_of_scope
     │   ├── stats.py        # job_stats, export_job_stats: the statistics and reports of a crawl job, of all its workers
     │   └── worker.py       # run_worker: a worker of a crawl job, its configuration and its files

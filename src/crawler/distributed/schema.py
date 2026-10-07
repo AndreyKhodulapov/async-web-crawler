@@ -1,7 +1,9 @@
-"""The tables of distributed crawl jobs in PostgreSQL, made by the first process that connects."""
+"""The tables of distributed crawl jobs in PostgreSQL, made by the first process that connects, and the functions of the frontier."""
 
 import asyncpg
 from asyncpg.pool import PoolConnectionProxy
+
+from crawler.distributed.procedures import FUNCTIONS
 
 # A connection of its own or one of a pool.
 Connection = asyncpg.Connection | PoolConnectionProxy
@@ -146,11 +148,13 @@ _STATEMENTS = (
     _WORKERS,
     _SCOPE,
     _OUT_OF_SCOPE,
+    # Replaced every time: they change with the code, as the tables do not.
+    *FUNCTIONS,
 )
 
 
 async def create_schema(connection: Connection) -> None:
-    """Make the tables of distributed crawls that are missing; workers may do it at once."""
+    """Make the tables of distributed crawls that are missing, and the functions of the frontier; workers may do it at once."""
     async with connection.transaction():
         # CREATE ... IF NOT EXISTS of two sessions at once may still fail on a duplicate.
         await connection.execute("SELECT pg_advisory_xact_lock($1)", _SCHEMA_LOCK)

@@ -20,66 +20,6 @@ from crawler.urls import get_host
 
 logger = logging.getLogger(__name__)
 
-# The ready host with the shallowest page, locked so that no other worker
-# takes a page of it at the same moment; the page locked and leased; the
-# host's next turn moved on by the interval of the job, or by its own if
-# that is longer. The page is read from the
-# snapshot of the statement: another worker may have taken it since, and
-# may hold its row, waiting for the host this one holds. So its row is
-# locked skipping, never waited for, and is leased only if still queued;
-# otherwise nothing is taken and the worker looks again. Nothing is handed
-# out while the job is seeding. The version of the scope comes along, so
-# that the worker learns of a host that joined it before it crawls the page.
-# A host given up is ready however long it is held back, and keeps its
-# turn: its pages come with the outcome to finish them with, unrequested.
-_TAKE = """
-WITH page AS (
-    SELECT h.host, h.given_up_outcome, h.given_up_reason, h.given_up_error, p.url
-    FROM hosts AS h
-    CROSS JOIN LATERAL (
-        SELECT f.url, f.depth, f.seq
-        FROM frontier AS f
-        WHERE f.job = h.job AND f.host = h.host AND f.state = 'queued' AND f.not_before <= now()
-        ORDER BY f.depth, f.seq
-        LIMIT 1
-    ) AS p
-    WHERE h.job = $1 AND (h.next_allowed_at <= now() OR h.given_up_outcome IS NOT NULL)
-        AND NOT EXISTS (
-            SELECT FROM crawl_jobs AS j WHERE j.id = $1 AND (j.requested >= j.max_pages OR j.state = 'seeding')
-        )
-    ORDER BY p.depth, p.seq
-    LIMIT 1
-    FOR UPDATE OF h SKIP LOCKED
-), queued AS (
-    SELECT f.url
-    FROM frontier AS f
-    JOIN page ON f.url = page.url
-    WHERE f.job = $1 AND f.state = 'queued'
-    FOR UPDATE OF f SKIP LOCKED
-), leased AS (
-    UPDATE frontier AS f
-    SET state = 'leased', worker = $2, lease_until = now() + make_interval(secs => $3)
-    FROM queued
-    WHERE f.job = $1 AND f.url = queued.url
-    RETURNING f.url, f.depth, f.host, f.waits
-), turn AS (
-    UPDATE hosts AS h
-    SET next_allowed_at = now() + make_interval(secs => greatest($4, h.interval))
-    FROM leased
-    WHERE h.job = $1 AND h.host = leased.host AND h.given_up_outcome IS NULL
-)
-SELECT
-    leased.url,
-    leased.depth,
-    leased.waits,
-    page.given_up_outcome,
-    page.given_up_reason,
-    page.given_up_error,
-    (SELECT scope_version FROM crawl_jobs WHERE id = $1) AS scope_version
-FROM leased
-JOIN page ON page.url = leased.url
-"""
-
 # What a worker that got no page waits for, if for anything.
 _WAIT_STATE = """
 SELECT
@@ -113,40 +53,6 @@ FROM crawl_jobs AS j
 WHERE j.id = $1
 """
 
-# Pages whose worker stopped renewing their leases: queued again, or
-# failed after max_attempts. Rows locked by their worker are left for the
-# next time. A page failed was not crawled: the targets of its redirects
-# may be queued again, as those of a page failed by a worker.
-_RECLAIM = """
-WITH expired AS (
-    SELECT url, host, state, worker, counted
-    FROM frontier
-    WHERE job = $1 AND state IN ('leased', 'saving') AND lease_until < now()
-    FOR UPDATE SKIP LOCKED
-), reclaimed AS (
-    UPDATE frontier AS f
-    SET state = CASE WHEN f.attempts + 1 >= $2 THEN 'failed' ELSE 'queued' END,
-        reason = CASE WHEN f.attempts + 1 >= $2 THEN format('lease expired %s times', f.attempts + 1) END,
-        error = CASE WHEN f.attempts + 1 >= $2 THEN 'LeaseExpired' END,
-        finished_at = CASE WHEN f.attempts + 1 >= $2 THEN now() END,
-        status = NULL,
-        elapsed = NULL,
-        attempts = f.attempts + 1,
-        worker = NULL,
-        lease_until = NULL,
-        counted = false,
-        not_before = '-infinity',
-        seq = nextval('frontier_seq')
-    FROM expired
-    WHERE f.job = $1 AND f.url = expired.url
-    RETURNING f.url, f.state, expired.state AS was, expired.worker, expired.host, expired.counted
-), unseen AS (
-    DELETE FROM frontier AS s USING reclaimed AS r
-    WHERE s.job = $1 AND s.state = 'seen' AND s.seen_from = r.url AND r.state = 'failed'
-)
-SELECT * FROM reclaimed
-"""
-
 # The job is over: no page is in progress or pending its save, and none is
 # left to hand out, or max_pages is reached.
 _FINISH_JOB = """
@@ -158,22 +64,6 @@ WHERE j.id = $1 AND j.state = 'running'
         OR NOT EXISTS (SELECT FROM frontier WHERE job = $1 AND state = 'queued')
     )
 RETURNING true
-"""
-
-_INSERT = """
-INSERT INTO frontier (job, url, host, depth, state)
-SELECT $1, page.url, page.host, $4, 'queued'
-FROM unnest($2::text[], $3::text[]) WITH ORDINALITY AS page (url, host, position)
-ORDER BY page.position
-ON CONFLICT DO NOTHING
-RETURNING url
-"""
-
-_COUNT_ACCEPTED = """
-INSERT INTO hosts (job, host, accepted)
-SELECT $1, page.host, page.accepted FROM unnest($2::text[], $3::int[]) AS page (host, accepted)
-ON CONFLICT (job, host) DO UPDATE SET accepted = hosts.accepted + excluded.accepted
-RETURNING host, accepted
 """
 
 _UNCOUNT_HOSTS = """
@@ -292,14 +182,6 @@ def worker_name() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(2)}"
 
 
-class _LeaseLost(Exception):
-    """The page is no longer leased to this worker: the lease expired and the page went back to the queue."""
-
-
-class _OverHostLimit(Exception):
-    """The host of the page has max_pages_per_host pages counted."""
-
-
 class PostgresFrontier(Frontier):
     """A `Frontier` in a PostgreSQL database, shared by the workers of one job.
 
@@ -328,7 +210,11 @@ class PostgresFrontier(Frontier):
     least every `poll_interval` seconds, and at once after an operation of
     this frontier. `stats` is a snapshot of the job, refreshed by the
     heartbeat and by `refresh_stats`; `requested` is also brought up to
-    date by `admit`. Workers never deadlock: an operation on a page locks
+    date by `admit`. Taking a page, admitting, putting back and finishing
+    it, and adding links are one call each, of a function in the database
+    (see `procedures.py`): the rows of the job and the host are locked for
+    as long as the function runs, not across round trips. Workers never
+    deadlock: an operation on a page locks
     its row, then the job, then the host; adding links locks the job and
     inserts new rows only; giving a host up locks the job, the host, then
     its pages queued; `take` and the taking back of expired leases skip
@@ -409,7 +295,7 @@ class PostgresFrontier(Frontier):
         Raises:
             JobError: there is no job of that name.
         """
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_size)
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_size, reset=_keep_session)
         try:
             async with pool.acquire() as connection:
                 await create_schema(connection)
@@ -443,10 +329,7 @@ class PostgresFrontier(Frontier):
 
     async def seed(self, urls: Iterable[str]) -> list[str]:
         pages = _pages_of(urls)
-        async with self._pool.acquire() as connection, connection.transaction():
-            await self._lock_job(connection)
-            inserted = await self._insert(connection, pages, depth=0)
-            await self._count_accepted(connection, inserted)
+        await self._add(self._pool, pages, depth=0, bounded=False)
         self._wakeup.set()
         return list(pages)
 
@@ -454,58 +337,27 @@ class PostgresFrontier(Frontier):
         pages = _pages_of(urls)
         if not pages:
             return 0
-        async with self._pool.acquire() as connection, connection.transaction():
-            accepted, dropped, accepted_by_host = await self._add(connection, pages, depth=depth)
+        accepted, dropped, accepted_by_host = await self._add(self._pool, pages, depth=depth)
         self._added(accepted, dropped, accepted_by_host)
         return accepted
 
     async def _add(
-        self, connection: Connection, pages: dict[str, str], *, depth: int
+        self, executor: Connection | asyncpg.Pool, pages: dict[str, str], *, depth: int, bounded: bool = True
     ) -> tuple[int, int, dict[str, int]]:
-        """Accept the pages found at `depth`, as far as the bounds allow, in the transaction of `connection`.
+        """Accept the pages found at `depth`, as far as the bounds allow unless not `bounded`, see `frontier_add`.
 
         Returns the number accepted, the number dropped as the frontier is
         full, and the pages accepted by host since the job began, for `_added`.
         """
-        # One worker adds at a time: the bounds are checked against counts no one else changes meanwhile.
-        job = await self._lock_job(connection)
-        if self._closed_at(job["requested"]):
-            return 0, 0, {}
-        seen = {
-            row["url"]
-            for row in await connection.fetch(
-                "SELECT url FROM frontier WHERE job = $1 AND url = ANY($2::text[])", self.job_id, list(pages)
-            )
-        }
-        host_accepted = dict(
-            await connection.fetch(
-                "SELECT host, accepted FROM hosts WHERE job = $1 AND host = ANY($2::text[])",
-                self.job_id,
-                list(set(pages.values())),
-            )
+        row = await executor.fetchrow(
+            "SELECT * FROM frontier_add($1, $2, $3, $4, $5)",
+            self.job_id,
+            list(pages),
+            list(pages.values()),
+            depth,
+            bounded,
         )
-        room = None if self._max_queued is None else self._max_queued - job["unfinished"] - job["requested"]
-        chosen: dict[str, str] = {}
-        dropped = dropped_by_host = 0
-        for url, host in pages.items():
-            accepted = host_accepted.get(host, 0)
-            if self._max_host_queued is not None and accepted >= self._max_host_queued:
-                if url not in seen:
-                    dropped_by_host += 1
-                continue
-            if room is not None and room <= 0:
-                if url not in seen:
-                    dropped += 1
-                continue
-            if url in seen:
-                continue
-            chosen[url] = host
-            host_accepted[host] = accepted + 1
-            if room is not None:
-                room -= 1
-        inserted = await self._insert(connection, chosen, depth=depth)
-        accepted_by_host = await self._count_accepted(connection, inserted, dropped, dropped_by_host)
-        return len(inserted), dropped, accepted_by_host
+        return row["accepted"], row["dropped"], dict(zip(row["accepted_hosts"], row["host_accepted"], strict=True))
 
     async def take(self) -> FrontierPage | None:
         while True:
@@ -516,9 +368,16 @@ class PostgresFrontier(Frontier):
                     # Not on open: the process that seeds the job opens a frontier, but takes no page.
                     await connection.execute(_JOIN, self.job_id, self.worker, self.lease_seconds)
                     self._joined = True
-                await self._reclaim(connection)
-                row = await connection.fetchrow(_TAKE, self.job_id, self.worker, self.lease_seconds, self.host_interval)
-                if row is not None:
+                row = await connection.fetchrow(
+                    "SELECT * FROM frontier_take($1, $2, $3, $4, $5)",
+                    self.job_id,
+                    self.worker,
+                    self.lease_seconds,
+                    self.host_interval,
+                    self.max_attempts,
+                )
+                self._log_reclaimed(row)
+                if row["url"] is not None:
                     self._held[row["url"]] = row["waits"]
                     if row["given_up_outcome"] is not None:
                         self._given_up[row["url"]] = GivenUp(
@@ -542,63 +401,35 @@ class PostgresFrontier(Frontier):
                     await self._wakeup.wait()
 
     async def admit(self, page: FrontierPage) -> Admission:
-        try:
-            async with self._pool.acquire() as connection, connection.transaction():
-                await self._lock_leased(connection, page)
-                requested = await connection.fetchval(
-                    "UPDATE crawl_jobs SET requested = requested + 1"
-                    " WHERE id = $1 AND (max_pages IS NULL OR requested < max_pages) RETURNING requested",
-                    self.job_id,
-                )
-                if requested is None:
-                    # Taken while another worker was still checking the page that reached the limit.
-                    return Admission.OVER_MAX_PAGES
-                admitted = await connection.fetchval(
-                    "UPDATE hosts SET requested = requested + 1"
-                    " WHERE job = $1 AND host = $2 AND ($3::int IS NULL OR requested < $3) RETURNING true",
-                    self.job_id,
-                    _host_of(page),
-                    self.max_pages_per_host,
-                )
-                if admitted is None:
-                    raise _OverHostLimit
-                await connection.execute(
-                    "UPDATE frontier SET counted = true WHERE job = $1 AND url = $2", self.job_id, page.url
-                )
-        except _OverHostLimit:
-            await self._pool.execute(
-                "UPDATE crawl_jobs SET over_host_limit = over_host_limit + 1 WHERE id = $1", self.job_id
-            )
-            return Admission.OVER_HOST_LIMIT
-        except _LeaseLost:
-            # Not requested: the caller puts it back, which finds the lease lost and tells so.
-            return Admission.OVER_MAX_PAGES
+        row = await self._pool.fetchrow("SELECT * FROM frontier_admit($1, $2, $3)", self.job_id, page.url, self.worker)
+        match row["admission"]:
+            case "over_max_pages":
+                return Admission.OVER_MAX_PAGES
+            case "lease_lost":
+                # Not requested: the caller puts it back, which finds the lease lost and tells so.
+                return Admission.OVER_MAX_PAGES
+            case "over_host_limit":
+                return Admission.OVER_HOST_LIMIT
         self._counted.add(page.url)
-        self._stats = dataclasses.replace(self._stats, requested=requested)
+        self._stats = dataclasses.replace(self._stats, requested=row["requested"])
         return Admission.ADMITTED
 
     async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool, waited: bool = False) -> None:
         self._check_held(page)
         uncount = uncount and page.url in self._counted
         try:
-            async with self._pool.acquire() as connection, connection.transaction():
-                await self._lock_leased(connection, page)
-                if uncount:
-                    await self._uncount(connection, page)
-                await connection.execute(
-                    "UPDATE frontier SET state = 'queued', worker = NULL, lease_until = NULL, counted = false,"
-                    " not_before = now() + make_interval(secs => $3), seq = nextval('frontier_seq'),"
-                    " waits = waits + $4::int WHERE job = $1 AND url = $2",
-                    self.job_id,
-                    page.url,
-                    float(delay),
-                    int(waited),
-                )
-        except _LeaseLost:
-            _log_lease_lost(page)
+            row = await self._pool.fetchrow(
+                "SELECT * FROM frontier_put_back($1, $2, $3, $4, $5, $6)",
+                self.job_id,
+                page.url,
+                self.worker,
+                float(delay),
+                uncount,
+                waited,
+            )
         finally:
             self._release(page)
-        self._wakeup.set()
+        self._left(page, row, uncount)
 
     async def finish(
         self,
@@ -618,32 +449,21 @@ class PostgresFrontier(Frontier):
         uncount = uncount and page.url in self._counted
         state = "saving" if pending_save and outcome is Outcome.PROCESSED else outcome.value
         try:
-            async with self._pool.acquire() as connection, connection.transaction():
-                await self._lock_leased(connection, page)
-                await connection.execute("UPDATE crawl_jobs SET unfinished = unfinished - 1 WHERE id = $1", self.job_id)
-                if uncount:
-                    await self._uncount(connection, page)
-                # A page pending its save keeps its worker and its lease; a
-                # page finished keeps its worker for the report of the job.
-                await connection.execute(
-                    "UPDATE frontier SET state = $3, reason = $4, counted = counted AND NOT $5,"
-                    " lease_until = CASE WHEN $3 = 'saving' THEN lease_until END,"
-                    " status = $6, elapsed = $7, error = $8, finished_at = now()"
-                    " WHERE job = $1 AND url = $2",
-                    self.job_id,
-                    page.url,
-                    state,
-                    reason,
-                    uncount,
-                    status,
-                    elapsed,
-                    error,
-                )
-        except _LeaseLost:
-            _log_lease_lost(page)
+            row = await self._pool.fetchrow(
+                "SELECT * FROM frontier_finish($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                self.job_id,
+                page.url,
+                self.worker,
+                state,
+                reason,
+                uncount,
+                status,
+                elapsed,
+                error,
+            )
         finally:
             self._release(page)
-        self._wakeup.set()
+        self._left(page, row, uncount)
 
     async def saved(self, urls: Iterable[str]) -> None:
         urls = list(urls)
@@ -851,59 +671,6 @@ class PostgresFrontier(Frontier):
             self._wakeup.set()
             await self._pool.close()
 
-    async def _insert(self, connection: Connection, pages: dict[str, str], *, depth: int) -> dict[str, str]:
-        """Queue the pages not in the frontier yet, in order; those queued, with their hosts."""
-        if not pages:
-            return {}
-        rows = await connection.fetch(_INSERT, self.job_id, list(pages), list(pages.values()), depth)
-        inserted = {row["url"] for row in rows}
-        # A page seen by another worker since it was looked for is not queued.
-        return {url: host for url, host in pages.items() if url in inserted}
-
-    async def _count_accepted(
-        self, connection: Connection, inserted: dict[str, str], dropped: int = 0, dropped_by_host: int = 0
-    ) -> dict[str, int]:
-        """Count the pages queued in their job and hosts; the pages accepted by host since the job began."""
-        await connection.execute(
-            "UPDATE crawl_jobs SET unfinished = unfinished + $2, links_dropped = links_dropped + $3,"
-            " links_dropped_by_host = links_dropped_by_host + $4 WHERE id = $1",
-            self.job_id,
-            len(inserted),
-            dropped,
-            dropped_by_host,
-        )
-        if not inserted:
-            return {}
-        by_host = Counter(inserted.values())
-        rows = await connection.fetch(_COUNT_ACCEPTED, self.job_id, list(by_host), list(by_host.values()))
-        return dict(rows)
-
-    async def _reclaim(self, connection: Connection) -> None:
-        """Queue again, uncounted, the pages whose leases expired; fail those that expired max_attempts times."""
-        expired = await connection.fetchval(
-            "SELECT EXISTS (SELECT FROM frontier"
-            " WHERE job = $1 AND state IN ('leased', 'saving') AND lease_until < now())",
-            self.job_id,
-        )
-        if not expired:
-            return
-        async with connection.transaction():
-            await self._lock_job(connection)
-            rows = await connection.fetch(_RECLAIM, self.job_id, self.max_attempts)
-            # A page in progress was unfinished and stays so if queued; a page pending its save was not.
-            unfinished = sum((row["state"] == "queued") - (row["was"] == "leased") for row in rows)
-            await connection.execute(
-                "UPDATE crawl_jobs SET unfinished = unfinished + $2 WHERE id = $1", self.job_id, unfinished
-            )
-            await self._uncount_all(connection, [row["host"] for row in rows if row["counted"]])
-        for row in rows:
-            if row["state"] == "failed":
-                logger.warning(
-                    "Lease of %s by %s expired %d times: the page failed", row["url"], row["worker"], self.max_attempts
-                )
-            else:
-                logger.warning("Lease of %s by %s expired: the page is queued again", row["url"], row["worker"])
-
     async def _read_scope(self, connection: Connection) -> None:
         """Learn the hosts brought into the scope of the job, and the version of the scope they make."""
         row = await connection.fetchrow(
@@ -928,26 +695,6 @@ class PostgresFrontier(Frontier):
         return await connection.fetchrow(
             "SELECT requested, unfinished FROM crawl_jobs WHERE id = $1 FOR NO KEY UPDATE", self.job_id
         )
-
-    async def _lock_leased(self, connection: Connection, page: FrontierPage) -> None:
-        """Lock the row of a page leased to this worker; raises _LeaseLost if it is not leased to it any more."""
-        leased = await connection.fetchval(
-            "SELECT true FROM frontier WHERE job = $1 AND url = $2 AND worker = $3 AND state = 'leased' FOR UPDATE",
-            self.job_id,
-            page.url,
-            self.worker,
-        )
-        if leased is None:
-            raise _LeaseLost(page.url)
-
-    async def _uncount(self, connection: Connection, page: FrontierPage) -> None:
-        requested = await connection.fetchval(
-            "UPDATE crawl_jobs SET requested = requested - 1 WHERE id = $1 RETURNING requested", self.job_id
-        )
-        await connection.execute(
-            "UPDATE hosts SET requested = requested - 1 WHERE job = $1 AND host = $2", self.job_id, _host_of(page)
-        )
-        self._stats = dataclasses.replace(self._stats, requested=requested)
 
     async def _uncount_all(self, connection: Connection, hosts: list[str]) -> None:
         """Uncount pages, one per host listed, from the limits of the job and their hosts."""
@@ -1013,6 +760,23 @@ class PostgresFrontier(Frontier):
         if accepted:
             self._wakeup.set()
 
+    def _left(self, page: FrontierPage, row: asyncpg.Record, uncount: bool) -> None:
+        """Tell of the lease of a page put back or finished that was lost, or of `requested` it uncounted."""
+        if not row["held"]:
+            _log_lease_lost(page)
+        elif uncount:
+            self._stats = dataclasses.replace(self._stats, requested=row["requested"])
+        self._wakeup.set()
+
+    def _log_reclaimed(self, row: asyncpg.Record) -> None:
+        """Tell of the pages whose leases expired, which `take` queued again or failed."""
+        reclaimed = zip(row["reclaimed_urls"], row["reclaimed_states"], row["reclaimed_workers"], strict=True)
+        for url, state, worker in reclaimed:
+            if state == "failed":
+                logger.warning("Lease of %s by %s expired %d times: the page failed", url, worker, self.max_attempts)
+            else:
+                logger.warning("Lease of %s by %s expired: the page is queued again", url, worker)
+
     def _log_bounds(self, dropped: int, accepted_by_host: dict[str, int]) -> None:
         if dropped and not self._drop_logged:
             self._drop_logged = True
@@ -1032,6 +796,15 @@ class PostgresFrontier(Frontier):
                 )
 
 
+async def _keep_session(connection: asyncpg.Connection) -> None:
+    """Leave a connection as it is when it goes back to the pool, saving a round trip an operation.
+
+    asyncpg would reset the session: the frontier sets nothing in it that
+    outlives a transaction (no settings, session locks, cursors or LISTEN).
+    A transaction left open is still rolled back.
+    """
+
+
 def _pages_of(urls: Iterable[str]) -> dict[str, str]:
     """The URLs in the form the frontier keeps them, each with its host; invalid ones and repeats left out."""
     pages = {}
@@ -1042,12 +815,6 @@ def _pages_of(urls: Iterable[str]) -> dict[str, str]:
             assert host is not None  # a valid URL has a host
             pages[form] = host
     return pages
-
-
-def _host_of(page: FrontierPage) -> str:
-    host = get_host(page.url)
-    assert host is not None  # the frontier holds valid URLs only
-    return host
 
 
 def _log_lease_lost(page: FrontierPage) -> None:

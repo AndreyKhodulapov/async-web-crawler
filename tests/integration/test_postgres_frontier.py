@@ -6,9 +6,11 @@ pending their save, the host interval and the limits held by all workers togethe
 """
 
 import asyncio
+import contextlib
 import functools
 import itertools
 import logging
+import random
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
@@ -154,35 +156,21 @@ class TestJobLock:
 
     A statement inserting a row checks its foreign key by locking the job
     FOR KEY SHARE; were the job locked FOR UPDATE, the statement would wait
-    for the holder while holding its new row, which the holder may insert next.
+    for the holder while holding its new row, which the holder may insert
+    next. The job is held here by a transaction of the test, as an
+    operation holds it, or as the check of a foreign key does.
     """
 
     @staticmethod
-    def pause_holding_the_job(frontier: PostgresFrontier, monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
-        """Make `frontier` stop once it has locked the job, until the second event is set; the first tells it did."""
-        locked, go_on = asyncio.Event(), asyncio.Event()
-        lock_job = frontier._lock_job
-
-        async def lock_and_wait(connection):
-            row = await lock_job(connection)
-            locked.set()
-            await go_on.wait()
-            return row
-
-        monkeypatch.setattr(frontier, "_lock_job", lock_and_wait)
-        return locked, go_on
-
-    async def insert_while_held(
-        self, holder: PostgresFrontier, hold: Awaitable[object], insert: Awaitable[object], monkeypatch
-    ) -> None:
-        locked, go_on = self.pause_holding_the_job(holder, monkeypatch)
-        holding = asyncio.create_task(hold)
-        await asyncio.wait_for(locked.wait(), 5)
+    @contextlib.asynccontextmanager
+    async def job_locked(mode: str) -> AsyncGenerator[None, None]:
+        connection = await asyncpg.connect(POSTGRES_DSN)
         try:
-            assert not await still_waiting(insert, 1)
+            async with connection.transaction():
+                await connection.execute(f"SELECT FROM crawl_jobs WHERE name = 'test' FOR {mode}")
+                yield
         finally:
-            go_on.set()
-            await asyncio.wait_for(holding, 5)
+            await connection.close()
 
     @pytest.mark.parametrize(
         "insert",
@@ -196,39 +184,143 @@ class TestJobLock:
             pytest.param(lambda other: other.take(), id="join"),
         ],
     )
-    async def test_worker_inserts_while_another_adds_links(self, open_frontier, monkeypatch, insert):
-        holder, other = await open_frontier("holder"), await open_frontier("other")
+    async def test_worker_inserts_while_another_holds_the_job(self, open_frontier, insert):
+        other = await open_frontier("other")
         # A page to take: with none, a worker would mark the job finished, and wait for the holder to do so.
-        await holder.seed(["http://site/"])
+        await other.seed(["http://site/"])
 
-        await self.insert_while_held(holder, holder.add(["http://site/new"], depth=1), insert(other), monkeypatch)
-
-        # Whichever came first, the page is in the frontier once.
-        assert len(await fetch("SELECT url FROM frontier WHERE url = 'http://site/new'")) <= 1
+        async with self.job_locked("NO KEY UPDATE"):
+            assert not await still_waiting(insert(other), 1)
 
     @pytest.mark.parametrize(
-        "hold",
+        ("admitted", "hold"),
         [
-            pytest.param(lambda holder: holder.seed(["http://site/new"]), id="seed"),
-            pytest.param(lambda holder: holder.add(["http://site/new"], depth=1), id="add"),
-            pytest.param(lambda holder: holder.widen_scope("elsewhere", lambda url: True), id="widen_scope"),
-            pytest.param(lambda holder: holder.give_up_host("site", Outcome.FAILED, "down"), id="give_up_host"),
-            pytest.param(lambda holder: holder.take(), id="reclaim"),
+            pytest.param(False, lambda holder, page: holder.seed(["http://site/new"]), id="seed"),
+            pytest.param(False, lambda holder, page: holder.add(["http://site/new"], depth=1), id="add"),
+            pytest.param(
+                False, lambda holder, page: holder.widen_scope("elsewhere", lambda url: True), id="widen_scope"
+            ),
+            pytest.param(False, lambda holder, page: holder.give_up_host("site", Outcome.FAILED, "down"), id="give_up"),
+            pytest.param(False, lambda holder, page: holder.admit(page), id="admit"),
+            pytest.param(True, lambda holder, page: holder.put_back(page, uncount=True), id="put_back"),
+            pytest.param(
+                True, lambda holder, page: holder.finish(page, Outcome.FAILED, "down", uncount=True), id="finish"
+            ),
+            pytest.param(True, lambda holder, page: holder.close(), id="close"),
         ],
     )
-    async def test_worker_marks_a_redirect_target_while_another_holds_the_job(self, open_frontier, monkeypatch, hold):
+    async def test_worker_holds_the_job_without_keeping_inserts_waiting(self, open_frontier, admitted, hold):
+        holder = await open_frontier("holder")
+        await holder.seed(["http://site/", "http://site/next"])
+        page = await take(holder)
+        if admitted:
+            assert await holder.admit(page) is Admission.ADMITTED
+
+        async with self.job_locked("KEY SHARE"):
+            assert not await still_waiting(hold(holder, page), 1)
+
+    async def test_worker_takes_back_expired_leases_without_keeping_inserts_waiting(self, open_frontier):
         stopped = await open_frontier("stopped", lease_seconds=0.2, heartbeat_seconds=60)
-        holder, other = await open_frontier("holder"), await open_frontier("other")
+        holder = await open_frontier("holder")
         await stopped.seed(["http://site/"])
-        await take(stopped)
-        await holder.hold_out_of_scope(["http://elsewhere/"])
+        assert await stopped.admit(await take(stopped)) is Admission.ADMITTED
         await asyncio.sleep(0.3)  # the lease of the page expires, for the holder to take it back
 
-        await self.insert_while_held(
-            holder, hold(holder), other.mark_seen("http://site/new", "http://site/moved"), monkeypatch
-        )
+        async with self.job_locked("KEY SHARE"):
+            assert not await still_waiting(holder.take(), 1)
 
-        assert len(await fetch("SELECT url FROM frontier WHERE url = 'http://site/new'")) == 1
+        assert (await row_of("http://site/"))["worker"] == "holder"
+
+
+class TestRoundTrips:
+    """An operation on a page is one call to the database: the rows it locks are held while the database works alone."""
+
+    async def test_each_operation_on_a_page_is_one_round_trip(self, open_frontier, monkeypatch):
+        queries: list[str] = []
+        create_pool = asyncpg.create_pool
+
+        async def log_queries(connection: asyncpg.Connection) -> None:
+            connection.add_query_logger(lambda query: queries.append(query.query))
+
+        monkeypatch.setattr(asyncpg, "create_pool", functools.partial(create_pool, init=log_queries))
+        frontier = await open_frontier("worker", max_pages=10, max_pages_per_host=10)
+        await frontier.seed(["http://site/a", "http://site/b"])
+        a = await take(frontier)  # the first one also joins the job
+        sent = {}
+
+        async def count(name: str, operation: Awaitable[object]) -> None:
+            queries.clear()
+            await operation
+            sent[name] = len(queries)
+
+        assert await frontier.admit(a) is Admission.ADMITTED
+        await count("take", frontier.take())
+        b = FrontierPage("http://site/b", 0)
+        await count("admit", frontier.admit(b))
+        await count("add", frontier.add(["http://site/c"], depth=1))
+        await count("put_back", frontier.put_back(b, 1, uncount=True, waited=True))
+        await count("finish", frontier.finish(a, Outcome.FAILED, "down", uncount=True, status=500, elapsed=0.1))
+
+        assert sent == {"take": 1, "admit": 1, "add": 1, "put_back": 1, "finish": 1}
+        assert (await row_of("http://site/a"))["state"] == "failed"
+        assert (await row_of("http://site/b"))["state"] == "queued"
+        (job,) = await fetch("SELECT requested, unfinished FROM crawl_jobs")
+        assert (job["requested"], job["unfinished"]) == (0, 2)
+
+
+class TestCounts:
+    async def test_counts_of_the_job_and_its_hosts_are_those_of_its_rows(self, open_frontier):
+        """Pages put off, uncounted, over the limits and of hosts given up, by many tasks of three workers at once."""
+        workers = [
+            await open_frontier(f"worker-{i}", max_pages=60, max_pages_per_host=25, frontier_factor=2) for i in range(3)
+        ]
+        hosts = [f"host-{i}" for i in range(4)]
+        await workers[0].seed([f"http://{host}/" for host in hosts])
+        rng = random.Random(7)
+
+        async def crawl(frontier: PostgresFrontier) -> None:
+            while (page := await frontier.take()) is not None:
+                host = page.url.split("/")[2]
+                if (given_up := frontier.given_up(page)) is not None:
+                    await frontier.finish(page, given_up.outcome, given_up.reason)
+                    continue
+                match await frontier.admit(page):
+                    case Admission.OVER_MAX_PAGES:
+                        await frontier.put_back(page, uncount=False)
+                        continue
+                    case Admission.OVER_HOST_LIMIT:
+                        await frontier.finish(page, Outcome.SKIPPED, "max_pages_per_host reached")
+                        continue
+                links = [f"http://{rng.choice(hosts)}/{rng.randrange(300)}" for _ in range(8)]
+                await frontier.add(links, depth=page.depth + 1)
+                chance = rng.random()
+                if chance < 0.2:
+                    await frontier.put_back(page, 0.01, uncount=True, waited=True)
+                elif chance < 0.23:
+                    await frontier.give_up_host(host, Outcome.UNREACHABLE, "down")
+                    await frontier.finish(page, Outcome.UNREACHABLE, "down", uncount=True)
+                else:
+                    await frontier.finish(page, Outcome.PROCESSED)
+
+        await asyncio.gather(*(crawl(frontier) for frontier in workers for _ in range(4)))
+
+        (job,) = await fetch(
+            "SELECT j.state, j.requested, j.unfinished,"
+            " (SELECT count(*) FILTER (WHERE counted) FROM frontier) AS counted,"
+            " (SELECT count(*) FILTER (WHERE state IN ('queued', 'leased')) FROM frontier) AS left"
+            " FROM crawl_jobs AS j"
+        )
+        assert (job["state"], job["requested"], job["unfinished"]) == ("finished", job["counted"], job["left"])
+        assert 0 < job["requested"] <= 60
+        by_host = await fetch(
+            "SELECT h.host, h.requested, h.accepted,"
+            " count(*) FILTER (WHERE f.counted) AS counted, count(f.url) AS rows"
+            " FROM hosts AS h LEFT JOIN frontier AS f ON f.job = h.job AND f.host = h.host GROUP BY h.job, h.host"
+        )
+        assert [(row["requested"], row["accepted"]) for row in by_host] == [
+            (row["counted"], row["rows"]) for row in by_host
+        ]
+        assert all(row["accepted"] <= 2 * 25 for row in by_host)
 
 
 class TestLease:

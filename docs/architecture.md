@@ -324,6 +324,19 @@ run against it; what it adds is what sharing needs.
     of the same host found none undone.
   - A hold that cannot reach the database is logged: the host stays held
     back in the worker that was answered, and the crawl goes on.
+- **One round trip per operation on a page.** Taking a page, admitting
+  it, putting it back, finishing it and adding the links found on it are
+  each one call of a PL/pgSQL function (`distributed/procedures.py`,
+  replaced as the tables are made). Every page needs the row of the job
+  three times (admitted, its links added, finished), and a transaction
+  made from the client held the row across its 4 to 8 round trips: some
+  7 ms of every page, for all the workers of the job together, so about
+  130 pages per second however many workers ran. A function holds it
+  while the database works alone. Plain statements with CTEs would not
+  do: admitting a page ends in one of three ways, and expired leases are
+  taken back only when there are some. A connection that goes back to
+  the pool is not reset either, which would be one more round trip: the
+  frontier leaves nothing in a session.
 - **Locks in one order, and no waits where the order cannot be kept.**
   Every operation on a page locks the row of the page, then the job,
   then the host; adding links locks the job first and only inserts new
