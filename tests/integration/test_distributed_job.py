@@ -7,9 +7,9 @@ import typing
 
 import asyncpg
 import pytest
-from helpers import POSTGRES_DSN, drop_frontier_tables, index, make_config, urlset
+from helpers import POSTGRES_DSN, DatabaseLink, drop_frontier_tables, index, make_config, urlset
 
-from crawler import AsyncCrawler, ConfigError, CrawlerConfig, JobError, SitemapParser
+from crawler import AsyncCrawler, ConfigError, CrawlerConfig, FrontierError, JobError, SitemapParser
 from crawler.distributed import JOB_SECTIONS, JobMode, create_job, job_config
 
 pytestmark = pytest.mark.postgres
@@ -107,6 +107,30 @@ async def test_job_keeps_none_of_the_secrets_of_the_configuration(url):
         if dataclasses.is_dataclass(hints[name]):
             assert not [field.name for field in dataclasses.fields(hints[name]) if "secret" in field.metadata]
     assert "secret" not in CrawlerConfig.__dataclass_fields__["urls"].metadata
+
+
+async def test_job_whose_database_cannot_be_reached_is_refused(url):
+    async with DatabaseLink() as link:
+        await link.cut()
+
+        with pytest.raises(
+            FrontierError, match="the database of crawl job test failed: .*Connect call failed"
+        ) as raised:
+            await create_job(make_config(urls=[url("/site/b.html")]), "test", dsn=link.dsn)
+
+    assert isinstance(raised.value.__cause__, OSError)
+
+
+@pytest.mark.usefixtures("restore_logging")
+async def test_job_created_with_logging_logs_by_its_configuration(url, tmp_path):
+    log = tmp_path / "crawler.log"
+    config = make_config(urls=[url("/site/b.html")], logging={"level": "INFO", "file": str(log)})
+
+    await create_job(config, "test", dsn=POSTGRES_DSN, configure_logging=True)
+
+    messages = [json.loads(line)["message"] for line in log.read_text(encoding="utf-8").splitlines()]
+    assert "Crawl job test is created" in messages
+    assert messages[-1] == "Crawl job test is seeded: 1 pages queued"
 
 
 async def test_job_without_start_urls_or_sitemaps_is_not_created():

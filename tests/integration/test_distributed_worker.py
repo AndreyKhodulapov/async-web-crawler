@@ -126,6 +126,8 @@ async def test_workers_crawl_every_page_once_as_a_local_crawl_does(url, site, tm
     assert sorted(saved_urls(tmp_path)) == sorted(expected)
     assert [path for path in site.hits if site.hits[path] != 1] == []
     assert sum(worker["total_pages"] for worker in stats) == WIDE_PAGES
+    assert [(worker["worker"], worker["save_failed"]) for worker in stats] == [("w0", 0), ("w1", 0), ("w2", 0)]
+    assert sum(worker["saved"] for worker in stats) == WIDE_PAGES
     assert await urls_in("processed") == expected
     assert await job_state() == "finished"
 

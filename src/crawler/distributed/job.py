@@ -1,9 +1,11 @@
 """Crawl jobs in PostgreSQL: one crawl that workers share, created, seeded, resumed or restarted here."""
 
+import contextlib
 import dataclasses
 import enum
 import json
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 import asyncpg
@@ -12,7 +14,7 @@ from crawler.advanced import AdvancedCrawler
 from crawler.config import CrawlerConfig, StorageOptions
 from crawler.distributed.frontier import PostgresFrontier
 from crawler.distributed.schema import Connection, create_schema
-from crawler.exceptions import JobError
+from crawler.exceptions import FrontierError, JobError
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +41,9 @@ def job_config(config: CrawlerConfig) -> dict[str, Any]:
     return json.loads(json.dumps(job))
 
 
-async def create_job(config: CrawlerConfig, name: str, *, dsn: str, mode: JobMode = JobMode.NEW) -> dict[str, str]:
+async def create_job(
+    config: CrawlerConfig, name: str, *, dsn: str, mode: JobMode = JobMode.NEW, configure_logging: bool = False
+) -> dict[str, str]:
     """Create the crawl job `name` in the database of `dsn` and seed it; return the sitemaps that could not be read.
 
     The job keeps `job_config(config)` and the limits of `config.crawler`.
@@ -55,36 +59,51 @@ async def create_job(config: CrawlerConfig, name: str, *, dsn: str, mode: JobMod
     A job whose seeding failed, say as the database went away, stays
     seeding: resumed, it is seeded again, sitemaps included.
 
+    With `configure_logging`, logging is set up by the `logging` section
+    of `config` for the time of the call, as `AdvancedCrawler` sets it up.
+
     Raises:
         JobError: with `JobMode.NEW`, the name is taken; with
             `JobMode.RESUME`, there is no such job, or `config` differs from
             that of the job in its part.
         ConfigError: as `AdvancedCrawler.seed`; nothing is created.
+        FrontierError: the database cannot be reached or failed an operation.
     """
     settings = job_config(config)
     # The storage is that of a worker, not of the job.
     async with AdvancedCrawler(
-        dataclasses.replace(config, storage=StorageOptions()), configure_logging=False
+        dataclasses.replace(config, storage=StorageOptions()), configure_logging=configure_logging
     ) as crawler:
         crawler.check_start()
-        connection = await asyncpg.connect(dsn)
-        try:
-            await create_schema(connection)
-            seeding = await _prepare_job(
-                connection, name, mode, settings, config, frontier_factor=crawler.crawler.FRONTIER_FACTOR
-            )
-            frontier = await PostgresFrontier.open(dsn, job=name)
+        with database_errors(name):
+            connection = await asyncpg.connect(dsn)
             try:
-                failed = await crawler.seed(frontier, sitemaps=seeding)
-                await frontier.refresh_stats()
+                await create_schema(connection)
+                seeding = await _prepare_job(
+                    connection, name, mode, settings, config, frontier_factor=crawler.crawler.FRONTIER_FACTOR
+                )
+                frontier = await PostgresFrontier.open(dsn, job=name)
+                try:
+                    failed = await crawler.seed(frontier, sitemaps=seeding)
+                    await frontier.refresh_stats()
+                finally:
+                    await frontier.close()
+                if seeding:
+                    await connection.execute("UPDATE crawl_jobs SET state = 'running' WHERE name = $1", name)
             finally:
-                await frontier.close()
-            if seeding:
-                await connection.execute("UPDATE crawl_jobs SET state = 'running' WHERE name = $1", name)
-        finally:
-            await connection.close()
-    logger.info("Crawl job %s is seeded: %d pages queued", name, frontier.stats().queued)
+                await connection.close()
+        # Before the crawler is closed, which resets the logging it set up.
+        logger.info("Crawl job %s is seeded: %d pages queued", name, frontier.stats().queued)
     return failed
+
+
+@contextlib.contextmanager
+def database_errors(job: str) -> Iterator[None]:
+    """Raise the errors of the database of the job as FrontierError, as a crawl of its frontier does."""
+    try:
+        yield
+    except PostgresFrontier.ERRORS as error:
+        raise FrontierError(f"the database of crawl job {job} failed: {type(error).__name__}: {error}") from error
 
 
 async def _prepare_job(

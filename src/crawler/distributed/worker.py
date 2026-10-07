@@ -1,11 +1,10 @@
 """A worker of a crawl job: crawls the pages of the job's frontier side by side with the other workers."""
 
-import contextlib
+import asyncio
 import dataclasses
 import json
 import logging
 import re
-from collections.abc import Iterator
 from typing import Any
 
 import asyncpg
@@ -13,9 +12,9 @@ import asyncpg
 from crawler.advanced import AdvancedCrawler
 from crawler.config import CrawlerConfig, CrawlOptions
 from crawler.distributed.frontier import PostgresFrontier, worker_name
-from crawler.distributed.job import JOB_SECTIONS, config_differences, job_config
+from crawler.distributed.job import JOB_SECTIONS, config_differences, database_errors, job_config
 from crawler.distributed.schema import create_schema
-from crawler.exceptions import ConfigError, FrontierError, JobError
+from crawler.exceptions import ConfigError, JobError
 from crawler.storage import storage_from_output
 
 logger = logging.getLogger(__name__)
@@ -28,6 +27,10 @@ async def run_worker(
     config: CrawlerConfig, job: str, *, worker: str | None = None, configure_logging: bool = True
 ) -> dict[str, Any]:
     """Crawl the pages of the crawl job `job` until none is left; return the statistics of this worker.
+
+    The statistics are those of `AdvancedCrawler.get_stats`, with
+    `worker`, the name of the worker, `saved`, the pages its storage
+    wrote, and `save_failed`, those it could not.
 
     What and how to crawl is the job's: the sections of `JOB_SECTIONS`,
     which `create_job` kept. `config` gives the rest: the database and the
@@ -59,7 +62,8 @@ async def run_worker(
     their leases expire. Running it again is the business of whatever
     started it, such as a restart policy of the container. Cancelled,
     the worker writes what its storage buffers, queues the pages it had in
-    flight again, uncounted, closes the frontier and raises `CancelledError`.
+    flight again, uncounted, writes its reports and cookies, closes the
+    frontier and raises `CancelledError`.
 
     Raises:
         ConfigError: there is no database, a file of the storage is
@@ -70,11 +74,11 @@ async def run_worker(
         ValueError: `worker` cannot be a part of a file name.
         StorageError: the storage cannot be opened; nothing is requested.
     """
-    if worker is not None and not _WORKER_NAME.fullmatch(worker):
-        raise ValueError(f"a worker name may hold letters, digits, '.', '_' and '-' only, got {worker!r}")
+    if worker is not None:
+        check_worker_name(worker)
     dsn = config.distributed.dsn()
     _check_files(config)
-    with _database_errors(job):
+    with database_errors(job):
         settings = await _job_settings(dsn, job)
     config = _worker_config(config, job, settings)
     name = worker or worker_name()
@@ -82,7 +86,7 @@ async def run_worker(
     async with AdvancedCrawler(config, configure_logging=configure_logging, worker=name) as crawler:
         if crawler.storage is None:
             logger.warning("Worker %s has no storage: the pages it crawls are not saved", name)
-        with _database_errors(job):
+        with database_errors(job):
             frontier = await PostgresFrontier.open(
                 dsn,
                 job=job,
@@ -96,9 +100,21 @@ async def run_worker(
         logger.info("Worker %s started on crawl job %s", name, job)
         try:
             await crawler.crawl_frontier(frontier)
+        except asyncio.CancelledError:
+            # What crawl_frontier writes once the crawl is over, of the pages crawled so far.
+            crawler.write_reports()
+            crawler.save_cookies()
+            raise
         finally:
             await frontier.close()
-        return crawler.get_stats()
+        saving = crawler.crawler.crawl_stats()
+        return {**crawler.get_stats(), "worker": name, "saved": saving.saved, "save_failed": saving.save_failed}
+
+
+def check_worker_name(name: str) -> None:
+    """Raises ValueError if `name` cannot name a worker: it stands for "{worker}" in file names."""
+    if not _WORKER_NAME.fullmatch(name):
+        raise ValueError(f"a worker name may hold letters, digits, '.', '_' and '-' only, got {name!r}")
 
 
 def host_interval(options: CrawlOptions) -> float:
@@ -106,15 +122,6 @@ def host_interval(options: CrawlOptions) -> float:
     if not options.per_domain_rate:
         return 0.0
     return max(0.0 if options.rate_limit is None else 1 / options.rate_limit, options.min_delay)
-
-
-@contextlib.contextmanager
-def _database_errors(job: str) -> Iterator[None]:
-    """Raise the errors of the database of the job as FrontierError, as a crawl of its frontier does."""
-    try:
-        yield
-    except PostgresFrontier.ERRORS as error:
-        raise FrontierError(f"the database of crawl job {job} failed: {type(error).__name__}: {error}") from error
 
 
 def _check_files(config: CrawlerConfig) -> None:

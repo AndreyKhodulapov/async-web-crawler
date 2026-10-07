@@ -900,13 +900,13 @@ stats = await run_worker(config, "shop")
 
 | Name | What it is |
 |------|------------|
-| `create_job(config, name, *, dsn, mode=JobMode.NEW)` | makes the tables if they are missing, creates the job and seeds it with the start URLs and the sitemaps of `config` (see `seed` in [Crawling](#crawling)); returns the sitemaps that could not be read |
+| `create_job(config, name, *, dsn, mode=JobMode.NEW, configure_logging=False)` | makes the tables if they are missing, creates the job and seeds it with the start URLs and the sitemaps of `config` (see `seed` in [Crawling](#crawling)); returns the sitemaps that could not be read; `FrontierError` if the database cannot be reached or fails; with `configure_logging`, logs by the `logging` section of `config` meanwhile |
 | `JobMode.NEW` | the name must be free, or `JobError` is raised |
 | `JobMode.RESUME` | goes on with the job of that name: its start URLs are seeded again (only those never queued are), a finished job runs again, the sitemaps are not read again unless the seeding did not finish; `config` must not differ from that of the job, or `JobError` names the keys that do |
 | `JobMode.RESTART` | deletes the job and its pages, then creates it anew |
 | `job_config(config)` | the part of a configuration the job keeps and every worker shares: the sections of `JOB_SECTIONS` (`urls`, `sitemaps`, `crawler`, `retry`, `circuit_breaker`, `filters`, `rendering`) without `crawler.max_concurrent` |
 | `PostgresFrontier.open(dsn, *, job, worker=None, ...)` | connects a worker to the job, with the limits of the job; `JobError` if there is no such job |
-| `run_worker(config, job, *, worker=None, configure_logging=True)` | crawls the pages of the job with `AdvancedCrawler.crawl_frontier` until none is left, then closes the frontier and the crawler; returns the statistics of this worker (`AdvancedCrawler.get_stats()`); `FrontierError` if the database fails; cancelled, it writes the buffer of the storage, queues the pages it had in flight again and raises `CancelledError` |
+| `run_worker(config, job, *, worker=None, configure_logging=True)` | crawls the pages of the job with `AdvancedCrawler.crawl_frontier` until none is left, then closes the frontier and the crawler; returns the statistics of this worker (`AdvancedCrawler.get_stats()` with `worker`, its name, `saved` and `save_failed`, the pages its storage wrote and could not); `FrontierError` if the database fails; cancelled, it writes the buffer of the storage, queues the pages it had in flight again, writes its reports and cookies and raises `CancelledError` |
 | `host_interval(config.crawler)` | the seconds between two pages of a host that the workers of a job take: `1 / rate_limit` or `min_delay`, whichever is longer, with `per_domain_rate`; 0 without it |
 
 A job is `seeding` while `create_job` fills it: workers started meanwhile
@@ -1013,6 +1013,10 @@ of the storage and the pages are `saved` while the frontier is still open,
 then `close` queues the pages it had in flight again, uncounted. The
 requests in flight are not finished. A buffer the storage cannot write is
 logged as an error, and its pages stay `saving` until their leases expire.
+
+The command line runs both: `python src/main.py job create --config
+config.yaml --name shop` and `python src/main.py worker --job shop`, see
+the [README](../README.md#crawl-jobs-on-the-command-line).
 
 ## Live progress
 
