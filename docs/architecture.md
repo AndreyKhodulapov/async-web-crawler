@@ -333,6 +333,15 @@ run against it; what it adds is what sharing needs.
   check that found this deadlock (32 tasks in 4 workers, pages put off,
   given up and uncounted at random) now ends with the counts of the job
   equal to those of its rows, and so does one that gives hosts up meanwhile.
+  - The job is locked `FOR NO KEY UPDATE`, not `FOR UPDATE`. A statement
+    of its own that inserts a row of the job (a redirect target seen, a
+    host held back, a worker joining) checks its foreign key by locking
+    the job `FOR KEY SHARE`, after the row is inserted. `FOR UPDATE`
+    would make it wait for the worker adding links while it holds the new
+    row, and that worker may insert the same row next: each waits for
+    the other. Two workers on the demo site deadlocked so in 5 runs of 15.
+    `FOR NO KEY UPDATE` still lets one worker at a time change the counts
+    of the job; an `UPDATE` of the job takes the same lock.
 - **Waiting is polling.** A worker with nothing to take asks the
   database what it waits for: a page put off, a host's turn, a lease of
   another worker that may expire, and sleeps until the nearest of them,

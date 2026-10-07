@@ -73,10 +73,10 @@ async def take(frontier: PostgresFrontier) -> FrontierPage:
     return page
 
 
-async def still_waiting(take: Awaitable[FrontierPage | None], seconds: float = 0.3) -> bool:
-    """Whether `take` is still waiting after `seconds`; it is cancelled then."""
+async def still_waiting(operation: Awaitable[object], seconds: float = 0.3) -> bool:
+    """Whether `operation` is still waiting after `seconds`; it is cancelled then."""
     try:
-        await asyncio.wait_for(take, seconds)
+        await asyncio.wait_for(operation, seconds)
     except TimeoutError:
         return True
     return False
@@ -147,6 +147,88 @@ class TestDeduplication:
         await asyncio.gather(*(crawl(frontier) for frontier in workers for _ in range(3)))
 
         assert sorted(taken) == sorted(f"http://site/{i}" for i in range(30))
+
+
+class TestJobLock:
+    """A worker that holds the job, to add links say, keeps no other from inserting a row of the job.
+
+    A statement inserting a row checks its foreign key by locking the job
+    FOR KEY SHARE; were the job locked FOR UPDATE, the statement would wait
+    for the holder while holding its new row, which the holder may insert next.
+    """
+
+    @staticmethod
+    def pause_holding_the_job(frontier: PostgresFrontier, monkeypatch) -> tuple[asyncio.Event, asyncio.Event]:
+        """Make `frontier` stop once it has locked the job, until the second event is set; the first tells it did."""
+        locked, go_on = asyncio.Event(), asyncio.Event()
+        lock_job = frontier._lock_job
+
+        async def lock_and_wait(connection):
+            row = await lock_job(connection)
+            locked.set()
+            await go_on.wait()
+            return row
+
+        monkeypatch.setattr(frontier, "_lock_job", lock_and_wait)
+        return locked, go_on
+
+    async def insert_while_held(
+        self, holder: PostgresFrontier, hold: Awaitable[object], insert: Awaitable[object], monkeypatch
+    ) -> None:
+        locked, go_on = self.pause_holding_the_job(holder, monkeypatch)
+        holding = asyncio.create_task(hold)
+        await asyncio.wait_for(locked.wait(), 5)
+        try:
+            assert not await still_waiting(insert, 1)
+        finally:
+            go_on.set()
+            await asyncio.wait_for(holding, 5)
+
+    @pytest.mark.parametrize(
+        "insert",
+        [
+            # The very row the holder inserts next: the two used to deadlock.
+            pytest.param(lambda other: other.mark_seen("http://site/new", "http://site/"), id="mark_seen"),
+            pytest.param(lambda other: other.hold_host("new", 10, "Retry-After"), id="hold_host"),
+            pytest.param(lambda other: other.set_host_interval("new", 1), id="set_host_interval"),
+            pytest.param(lambda other: other.count_host_failures("new", circuit_openings=1), id="count_host_failures"),
+            pytest.param(lambda other: other.hold_out_of_scope(["http://elsewhere/"]), id="hold_out_of_scope"),
+            pytest.param(lambda other: other.take(), id="join"),
+        ],
+    )
+    async def test_worker_inserts_while_another_adds_links(self, open_frontier, monkeypatch, insert):
+        holder, other = await open_frontier("holder"), await open_frontier("other")
+        # A page to take: with none, a worker would mark the job finished, and wait for the holder to do so.
+        await holder.seed(["http://site/"])
+
+        await self.insert_while_held(holder, holder.add(["http://site/new"], depth=1), insert(other), monkeypatch)
+
+        # Whichever came first, the page is in the frontier once.
+        assert len(await fetch("SELECT url FROM frontier WHERE url = 'http://site/new'")) <= 1
+
+    @pytest.mark.parametrize(
+        "hold",
+        [
+            pytest.param(lambda holder: holder.seed(["http://site/new"]), id="seed"),
+            pytest.param(lambda holder: holder.add(["http://site/new"], depth=1), id="add"),
+            pytest.param(lambda holder: holder.widen_scope("elsewhere", lambda url: True), id="widen_scope"),
+            pytest.param(lambda holder: holder.give_up_host("site", Outcome.FAILED, "down"), id="give_up_host"),
+            pytest.param(lambda holder: holder.take(), id="reclaim"),
+        ],
+    )
+    async def test_worker_marks_a_redirect_target_while_another_holds_the_job(self, open_frontier, monkeypatch, hold):
+        stopped = await open_frontier("stopped", lease_seconds=0.2, heartbeat_seconds=60)
+        holder, other = await open_frontier("holder"), await open_frontier("other")
+        await stopped.seed(["http://site/"])
+        await take(stopped)
+        await holder.hold_out_of_scope(["http://elsewhere/"])
+        await asyncio.sleep(0.3)  # the lease of the page expires, for the holder to take it back
+
+        await self.insert_while_held(
+            holder, hold(holder), other.mark_seen("http://site/new", "http://site/moved"), monkeypatch
+        )
+
+        assert len(await fetch("SELECT url FROM frontier WHERE url = 'http://site/new'")) == 1
 
 
 class TestLease:

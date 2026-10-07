@@ -330,7 +330,9 @@ class PostgresFrontier(Frontier):
     its row, then the job, then the host; adding links locks the job and
     inserts new rows only; giving a host up locks the job, the host, then
     its pages queued; `take` and the taking back of expired leases skip
-    the rows other workers hold (see docs/architecture.md).
+    the rows other workers hold. The job is locked FOR NO KEY UPDATE, so
+    that the inserts of other workers check their foreign keys on it
+    without waiting (see docs/architecture.md).
 
     An operation fails with one of `ERRORS` when the database cannot be
     reached or refuses it; it is not tried again: the worker stops, and
@@ -440,7 +442,7 @@ class PostgresFrontier(Frontier):
     async def seed(self, urls: Iterable[str]) -> list[str]:
         pages = _pages_of(urls)
         async with self._pool.acquire() as connection, connection.transaction():
-            await connection.execute("SELECT FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id)
+            await self._lock_job(connection)
             inserted = await self._insert(connection, pages, depth=0)
             await self._count_accepted(connection, inserted)
         self._wakeup.set()
@@ -464,9 +466,7 @@ class PostgresFrontier(Frontier):
         full, and the pages accepted by host since the job began, for `_added`.
         """
         # One worker adds at a time: the bounds are checked against counts no one else changes meanwhile.
-        job = await connection.fetchrow(
-            "SELECT requested, unfinished FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id
-        )
+        job = await self._lock_job(connection)
         if self._closed_at(job["requested"]):
             return 0, 0, {}
         seen = {
@@ -717,7 +717,7 @@ class PostgresFrontier(Frontier):
         async with self._pool.acquire() as connection:
             async with connection.transaction():
                 # The job first, as every addition locks it: the pages held are queued by one worker at a time.
-                await connection.execute("SELECT FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id)
+                await self._lock_job(connection)
                 added = await connection.fetchval(
                     "INSERT INTO job_scope (job, host) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING true",
                     self.job_id,
@@ -764,7 +764,7 @@ class PostgresFrontier(Frontier):
         async with self._pool.acquire() as connection, connection.transaction():
             # The job before the host, as a page in progress is finished:
             # see the order of the locks in the docstring of the class.
-            await connection.execute("SELECT FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id)
+            await self._lock_job(connection)
             if not await connection.fetchval(_GIVE_UP_HOST, self.job_id, host, outcome.value, reason, error):
                 return
             finished = await connection.fetchval(_FINISH_HOST_PAGES, self.job_id, host, outcome.value, reason, error)
@@ -886,7 +886,7 @@ class PostgresFrontier(Frontier):
         if not expired:
             return
         async with connection.transaction():
-            await connection.execute("SELECT FROM crawl_jobs WHERE id = $1 FOR UPDATE", self.job_id)
+            await self._lock_job(connection)
             rows = await connection.fetch(_RECLAIM, self.job_id, self.max_attempts)
             # A page in progress was unfinished and stays so if queued; a page pending its save was not.
             unfinished = sum((row["state"] == "queued") - (row["was"] == "leased") for row in rows)
@@ -916,6 +916,16 @@ class PostgresFrontier(Frontier):
         """Mark the job finished if nothing is left to do in it."""
         if await connection.fetchval(_FINISH_JOB, self.job_id):
             logger.info("Crawl job %s is finished", self.job)
+
+    async def _lock_job(self, connection: Connection) -> asyncpg.Record:
+        """Lock the row of the job for the transaction of `connection`; returns its counts of pages."""
+        # Not FOR UPDATE: a statement inserting a row of the job, such as
+        # mark_seen, checks its foreign key by locking the job FOR KEY SHARE.
+        # It would wait for this worker while holding its new row, which
+        # this worker may insert next: each would wait for the other.
+        return await connection.fetchrow(
+            "SELECT requested, unfinished FROM crawl_jobs WHERE id = $1 FOR NO KEY UPDATE", self.job_id
+        )
 
     async def _lock_leased(self, connection: Connection, page: FrontierPage) -> None:
         """Lock the row of a page leased to this worker; raises _LeaseLost if it is not leased to it any more."""
