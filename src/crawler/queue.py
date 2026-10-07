@@ -125,6 +125,10 @@ class CrawlerQueue:
         """Depth of an accepted URL; raises KeyError for an unknown one."""
         return self._depths[url]
 
+    def is_in_progress(self, url: str) -> bool:
+        """Whether a URL taken by `get_next` is not finished or put back yet."""
+        return url in self._in_progress
+
     def mark_processed(self, url: str) -> None:
         self._finish(url)
         self._processed_count += 1

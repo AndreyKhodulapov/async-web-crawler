@@ -177,10 +177,12 @@ class CrawlRun:
                 )
                 await self._crawl_pages(url_filter)
             except self._frontier.ERRORS as error:
-                logger.error("The crawl stops: its frontier failed: %s: %s", type(error).__name__, error)
+                # Told by the error the frontier got, if it raised its own from it.
+                cause = error.__cause__ or error
+                logger.error("The crawl stops: its frontier failed: %s: %s", type(cause).__name__, cause)
                 # The pages done so far are stored all the same; those in progress come back to others.
                 await self._flush_storage()
-                raise FrontierError(f"the frontier failed: {type(error).__name__}: {error}") from error
+                raise FrontierError(f"the frontier failed: {type(cause).__name__}: {cause}") from cause
             except asyncio.CancelledError:
                 if self.storage is not None:
                     # Written while `on_settled` still stands: the pages of
@@ -242,7 +244,8 @@ class CrawlRun:
         except ExceptionGroup as errors:
             if (error := _first_of(errors, self._frontier.ERRORS)) is None:
                 raise
-            raise error from None
+            # Out of the group, with the cause it was raised from, if any.
+            raise error from error.__cause__
 
     async def seed(
         self, start_urls: list[str], *, url_filter: UrlFilter, sitemap_urls: list[str], robots_sitemaps: bool
@@ -482,8 +485,10 @@ class CrawlRun:
                 # Fetcher.fetch() reports expected failures in the result, so this
                 # is a bug; it must not kill the worker, and the page
                 # must leave the in-progress state, or take() would wait forever.
+                # It may have left it before the error: then there is nothing to fail.
                 logger.exception("Unexpected error while crawling %s", url)
-                await self._fail_page(page, UnexpectedError(url, f"{type(exc).__name__}: {exc}"))
+                if frontier.in_progress(page):
+                    await self._fail_page(page, UnexpectedError(url, f"{type(exc).__name__}: {exc}"))
 
     async def _crawl_page(self, page: FrontierPage, url_filter: UrlFilter) -> None:
         url, depth = page

@@ -1827,6 +1827,27 @@ class TestCrawlSharedFrontierFailures:
         assert list(crawler.failed_urls) == ["http://a/1"]
         assert list(crawler.processed_urls) == ["http://a/2"]
 
+    @pytest.mark.parametrize("frontier_class", [MemoryFrontier, SharedMemoryFrontier])
+    async def test_error_after_a_page_is_finished_leaves_it_as_it_is(
+        self, make_crawler, fake_session, caplog, frontier_class
+    ):
+        # A bug once the page is done: there is nothing left to fail, the worker goes on.
+        caplog.set_level(logging.ERROR, logger="crawler")
+
+        class Buggy(frontier_class):
+            async def finish(self, page, outcome, reason=None, **options):
+                await super().finish(page, outcome, reason, **options)
+                if page.url == "http://a/1":
+                    raise RuntimeError("bug")
+
+        crawler = make_crawler(max_concurrent=1, max_depth=0)
+
+        await crawler.crawl_frontier(Buggy(), ["http://a/1", "http://a/2"])
+
+        assert list(crawler.processed_urls) == ["http://a/1", "http://a/2"]
+        assert crawler.failed_urls == {}
+        assert "Unexpected error while crawling http://a/1" in caplog.text
+
     @staticmethod
     def cancelled_with_a_page_in_flight(make_crawler, fake_session, storage: MemoryStorage):
         """A crawl of a/1, done and buffered, and a/2, in flight, cancelled; the pages reported saved."""

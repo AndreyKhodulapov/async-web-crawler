@@ -32,6 +32,7 @@ from crawler import (
 from crawler.config import StorageOptions
 from crawler.distributed import create_job, job_stats, run_worker
 from crawler.distributed import worker as worker_module
+from crawler.distributed.frontier import DATABASE_ERRORS
 
 pytestmark = pytest.mark.postgres
 
@@ -746,9 +747,12 @@ async def test_worker_whose_database_is_gone_stops_and_the_others_crawl_its_page
         await link.cut()
 
         async with asyncio.timeout(5):
-            with pytest.raises(FrontierError, match="the frontier failed"):
+            with pytest.raises(FrontierError, match="the frontier failed") as raised:
                 await first
 
+    # Told by the error of the database itself.
+    assert isinstance(raised.value.__cause__, DATABASE_ERRORS)
+    assert str(raised.value).startswith(f"the frontier failed: {type(raised.value.__cause__).__name__}: ")
     # The pages it crawled are written all the same; none failed for the database.
     assert len(saved_urls(tmp_path)) >= 5
     assert await urls_in("failed") == set()
@@ -759,6 +763,27 @@ async def test_worker_whose_database_is_gone_stops_and_the_others_crawl_its_page
     processed = await urls_in("processed")
     assert len(processed) == WIDE_PAGES
     assert set(saved_urls(tmp_path)) == processed
+    assert await job_state() == "finished"
+
+
+async def test_os_error_of_a_worker_outside_the_database_fails_its_page_alone(url, site, monkeypatch, caplog):
+    # A bug in parsing raises OSError, as the database gone would: only the page fails, the worker goes on.
+    parse = AsyncCrawler._parse
+
+    async def failing_parse(self, result):
+        if result.url == url("/site/a.html"):
+            raise OSError("bug")
+        return await parse(self, result)
+
+    monkeypatch.setattr(AsyncCrawler, "_parse", failing_parse)
+    await create_job(make_config(urls=[url("/site/")], crawler={"max_depth": 1}), "test", dsn=POSTGRES_DSN)
+
+    await run_worker(worker_config(), "test", worker="w0", configure_logging=False)
+
+    (failed,) = await fetch("SELECT url, error FROM frontier WHERE state = 'failed' AND error = 'UnexpectedError'")
+    assert failed["url"] == url("/site/a.html")
+    assert url("/site/b.html") in await urls_in("processed")
+    assert "Unexpected error while crawling" in caplog.text
     assert await job_state() == "finished"
 
 

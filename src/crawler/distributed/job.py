@@ -12,7 +12,7 @@ import asyncpg
 
 from crawler.advanced import AdvancedCrawler
 from crawler.config import CrawlerConfig, StorageOptions
-from crawler.distributed.frontier import PostgresFrontier
+from crawler.distributed.frontier import DATABASE_ERRORS, FrontierDatabaseError, PostgresFrontier
 from crawler.distributed.schema import Connection, create_schema
 from crawler.exceptions import ConfigError, FrontierError, JobError
 from crawler.queue import queue_form
@@ -115,11 +115,15 @@ def _check_start_urls(urls: Iterable[str]) -> None:
 
 @contextlib.contextmanager
 def database_errors(job: str) -> Iterator[None]:
-    """Raise the errors of the database of the job as FrontierError, as a crawl of its frontier does."""
+    """Raise the errors of the database of the job as FrontierError, as a crawl of its frontier does.
+
+    Those of the database itself and those of the operations of a `PostgresFrontier`, told by the error they got.
+    """
     try:
         yield
-    except PostgresFrontier.ERRORS as error:
-        raise FrontierError(f"the database of crawl job {job} failed: {type(error).__name__}: {error}") from error
+    except (FrontierDatabaseError, *DATABASE_ERRORS) as error:
+        cause = error.__cause__ if isinstance(error, FrontierDatabaseError) else error
+        raise FrontierError(f"the database of crawl job {job} failed: {type(cause).__name__}: {cause}") from cause
 
 
 async def _prepare_job(

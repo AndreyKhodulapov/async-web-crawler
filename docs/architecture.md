@@ -143,7 +143,9 @@ run against it; what it adds is what sharing needs.
   when their leases expire, uncounted from `max_pages`, and fail after
   `max_attempts` expiries. So a page is crawled **at least once**, not
   exactly once, and the storage must take a page twice: a table with a
-  row per URL does.
+  row per URL does. A lease that expired while the worker was slow, not
+  gone, may come back to that worker through another of its tasks: the
+  page is left to the task that crawls it, not crawled a second time.
 - **The target of a redirect is seen from its page.** A redirect marks
   its target seen, so that a link to it is not crawled a second time,
   and the row keeps the page it was seen from (`frontier.seen_from`). A
@@ -193,12 +195,15 @@ run against it; what it adds is what sharing needs.
   before its buffer is written: its pages would wait for their leases,
   and there may be no other worker to take them then.
 - **A database that fails stops the worker.** An operation of the
-  frontier that fails with one of `PostgresFrontier.ERRORS` (the database
-  is down, the connection broke, a query was refused) is not tried again
-  and does not fail the page: the crawl stops all its tasks, the storage
-  writes what it buffers, and `run_worker` raises `FrontierError`. The
-  pages in progress stay `leased` and come back to the other workers
-  once their leases expire; `close` tries to put them back at once and
+  frontier that fails with `FrontierDatabaseError`, its one
+  `PostgresFrontier.ERRORS` (the database is down, the connection broke,
+  a query was refused), is not tried again and does not fail the page.
+  Only the operations of the frontier raise it, so an `OSError` of the
+  crawl itself fails its page alone. On a failure of the database the
+  crawl stops all its tasks, the storage writes what it buffers, and
+  `run_worker` raises `FrontierError`, the error of the database as its
+  cause. The pages in progress stay `leased` and come back to the other
+  workers once their leases expire; `close` tries to put them back at once and
   only logs if it cannot. Starting the worker again is the business of
   whatever runs it (a restart policy of compose, a Kubernetes Job), as
   in crash-only software: a worker that tried to ride out an outage would
@@ -380,7 +385,9 @@ run against it; what it adds is what sharing needs.
   database what it waits for: a page put off, a host's turn, a lease of
   another worker that may expire, and sleeps until the nearest of them,
   at most `poll_interval`. Operations of its own frontier wake it at
-  once. `LISTEN/NOTIFY` could wake it on the operations of others; it
+  once: each sets the event the waiting tasks saw before they looked and
+  starts a new one, so a task that looks meanwhile clears no wakeup of
+  another. `LISTEN/NOTIFY` could wake it on the operations of others; it
   is worth it only if the measurements show the polls cost too much.
 - **Times are those of the database**: one clock for all workers, so a
   host interval holds whatever the clocks of the machines say. The

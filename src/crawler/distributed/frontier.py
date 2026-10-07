@@ -3,12 +3,14 @@
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import logging
 import os
 import secrets
 import socket
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
+from typing import ParamSpec, TypeVar
 
 import asyncpg
 
@@ -19,6 +21,12 @@ from crawler.queue import queue_form
 from crawler.urls import get_host
 
 logger = logging.getLogger(__name__)
+
+# What the database, or the way to it, fails an operation with.
+DATABASE_ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 # What a worker that got no page waits for, if for anything.
 _WAIT_STATE = """
@@ -177,6 +185,27 @@ def _waits_for_others(state: asyncpg.Record) -> bool:
     return state["others_busy"] and not state["queued"]
 
 
+class FrontierDatabaseError(Exception):
+    """An operation of a `PostgresFrontier` failed in the database, or could not reach it; the cause is what it failed with."""
+
+
+def _database_operation(operation: Callable[_P, Awaitable[_R]]) -> Callable[_P, Awaitable[_R]]:
+    """Raise what the database fails `operation` with as `FrontierDatabaseError`.
+
+    Only the operations of the frontier raise it: an OSError of the crawl
+    itself, in parsing a page say, is not taken for the database gone.
+    """
+
+    @functools.wraps(operation)
+    async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        try:
+            return await operation(*args, **kwargs)
+        except DATABASE_ERRORS as error:
+            raise FrontierDatabaseError(f"{type(error).__name__}: {error}") from error
+
+    return wrapper
+
+
 def worker_name() -> str:
     """A name for a worker, unlike that of any other: the host name, the process id and a random part."""
     return f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(2)}"
@@ -230,9 +259,14 @@ class PostgresFrontier(Frontier):
     full before its pages are `saved`; a `saved` lost leaves them
     `saving` until their leases expire.
 
-    An operation fails with one of `ERRORS` when the database cannot be
-    reached or refuses it; it is not tried again: the worker stops, and
+    An operation fails with `FrontierDatabaseError`, its one `ERRORS`,
+    when the database cannot be reached or refuses it, the error of the
+    database as its cause; it is not tried again: the worker stops, and
     its pages come back to the others once their leases expire.
+
+    A worker that takes back a page of its own whose lease expired, while
+    another of its tasks still crawls it, leaves the page to that task:
+    `take` looks for another one.
 
     A URL is a key of the database, and a key holds about 2.7 KB: a URL
     longer than `MAX_URL_LENGTH` is never kept. `seed`, `add` and
@@ -242,7 +276,7 @@ class PostgresFrontier(Frontier):
     """
 
     shared = True
-    ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
+    ERRORS = (FrontierDatabaseError,)
     # As long as a link the crawler follows (AsyncCrawler.MAX_URL_LENGTH);
     # a key of an index holds 2704 bytes, the job and the header included.
     MAX_URL_LENGTH = 2048
@@ -278,6 +312,8 @@ class PostgresFrontier(Frontier):
         self._held: dict[str, int] = {}  # pages taken and not finished, with their waits
         self._given_up: dict[str, GivenUp] = {}  # pages held whose host is given up
         self._counted: set[str] = set()  # pages held and counted toward the limits
+        # Set by an operation of this frontier, then replaced: each `take`
+        # waits for the one it saw before it looked, which no other clears.
         self._wakeup = asyncio.Event()
         # The heartbeat, saved and close each change many rows of this
         # worker: one at a time, or two of them may deadlock.
@@ -291,6 +327,7 @@ class PostgresFrontier(Frontier):
         self._closed = False
 
     @classmethod
+    @_database_operation
     async def open(
         cls,
         dsn: str,
@@ -330,35 +367,37 @@ class PostgresFrontier(Frontier):
                 )
             if row is None:
                 raise JobError(f'There is no crawl job named "{job}"')
+            frontier = cls(
+                pool,
+                job=job,
+                job_id=row["id"],
+                worker=worker or worker_name(),
+                max_pages=row["max_pages"],
+                max_pages_per_host=row["max_pages_per_host"],
+                frontier_factor=row["frontier_factor"],
+                lease_seconds=lease_seconds,
+                heartbeat_seconds=heartbeat_seconds,
+                max_attempts=max_attempts,
+                host_interval=host_interval,
+                poll_interval=poll_interval,
+            )
+            await frontier.refresh_stats()
+            async with pool.acquire() as connection:
+                await frontier._read_scope(connection)
         except BaseException:
             await pool.close()
             raise
-        frontier = cls(
-            pool,
-            job=job,
-            job_id=row["id"],
-            worker=worker or worker_name(),
-            max_pages=row["max_pages"],
-            max_pages_per_host=row["max_pages_per_host"],
-            frontier_factor=row["frontier_factor"],
-            lease_seconds=lease_seconds,
-            heartbeat_seconds=heartbeat_seconds,
-            max_attempts=max_attempts,
-            host_interval=host_interval,
-            poll_interval=poll_interval,
-        )
-        await frontier.refresh_stats()
-        async with pool.acquire() as connection:
-            await frontier._read_scope(connection)
         frontier._heartbeat = asyncio.create_task(frontier._beat())
         return frontier
 
+    @_database_operation
     async def seed(self, urls: Iterable[str]) -> list[str]:
         pages = self._pages_of(urls)
         await self._add(self._pool, pages, depth=0, bounded=False)
-        self._wakeup.set()
+        self._wake()
         return list(pages)
 
+    @_database_operation
     async def add(self, urls: Iterable[str], *, depth: int) -> int:
         pages = self._pages_of(urls)
         if not pages:
@@ -385,10 +424,11 @@ class PostgresFrontier(Frontier):
         )
         return row["accepted"], row["dropped"], dict(zip(row["accepted_hosts"], row["host_accepted"], strict=True))
 
+    @_database_operation
     async def take(self) -> FrontierPage | None:
         while True:
-            # Cleared before looking: an operation of this frontier meanwhile wakes the wait below.
-            self._wakeup.clear()
+            # Seen before looking: an operation of this frontier meanwhile wakes the wait below.
+            wakeup = self._wakeup
             async with self._pool.acquire() as connection:
                 if not self._joined:
                     # Not on open: the process that seeds the job opens a frontier, but takes no page.
@@ -403,6 +443,15 @@ class PostgresFrontier(Frontier):
                     self.max_attempts,
                 )
                 self._log_reclaimed(row)
+                if row["url"] in self._held:
+                    # Its lease expired while another task of this worker
+                    # crawls it, and was given back to this worker: that task
+                    # finishes it. Taken back, it was uncounted.
+                    logger.info(
+                        "Lease of %s expired and came back to this worker: the page is crawled once", row["url"]
+                    )
+                    self._counted.discard(row["url"])
+                    continue
                 if row["url"] is not None:
                     self._held[row["url"]] = row["waits"]
                     if row["given_up_outcome"] is not None:
@@ -424,8 +473,9 @@ class PostgresFrontier(Frontier):
                 await self.on_waiting()
             with contextlib.suppress(TimeoutError):
                 async with asyncio.timeout(delay):
-                    await self._wakeup.wait()
+                    await wakeup.wait()
 
+    @_database_operation
     async def admit(self, page: FrontierPage) -> Admission:
         row = await self._pool.fetchrow("SELECT * FROM frontier_admit($1, $2, $3)", self.job_id, page.url, self.worker)
         match row["admission"]:
@@ -440,6 +490,7 @@ class PostgresFrontier(Frontier):
         self._stats = dataclasses.replace(self._stats, requested=row["requested"])
         return Admission.ADMITTED
 
+    @_database_operation
     async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool, waited: bool = False) -> None:
         self._check_held(page)
         uncount = uncount and page.url in self._counted
@@ -457,6 +508,7 @@ class PostgresFrontier(Frontier):
             self._release(page)
         self._left(page, row, uncount)
 
+    @_database_operation
     async def finish(
         self,
         page: FrontierPage,
@@ -491,6 +543,7 @@ class PostgresFrontier(Frontier):
             self._release(page)
         self._left(page, row, uncount)
 
+    @_database_operation
     async def saved(self, urls: Iterable[str]) -> None:
         urls = list(urls)
         if not urls:
@@ -510,6 +563,7 @@ class PostgresFrontier(Frontier):
         self._check_held(page)
         return self._held[page.url]
 
+    @_database_operation
     async def mark_seen(self, url: str, source: str) -> bool:
         form = queue_form(url)
         if form is None:
@@ -530,6 +584,7 @@ class PostgresFrontier(Frontier):
         )
         return new is not None
 
+    @_database_operation
     async def forget(self, url: str, source: str) -> None:
         form = queue_form(url)
         if form is not None:
@@ -540,6 +595,7 @@ class PostgresFrontier(Frontier):
                 source,
             )
 
+    @_database_operation
     async def is_pending_or_processed(self, url: str) -> bool:
         form = queue_form(url)
         if form is None:
@@ -547,12 +603,14 @@ class PostgresFrontier(Frontier):
         state = await self._pool.fetchval("SELECT state FROM frontier WHERE job = $1 AND url = $2", self.job_id, form)
         return state in ("queued", "leased", "saving", "processed")
 
+    @_database_operation
     async def full(self) -> bool:
         if self._max_queued is None:
             return False
         job = await self._pool.fetchrow("SELECT requested, unfinished FROM crawl_jobs WHERE id = $1", self.job_id)
         return not self._closed_at(job["requested"]) and job["unfinished"] + job["requested"] >= self._max_queued
 
+    @_database_operation
     async def hold_out_of_scope(self, urls: Iterable[str]) -> None:
         # A URL too long to keep is turned away by the filter whatever the scope.
         urls = [url for url in dict.fromkeys(urls) if len(url) <= self.MAX_URL_LENGTH]
@@ -565,6 +623,7 @@ class PostgresFrontier(Frontier):
                 urls,
             )
 
+    @_database_operation
     async def widen_scope(self, host: str, allows: Callable[[str], bool]) -> int:
         async with self._pool.acquire() as connection:
             async with connection.transaction():
@@ -594,15 +653,18 @@ class PostgresFrontier(Frontier):
     def scope_hosts(self) -> list[str]:
         return list(self._scope_hosts)
 
+    @_database_operation
     async def hold_host(self, host: str, seconds: float, reason: str | None) -> None:
         # A statement of its own: it locks the host alone, so it may wait
         # for a take() or admit() that holds it, but takes part in no deadlock.
         await self._pool.execute(_HOLD_HOST, self.job_id, host, float(seconds), reason)
 
+    @_database_operation
     async def set_host_interval(self, host: str, seconds: float) -> None:
         # A statement of its own on the host alone, as in hold_host.
         await self._pool.execute(_SET_INTERVAL, self.job_id, host, float(seconds))
 
+    @_database_operation
     async def count_host_failures(
         self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
     ) -> HostFailures:
@@ -612,6 +674,7 @@ class PostgresFrontier(Frontier):
         )
         return HostFailures(row["circuit_openings"], row["robots_failures"])
 
+    @_database_operation
     async def give_up_host(self, host: str, outcome: Outcome, reason: str, *, error: str | None = None) -> None:
         async with self._pool.acquire() as connection, connection.transaction():
             # The job before the host, as a page in progress is finished:
@@ -626,7 +689,7 @@ class PostgresFrontier(Frontier):
         logger.warning(
             "Gave up on %s for the whole job: %s; %d pages queued are %s", host, reason, finished, outcome.value
         )
-        self._wakeup.set()
+        self._wake()
 
     def given_up(self, page: FrontierPage) -> GivenUp | None:
         self._check_held(page)
@@ -635,6 +698,7 @@ class PostgresFrontier(Frontier):
     def stats(self) -> FrontierStats:
         return self._stats
 
+    @_database_operation
     async def refresh_stats(self) -> None:
         """Read the counts of the job's pages by state, for `stats`."""
         async with self._pool.acquire() as connection:
@@ -688,7 +752,7 @@ class PostgresFrontier(Frontier):
                 # The last pages of the job may have been pending their save until now.
                 await self._finish_job(connection)
                 await connection.execute(_SEEN, self.job_id, self.worker, self.lease_seconds, True)
-        except self.ERRORS as error:
+        except DATABASE_ERRORS as error:
             logger.warning(
                 "Could not put back the pages worker %s has in progress: %s; they come back once their leases expire",
                 self.worker,
@@ -698,7 +762,7 @@ class PostgresFrontier(Frontier):
             self._held.clear()
             self._given_up.clear()
             self._counted.clear()
-            self._wakeup.set()
+            self._wake()
             await self._pool.close()
 
     async def _read_scope(self, connection: Connection) -> None:
@@ -790,6 +854,14 @@ class PostgresFrontier(Frontier):
             pages[form] = host
         return pages
 
+    def in_progress(self, page: FrontierPage) -> bool:
+        return page.url in self._held
+
+    def _wake(self) -> None:
+        """Wake every `take` that waits, and those that look meanwhile once they wait."""
+        self._wakeup.set()
+        self._wakeup = asyncio.Event()
+
     def _check_held(self, page: FrontierPage) -> None:
         if page.url not in self._held:
             raise ValueError(f"{page.url} is not in progress")
@@ -803,7 +875,7 @@ class PostgresFrontier(Frontier):
         """Tell of the bounds an addition reached, and wake the waiting workers if pages were accepted; after it commits."""
         self._log_bounds(dropped, accepted_by_host)
         if accepted:
-            self._wakeup.set()
+            self._wake()
 
     def _left(self, page: FrontierPage, row: asyncpg.Record, uncount: bool) -> None:
         """Tell of the lease of a page put back or finished that was lost, or of `requested` it uncounted."""
@@ -811,7 +883,7 @@ class PostgresFrontier(Frontier):
             _log_lease_lost(page)
         elif uncount:
             self._stats = dataclasses.replace(self._stats, requested=row["requested"])
-        self._wakeup.set()
+        self._wake()
 
     def _log_reclaimed(self, row: asyncpg.Record) -> None:
         """Tell of the pages whose leases expired, which `take` queued again or failed."""

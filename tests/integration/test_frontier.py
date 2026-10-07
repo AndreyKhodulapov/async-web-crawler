@@ -205,6 +205,16 @@ class TestTake:
 
         assert await asyncio.gather(*waiters) == [None, None, None]
 
+    async def test_page_is_in_progress_until_put_back_or_finished(self, frontier):
+        await frontier.seed(["http://site/a", "http://site/b"])
+        a, b = await take(frontier), await take(frontier)
+        assert frontier.in_progress(a) and frontier.in_progress(b)
+
+        await frontier.put_back(a, uncount=False)
+        await frontier.finish(b, Outcome.PROCESSED)
+
+        assert not frontier.in_progress(a) and not frontier.in_progress(b)
+
 
 class TestPutBack:
     async def test_page_put_back_is_taken_again_with_its_depth(self, frontier):

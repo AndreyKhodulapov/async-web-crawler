@@ -19,6 +19,7 @@ import pytest
 from helpers import POSTGRES_DSN, DatabaseLink, drop_frontier_tables, long_url, make_job
 
 from crawler import Admission, FrontierPage, GivenUp, HostFailures, JobError, Outcome, PostgresFrontier
+from crawler.distributed.frontier import DATABASE_ERRORS
 
 pytestmark = pytest.mark.postgres
 
@@ -85,6 +86,27 @@ async def still_waiting(operation: Awaitable[object], seconds: float = 0.3) -> b
 
 
 class TestJob:
+    async def test_worker_that_fails_to_open_closes_its_connections(self, open_frontier, monkeypatch):
+        await open_frontier("seeder")
+        pools = []
+        create_pool = asyncpg.create_pool
+
+        async def recording_pool(*args, **kwargs):
+            pools.append(await create_pool(*args, **kwargs))
+            return pools[-1]
+
+        async def failing(self):
+            raise OSError("connection reset")
+
+        monkeypatch.setattr(asyncpg, "create_pool", recording_pool)
+        monkeypatch.setattr(PostgresFrontier, "refresh_stats", failing)
+
+        with pytest.raises(PostgresFrontier.ERRORS):
+            await PostgresFrontier.open(POSTGRES_DSN, job="test", worker="failing")
+
+        (pool,) = pools
+        assert pool.is_closing()
+
     async def test_worker_of_a_job_that_does_not_exist_fails(self, open_frontier):
         await make_job("other")
 
@@ -491,6 +513,46 @@ class TestLease:
 
         assert (await row_of(page.url))[:2] == ("leased", "other")
 
+    @staticmethod
+    async def taken_back(url: str) -> None:
+        """Wait until the page has been queued again once and is leased anew."""
+        async with asyncio.timeout(5):
+            while tuple((await row_of(url))[:3]) != ("leased", "slow", 1):
+                await asyncio.sleep(0.01)
+
+    async def test_page_whose_lease_came_back_to_its_worker_is_left_to_the_task_crawling_it(self, open_frontier):
+        # The database was slow: the lease expired while a task crawled the
+        # page, and another task of the same worker took it back.
+        slow = await open_frontier("slow", lease_seconds=0.3, heartbeat_seconds=60)
+        await slow.seed(["http://site/"])
+        page = await take(slow)
+        await asyncio.sleep(0.35)
+        other_task = asyncio.create_task(slow.take())
+        await self.taken_back(page.url)
+
+        assert not other_task.done()
+        await slow.finish(page, Outcome.PROCESSED)
+
+        assert await asyncio.wait_for(other_task, 5) is None
+        assert (await row_of(page.url))[:3] == ("processed", "slow", 1)
+
+    async def test_page_whose_lease_came_back_to_its_worker_is_uncounted_once(self, open_frontier):
+        slow = await open_frontier("slow", lease_seconds=0.3, heartbeat_seconds=60, max_pages=5)
+        await slow.seed(["http://site/"])
+        page = await take(slow)
+        assert await slow.admit(page) is Admission.ADMITTED
+        await asyncio.sleep(0.35)
+        other_task = asyncio.create_task(slow.take())
+        await self.taken_back(page.url)
+
+        # Nothing was sent: the page is uncounted, but it was already as its lease expired.
+        await slow.finish(page, Outcome.SKIPPED, "not sent", uncount=True)
+
+        assert await asyncio.wait_for(other_task, 5) is None
+        (job,) = await fetch("SELECT requested FROM crawl_jobs")
+        (host,) = await fetch("SELECT requested FROM hosts")
+        assert (job["requested"], host["requested"]) == (0, 0)
+
 
 class TestWaits:
     async def test_waits_of_a_page_are_known_to_the_next_worker_and_outlast_its_lease(self, open_frontier):
@@ -880,6 +942,28 @@ class TestWaiting:
 
         assert await asyncio.wait_for(waiter, 5) is None
 
+    async def test_wakeup_while_a_task_looks_is_not_lost_to_another_task_that_looks_meanwhile(self, open_frontier):
+        # A task of the worker writes out its storage between looking and
+        # waiting; meanwhile another of its tasks starts looking, waits, and
+        # wakes when the worker finishes its last page: the first one ends at
+        # once too, not after poll_interval.
+        busy = await open_frontier("busy")
+        waiting = await open_frontier("waiting", poll_interval=5)
+        await busy.seed(["http://site/a", "http://site/b"])
+        held_by_busy, held_by_waiting = await take(busy), await take(waiting)
+
+        async def on_waiting() -> None:
+            waiting.on_waiting = None
+            await busy.finish(held_by_busy, Outcome.PROCESSED)
+            other_task = asyncio.create_task(waiting.take())
+            await asyncio.sleep(0.2)
+            await waiting.finish(held_by_waiting, Outcome.PROCESSED)
+            assert await asyncio.wait_for(other_task, 1) is None
+
+        waiting.on_waiting = on_waiting
+
+        assert await asyncio.wait_for(waiting.take(), 1) is None
+
 
 class TestSeeding:
     async def test_no_page_is_handed_out_while_the_job_is_seeding(self, open_frontier):
@@ -1047,10 +1131,12 @@ class TestDatabaseGone:
                 page = await take(frontier)
                 await link.cut()
 
-                with pytest.raises(PostgresFrontier.ERRORS):
+                with pytest.raises(PostgresFrontier.ERRORS) as raised:
                     await frontier.finish(page, Outcome.PROCESSED)
                 with pytest.raises(PostgresFrontier.ERRORS):
                     await frontier.take()
+                # The error of the database is the cause.
+                assert isinstance(raised.value.__cause__, DATABASE_ERRORS)
             finally:
                 await frontier.close()
 

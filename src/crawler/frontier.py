@@ -92,9 +92,12 @@ class Frontier(ABC):
     means no limit.
 
     A frontier kept outside the process lists in `ERRORS` the exceptions
-    its operations fail with when it cannot be reached. A crawl stops on
-    them instead of failing the page: the pages it has in progress are not
-    finished, and other processes crawl them once their leases expire.
+    its operations fail with when it cannot be reached; nothing but its
+    operations raises them, or the crawl would take an error of its own
+    for the frontier gone. A crawl stops on them instead of failing the
+    page: the pages it has in progress are not finished, and other
+    processes crawl them once their leases expire. One raised from
+    another error (`raise ... from`) is told by that error.
     """
 
     # Room for the pages that do not count toward max_pages, such as those robots.txt disallows.
@@ -157,6 +160,10 @@ class Frontier(ABC):
 
         With `waited`, the page goes back to wait for its host, and the wait counts in `waits`.
         """
+
+    @abstractmethod
+    def in_progress(self, page: FrontierPage) -> bool:
+        """Whether a page taken is still to be put back or finished by this process."""
 
     @abstractmethod
     def waits(self, page: FrontierPage) -> int:
@@ -407,6 +414,9 @@ class MemoryFrontier(Frontier):
                 self.queue.mark_blocked(page.url, reason)
             case Outcome.UNREACHABLE:
                 self.queue.mark_unreachable(page.url, reason)
+
+    def in_progress(self, page: FrontierPage) -> bool:
+        return self.queue.is_in_progress(page.url)
 
     def waits(self, page: FrontierPage) -> int:
         return self._waits[page.url]
