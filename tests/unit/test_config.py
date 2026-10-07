@@ -103,7 +103,13 @@ FULL = {
         "csv_encoding": "utf-8-sig",
         "overwrite": True,
     },
-    "logging": {"level": "DEBUG", "file": "crawler.log", "max_bytes": 1000, "backup_count": 2},
+    "logging": {
+        "level": "DEBUG",
+        "file": "crawler.log",
+        "max_bytes": 1000,
+        "backup_count": 2,
+        "console_format": "json",
+    },
     "report": {"stats_json": "stats.json", "html": "report.html", "title": "Blog crawl", "top_domains": 5},
     "distributed": {
         "database_url": "postgresql://crawler:dbp4ss@db.example:5432/crawler",
@@ -154,7 +160,9 @@ class TestDefaults:
         )
         assert {"pdf", "jpg", "zip", "mp4"} <= set(EXCLUDED_EXTENSIONS)
         assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8", overwrite=False)
-        assert config.logging == LoggingOptions(level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5)
+        assert config.logging == LoggingOptions(
+            level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5, console_format="text"
+        )
         assert config.report == ReportOptions(stats_json=None, html=None, title="Crawl report", top_domains=10)
         assert config.session == SessionOptions(
             keep_cookies=True, cookies=(), cookies_file=None, save_cookies=None, headers={}
@@ -385,6 +393,7 @@ class TestInvalid:
                 'logging.level: expected one of DEBUG, INFO, WARNING, ERROR, CRITICAL, got "LOUD"',
             ),
             ({"logging": {"backup_count": -1}}, "logging.backup_count: must be >= 0, got -1"),
+            ({"logging": {"console_format": "xml"}}, 'logging.console_format: expected one of text, json, got "xml"'),
             ({"report": {"top_domains": 0}}, "report.top_domains: must be >= 1, got 0"),
             ({"report": {"html": ""}}, 'report.html: must not be empty, got ""'),
         ],

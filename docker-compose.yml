@@ -3,6 +3,34 @@
 #   export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
 # If port 5432 is taken, export CRAWLER_POSTGRES_PORT=55432 first and put
 # that port in the URL; the tests read the port from the same variable.
+#
+# The crawler runs in the services below, built from the Dockerfile; their
+# configuration files are those of examples/docker, the files they write
+# go to ./out. Each is started by its name only:
+#   docker compose run --rm crawl                     # a crawl of its own
+#   docker compose run --rm job                       # create the crawl job "books"
+#   docker compose up --scale worker=4 worker         # its workers, until no page is left
+#   docker compose run --rm job status --job books    # its progress
+#   docker compose run --rm job report --job books --report out/report.html
+# CRAWLER_JOB names another job for the workers. On Linux, create ./out
+# first and export CRAWLER_USER=$(id -u):$(id -g), so that they can write there.
+
+x-crawler: &crawler
+  build:
+    context: .
+    target: crawler
+  image: async-web-crawler
+  init: true  # passes signals on and reaps the processes a browser leaves behind
+  user: "${CRAWLER_USER:-10001:10001}"
+  environment:
+    CRAWLER_DATABASE_URL: postgresql://crawler:crawler@postgres:5432/crawler
+  volumes:
+    - ./examples/docker:/config:ro
+    - ./out:/app/out
+  # docker stop sends SIGTERM: the crawler writes what its storage buffers
+  # and its reports, and a worker queues its pages in progress again.
+  stop_grace_period: 30s
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -19,6 +47,30 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  crawl:
+    <<: *crawler
+    profiles: [crawl]
+    command: ["--config", "/config/crawl.yaml"]
+
+  job:
+    <<: *crawler
+    profiles: [job]
+    command: ["job", "create", "--config", "/config/job.yaml", "--name", "${CRAWLER_JOB:-books}"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    <<: *crawler
+    profiles: [job]
+    command: ["worker", "--job", "${CRAWLER_JOB:-books}", "--config", "/config/worker.yaml"]
+    # A worker the database failed (exit code 1) starts again and takes up
+    # the job; the pages it had in progress come back once their leases expire.
+    restart: on-failure:5
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   postgres-data:

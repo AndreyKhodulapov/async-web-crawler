@@ -369,9 +369,15 @@ def make_app() -> web.Application:
 
 
 @pytest.fixture
-async def server(aiohttp_server):
+def server_host() -> str:
+    """The address the test site listens on; tests whose client runs elsewhere, as in a container, override it."""
+    return "127.0.0.1"
+
+
+@pytest.fixture
+async def server(aiohttp_server, server_host):
     """Local HTTP server with predictable endpoints; no internet required."""
-    return await aiohttp_server(make_app())
+    return await aiohttp_server(make_app(), host=server_host)
 
 
 @pytest.fixture

@@ -1136,7 +1136,9 @@ The file gets JSON Lines, an object per record, so it can be read by
 ```
 
 `time` is UTC in ISO 8601; a record logged with an exception has its
-traceback under `exception`. The file is appended to. Once it reaches
+traceback under `exception`. `console_format="json"` sends the same JSON
+Lines to the console, for a collector that reads the output of a
+container (Loki, ELK). The file is appended to. Once it reaches
 `max_bytes` it becomes `crawler.log.1` (the older ones `crawler.log.2` and
 so on, `backup_count` of them are kept) and a new one is started; with
 either of the two set to 0 the file is never rotated. A record is never

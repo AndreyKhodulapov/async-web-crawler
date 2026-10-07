@@ -1,0 +1,15 @@
+# A worker of the crawl job: docker compose up --scale worker=4 worker
+# Each worker writes files of its own: {worker} is its name.
+
+crawler:
+  max_concurrent: 10    # requests in flight of this worker
+
+storage:
+  outputs:
+    - out/pages-{worker}.jsonl
+
+logging:
+  console_format: json  # JSON Lines on stderr, for a log collector reading the containers
+
+report:
+  stats_json: out/stats-{worker}.json

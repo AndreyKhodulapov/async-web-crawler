@@ -387,6 +387,9 @@ def print_stats(stats: dict[str, Any]) -> None:
 async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
     """Crawl by the configuration, print the summary; return the exit code.
 
+    With `logging.console_format: json` the progress line is not shown:
+    stderr is left to JSON Lines, for a log collector.
+
     Cancelled (Ctrl-C), it stops the crawl, writes the reports of the pages
     fetched so far, the cookies and those pages before the cancellation goes on.
     SIGTERM (`docker stop`, systemd) cancels it the same way; a second
@@ -409,7 +412,7 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
         async with AdvancedCrawler(config) as crawler:
             crawl = asyncio.create_task(crawler.crawl())
             try:
-                if progress:
+                if progress and config.logging.console_format == "text":
                     await show_progress(crawler.crawler, crawl, config.crawler.max_pages)
                 await crawl
             except BaseException as error:

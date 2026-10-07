@@ -128,6 +128,7 @@ class AdvancedCrawler:
                 config.logging.file,
                 max_bytes=config.logging.max_bytes,
                 backup_count=config.logging.backup_count,
+                console_format=config.logging.console_format,
             )
         if config.proxy.from_env and proxies is None:
             logger.warning("proxy.from_env: neither HTTP_PROXY nor HTTPS_PROXY is set, requests go directly")

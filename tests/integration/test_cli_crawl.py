@@ -71,6 +71,16 @@ async def test_crawl_by_a_file_and_options(url, config_file, tmp_path, capsys):
     assert "| 4/100 pages, 1 failed |" in captured.err.splitlines()[-1]
 
 
+async def test_json_console_gets_no_progress_line(config_file, capsys):
+    argv = ["--config", config_file(logging={"level": "INFO", "console_format": "json"})]
+
+    assert await run(build_config(parse_args(argv))) == 0
+
+    entries = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert entries
+    assert all(entry["level"] in {"INFO", "WARNING"} for entry in entries)
+
+
 async def test_options_limit_the_crawl_of_the_file(url, site, config_file, capsys):
     argv = ["--config", config_file(), "--max-depth", "0", "--no-progress"]
 

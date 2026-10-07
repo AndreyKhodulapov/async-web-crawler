@@ -410,6 +410,7 @@ See [Logging](api.md#logging).
 | `file` | string or `null` | `null` | also write the log to this file, as JSON Lines; the console gets it either way |
 | `max_bytes` | whole number, >= 0 | `10485760` | the file is rotated at this size; 0 never rotates it |
 | `backup_count` | whole number, >= 0 | `5` | rotated files that are kept; 0 never rotates the file |
+| `console_format` | string | `text` | `text` or `json`: the console gets JSON Lines too, as the file does, for a log collector reading the output of a container; the progress line of a crawl is not shown then |
 
 ### `report`
 

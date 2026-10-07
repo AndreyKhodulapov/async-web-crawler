@@ -1,4 +1,4 @@
-"""Sets up logging: text on the console and, optionally, JSON Lines in a rotated file."""
+"""Sets up logging: text or JSON Lines on the console and, optionally, JSON Lines in a rotated file."""
 
 import json
 import logging
@@ -7,6 +7,9 @@ import sys
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+# What the console gets: a line of text, or of JSON (see `JsonLinesFormatter`), per record.
+CONSOLE_FORMATS = ("text", "json")
 
 
 class ProgressAwareHandler(logging.StreamHandler):
@@ -58,11 +61,13 @@ def configure_logging(
     *,
     max_bytes: int = 10 * 1024 * 1024,
     backup_count: int = 5,
+    console_format: str = "text",
 ) -> None:
     """Send the records of `level` and above to the console and, with `file`, to that file too.
 
-    The console (stderr) gets text lines: time, level, logger, message. The
-    file gets JSON Lines (see `JsonLinesFormatter`) in UTF-8 and is appended
+    The console (stderr) gets text lines: time, level, logger, message; with
+    `console_format="json"`, JSON Lines as the file does, for a log collector
+    that reads the output of a container. The file gets JSON Lines (see `JsonLinesFormatter`) in UTF-8 and is appended
     to. Once it reaches `max_bytes` it is renamed to `file.1` (the older
     ones to `file.2` and so on, `backup_count` of them are kept) and a new
     one is started; with `max_bytes` or `backup_count` of 0 the file is
@@ -74,13 +79,16 @@ def configure_logging(
     previous call; handlers added by other code are left in place.
 
     Raises:
-        ValueError: `level` is not a logging level, or a limit is negative.
+        ValueError: `level` is not a logging level, `console_format` is not
+            one of `CONSOLE_FORMATS`, or a limit is negative.
         OSError: `file` cannot be opened; its directory is not created.
     """
     if max_bytes < 0:
         raise ValueError(f"max_bytes must be >= 0, got {max_bytes}")
     if backup_count < 0:
         raise ValueError(f"backup_count must be >= 0, got {backup_count}")
+    if console_format not in CONSOLE_FORMATS:
+        raise ValueError(f"console_format must be one of {', '.join(CONSOLE_FORMATS)}, got {console_format!r}")
     if isinstance(level, str):
         level = level.upper()
         if level not in logging.getLevelNamesMapping():
@@ -88,7 +96,9 @@ def configure_logging(
 
     handlers: list[logging.Handler] = [ProgressAwareHandler()]
     handlers[0].setFormatter(
-        logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s", datefmt="%H:%M:%S")
+        JsonLinesFormatter()
+        if console_format == "json"
+        else logging.Formatter("%(asctime)s | %(levelname)-7s | %(name)s | %(message)s", datefmt="%H:%M:%S")
     )
     if file is not None:
         # Opened before the old handlers are removed: a file that cannot be

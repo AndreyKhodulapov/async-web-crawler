@@ -19,6 +19,7 @@ import yaml
 from crawler.client import AsyncCrawler
 from crawler.exceptions import ConfigError
 from crawler.filters import extension_problem, normalize_extension
+from crawler.logging_setup import CONSOLE_FORMATS
 from crawler.proxy import Proxy, ProxyPool, proxy_url_problem
 from crawler.rendering import RESOURCE_TYPES, WAIT_STATES, Rendering, playwright_problem
 from crawler.robots import product_token
@@ -130,6 +131,10 @@ def _not_blank(value: str) -> str | None:
 
 def _rotation(value: str) -> str | None:
     return None if value in ("per_host", "per_request") else "expected per_host or per_request"
+
+
+def _console_format(value: str) -> str | None:
+    return None if value in CONSOLE_FORMATS else f"expected one of {', '.join(CONSOLE_FORMATS)}"
 
 
 def _render_mode(value: str) -> str | None:
@@ -365,12 +370,13 @@ class StorageOptions:
 
 @dataclass(frozen=True)
 class LoggingOptions:
-    """Section `logging`: the level of the log and the file it is also written to."""
+    """Section `logging`: the level of the log, the file it is also written to and the format of the console."""
 
     level: str = _option("INFO", check=_log_level, normalize=str.upper)
     file: str | None = _option(None, check=_file_path)
     max_bytes: int = _option(10 * 1024 * 1024, minimum=0)  # the file is rotated at this size; 0 never rotates it
     backup_count: int = _option(5, minimum=0)  # rotated files that are kept; 0 never rotates the file
+    console_format: str = _option("text", check=_console_format)  # json: JSON Lines on the console, as in the file
 
 
 @dataclass(frozen=True)
