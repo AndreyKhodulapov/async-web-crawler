@@ -26,8 +26,13 @@ async def open_worker(worker: str, **options) -> PostgresFrontier:
 
 
 async def test_statistics_of_a_job_are_those_of_a_crawl_of_one_process(url):
-    # Broken links fail, a noindex page is skipped.
-    job = make_config(urls=[url("/site/"), url("/site/noindex.html")], crawler={"max_depth": 3, "respect_robots": True})
+    # Broken links fail, a page that asks TestBot not to keep it is skipped.
+    # Each page is reached one way only, so the order the workers take the
+    # pages in does not change them: a page that links to b.html, or a depth
+    # of 3 (c.html by a link as well as by the redirect of moved), would.
+    job = make_config(
+        urls=[url("/site/"), url("/site/for-testbot.html")], crawler={"max_depth": 2, "respect_robots": True}
+    )
     async with AdvancedCrawler(job, configure_logging=False) as crawler:
         await crawler.crawl()
         local = crawler.get_stats()
