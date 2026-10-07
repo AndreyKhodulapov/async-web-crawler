@@ -229,15 +229,75 @@ class TestWriteErrors:
 
         assert storage.attempts == 1
 
-    async def test_batch_of_another_error_is_dropped(self):
-        storage = MemoryStorage(batch_size=2, failures=[TypeError("not serializable")])
-        with pytest.raises(TypeError):
+    async def test_only_the_record_that_cannot_be_written_is_dropped(self, caplog):
+        names = [f"page-{number}" for number in range(10)]
+        storage = MemoryStorage(batch_size=10, refused={"page-3"})
+
+        with caplog.at_level(logging.ERROR, logger="crawler.storage"), pytest.raises(ValueError, match="page-3"):
+            await save_pages(storage, *names)
+
+        # The batch is written again one record at a time.
+        assert storage.urls == [[name] for name in names if name != "page-3"]
+        assert (storage.pending, storage.written) == (0, 9)
+        assert "Dropped the record of page-3: MemoryStorage cannot write it: cannot write page-3" in caplog.text
+
+    async def test_storage_goes_on_after_a_record_is_dropped(self):
+        storage = MemoryStorage(batch_size=2, refused={"a"})
+        with pytest.raises(ValueError):
             await save_pages(storage, "a", "b")
 
         await save_pages(storage, "c", "d")
 
+        assert storage.urls == [["b"], ["c", "d"]]
+        assert (storage.pending, storage.written) == (0, 3)
+
+    async def test_batch_of_one_record_that_cannot_be_written_is_dropped(self, caplog):
+        storage = MemoryStorage(batch_size=1, refused={"a"})
+
+        with caplog.at_level(logging.ERROR, logger="crawler.storage"), pytest.raises(ValueError):
+            await save_pages(storage, "a")
+
+        assert storage.attempts == 1  # not written again on its own
+        assert (storage.pending, storage.written) == (0, 0)
+        assert "Dropped the record of a: MemoryStorage cannot write it" in caplog.text
+
+    async def test_batch_that_fails_only_whole_is_written_one_by_one(self, caplog):
+        storage = MemoryStorage(batch_size=2, failures=[TypeError("not serializable")])
+
+        with caplog.at_level(logging.WARNING, logger="crawler.storage"):
+            await save_pages(storage, "a", "b")
+
+        # Nothing is lost, so nothing is raised.
+        assert storage.urls == [["a"], ["b"]]
         assert (storage.pending, storage.written) == (0, 2)
-        assert storage.urls == [["c", "d"]]
+        assert "wrote its records one by one" in caplog.text
+
+    async def test_storage_error_of_a_write_is_not_retried_and_drops_the_records(self):
+        # Such as a file of another layout, found out when the first write opens it.
+        storage = MemoryStorage(batch_size=2, failures=[StorageError("not JSON Lines")] * 3)
+
+        with pytest.raises(StorageError, match="^not JSON Lines$"):
+            await save_pages(storage, "a", "b")
+
+        assert storage.attempts == 3  # the batch, then each record
+        assert (storage.pending, storage.written) == (0, 0)
+
+    async def test_write_error_while_writing_one_by_one_keeps_the_rest(self):
+        class DiskFillsUp(MemoryStorage):
+            async def _write_batch(self, records):
+                if self.batches:
+                    raise OSError("disk full")
+                await super()._write_batch(records)
+
+        storage = DiskFillsUp(batch_size=3, refused={"a"})
+
+        # a is dropped, b written, c fails with a write error and its retries.
+        with pytest.raises(StorageError, match="disk full"):
+            await save_pages(storage, "a", "b", "c")
+
+        assert storage.urls == [["b"]]
+        assert (storage.pending, storage.written) == (1, 1)
+        assert [record["url"] for record in storage._buffer] == ["c"]
 
     async def test_retries_can_be_turned_off(self):
         storage = MemoryStorage(batch_size=1, failures=[OSError("disk full")], retry_strategy=RetryStrategy(0))
@@ -314,6 +374,115 @@ class TestCooldown:
 
         assert storage.attempts == 8
 
+    async def test_write_failed_tells_of_records_a_write_could_not_take(self):
+        storage = MemoryStorage(batch_size=1, failures=[OSError("disk full")] * 4)
+        assert not storage.write_failed
+
+        with pytest.raises(StorageError):
+            await save_pages(storage, "a")
+        assert storage.write_failed
+
+        await storage.flush()
+        assert not storage.write_failed
+        assert storage.urls == [["a"]]
+
+    async def test_write_failed_is_cleared_once_the_records_are_gone(self):
+        # The record left by the failed write is then one no write can take: dropped.
+        storage = MemoryStorage(batch_size=1, failures=[OSError("disk full")] * 4 + [TypeError("not serializable")])
+        with pytest.raises(StorageError):
+            await save_pages(storage, "a")
+
+        with pytest.raises(TypeError):
+            await storage.flush()
+
+        assert not storage.write_failed
+        assert storage.pending == 0
+
+    async def test_record_that_cannot_be_written_is_no_failed_write(self):
+        storage = MemoryStorage(batch_size=2, refused={"a"})
+
+        with pytest.raises(ValueError):
+            await save_pages(storage, "a", "b")
+
+        assert not storage.write_failed
+
     def test_negative_cooldown_is_refused(self):
         with pytest.raises(ValueError, match="cooldown"):
             MemoryStorage(cooldown=-1)
+
+
+class TestSettled:
+    @staticmethod
+    def listened(storage: DataStorage) -> list[list[str]]:
+        """The URLs `on_settled` is called with, a list per call."""
+        calls: list[list[str]] = []
+
+        async def on_settled(urls: list[str]) -> None:
+            calls.append(urls)
+
+        storage.on_settled = on_settled
+        return calls
+
+    async def test_urls_of_a_written_batch_are_reported(self):
+        storage = MemoryStorage(batch_size=2)
+        calls = self.listened(storage)
+
+        await save_pages(storage, "a")
+        assert calls == []
+        await save_pages(storage, "b")
+
+        assert calls == [["a", "b"]]
+
+    async def test_records_of_a_failed_write_are_reported_once_written(self):
+        storage = MemoryStorage(batch_size=2, failures=[OSError("disk full")] * 4)
+        calls = self.listened(storage)
+        with pytest.raises(StorageError):
+            await save_pages(storage, "a", "b")
+        assert calls == []
+
+        await storage.flush()
+
+        assert calls == [["a", "b"]]
+
+    async def test_records_dropped_are_reported_with_those_written(self):
+        names = [f"page-{number}" for number in range(4)]
+        storage = MemoryStorage(batch_size=4, refused={"page-1"})
+        calls = self.listened(storage)
+
+        with pytest.raises(ValueError):
+            await save_pages(storage, *names)
+
+        # Written one by one: each is settled once written or dropped.
+        assert calls == [[name] for name in names]
+
+    async def test_batch_of_one_record_dropped_is_reported(self):
+        storage = MemoryStorage(batch_size=1, refused={"a"})
+        calls = self.listened(storage)
+
+        with pytest.raises(ValueError):
+            await save_pages(storage, "a")
+
+        assert calls == [["a"]]
+
+    async def test_records_lost_at_close_are_not_reported(self):
+        storage = MemoryStorage(batch_size=2, failures=[OSError("disk full")] * 4)
+        calls = self.listened(storage)
+        await save_pages(storage, "a")
+
+        with pytest.raises(StorageError):
+            await storage.close()
+
+        assert calls == []
+
+    async def test_error_of_the_listener_is_logged_and_the_write_goes_on(self, caplog):
+        storage = MemoryStorage(batch_size=1)
+
+        async def on_settled(urls: list[str]) -> None:
+            raise RuntimeError("frontier is down")
+
+        storage.on_settled = on_settled
+        with caplog.at_level(logging.ERROR, logger="crawler.storage"):
+            await save_pages(storage, "a", "b")
+
+        assert storage.urls == [["a"], ["b"]]
+        assert "Failed to report 1 records settled by MemoryStorage" in caplog.text

@@ -320,6 +320,45 @@ def test_scale_defaults_and_options():
 
     args = parse_args(["scale", "10", "20", "--delay", "0", "--concurrency", "5", "--no-memory"])
     assert (args.pages, args.delay, args.concurrency, args.no_memory) == ([10, 20], 0.0, 5, True)
+    assert (args.workers, args.database_url) == (None, None)
+
+
+def test_scale_workers_take_the_database_from_the_option_or_the_environment(monkeypatch):
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", "postgresql://crawler@db.example/jobs")
+
+    args = parse_args(["scale", "10", "--workers", "1", "2", "4"])
+    assert (args.pages, args.workers, args.database_url) == ([10], [1, 2, 4], "postgresql://crawler@db.example/jobs")
+
+    args = parse_args(["scale", "--workers", "2", "--database-url", "postgresql://crawler@other.example/jobs"])
+    assert args.database_url == "postgresql://crawler@other.example/jobs"
+
+
+@pytest.mark.parametrize(
+    ("options", "environment", "message"),
+    [
+        (["--workers", "1"], None, "--workers needs a postgresql:// URL in --database-url or $CRAWLER_DATABASE_URL"),
+        (["--workers", "1"], "sqlite:///crawler.db", "--workers needs a postgresql:// URL"),
+        (["--workers", "1", "--database-url", "sqlite:///s3cr3t.db"], None, "--workers needs a postgresql:// URL"),
+        (
+            ["--database-url", "postgresql://crawler@db.example/jobs"],
+            None,
+            "the database of the crawl jobs of --workers",
+        ),
+        (["--workers", "0"], "postgresql://crawler@db.example/jobs", "must be positive, got 0"),
+    ],
+)
+def test_scale_workers_reject_a_missing_or_wrong_database(monkeypatch, capsys, options, environment, message):
+    monkeypatch.delenv("CRAWLER_DATABASE_URL", raising=False)
+    if environment is not None:
+        monkeypatch.setenv("CRAWLER_DATABASE_URL", environment)
+
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["scale", *options])
+
+    assert exit_info.value.code == 2
+    errors = capsys.readouterr().err
+    assert message in errors
+    assert "s3cr3t" not in errors
 
 
 @pytest.mark.parametrize("options", [["0"], ["ten"], ["--delay", "-1"], ["--concurrency", "0"], ["--rps", "1"]])

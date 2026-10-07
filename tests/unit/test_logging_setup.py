@@ -37,6 +37,17 @@ def test_console_only_by_default(capsys):
     assert (level.strip(), name, message) == ("INFO", "crawler.test", "fetched https://site/")
 
 
+def test_console_gets_json_lines_with_the_json_format(tmp_path, capsys):
+    path = tmp_path / "crawler.log"
+    configure_logging(file=path, console_format="json")
+    logger.info("fetched %s", "https://site/")
+    logger.warning("two\nlines")
+
+    lines = capsys.readouterr().err.splitlines()
+    assert [json.loads(line) for line in lines] == read_entries(path)
+    assert [entry["message"] for entry in read_entries(path)] == ["fetched https://site/", "two\nlines"]
+
+
 def test_every_line_of_the_file_is_json(tmp_path):
     path = tmp_path / "crawler.log"
     configure_logging("DEBUG", path)
@@ -117,6 +128,7 @@ def test_level_by_name_in_any_case_or_by_number(level):
         ({"level": "LOUD"}, "unknown logging level: 'LOUD'"),
         ({"max_bytes": -1}, "max_bytes must be >= 0, got -1"),
         ({"backup_count": -1}, "backup_count must be >= 0, got -1"),
+        ({"console_format": "xml"}, "console_format must be one of text, json, got 'xml'"),
     ],
 )
 def test_rejects_invalid_options(options, message):

@@ -13,6 +13,7 @@ import yaml
 from helpers import BOT, EXAMPLES, load_example
 
 from crawler import load_config
+from crawler.distributed.worker import _check_files
 
 SRC = EXAMPLES.parent / "src"
 
@@ -31,6 +32,16 @@ def test_configuration_of_the_example_is_valid(example):
     assert config.urls
     assert config.storage.outputs
     assert config.crawler.respect_robots and config.crawler.rate_limit  # it crawls a real site
+
+
+def test_configurations_of_the_containers_are_valid():
+    """Those of docker-compose.yml: a crawl of its own, a crawl job and its workers."""
+    crawl, job, worker = (load_config(EXAMPLES / "docker" / name) for name in ("crawl.yaml", "job.yaml", "worker.yaml"))
+
+    assert crawl.urls and job.urls  # a worker takes them from the job
+    assert crawl.crawler.respect_robots and job.crawler.rate_limit  # real sites
+    _check_files(worker)  # every file of a worker is its own
+    assert worker.logging.console_format == "json"
 
 
 async def test_example_crawls_saves_and_reports(example, url, tmp_path, monkeypatch, capsys):

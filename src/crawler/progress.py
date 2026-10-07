@@ -116,11 +116,24 @@ def format_duration(seconds: float) -> str:
     return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
 
 
-def format_progress(progress: Progress) -> str:
-    """One line: a bar, the percent, pages done, speed, time left, active tasks, the queue and the time passed."""
+def progress_bar(percent: float) -> str:
+    """A bar of 20 cells and the percent, as `[####----]  20%`."""
     # Rounded down: the bar is full and the percent is 100 only when every page is done.
     width = 20
-    filled = int(width * progress.percent / 100)
+    filled = int(width * percent / 100)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {int(percent):3d}%"
+
+
+def print_progress_line(line: str, stream: TextIO, *, live: bool) -> None:
+    """Redraw the progress line in place in a terminal (`live`), or print it on a line of its own."""
+    if live:
+        print(f"\r\033[K{line}", end="", file=stream, flush=True)
+    else:
+        print(line, file=stream, flush=True)
+
+
+def format_progress(progress: Progress) -> str:
+    """One line: a bar, the percent, pages done, speed, time left, active tasks, the queue and the time passed."""
     if progress.finished:
         left = "done"
     elif progress.eta is None:
@@ -128,8 +141,7 @@ def format_progress(progress: Progress) -> str:
     else:
         left = f"ETA {format_duration(progress.eta)}"
     return (
-        f"[{'#' * filled}{'-' * (width - filled)}] {int(progress.percent):3d}% | "
-        f"{progress.done}/{progress.total} pages, {progress.failed} failed | "
+        f"{progress_bar(progress.percent)} | {progress.done}/{progress.total} pages, {progress.failed} failed | "
         f"{progress.pages_per_second:.1f} pages/s | {left} | "
         f"active {progress.active} ({progress.in_flight} in flight) | queued {progress.queued} | "
         f"{format_duration(progress.elapsed)}"
@@ -158,11 +170,9 @@ async def show_progress(
     while True:
         await asyncio.wait({crawl_task}, timeout=interval)
         finished = crawl_task.done()
-        line = format_progress(tracker.update(crawler.crawl_stats(), finished=finished))
-        if live:
-            print(f"\r\033[K{line}", end="", file=stream, flush=True)
-        else:
-            print(line, file=stream, flush=True)
+        print_progress_line(
+            format_progress(tracker.update(crawler.crawl_stats(), finished=finished)), stream, live=live
+        )
         if finished:
             break
     if live:

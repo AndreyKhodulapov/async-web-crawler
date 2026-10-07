@@ -1,0 +1,15 @@
+# What the crawl job crawls, kept in the database by
+#   docker compose run --rm job
+# The workers take these sections from the job, see examples/docker/worker.yaml.
+
+urls:
+  - https://books.toscrape.com/index.html
+  - https://quotes.toscrape.com/
+
+crawler:
+  max_pages: 300
+  max_depth: 3
+  rate_limit: 2.0       # requests per second to a host, by all the workers together
+
+filters:
+  same_domain_only: true

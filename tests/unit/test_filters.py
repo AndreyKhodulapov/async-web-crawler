@@ -48,6 +48,19 @@ def test_allow_host_of_extends_the_set():
     assert url_filter.allowed_hosts == {"example.com", "www.example.com"}
 
 
+def test_allow_host_takes_a_host_and_lets_its_subdomains_through():
+    url_filter = UrlFilter(allowed_hosts={"example.com"})
+    url_filter.allow_host("www.other.org")
+    assert url_filter.allowed_hosts == {"example.com", "www.other.org"}
+    assert url_filter.allows("https://docs.other.org/")
+
+
+def test_allow_host_keeps_hosts_unrestricted():
+    url_filter = UrlFilter()
+    url_filter.allow_host("example.com")
+    assert url_filter.allowed_hosts is None
+
+
 def test_allowed_hosts_are_read_only():
     url_filter = UrlFilter(allowed_hosts={"example.com"})
     # A host added past allow_host_of() would not reach the lookup.

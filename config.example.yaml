@@ -100,6 +100,8 @@ rendering:
 
 # Where the crawled pages are saved: files, by extension (.jsonl, .json,
 # .csv, .db), or database URLs (sqlite:///pages.db, postgresql://...).
+# "{worker}" in a file name is the name of the worker of a crawl job, and
+# "local" in a crawl of its own: every worker writes a file of its own.
 storage:
   outputs: []           # e.g. [pages.jsonl, pages.csv]
   batch_size: 100       # pages written at once
@@ -111,6 +113,7 @@ logging:
   file: null            # e.g. crawler.log; the log goes to the console either way
   max_bytes: 10485760   # the file is rotated at this size; 0 never rotates it
   backup_count: 5       # rotated files that are kept; 0 never rotates the file
+  console_format: text  # json: JSON Lines on the console too, for a log collector; hides the progress line
 
 # Files the statistics are written to after the crawl.
 report:
@@ -118,3 +121,13 @@ report:
   html: null            # e.g. report.html
   title: Crawl report
   top_domains: 10       # hosts listed in the statistics
+
+# The workers of a crawl job: the database they share and how they hold
+# their pages. Each worker has its own; a crawl of its own ignores them.
+distributed:
+  database_url: null    # postgresql://user:password@host:5432/database; null: CRAWLER_DATABASE_URL
+  lease_seconds: 60.0   # a page of a worker that stopped is crawled again after this long
+  heartbeat_seconds: 20.0  # how often a worker renews the leases of its pages; less than lease_seconds
+  max_attempts: 3       # leases of a page that may expire before it fails
+  poll_interval: 1.0    # how often a worker with no page looks for one at least
+  pool_size: 4          # connections of a worker to the database; its other tasks wait for one

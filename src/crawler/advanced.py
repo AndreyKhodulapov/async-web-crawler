@@ -12,6 +12,7 @@ from crawler.circuit_breaker import CircuitBreaker
 from crawler.client import AsyncCrawler
 from crawler.config import CrawlerConfig, load_config
 from crawler.exceptions import ConfigError
+from crawler.frontier import Frontier
 from crawler.models import ParsedPage
 from crawler.report import render_html, render_json
 from crawler.retry import RetryStrategy
@@ -45,6 +46,10 @@ class AdvancedCrawler:
     are the report files the latest crawl wrote, `cookie_file` the file the
     cookies were saved to.
 
+    "{worker}" in the paths of the files written, such as
+    "pages-{worker}.jsonl", is `worker`: "local" for a crawl of its own,
+    the name of the worker for a worker of a crawl job (see
+    `CrawlerConfig.for_worker`); `config` keeps the paths with it replaced.
     Directories of the log, the reports and the files of the storage are
     created if they are missing. Logging is set up when the crawler is
     made and reset by `close()`; it belongs to the whole process, so with
@@ -53,14 +58,16 @@ class AdvancedCrawler:
     `logging` section is ignored: for a program that sets up logging itself.
     """
 
-    def __init__(self, config: CrawlerConfig | None = None, *, configure_logging: bool = True) -> None:
+    def __init__(
+        self, config: CrawlerConfig | None = None, *, configure_logging: bool = True, worker: str = "local"
+    ) -> None:
         """
         Raises:
             ConfigError: `session.cookies_file` cannot be read, or is not a cookies.txt file;
                 with `proxy.from_env`, a variable is not the URL of a proxy.
             OSError: a directory cannot be created, or the log file cannot be opened.
         """
-        self.config = config = CrawlerConfig() if config is None else config
+        self.config = config = (CrawlerConfig() if config is None else config).for_worker(worker)
         options = config.crawler
         cookies = config.session.initial_cookies()
         proxies = config.proxy.build()
@@ -111,16 +118,17 @@ class AdvancedCrawler:
         self._configures_logging = configure_logging
 
         for path in _storage_files(self.storage):
-            _make_directory(path)
+            make_directory(path)
         if configure_logging:
             if config.logging.file is not None:
-                _make_directory(config.logging.file)
+                make_directory(config.logging.file)
             # The last step that can fail: nothing after it can leave the log file open.
             logging_setup.configure_logging(
                 config.logging.level,
                 config.logging.file,
                 max_bytes=config.logging.max_bytes,
                 backup_count=config.logging.backup_count,
+                console_format=config.logging.console_format,
             )
         if config.proxy.from_env and proxies is None:
             logger.warning("proxy.from_env: neither HTTP_PROXY nor HTTPS_PROXY is set, requests go directly")
@@ -178,9 +186,8 @@ class AdvancedCrawler:
                 of another layout, the database cannot be reached); nothing
                 is requested.
         """
+        self.check_start()
         config = self.config
-        if not config.urls and not config.sitemaps.urls:
-            raise ConfigError(["urls: nothing to crawl, give start URLs here or sitemaps in sitemaps.urls"])
         pages = await self.crawler.crawl(
             config.urls,
             max_pages=config.crawler.max_pages,
@@ -195,6 +202,60 @@ class AdvancedCrawler:
         self.write_reports()
         self.save_cookies()
         return pages
+
+    async def crawl_frontier(self, frontier: Frontier) -> dict[str, ParsedPage]:
+        """Crawl the pages of `frontier`, which seed() filled, as crawl() crawls those of the configuration.
+
+        The limits are those of the frontier, and the sitemaps are not read
+        again; see `AsyncCrawler.crawl_frontier`. The reports and the
+        cookies are written afterwards, as crawl() writes them. The
+        frontier is left open.
+
+        Raises:
+            ConfigError: as crawl().
+            StorageError: as crawl().
+        """
+        self.check_start()
+        config = self.config
+        pages = await self.crawler.crawl_frontier(
+            frontier,
+            config.urls,
+            same_domain_only=config.filters.same_domain_only,
+            include_patterns=config.filters.include,
+            exclude_patterns=config.filters.exclude,
+            exclude_extensions=config.filters.exclude_extensions,
+            sitemap_urls=config.sitemaps.urls,
+        )
+        self.write_reports()
+        self.save_cookies()
+        return pages
+
+    async def seed(self, frontier: Frontier, *, sitemaps: bool = True) -> dict[str, str]:
+        """Queue the start URLs and the pages of the sitemaps of the configuration in `frontier`; crawl nothing.
+
+        Without `sitemaps`, the sitemaps are not read. Returns the sitemaps
+        that could not be read, with the reasons; see `AsyncCrawler.seed`.
+
+        Raises:
+            ConfigError: as crawl().
+        """
+        self.check_start()
+        config = self.config
+        return await self.crawler.seed(
+            frontier,
+            config.urls,
+            same_domain_only=config.filters.same_domain_only,
+            include_patterns=config.filters.include,
+            exclude_patterns=config.filters.exclude,
+            exclude_extensions=config.filters.exclude_extensions,
+            sitemap_urls=config.sitemaps.urls if sitemaps else (),
+            robots_sitemaps=config.sitemaps.from_robots and sitemaps,
+        )
+
+    def check_start(self) -> None:
+        """Raises ConfigError if the configuration has neither start URLs nor sitemaps."""
+        if not self.config.urls and not self.config.sitemaps.urls:
+            raise ConfigError(["urls: nothing to crawl, give start URLs here or sitemaps in sitemaps.urls"])
 
     def write_reports(self) -> list[Path]:
         """Write the statistics to the files of the `report` section; return those written.
@@ -234,7 +295,7 @@ class AdvancedCrawler:
             return None
         cookies = self.crawler.export_cookies()
         try:
-            save_cookies_file(cookies, _make_directory(path))
+            save_cookies_file(cookies, make_directory(path))
         except OSError as error:
             logger.error("Failed to save the cookies to %s: %s", path, error)
             return None
@@ -264,7 +325,7 @@ class AdvancedCrawler:
         Raises:
             OSError: the file cannot be written.
         """
-        _make_directory(filename).write_text(render_json(self.get_stats()), encoding="utf-8")
+        make_directory(filename).write_text(render_json(self.get_stats()), encoding="utf-8")
 
     def export_to_html_report(self, filename: str | Path, *, title: str | None = None) -> None:
         """Write the HTML report of `get_stats()`, see `CrawlerStats.export_to_html_report`.
@@ -275,7 +336,7 @@ class AdvancedCrawler:
             OSError: the file cannot be written.
         """
         report = render_html(self.get_stats(), title=self.config.report.title if title is None else title)
-        _make_directory(filename).write_text(report, encoding="utf-8")
+        make_directory(filename).write_text(report, encoding="utf-8")
 
     async def close(self) -> None:
         """Close the crawler, write what the storage still holds and stop logging to the file. Safe to call more than once."""
@@ -299,7 +360,7 @@ def _storage_files(storage: DataStorage | None) -> list[Path]:
     return [] if path is None else [path]
 
 
-def _make_directory(file: str | Path) -> Path:
+def make_directory(file: str | Path) -> Path:
     """Create the directory of a file if it is missing; return the path of the file with `~` expanded."""
     path = Path(file).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)

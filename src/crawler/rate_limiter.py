@@ -13,6 +13,15 @@ from dataclasses import dataclass
 from crawler.models import DomainRate, RateStats
 
 
+class HostPenalizedError(Exception):
+    """Raised by `RateLimiter.slot` for a domain penalized longer than the request may wait."""
+
+    def __init__(self, domain: str, seconds: float) -> None:
+        super().__init__(f"{domain} is held back for {seconds:.1f}s")
+        self.domain = domain
+        self.seconds = seconds
+
+
 @dataclass(slots=True)
 class _DomainCounter:
     requests: int = 0
@@ -94,19 +103,21 @@ class RateLimiter:
             return self.interval
         return max(self.interval, self._delays.get(domain, 0.0))
 
-    def set_delay(self, domain: str, delay: float) -> None:
-        """Keep requests to `domain` at least `delay` seconds apart, e.g. its Crawl-delay.
+    def set_delay(self, domain: str, delay: float) -> bool:
+        """Keep requests to `domain` at least `delay` seconds apart, e.g. its Crawl-delay; whether its delay grew.
 
         A delay never goes down: a host may serve several sites (ports,
         schemes), each with a robots.txt of its own, and the longest delay wins.
         """
         _check_seconds("delay", delay)
-        delay = max(delay, self._delays.get(domain, 0.0))
+        if delay <= self._delays.get(domain, 0.0):
+            return False
         self._delays[domain] = delay
         # The request that fetched robots.txt has already booked the next
         # start with the old interval: move it.
         if domain in self._last_start:
             self._next_start[domain] = max(self._next_start[domain], self._last_start[domain] + delay)
+        return True
 
     def penalize(self, domain: str, seconds: float) -> None:
         """Let no request to `domain` start in the next `seconds`, e.g. after HTTP 429.
@@ -147,6 +158,8 @@ class RateLimiter:
         self,
         domain: str | None = None,
         gate: Callable[[], AbstractAsyncContextManager[object]] = contextlib.nullcontext,
+        *,
+        max_wait: float | None = None,
     ) -> AsyncGenerator[None, None]:
         """Wait for the turn of `domain`, then hold `gate()`, e.g. a concurrency slot, for the request.
 
@@ -157,10 +170,16 @@ class RateLimiter:
         started too recently in the meantime, or the domain has been
         penalized, the request lets the gate go and waits for a new turn
         outside it.
+
+        With `max_wait`, a penalty of the domain longer than that is not
+        waited for: `HostPenalizedError` is raised instead, before the
+        request books a turn, or once it finds the penalty that came while
+        it waited for one. The interval and the domain's own delay are
+        waited for however long they are.
         """
         waited = 0.0
         while True:
-            start, slept = await self._wait_turn(domain)
+            start, slept = await self._wait_turn(domain, max_wait)
             waited += slept
             async with gate():
                 if not self._start(domain, start):
@@ -221,13 +240,16 @@ class RateLimiter:
             self._next_start[key] = start + interval + extra
         return start
 
-    async def _wait_turn(self, domain: str | None) -> tuple[float, float]:
+    async def _wait_turn(self, domain: str | None, max_wait: float | None) -> tuple[float, float]:
         """Sleep until a booked start for `domain`; return the start and the seconds slept.
 
-        The schedules are booked one by one, each after the wait for the one before.
+        The schedules are booked one by one, each after the wait for the one
+        before. A penalty longer than `max_wait` raises `HostPenalizedError`.
         """
         slept = 0.0
         while True:
+            if domain is not None and max_wait is not None and (penalty := self.penalty_left(domain)) > max_wait:
+                raise HostPenalizedError(domain, penalty)
             for schedule in self._schedules(domain):
                 now = self._clock()
                 start = self._book([schedule], now)

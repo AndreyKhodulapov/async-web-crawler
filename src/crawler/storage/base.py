@@ -5,7 +5,7 @@ import contextlib
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path
 from types import TracebackType
 from typing import ClassVar, Self
@@ -36,9 +36,14 @@ class DataStorage(ABC):
     records stay in the buffer, so the next write takes them along. For
     `cooldown` seconds after that `save` only buffers the records, so that
     a storage that is down does not make every save wait for the retries;
-    `flush` and `close` write at once all the same. Any
-    other error is raised as it is and its batch is dropped: no retry cures
-    it, and kept in the buffer the batch would fail every later write.
+    `flush` and `close` write at once all the same. `write_failed` tells
+    that the buffer holds records a write could not take. Any
+    other error is one no retry cures, and kept in the buffer the batch
+    would fail every later write: the batch is written again a record at
+    a time, and only the records that fail on their own are dropped, each
+    logged with its URL. A batch is written whole or not at all, so
+    nothing is written twice. The error of the first record dropped is
+    raised as it is; when none is, nothing is raised.
 
     `open` opens the file or the connection ahead of the first write and
     checks that it can be written to: a storage that cannot be is found
@@ -48,6 +53,13 @@ class DataStorage(ABC):
     A subclass implements `_write_batch`, `_read` and `_close`, and lists in
     `WRITE_ERRORS` the exceptions its writes fail with; `_open_storage`
     does what the first write would otherwise do to open the storage.
+
+    `on_settled`, if set, is called with the URLs of the records settled:
+    written, or dropped as ones no write can take. A crawl uses it to mark
+    its pages done once they are stored. Records that stay in the buffer
+    after a failed write are reported once a later write takes them, and
+    those lost when `close` cannot write them are not reported. An error
+    of `on_settled` is logged and does not fail the write.
     """
 
     WRITE_ERRORS: ClassVar[tuple[type[Exception], ...]] = (OSError,)
@@ -68,17 +80,24 @@ class DataStorage(ABC):
         self.cooldown = cooldown
         self._clock = clock
         self._paused_until = 0.0
+        self._failing = False
         self.retry_strategy = retry_strategy or RetryStrategy(retry_on=self.WRITE_ERRORS, base_delay=0.1)
         self._buffer: list[PageRecord] = []
         # Keeps the batches in order and a record out of two writes at once.
         self._lock = asyncio.Lock()
         self._closed = False
         self._written = 0
+        self.on_settled: Callable[[list[str]], Awaitable[None]] | None = None
 
     @property
     def pending(self) -> int:
         """The number of records saved but not written out yet."""
         return len(self._buffer)
+
+    @property
+    def write_failed(self) -> bool:
+        """Whether the buffer holds records a write could not take, retries included, until a write takes them."""
+        return self._failing and bool(self._buffer)
 
     @property
     def written(self) -> int:
@@ -126,8 +145,9 @@ class DataStorage(ABC):
                 completed could not be written. The record is kept either
                 way, unless the storage is closed. During the `cooldown`
                 after a failed write nothing is written and nothing raised.
-            Exception: the batch failed with an error outside `WRITE_ERRORS`
-                and is dropped, this record included.
+            Exception: a record of the batch failed with an error outside
+                `WRITE_ERRORS` and is dropped, this one or another; the
+                other records of the batch are written.
         """
         async with self._lock:
             if self._closed:
@@ -178,23 +198,86 @@ class DataStorage(ABC):
             return
         batch = self._buffer
         try:
-            await self.retry_strategy.run(
-                lambda: self._write_batch(batch),
-                target=f"write of {len(batch)} records to {type(self).__name__}",
-            )
+            await self._write_with_retries(batch)
         except self.WRITE_ERRORS as error:
-            self._paused_until = self._clock() + self.cooldown
-            raise StorageError(f"failed to write {len(batch)} records: {error}") from error
-        except Exception:
+            raise self._write_failed(len(batch), error) from error
+        except Exception as error:
             # No retry cures this error, so the next write of the same batch
             # would fail too, and every one after it.
-            self._buffer = []
-            logger.error("Dropped %d records that %s cannot write", len(batch), type(self).__name__)
-            raise
+            if len(batch) == 1:
+                self._buffer = []
+                self._log_dropped(batch[0], error)
+                await self._settle(batch)
+                raise
+            await self._write_one_by_one(error)
+            return
         self._buffer = []
         self._paused_until = 0.0
+        self._failing = False
         self._written += len(batch)
         logger.debug("Wrote %d records to %s", len(batch), type(self).__name__)
+        await self._settle(batch)
+
+    async def _write_with_retries(self, records: list[PageRecord]) -> None:
+        await self.retry_strategy.run(
+            lambda: self._write_batch(records),
+            target=f"write of {len(records)} records to {type(self).__name__}",
+        )
+
+    def _write_failed(self, records: int, error: Exception) -> StorageError:
+        """Pause the writes for `cooldown` after a write error that outlasted the retries; the error to raise."""
+        self._paused_until = self._clock() + self.cooldown
+        self._failing = True
+        return StorageError(f"failed to write {records} records: {error}")
+
+    async def _write_one_by_one(self, batch_error: Exception) -> None:
+        """Write the buffer a record at a time after its batch failed with an error no retry cures.
+
+        A batch is written whole or not at all, so its records can be
+        written again: only those that fail on their own are dropped, and
+        the error of the first one is raised. A write error stops the
+        writing as for a batch: the records not written yet stay in the buffer.
+        """
+        logger.warning(
+            "Writing %d records to %s one by one: their batch failed with %s: %s",
+            len(self._buffer),
+            type(self).__name__,
+            type(batch_error).__name__,
+            batch_error,
+        )
+        first_error: Exception | None = None
+        while self._buffer:
+            record = self._buffer[0]
+            try:
+                await self._write_with_retries([record])
+            except self.WRITE_ERRORS as error:
+                raise self._write_failed(len(self._buffer), error) from error
+            except Exception as error:  # noqa: BLE001 - raised once the other records are written
+                self._log_dropped(record, error)
+                first_error = first_error or error
+            else:
+                self._written += 1
+            # Gone from the buffer as soon as it is written or dropped, so
+            # that a cancelled flush does not write it twice.
+            self._buffer = self._buffer[1:]
+            await self._settle([record])
+        self._paused_until = 0.0
+        self._failing = False
+        if first_error is not None:
+            raise first_error
+        logger.warning("%s wrote its records one by one: none of them failed on its own", type(self).__name__)
+
+    async def _settle(self, records: Sequence[PageRecord]) -> None:
+        """Report the records written or dropped to `on_settled`; its error is logged, not raised."""
+        if self.on_settled is None:
+            return
+        try:
+            await self.on_settled([record["url"] for record in records])
+        except Exception:
+            logger.exception("Failed to report %d records settled by %s", len(records), type(self).__name__)
+
+    def _log_dropped(self, record: PageRecord, error: Exception) -> None:
+        logger.error("Dropped the record of %s: %s cannot write it: %s", record["url"], type(self).__name__, error)
 
     async def _open_storage(self) -> None:
         """Open the file or the connection, unless it is open; what the first write does otherwise. Nothing by default."""

@@ -1,12 +1,13 @@
 """Integration tests: crawls that take their pages from sitemaps served by a local aiohttp server."""
 
+import asyncio
 import gzip
 import logging
 
 import pytest
 from helpers import BOT, UNTHROTTLED, index, urlset
 
-from crawler import AsyncCrawler, RetryStrategy, SitemapParser
+from crawler import AsyncCrawler, MemoryFrontier, RetryStrategy, SitemapParser
 
 SITEMAP = "/sitemaps/sitemap.xml"
 
@@ -321,6 +322,44 @@ async def test_max_pages_caps_the_pages_of_a_sitemap(url, site):
     assert crawler.crawl_stats().queued == 1
 
 
+async def test_sitemaps_are_read_until_the_queue_is_full(url, site):
+    names = [f"{number}.xml" for number in range(300)]
+    site.sitemaps = {"sitemap.xml": index(*(url(f"/sitemaps/{name}") for name in names))} | {
+        name: urlset(*(url(f"/wide/{number * 100 + page}") for page in range(100))) for number, name in enumerate(names)
+    }
+    async with make_crawler() as crawler:
+        pages = await crawler.crawl([], 10, sitemap_urls=[url(SITEMAP)])
+
+    assert len(pages) == 10
+    # The index and its first batch of sitemaps, whose pages fill the queue.
+    assert site.hits[SITEMAP] == 1
+    assert sum(site.hits[f"/sitemaps/{name}"] for name in names) == SitemapParser.CONCURRENCY
+
+
+async def test_sitemap_after_the_one_that_fills_the_queue_is_not_read(url, site):
+    site.sitemaps = {
+        "first.xml": urlset(*(url(f"/wide/{number}") for number in range(AsyncCrawler.FRONTIER_FACTOR * 5))),
+        "second.xml": urlset(url("/site/c.html")),
+    }
+    async with make_crawler() as crawler:
+        pages = await crawler.crawl([], 5, sitemap_urls=[url("/sitemaps/first.xml"), url("/sitemaps/second.xml")])
+
+    assert len(pages) == 5
+    assert site.hits["/sitemaps/second.xml"] == 0
+
+
+async def test_pages_that_only_the_last_sitemap_lets_through_the_filters_are_crawled(url, site):
+    # The pages of the sitemaps before it do not pass the filter, so they do not fill the queue.
+    names = [f"{number}.xml" for number in range(12)]
+    site.sitemaps = {"sitemap.xml": index(*(url(f"/sitemaps/{name}") for name in names))} | {
+        name: urlset(*(url(f"/wide/{number * 10 + page}") for page in range(10))) for number, name in enumerate(names)
+    }
+    async with make_crawler(max_concurrent=1) as crawler:
+        pages = await crawler.crawl([], 5, sitemap_urls=[url(SITEMAP)], include_patterns=[r"/wide/11\d$"])
+
+    assert list(pages) == [url(f"/wide/{number}") for number in range(110, 115)]
+
+
 async def test_invalid_sitemap_arguments_are_rejected(url, site):
     async with make_crawler() as crawler:
         with pytest.raises(ValueError, match="invalid sitemap URLs: 'sitemap.xml'"):
@@ -330,3 +369,50 @@ async def test_invalid_sitemap_arguments_are_rejected(url, site):
         with pytest.raises(ValueError, match="robots_sitemaps needs"):
             await crawler.crawl([url("/site/")], robots_sitemaps=True)
     assert site.hits.total() == 0
+
+
+class TestSeed:
+    async def test_seed_queues_the_start_urls_and_the_sitemap_pages_without_crawling_them(self, url, site):
+        site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"), url("/site/c.html", "localhost"))}
+        frontier = MemoryFrontier()
+        async with make_crawler() as crawler:
+            failed = await crawler.seed(
+                frontier, [url("/site/b.html")], sitemap_urls=[url(SITEMAP), url("/sitemaps/missing.xml")]
+            )
+
+        assert list(failed) == [url("/sitemaps/missing.xml")]
+        assert frontier.queue.get_stats()["queued"] == 3
+        assert not any(path.startswith("/site/") for path in site.hits)
+
+    async def test_pages_out_of_scope_are_held_in_the_frontier(self, url, site):
+        site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"), url("/site/c.html", "localhost"))}
+        frontier = MemoryFrontier()
+        async with make_crawler() as crawler:
+            await crawler.seed(frontier, [url("/site/b.html")], sitemap_urls=[url(SITEMAP)], same_domain_only=True)
+
+        assert frontier.queue.get_stats()["queued"] == 2
+        assert await frontier.widen_scope("localhost", lambda page: True) == 1
+
+    async def test_crawl_of_a_seeded_frontier_is_that_of_crawl_without_reading_the_sitemaps_again(self, url, site):
+        site.sitemaps = {"sitemap.xml": urlset(url("/site/a.html"), url("/site/c.html", "localhost"))}
+        start, options = [url("/site/to-other-host")], {"sitemap_urls": [url(SITEMAP)], "same_domain_only": True}
+        async with make_crawler(max_depth=1) as crawler:
+            expected = set(await crawler.crawl(start, **options))
+            frontier = MemoryFrontier()
+            await crawler.seed(frontier, start, **options)
+            site.hits.clear()
+
+            pages = await crawler.crawl_frontier(frontier, start, **options)
+
+        assert set(pages) == expected
+        assert site.hits[SITEMAP] == 0
+        assert crawler.visited_urls == frontier.queue.visited
+
+    async def test_seed_while_a_crawl_runs_is_refused(self, url, site):
+        site.latency = 0.3
+        async with make_crawler() as crawler:
+            crawl = asyncio.create_task(crawler.crawl([url("/site/b.html")]))
+            await asyncio.sleep(0.1)
+            with pytest.raises(RuntimeError, match="already running"):
+                await crawler.seed(MemoryFrontier(), [url("/site/a.html")])
+            await crawl

@@ -32,10 +32,12 @@ def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str
 
     `stats` is what `CrawlerStats.get_stats()` returns; with a `proxies`
     key, as `AdvancedCrawler.get_stats()` has it, a table of the proxies
-    follows, and with a `rendering` key, the numbers of the rendering. The page is one file that needs nothing else: the styles are
+    follows, with a `rendering` key, the numbers of the rendering, and
+    with a `workers` key, as `job_stats()` has it, a table of the workers
+    of a crawl job. The page is one file that needs nothing else: the styles are
     inline, the charts are PNG images embedded as data URIs, and there are
     no scripts. Everything that comes from the crawl (hosts, error names,
-    proxies) is escaped.
+    proxies, workers) is escaped.
     """
     style = textwrap.dedent(f"""
     body {{ margin: 0; padding: 32px 16px; background: {_SURFACE}; color: {_TEXT};
@@ -75,6 +77,8 @@ def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str
         sections.append(_proxy_section(stats["proxies"]))
     if "rendering" in stats:
         sections.append(_rendering_section(stats["rendering"]))
+    if "workers" in stats:
+        sections.append(_worker_section(stats["workers"]))
     return (
         "<!DOCTYPE html>\n"
         '<html lang="en">\n<head>\n<meta charset="utf-8">\n'
@@ -114,6 +118,24 @@ def _proxy_section(proxies: Mapping[str, Mapping[str, Any]]) -> str:
         "<section>\n<h2>Proxies</h2>\n"
         '<table>\n<thead><tr><th>Proxy</th><th class="number">Requests</th><th class="number">Failures</th>'
         '<th class="number">Times out of rotation</th><th>State</th></tr></thead>\n'
+        f"<tbody>\n{rows}</tbody>\n</table>\n</section>\n"
+    )
+
+
+def _worker_section(workers: Mapping[str, Mapping[str, Any]]) -> str:
+    if not workers:
+        return '<section>\n<h2>Workers</h2>\n<p class="empty">No worker has started.</p>\n</section>\n'
+    rows = "".join(
+        f'<tr><td>{escape(name)}</td><td>{escape(worker["state"])}</td><td class="number">{_count(worker["pages"])}</td>'
+        f'<td class="number">{_count(worker["failed"])}</td><td class="number">{worker["pages_per_second"]:.2f}</td>'
+        f'<td class="number">{_duration(worker["active_seconds"])}</td></tr>\n'
+        for name, worker in workers.items()
+    )
+    return (
+        "<section>\n<h2>Workers</h2>\n"
+        '<table>\n<thead><tr><th>Worker</th><th>State</th><th class="number">Pages</th>'
+        '<th class="number">Failed</th><th class="number">Pages per second</th>'
+        '<th class="number">Running time</th></tr></thead>\n'
         f"<tbody>\n{rows}</tbody>\n</table>\n</section>\n"
     )
 

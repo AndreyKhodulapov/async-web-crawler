@@ -71,13 +71,24 @@ configuration file, by command-line options, or from Python.
 - **Logging** to the console and to a rotated file of JSON Lines
 - **Live progress**: percent of the page limit, current speed, time left,
   active tasks
+- **Crawl jobs**: one crawl shared by worker processes or containers
+  through PostgreSQL; deduplication, `max_pages`, the scope and the rate
+  of a host are the job's, so the workers count against the same limits
+  and ask a host in turn; a page of a worker that dies comes back to the
+  others; a stopped job goes on where it was; the progress and the
+  reports of the whole job, of all its workers
+- **Docker**: an image of the crawler and one with Chromium for
+  rendering; a compose file with PostgreSQL, a crawl of its own and a
+  crawl job with as many workers as you like; logs as JSON Lines for a
+  log collector
 - **Measured performance**: 13x faster than a synchronous crawler on 1000
-  pages, memory that does not grow with the crawl
-  ([docs/performance.md](docs/performance.md))
+  pages, memory that does not grow with the crawl, crawl jobs of 1, 2
+  and 4 workers ([docs/performance.md](docs/performance.md))
 
 ## Requirements
 
-Python 3.11+
+Python 3.11+. Crawl jobs need PostgreSQL; Docker is optional (an image
+and a compose file are provided, see [Docker](#docker)).
 
 ## Installation
 
@@ -120,6 +131,52 @@ python src/main.py --config config.yaml
 
 [config.example.yaml](config.example.yaml) lists every key with its default;
 the [configuration guide](docs/configuration.md) explains them.
+
+## Docker
+
+```bash
+docker build -t async-web-crawler .                   # the crawler, about 700 MB
+docker build --target js -t async-web-crawler:js .    # with Chromium for rendering, about 2.2 GB
+docker run --rm -v "$PWD/out:/app/out" async-web-crawler \
+    --urls https://books.toscrape.com/ --max-pages 20 --output out/pages.jsonl --report out/report.html
+```
+
+The image runs `python src/main.py`: its arguments are those of the
+[command line](#command-line), `--help` without any. It works in `/app`
+as a user that is not root (uid 10001) and writes to `/app/out`, a
+volume; on Linux, give it a directory it can write to, or run it as
+yourself with `--user $(id -u):$(id -g)`. The image `js` renders pages in
+Chromium; run it with `--init --shm-size=1g`. `docker stop` stops a crawl
+as Ctrl-C does: what the storage buffers is written, the reports too,
+and the exit code is 143.
+
+[docker-compose.yml](docker-compose.yml) runs the crawler next to its
+PostgreSQL, with the configuration files of
+[examples/docker](examples/docker) (sandboxes made for crawling practice)
+and the files written in `./out`:
+
+```bash
+docker compose run --rm crawl                          # a crawl of its own: 50 pages of books.toscrape.com
+docker compose run --rm job                            # create the crawl job "books" and seed it
+docker compose up --scale worker=4 worker              # four workers, until no page is left
+docker compose run --rm job status --job books --watch
+docker compose run --rm job report --job books --report out/report.html
+```
+
+The crawler services are started by their names only: `docker compose
+up -d --wait` starts PostgreSQL alone, for the tests. The workers log
+JSON Lines; `docker compose stop worker` puts their pages back in the
+queue, and a worker the database failed is started again (up to 5
+times). The job is made once: to crawl it anew, `docker compose run --rm
+job job create --config /config/job.yaml --name books --restart`.
+`CRAWLER_JOB` names another job; `CRAWLER_TARGET=js` builds and runs the
+image with Chromium, which the workers of a job that renders its pages
+need (without it they stop with exit code 2); `CRAWLER_POSTGRES_PORT` moves
+the port of PostgreSQL on the host if 5432 is taken; on Linux, create
+`./out` first and export `CRAWLER_USER=$(id -u):$(id -g)`. The recipe in
+the [configuration guide](docs/configuration.md#recipes) explains the
+configurations, [docs/distributed.md](docs/distributed.md) what sharing
+a crawl costs and how it runs in production.
 
 ## Command line
 
@@ -197,10 +254,76 @@ rendered, 1 failed, average 0.84s` (the average of the rendered ones).
 | 1 | no page was fetched, some could not be saved, or a directory, the log file, an output file or the database could not be opened; an output that cannot be opened is reported before anything is requested |
 | 2 | wrong options or configuration; nothing was requested or written |
 | 130 | interrupted with Ctrl-C |
+| 143 | stopped with SIGTERM (`docker stop`, systemd); not on Windows, where SIGTERM ends the process at once |
 
-A crawl interrupted with Ctrl-C stops its requests, saves the pages fetched
-by then, writes the reports of them and prints the summary. The summary names
-the reports that were written: one that could not be is an error in the log.
+A crawl interrupted with Ctrl-C or stopped with SIGTERM stops its requests,
+saves the pages fetched by then, writes the reports of them and prints the
+summary. The summary names the reports that were written: one that could
+not be is an error in the log. A second Ctrl-C or SIGTERM kills the process
+at once, whatever is still unsaved.
+
+### Crawl jobs on the command line
+
+A crawl job is one crawl that workers share through PostgreSQL (see
+[Crawl jobs](docs/api.md#crawl-jobs)): `job create` checks the
+configuration, creates the job, reads its sitemaps and queues its start
+URLs; `worker`, started in as many processes or containers as you like,
+crawls its pages until none is left; `report` writes the statistics of
+the whole job, of all its workers, at any time; `status` shows how far it
+has got.
+
+```bash
+export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
+python src/main.py job create --config config.yaml --name books
+python src/main.py worker --job books --config worker.yaml --concurrency 20   # in each of several terminals
+python src/main.py status --job books --watch
+python src/main.py report --job books --stats-json out/stats.json --report out/report.html
+```
+
+| Option | Effect |
+|--------|--------|
+| `job create --config PATH` | configuration of the job: it keeps `urls`, `sitemaps`, `crawler`, `retry`, `circuit_breaker`, `filters` and `rendering` |
+| `job create --name NAME` | name of the job, which the workers are given; a name taken is an error (exit code 1) |
+| `--resume` | go on with the job of that name: queue the start URLs it never queued; the configuration must not differ |
+| `--restart` | delete the job of that name with its pages and create it anew |
+| `worker --job NAME` | the job to crawl |
+| `worker --config PATH` | configuration of the worker: `distributed`, `session`, `proxy`, `storage`, `logging`, `report`; the keys of the job in it are ignored with a warning. Every file of the storage needs `{worker}` in its name, such as `pages-{worker}.jsonl` |
+| `--concurrency N` | pages crawled at a time, in place of `crawler.max_concurrent` |
+| `--name WORKER` | name of the worker in the database and for `{worker}`; by default the host name, the process id and a random part |
+| `report --job NAME` | the job to report on, finished or still running |
+| `report --stats-json PATH`, `--report PATH` | the statistics of the job as JSON, an HTML report with charts and a table of the workers; without them, `report.stats_json` and `report.html` of the configuration |
+| `report --config PATH` | configuration with the database and the `report` section (`title`, `top_domains`, the files) |
+| `status --job NAME` | print a line of the progress of the job: percent of `max_pages`, speed, time left, workers |
+| `status --watch` | update the line until the job is finished; `--interval SECONDS` between the updates (default 2) |
+| `status --config PATH` | configuration with the database |
+
+The database is `distributed.database_url` of the configuration or the
+`CRAWLER_DATABASE_URL` variable; it is not an option, which would show its
+password in the list of processes. A worker logs to stderr and shows no
+progress line; at the end it prints a summary of the pages it crawled
+itself and exits with 0, even when the other workers crawled the rest.
+Exit code 1 is a job that does not exist, a database that cannot be reached
+or fails, or pages the storage could not save; 2 a wrong option or
+configuration, or a job that renders its pages where Chromium is not
+installed (the worker takes none of them). A worker stopped with Ctrl-C (130) or SIGTERM (143) writes
+what its storage buffers and its reports, and queues the pages it had in
+progress again for the other workers; `job create` stopped leaves the job
+seeding, and `--resume` seeds it again. `report` reads the job from the
+database: the pages of all workers, each worker's pages per second and
+state (`running`, `stopped`, or `lost` if it was killed), and prints a
+summary; it exits with 1 if there is no such job or a report cannot be
+written, with 2 if there is no file to write. `status` prints the line of
+the whole job to stdout:
+
+```
+[########------------]  40% | 400/1000 pages, 3 failed | 12.5 pages/s | ETA 48s | workers 3 (1 lost) | in progress 12 | queued 350 | 32s
+```
+
+The speed is that of the pages finished in the last 30 seconds, by any
+worker, so it falls to 0 while no worker runs; `seeding` and `done` stand
+for the time left before the first worker can start and after the end.
+With `--watch` the line is redrawn in place in a terminal, or printed
+again in a pipe, until the job is finished; Ctrl-C stops watching (130).
 
 ## Usage from Python
 
@@ -279,7 +402,11 @@ storages. All of it is described in the [API reference](docs/api.md).
   `noindex`, one that is a variant of another page by its canonical URL.
   So `--max-pages 100` may save fewer than 100 pages; the summary shows how
   many were skipped and why. Pages that robots.txt disallows are not
-  requested and do not count.
+  requested and do not count. A page put off after its request (a
+  Retry-After too long to retry, a circuit breaker that opened, a redirect
+  to a host that cannot be asked yet) counts once, when it is crawled, but
+  is requested each time it comes back, so a crawl may send more than
+  `max_pages` page requests.
 - **A site is a host name.** `same_domain_only` keeps the crawl on the
   start hosts and their subdomains, `www.example.com` and `example.com`
   being one host. There is no public suffix list: a start URL on
@@ -289,22 +416,28 @@ storages. All of it is described in the [API reference](docs/api.md).
   limit, the circuit breaker and `max_pages_per_host` are kept per host, so
   a site that spreads its links over `example.com`, `www.example.com` and
   `docs.example.com` is asked at up to three times the rate, as one server.
-- **A crawl cannot be resumed.** Ctrl-C keeps the pages fetched so far,
-  but the queue is lost: the next run starts from the start URLs again,
-  adding to the output files or starting them anew with `--overwrite`.
-- **A storage that keeps failing fills memory.** Pages that could not be
-  written stay buffered and are retried; a database that is down for long
-  holds every page since the outage in memory.
-- **One host at a time under a rate limit.** The workers take pages from
-  one queue in the order of depth and wait for the turn of their host in
-  the rate limiter; while the pages of the first host last, those of the
-  other hosts wait in the queue. A crawl of several hosts with a rate limit
-  takes about the sum of their times, not the longest of them (two hosts
-  of 30 pages at 2 requests per second: 25 s instead of 15), and the time
-  left on the progress line does not know it. One site never notices; for
-  the sitemaps of several hosts, a list of start URLs on several hosts,
-  `same_domain_only: false` or a site on many subdomains, set `rate_limit`
-  higher or to `null` and rely on `max_per_domain`. See [docs/concurrency_control.md](docs/concurrency_control.md).
+- **A crawl of its own cannot be resumed.** Ctrl-C keeps the pages
+  fetched so far, but the queue is lost: the next run starts from the
+  start URLs again, adding to the output files or starting them anew with
+  `--overwrite`. A crawl job keeps its queue in PostgreSQL and goes on
+  where it stopped.
+- **A storage that keeps failing fills memory**, in a crawl of its own.
+  Pages that could not be written stay buffered and are retried; a
+  database that is down for long holds every page since the outage in
+  memory. A worker of a crawl job takes no pages until its storage writes
+  again, and leaves the rest to the others.
+- **One host at a time under a rate limit**, in a crawl of its own. The
+  workers take pages from one queue in the order of depth and wait for the
+  turn of their host in the rate limiter; while the pages of the first host
+  last, those of the other hosts wait in the queue. A crawl of several hosts
+  with a rate limit takes about the sum of their times, not the longest of
+  them (two hosts of 30 pages at 2 requests per second: 25 s instead of 15),
+  and the time left on the progress line does not know it. One site never
+  notices; for the sitemaps of several hosts, a list of start URLs on
+  several hosts, `same_domain_only: false` or a site on many subdomains, set
+  `rate_limit` higher or to `null` and rely on `max_per_domain`, or crawl
+  them as a crawl job, whose frontier hands out the pages of the hosts that
+  are ready. See [docs/concurrency_control.md](docs/concurrency_control.md).
 - **No login form.** The crawler does not fill in and send a login form.
   A site behind a login is crawled with the cookies of a browser session:
   log in in the browser, export its cookies to `cookies.txt` and pass it
@@ -381,12 +514,13 @@ storages. All of it is described in the [API reference](docs/api.md).
   (`127.0.0.1`, `10.0.0.0/8`, the cloud metadata address) are followed
   like any other. The crawler is a command-line tool for sites you choose,
   not a service that takes URLs from users.
-- **Parsing is bound by one CPU.** HTML is parsed in a worker thread of
-  one process; a few heavy pages per second is the ceiling whatever
-  `max_concurrent` says. With a rate limit per host it never matters; a
-  crawl of many hosts without one is parsing-bound. A page costs about
-  forty times its size in memory and a couple of seconds per megabyte to
-  parse, so pages over `max_page_size` (3 MiB) are not read and at most
+- **Parsing is bound by one CPU** in a crawl of its own. HTML is parsed in a
+  worker thread of one process; a few heavy pages per second is the ceiling
+  whatever `max_concurrent` says, and the workers of a crawl job, each a
+  process, are the way to more of them. With a rate limit per host it never
+  matters; a crawl of many hosts without one is parsing-bound. A page costs
+  about forty times its size in memory and a couple of seconds per megabyte
+  to parse, so pages over `max_page_size` (3 MiB) are not read and at most
   `max_parsing` (2) are parsed at once; raising both for a site of huge
   pages costs memory accordingly.
 - **Some guards are constants, not options.** The URL length limit (2048),
@@ -397,6 +531,57 @@ storages. All of it is described in the [API reference](docs/api.md).
   for a Retry-After too long to retry (3) are class attributes of
   `AsyncCrawler`.
 
+### Crawl jobs
+
+- **At least once, not exactly once.** A page of a worker that is killed
+  comes back to the others when its lease expires (60 s by default) and
+  is crawled again, though the worker may have stored it. Every file of
+  a worker's storage has `{worker}` in its name, so such a page may be in
+  the files of two workers; a PostgreSQL storage keeps one row per URL.
+  `storage.overwrite` with a worker name used before empties the file of
+  its earlier run, whose pages the job counts as done: use it with
+  `--restart` only.
+- **A job has a ceiling of its own.** Every page updates the counts of
+  the job, one row in the database, one transaction at a time: about 240
+  pages per second on the machine measured, where four workers are no
+  faster than two. A rate limit per host keeps a crawl of real sites far
+  below it; see [docs/performance.md](docs/performance.md#crawl-jobs-of-several-workers).
+- **A job is for a few sites, not the whole web.** To hand out a page,
+  the frontier reads every host of the job whose turn has come: a take
+  costs 6 ms at 1 000 hosts and 137 ms at 20 000. A crawl with
+  `same_domain_only: false` that meets thousands of hosts slows down
+  with them; see [docs/performance.md](docs/performance.md#many-hosts).
+- **Some limits are each worker's.** The rate of a host and `max_pages`
+  are the job's; `max_concurrent`, `max_per_domain` and the jitter are
+  each worker's, so with `rate_limit: null` a host gets up to the number
+  of workers times `max_per_domain` requests at once, and a rate under
+  `per_domain_rate: false` is that of each worker. robots.txt is
+  downloaded, and a failing host probed, by every worker: a host gets a
+  few such requests per worker where a crawl of its own sends one.
+  Cookies and proxies are each worker's too.
+- **A job keeps its configuration.** What to crawl is fixed when the job
+  is created, and its sitemaps are read then: `--resume` takes the same
+  configuration, another one needs `--restart`, which crawls anew. The
+  options of a crawl of its own (`--urls`, `--max-pages`, `--output` ...)
+  are not those of `job create` and `worker`: they take files.
+- **The report of a job is of what the database keeps**: outcomes,
+  status codes, errors by class, hosts and workers. The retries, the
+  requests per proxy and the pages rendered are counted by each worker,
+  in its own statistics and reports.
+- **URLs of up to 2048 characters.** A URL is a key in the database:
+  `job create` refuses a longer start URL, and a longer target of a
+  redirect of a start URL, such as a sign-in page with a token, is
+  followed but not remembered, so two start URLs that lead there both
+  crawl it.
+- **A worker polls.** With nothing to take, it sleeps until the next
+  page or host is due, `poll_interval` (1 s) at most, and asks the
+  database again: a page another worker queues meanwhile waits for that
+  poll, as there is no notification. A worker exits with 0 when the job is
+  done, even if it crawled no page.
+- **PostgreSQL only**, and its frontier commits without waiting for the
+  disk: if the database itself crashes, up to 0.6 s of changes are lost,
+  and those pages are handed out or finished once more.
+
 ## Documentation
 
 | Document | Content |
@@ -404,9 +589,10 @@ storages. All of it is described in the [API reference](docs/api.md).
 | [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, cookies and headers, proxies, rendering, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page, the internal layers |
 | [docs/configuration.md](docs/configuration.md) | configuration guide: every key with its type and default, validation, overrides, recipes |
 | [docs/demo.md](docs/demo.md) | the demo commands and their output |
-| [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler, memory, bottlenecks found and fixed |
+| [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler and of the workers of a crawl job, memory, bottlenecks found and fixed |
+| [docs/distributed.md](docs/distributed.md) | notes on crawl jobs: a shared frontier, leases and "at least once", politeness of many workers, failures, PostgreSQL against Redis, the ceiling of a job, production |
 | [config.example.yaml](config.example.yaml) | every configuration key with its default |
-| [examples/](examples/) | a crawl from Python by a configuration file; what rendering adds to a page |
+| [examples/](examples/) | a crawl from Python by a configuration file; what rendering adds to a page; the configurations of the compose services |
 
 Notes on the concepts behind the crawler:
 [asyncio](docs/asyncio_concepts.md),
@@ -417,7 +603,8 @@ Notes on the concepts behind the crawler:
 [data storage](docs/data_storage.md),
 [advanced features](docs/advanced_features.md),
 [sessions, proxies and rendering](docs/sessions_proxies_rendering.md),
-[architecture](docs/architecture.md).
+[architecture](docs/architecture.md),
+[distributed crawling](docs/distributed.md).
 
 ## Demo
 
@@ -426,7 +613,8 @@ links from start pages, `errors` crawls a local site that fails on purpose,
 `save` writes crawled pages to JSON, CSV and a database, `parse` extracts
 data from pages, `benchmark` compares sequential and concurrent fetching,
 and `scale` measures the crawler against a synchronous one on sites of 100,
-500 and 1000 pages.
+500 and 1000 pages, or, with `--workers`, a crawl of one process against
+crawl jobs of several worker processes.
 
 ```bash
 python src/demo_main.py crawl https://books.toscrape.com/ --max-depth 1 --max-pages 20 --same-domain
@@ -445,6 +633,7 @@ pytest tests/integration    # real HTTP, crawls, sitemaps, rate limits, robots.t
 pytest -m network           # smoke tests against the real internet
 pytest -m postgres          # the database tests and the save demo against PostgreSQL
 pytest -m browser           # rendering in a headless Chromium; skipped without Playwright or Chromium
+pytest -m docker            # build the images and crawl the test site in containers; needs Docker, takes minutes
 ```
 
 The test of `examples/render_js.py` against the real site has both
@@ -461,7 +650,8 @@ found by the same variable that moved it:
 ```bash
 export CRAWLER_POSTGRES_PORT=55432          # port 5432 is taken
 docker compose up -d --wait
-pytest -m ""                                # every test: the default ones, network, postgres and browser
+pytest -m "not docker"                      # every test but the images: the default ones, network, postgres and browser
+pytest -m ""                                # every test, docker ones included
 ```
 
 ```bash
@@ -474,10 +664,12 @@ The [Makefile](Makefile) keeps these commands short, with the tools of `.venv`:
 ```bash
 make install                # the crawler, the tools and the Chromium of Playwright
 make test                   # the default tests
-make test-all               # every test, network, postgres and browser too
+make test-all               # every test, network, postgres and browser too, but not docker
+make test-docker            # the docker tests
+make docker-build           # build the image of the crawler and the one with Chromium
 make lint                   # ruff check and a format check
 make db                     # start the PostgreSQL of docker-compose.yml
-make check                  # lint and every test: what a change must pass
+make check                  # lint and test-all: what a change must pass
 make db check CRAWLER_POSTGRES_PORT=55432   # the same with the server on another port
 ```
 
@@ -485,16 +677,17 @@ make db check CRAWLER_POSTGRES_PORT=55432   # the same with the server on anothe
 
 ```
 src/
-├── main.py                 # command line of the crawler: a configuration file and options over it
+├── main.py                 # command line of the crawler: a configuration file and options over it; `job create`, `worker`, `status` and `report` commands
 ├── cli_options.py          # checks of command-line values shared by main.py and demo_main.py
 ├── demo_main.py            # demo CLI: `crawl`, `errors`, `save`, `parse`, `benchmark` and `scale` commands
 ├── demo_urls.yaml          # URLs the demo commands use when none are given
 ├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors` and `save`
-├── demo_scale.py           # ScaleSite, SyncCrawler and the measurements of the `scale` command
+├── demo_scale.py           # ScaleSite, SyncCrawler, crawl jobs of worker processes and the measurements of `scale`
 └── crawler/
     ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
     ├── client.py           # AsyncCrawler: the public API — fetch_*, crawl(), statistics, close()
-    ├── crawl_run.py        # CrawlRun: one crawl — queue, filters, limits, deferred pages, counters, saving
+    ├── crawl_run.py        # CrawlRun: one crawl — filters, deferred pages, counters, saving
+    ├── frontier.py         # Frontier contract; MemoryFrontier: the pages of a crawl, their outcomes, max_pages
     ├── fetching.py         # Fetcher: one URL with robots.txt, circuit breaker, rate limit, retries and redirects
     ├── transport.py        # Transport contract; HttpTransport: single GET requests over an aiohttp session, decoding, size limits
     ├── rendering.py        # Rendering, BrowserTransport, Renderer: HTML pages rendered in a headless Chromium (Playwright)
@@ -517,7 +710,15 @@ src/
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
     ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats, ProxyStats, RenderStats
-    ├── exceptions.py       # FetchError hierarchy, StorageError, ConfigError
+    ├── exceptions.py       # FetchError hierarchy, StorageError, JobError, FrontierError, ConfigError
+    ├── distributed/
+    │   ├── frontier.py     # PostgresFrontier: the frontier of a crawl job shared by workers — leases, heartbeat, host turns
+    │   ├── job.py          # create_job: a crawl job created, seeded, resumed or restarted
+    │   ├── progress.py     # job_progress, watch_job: the progress line of a crawl job, of all its workers
+    │   ├── procedures.py   # PL/pgSQL functions: a page taken, admitted, put back or finished, links added, in one call each
+    │   ├── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, workers, job_scope, out_of_scope
+    │   ├── stats.py        # job_stats, export_job_stats: the statistics and reports of a crawl job, of all its workers
+    │   └── worker.py       # run_worker: a worker of a crawl job, its configuration and its files
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes
         ├── json_file.py    # JSONStorage: JSON Lines or an indented array
@@ -530,28 +731,32 @@ src/
 examples/
 ├── advanced_usage.py       # a crawl by a configuration file: progress, statistics, report
 ├── config.yaml             # the configuration of the example
-└── urls.txt                # a list of start URLs for --urls-file
+├── urls.txt                # a list of start URLs for --urls-file
+└── docker/                 # the configurations of the compose services: a crawl of its own, a crawl job, its workers
 config.example.yaml         # every configuration key with its default
-docker-compose.yml          # PostgreSQL for the crawler and its tests
+Dockerfile                  # the image of the crawler, and with --target js the one with Chromium
+.dockerignore               # what the build does not need: .venv, tests, docs, output
+docker-compose.yml          # PostgreSQL for the crawler and its tests; a crawl, a crawl job and its workers in containers
 Makefile                    # install, test, lint and database commands
 tests/
 ├── fixtures/               # valid and broken HTML pages
 ├── pages.py                # test pages and a small site for crawl tests
 ├── helpers.py              # test bot name, crawler options for tests that skip politeness, sitemaps, page records, a storage in memory
 ├── unit/                   # links of the documentation, parser, URLs, queue, limits, robots.txt, sitemaps, retries, circuit breaker, error and page stats, reports, configuration, logging, progress, filters, storages, client
-└── integration/            # local HTTP server, databases; live tests marked `network`, PostgreSQL ones `postgres`
+└── integration/            # local HTTP server, databases, the frontier in memory and in PostgreSQL, crawl jobs, their workers and their statistics, the commands of crawl jobs in processes of their own, the images in containers; live tests marked `network`, PostgreSQL ones `postgres`, Docker ones `docker`
 docs/
 ├── api.md                  # API reference
 ├── configuration.md        # configuration guide: every key, validation, recipes
 ├── demo.md                 # the demo commands and their output
 ├── advanced_features.md    # notes on sitemaps, configuration, logging, monitoring and integration
-├── architecture.md         # notes on the layers of the crawler and refactoring without changing behaviour
+├── architecture.md         # notes on the layers of the crawler, the frontier in a database and refactoring without changing behaviour
 ├── asyncio_concepts.md     # notes on async concepts used here
 ├── concurrency_control.md  # notes on queues, limits and crawl order
 ├── data_storage.md         # notes on saving data: files, databases, batching, failed writes
+├── distributed.md          # notes on crawl jobs: shared frontier, leases, many workers, production
 ├── error_handling.md       # notes on error kinds, retries, timeouts and circuit breakers
 ├── html_parsing.md         # notes on HTML parsing and URL handling
-├── performance.md          # sync vs async measurements, memory, bottlenecks found and fixed
+├── performance.md          # sync vs async, workers of a job, memory, bottlenecks
 ├── politeness.md           # notes on rate limiting, robots.txt and backoff
 └── sessions_proxies_rendering.md  # notes on cookies, proxies and a headless browser
 ```

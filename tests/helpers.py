@@ -4,12 +4,18 @@ import asyncio
 import base64
 import importlib.util
 import os
-from collections.abc import AsyncIterator, Sequence
+import random
+from collections.abc import AsyncIterator, Collection, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
+from typing import Self
+from urllib.parse import urlsplit
 
-from crawler import CircuitBreaker, CrawlerConfig, DataStorage, PageRecord, RetryStrategy
+import asyncpg
+
+from crawler import CircuitBreaker, CrawlerConfig, DataStorage, Frontier, PageRecord, RetryStrategy
+from crawler.distributed.schema import create_schema
 from demo_site import free_port
 
 BOT = "TestBot/1.0 (+https://example.com/bot)"
@@ -45,6 +51,93 @@ FAST_CONFIG = {
 # The password of the user `crawler` of a test proxy, and the header a proxy that asks for it expects.
 PROXY_PASSWORD = "s3cr3t-pw"
 PROXY_AUTHORIZATION = "Basic " + base64.b64encode(f"crawler:{PROXY_PASSWORD}".encode()).decode()
+
+
+async def drop_frontier_tables() -> None:
+    """Drop the tables of `PostgresFrontier`, so that the next frontier opened starts on empty ones."""
+    connection = await asyncpg.connect(POSTGRES_DSN)
+    try:
+        await connection.execute(
+            "DROP TABLE IF EXISTS out_of_scope, job_scope, workers, hosts, frontier, crawl_jobs;"
+            " DROP SEQUENCE IF EXISTS frontier_seq"
+        )
+    finally:
+        await connection.close()
+
+
+class DatabaseLink:
+    """A TCP relay to the database of the tests that can be cut, as when the database or the network goes down.
+
+    `dsn` reaches the database through it. Once cut, the connections
+    through it are reset and new ones refused.
+    """
+
+    def __init__(self) -> None:
+        self._server: asyncio.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+        self.dsn = ""
+
+    async def __aenter__(self) -> Self:
+        self._server = await asyncio.start_server(self._relay, "127.0.0.1", 0)
+        port = self._server.sockets[0].getsockname()[1]
+        parts = urlsplit(POSTGRES_DSN)
+        self.dsn = parts._replace(netloc=f"{parts.username}:{parts.password}@127.0.0.1:{port}").geturl()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.cut()
+
+    async def cut(self) -> None:
+        assert self._server is not None
+        self._server.close()
+        for writer in self._writers:
+            writer.transport.abort()
+        self._writers.clear()
+
+    async def _relay(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        database = urlsplit(POSTGRES_DSN)
+        upstream_reader, upstream_writer = await asyncio.open_connection(database.hostname, database.port)
+        self._writers |= {writer, upstream_writer}
+
+        async def pipe(source: asyncio.StreamReader, target: asyncio.StreamWriter) -> None:
+            try:
+                while chunk := await source.read(65536):
+                    target.write(chunk)
+                    await target.drain()
+            except OSError:
+                pass
+            finally:
+                target.transport.abort()
+
+        await asyncio.gather(pipe(reader, upstream_writer), pipe(upstream_reader, writer))
+
+
+async def make_job(
+    name: str = "test",
+    *,
+    max_pages: int | None = None,
+    max_pages_per_host: int | None = None,
+    frontier_factor: int = Frontier.FRONTIER_FACTOR,
+    state: str = "running",
+) -> None:
+    """Make the tables of `PostgresFrontier` and a job with these limits, unless one of that name exists.
+
+    The job is ready for its workers, as `create_job` leaves it, but empty and without a configuration.
+    """
+    connection = await asyncpg.connect(POSTGRES_DSN)
+    try:
+        await create_schema(connection)
+        await connection.execute(
+            "INSERT INTO crawl_jobs (name, max_pages, max_pages_per_host, frontier_factor, state)"
+            " VALUES ($1, $2, $3, $4, $5) ON CONFLICT (name) DO NOTHING",
+            name,
+            max_pages,
+            max_pages_per_host,
+            frontier_factor,
+            state,
+        )
+    finally:
+        await connection.close()
 
 
 def make_config(**sections) -> CrawlerConfig:
@@ -84,6 +177,16 @@ def index(*locations: str) -> bytes:
     ).encode()
 
 
+def long_url(start: str = "http://site/", length: int = 4000) -> str:
+    """A URL of `length` characters with a token in its query, as a sign-in page gets one.
+
+    The token is random bytes, which PostgreSQL cannot compress: a URL of
+    4000 characters is too long for a key of its index (about 2.7 KB).
+    """
+    url = f"{start}?token="
+    return url + random.Random(length).randbytes(length).hex()[: length - len(url)]
+
+
 class FakeClock:
     """A clock for the `clock` option that moves only when a test sets `now`."""
 
@@ -110,15 +213,27 @@ def make_record(url: str = "https://site/page", **fields: object) -> PageRecord:
 
 
 class MemoryStorage(DataStorage):
-    """Keeps the batches in a list; a write fails with the next of `failures`, if any."""
+    """Keeps the batches in a list; a write fails with the next of `failures`, if any.
 
-    def __init__(self, batch_size: int = 100, *, failures: Sequence[Exception] = (), **options) -> None:
+    A write of a batch with a record whose URL is in `refused` fails with
+    ValueError, every time: the record is one the storage cannot write.
+    """
+
+    def __init__(
+        self,
+        batch_size: int = 100,
+        *,
+        failures: Sequence[Exception] = (),
+        refused: Collection[str] = (),
+        **options,
+    ) -> None:
         options.setdefault("retry_strategy", RetryStrategy(retry_on=(OSError,), base_delay=0.001, max_delay=0.001))
         # No pause after a failed write, unless a test asks for one.
         options.setdefault("cooldown", 0)
         super().__init__(batch_size, **options)
         self.batches: list[list[PageRecord]] = []
         self.failures = list(failures)
+        self.refused = refused
         self.attempts = 0
         self.released = 0
         self._writing = False
@@ -135,6 +250,9 @@ class MemoryStorage(DataStorage):
             await asyncio.sleep(0)
             if self.failures:
                 raise self.failures.pop(0)
+            for record in records:
+                if record["url"] in self.refused:
+                    raise ValueError(f"cannot write {record['url']}")
             self.batches.append(list(records))
         finally:
             self._writing = False

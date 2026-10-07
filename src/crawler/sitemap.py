@@ -4,7 +4,8 @@ import asyncio
 import logging
 import zlib
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import aclosing
 from typing import NamedTuple
 
 from lxml import etree
@@ -45,7 +46,8 @@ class SitemapParser:
 
     URLs are returned normalized and without duplicates, in the order they
     are listed; those that are not valid http(s) URLs are dropped. No more
-    than `max_urls` are returned.
+    than `max_urls` are returned. `iter_pages` yields them as the files are
+    read, for a caller that may need only the first of them.
     """
 
     MAX_SIZE = 50 * 1024 * 1024
@@ -66,16 +68,34 @@ class SitemapParser:
             FetchError: `sitemap_url` could not be downloaded.
             SitemapError: it was downloaded but is not a sitemap.
         """
+        pages = []
+        async with aclosing(self.iter_pages(sitemap_url)) as batches:
+            async for batch in batches:
+                pages.extend(batch)
+        return pages
+
+    async def iter_pages(self, sitemap_url: str) -> AsyncGenerator[list[str], None]:
+        """Download a sitemap and yield the page URLs that `fetch_sitemap` returns, as its files are read.
+
+        After every batch of up to `CONCURRENCY` files, yields the pages of
+        the batch that were not yielded before. Nothing more is downloaded
+        once the caller stops reading: a caller that needs a few pages
+        reads only the first files of a large index (close the generator
+        with `contextlib.aclosing`). Raises as `fetch_sitemap` does, before
+        the first pages are yielded.
+        """
         root = normalize_url(sitemap_url)
         if root is None:
             raise ValueError(f"not an absolute http(s) URL: {sitemap_url!r}")
         pages: dict[str, None] = {}
         known = {root}
         pending = deque([root])
+        cut = False
         while pending and len(pages) < self.max_urls:
             batch = [pending.popleft() for _ in range(min(len(pending), self.CONCURRENCY))]
             async with asyncio.TaskGroup() as group:
                 tasks = [group.create_task(self._load(url)) for url in batch]
+            new: dict[str, None] = {}
             for url, task in zip(batch, tasks, strict=True):
                 sitemap = task.result()
                 if isinstance(sitemap, FetchError):
@@ -85,11 +105,16 @@ class SitemapParser:
                 elif sitemap.is_index:
                     pending.extend(self._new_sitemaps(url, sitemap.locations, known))
                 else:
-                    pages.update(dict.fromkeys(sitemap.locations))
-        if len(pages) > self.max_urls or pending:
+                    new.update(dict.fromkeys(location for location in sitemap.locations if location not in pages))
+            taken = list(new)[: self.max_urls - len(pages)]
+            cut = len(taken) < len(new)
+            if taken:
+                pages.update(dict.fromkeys(taken))
+                # Out of the task group: a caller that stops here leaves no download running.
+                yield taken
+        if cut or pending:
             logger.warning("Sitemap %s lists more than %d URLs, the rest are left out", root, self.max_urls)
-        logger.info("Sitemap %s: %d URLs in %d files", root, min(len(pages), self.max_urls), len(known))
-        return list(pages)[: self.max_urls]
+        logger.info("Sitemap %s: %d URLs in %d files", root, len(pages), len(known))
 
     def _new_sitemaps(self, index_url: str, locations: list[str], known: set[str]) -> list[str]:
         """The sitemaps of an index that are not known yet, as many as `MAX_FILES` allows; adds them to `known`."""

@@ -59,7 +59,12 @@ class UrlFilter:
     def allow_host_of(self, url: str) -> None:
         """Add the host of `url` to `allowed_hosts`; does nothing when hosts are not restricted."""
         host = get_host(url)
-        if self._hosts is not None and self._sites is not None and host is not None:
+        if host is not None:
+            self.allow_host(host)
+
+    def allow_host(self, host: str) -> None:
+        """Add a host, as `get_host` gives it, to `allowed_hosts`; does nothing when hosts are not restricted."""
+        if self._hosts is not None and self._sites is not None:
             self._hosts[host] = None
             self._sites.add(_site(host))
 

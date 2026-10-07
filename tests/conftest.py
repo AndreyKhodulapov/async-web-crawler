@@ -11,6 +11,7 @@ import certifi
 import pytest
 import trustme
 from aiohttp import web
+from helpers import long_url
 from pages import ENCODING_PAGES, JS_PAGES, JS_SCRIPT, SITE_HEADERS, SITE_PAGES, fixture_html
 from proxy_server import ProxyServer
 
@@ -262,6 +263,14 @@ async def site_page(request: web.Request) -> web.Response:
         raise web.HTTPFound("/site/missing.html")
     if request.path == "/site/to-other-host":
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/")
+    if request.path == "/site/to-sign-in":
+        raise web.HTTPFound(long_url("/site/c.html"))
+    if request.path == "/site/to-busy":
+        raise web.HTTPFound(f"http://localhost:{request.url.port}/busy/60")
+    if request.path == "/site/to-overloaded":
+        raise web.HTTPFound(f"http://localhost:{request.url.port}/overloaded/1/1")
+    if request.path == "/site/to-flaky":
+        raise web.HTTPFound(f"http://localhost:{request.url.port}/flaky/100")
     if request.path == "/site/bounce":
         # Through a page of another host, like a consent page, and back.
         raise web.HTTPFound(f"http://localhost:{request.url.port}/site/bounce-back")
@@ -363,9 +372,15 @@ def make_app() -> web.Application:
 
 
 @pytest.fixture
-async def server(aiohttp_server):
+def server_host() -> str:
+    """The address the test site listens on; tests whose client runs elsewhere, as in a container, override it."""
+    return "127.0.0.1"
+
+
+@pytest.fixture
+async def server(aiohttp_server, server_host):
     """Local HTTP server with predictable endpoints; no internet required."""
-    return await aiohttp_server(make_app())
+    return await aiohttp_server(make_app(), host=server_host)
 
 
 @pytest.fixture

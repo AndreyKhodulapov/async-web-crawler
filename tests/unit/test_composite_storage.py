@@ -183,3 +183,28 @@ class TestCounters:
             await storage.save(make_record())
 
         assert (storage.pending, storage.written) == (1, 0)
+        assert storage.write_failed
+
+        broken.failures = []
+        await storage.flush()
+        assert not storage.write_failed
+
+
+class TestSettled:
+    async def test_record_is_reported_once_every_storage_has_settled_it(self):
+        first, second = MemoryStorage(batch_size=1), MemoryStorage(batch_size=3, refused={"b"})
+        storage = CompositeStorage(first, second)
+        calls: list[list[str]] = []
+
+        async def on_settled(urls: list[str]) -> None:
+            calls.append(urls)
+
+        storage.on_settled = on_settled
+        await save_pages(storage, "a", "b")
+        assert calls == []
+
+        # The second storage writes a and drops b, which the first has written.
+        with pytest.raises(StorageError):
+            await storage.flush()
+
+        assert calls == [["a"], ["b"]]

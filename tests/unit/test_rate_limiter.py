@@ -10,6 +10,7 @@ import pytest
 from helpers import FakeClock
 
 from crawler import DomainRate, RateLimiter
+from crawler.rate_limiter import HostPenalizedError
 
 
 @pytest.fixture
@@ -123,6 +124,14 @@ class TestDomainDelays:
         limiter.set_delay("a", 5.0)
         limiter.set_delay("a", 1.0)
         assert limiter.interval_for("a") == 5.0
+
+    def test_set_delay_tells_whether_the_delay_grew(self, clock):
+        limiter = RateLimiter(2.0, clock=clock)
+        assert limiter.set_delay("a", 3.0)
+        assert not limiter.set_delay("a", 3.0)
+        assert not limiter.set_delay("a", 1.0)
+        assert limiter.set_delay("a", 4.0)
+        assert not limiter.set_delay("b", 0.0)
 
     def test_penalty_holds_back_one_domain(self, clock):
         limiter = RateLimiter(2.0, clock=clock)
@@ -347,3 +356,70 @@ class TestSlot:
         await asyncio.gather(*(request(domain) for domain in domains), *blockers)
         assert max(held) < 0.02
         assert all(later - earlier >= 0.1 - EPSILON for earlier, later in itertools.pairwise(sorted(started)))
+
+
+class TestMaxWait:
+    """A request that waits no longer than `max_wait` for a penalty of its domain."""
+
+    async def test_penalty_longer_than_max_wait_is_not_waited_for(self, clock):
+        limiter = RateLimiter(2.0, clock=clock)
+        limiter.penalize("a", 5.0)
+
+        with pytest.raises(HostPenalizedError) as raised:
+            async with limiter.slot("a", max_wait=1.0):
+                pytest.fail("the request started")
+
+        assert (raised.value.domain, raised.value.seconds) == ("a", 5.0)
+        assert limiter.get_stats().requests == 0
+        # Nothing was booked for it: the next request after the penalty starts on time.
+        clock.now += 5.0
+        assert limiter.reserve("a") == 0.0
+
+    async def test_penalty_that_comes_while_the_request_waits_for_its_turn_is_not_waited_for(self):
+        limiter = RateLimiter(5.0)  # 0.2 s apart
+        await limiter.acquire("a")
+        began = time.monotonic()
+
+        async def request() -> None:
+            async with limiter.slot("a", max_wait=1.0):
+                pytest.fail("the request started")
+
+        waiting = asyncio.create_task(request())
+        await asyncio.sleep(0.05)
+        limiter.penalize("a", 5.0)
+
+        with pytest.raises(HostPenalizedError):
+            await waiting
+        # Given up at the turn it had booked, not after the penalty.
+        assert time.monotonic() - began < 0.5
+
+    async def test_long_crawl_delay_is_waited_for(self):
+        limiter = RateLimiter(None)
+        limiter.set_delay("a", 0.3)
+        await limiter.acquire("a")
+        began = time.monotonic()
+
+        async with limiter.slot("a", max_wait=0.1):
+            pass
+
+        assert time.monotonic() - began >= 0.3 - EPSILON
+
+    async def test_penalty_within_max_wait_is_waited_for(self):
+        limiter = RateLimiter(None)
+        limiter.penalize("a", 0.2)
+        began = time.monotonic()
+
+        async with limiter.slot("a", max_wait=1.0):
+            pass
+
+        assert time.monotonic() - began >= 0.2 - EPSILON
+
+    async def test_penalty_of_another_domain_is_not_waited_for_under_a_global_limit(self):
+        limiter = RateLimiter(20.0, per_domain=False)
+        limiter.penalize("a", 5.0)
+
+        async with limiter.slot("b", max_wait=1.0):
+            pass
+        with pytest.raises(HostPenalizedError):
+            async with limiter.slot("a", max_wait=1.0):
+                pytest.fail("the request started")

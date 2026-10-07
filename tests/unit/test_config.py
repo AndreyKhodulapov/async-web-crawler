@@ -17,6 +17,7 @@ from crawler import (
     CrawlerConfig,
     CSVStorage,
     JSONStorage,
+    PostgresFrontier,
     ProxyPool,
     Rendering,
     RetryStrategy,
@@ -26,6 +27,7 @@ from crawler.config import (
     EXCLUDED_EXTENSIONS,
     CircuitBreakerOptions,
     CrawlOptions,
+    DistributedOptions,
     FilterOptions,
     LoggingOptions,
     ProxyOptions,
@@ -101,8 +103,22 @@ FULL = {
         "csv_encoding": "utf-8-sig",
         "overwrite": True,
     },
-    "logging": {"level": "DEBUG", "file": "crawler.log", "max_bytes": 1000, "backup_count": 2},
+    "logging": {
+        "level": "DEBUG",
+        "file": "crawler.log",
+        "max_bytes": 1000,
+        "backup_count": 2,
+        "console_format": "json",
+    },
     "report": {"stats_json": "stats.json", "html": "report.html", "title": "Blog crawl", "top_domains": 5},
+    "distributed": {
+        "database_url": "postgresql://crawler:dbp4ss@db.example:5432/crawler",
+        "lease_seconds": 120.0,
+        "heartbeat_seconds": 30.0,
+        "max_attempts": 5,
+        "poll_interval": 0.5,
+        "pool_size": 2,
+    },
 }
 
 
@@ -144,7 +160,9 @@ class TestDefaults:
         )
         assert {"pdf", "jpg", "zip", "mp4"} <= set(EXCLUDED_EXTENSIONS)
         assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8", overwrite=False)
-        assert config.logging == LoggingOptions(level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5)
+        assert config.logging == LoggingOptions(
+            level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5, console_format="text"
+        )
         assert config.report == ReportOptions(stats_json=None, html=None, title="Crawl report", top_domains=10)
         assert config.session == SessionOptions(
             keep_cookies=True, cookies=(), cookies_file=None, save_cookies=None, headers={}
@@ -158,6 +176,14 @@ class TestDefaults:
             timeout=30.0,
             max_open_pages=2,
             block_resources=("image", "font", "media"),
+        )
+        assert config.distributed == DistributedOptions(
+            database_url=None,
+            lease_seconds=60.0,
+            heartbeat_seconds=20.0,
+            max_attempts=3,
+            poll_interval=1.0,
+            pool_size=4,
         )
 
     def test_defaults_are_those_of_the_components(self):
@@ -198,6 +224,9 @@ class TestDefaults:
         pool = defaults(ProxyPool.__init__)
         for name in ("rotation", "max_failures", "cooldown"):
             assert getattr(ProxyOptions(), name) == pool[name], name
+        frontier = defaults(PostgresFrontier.open)
+        for name in ("lease_seconds", "heartbeat_seconds", "max_attempts", "poll_interval", "pool_size"):
+            assert getattr(DistributedOptions(), name) == frontier[name], name
         assert RenderingOptions(mode="always").build() == Rendering()
 
     def test_configuration_cannot_be_changed(self):
@@ -364,6 +393,7 @@ class TestInvalid:
                 'logging.level: expected one of DEBUG, INFO, WARNING, ERROR, CRITICAL, got "LOUD"',
             ),
             ({"logging": {"backup_count": -1}}, "logging.backup_count: must be >= 0, got -1"),
+            ({"logging": {"console_format": "xml"}}, 'logging.console_format: expected one of text, json, got "xml"'),
             ({"report": {"top_domains": 0}}, "report.top_domains: must be >= 1, got 0"),
             ({"report": {"html": ""}}, 'report.html: must not be empty, got ""'),
         ],
@@ -996,3 +1026,81 @@ class TestRendering:
         monkeypatch.setitem(sys.modules, "playwright", None)
 
         assert CrawlerConfig.from_dict({"rendering": {"mode": "off", "timeout": 5}}).rendering.build() is None
+
+
+class TestDistributed:
+    def test_database_url_is_a_secret(self):
+        text = repr(CrawlerConfig.from_dict(FULL))
+
+        assert "dbp4ss" not in text
+        assert "lease_seconds=120.0" in text
+
+    @pytest.mark.parametrize(
+        "section, problem",
+        [
+            ({"database_url": "sqlite:///jobs.db"}, "distributed.database_url: expected a postgresql:// URL"),
+            ({"lease_seconds": 0}, "distributed.lease_seconds: must be > 0, got 0.0"),
+            ({"heartbeat_seconds": 0}, "distributed.heartbeat_seconds: must be > 0, got 0.0"),
+            ({"max_attempts": 0}, "distributed.max_attempts: must be >= 1, got 0"),
+            ({"poll_interval": 0}, "distributed.poll_interval: must be > 0, got 0.0"),
+            ({"pool_size": 0}, "distributed.pool_size: must be >= 1, got 0"),
+            (
+                {"lease_seconds": 20, "heartbeat_seconds": 20},
+                "distributed.heartbeat_seconds: must be less than distributed.lease_seconds (20.0), got 20.0",
+            ),
+        ],
+    )
+    def test_invalid_values(self, section, problem):
+        assert problems({"distributed": section}) == [problem]
+
+    def test_invalid_database_url_is_not_shown(self):
+        (problem,) = problems({"distributed": {"database_url": "mysql://crawler:dbp4ss@db.example/crawler"}})
+
+        assert "dbp4ss" not in problem
+
+    def test_database_url_of_the_section_wins_over_the_environment(self, monkeypatch):
+        monkeypatch.setenv("CRAWLER_DATABASE_URL", "postgresql://env.example/crawler")
+
+        assert DistributedOptions(database_url="postgres://db.example/crawler").dsn() == "postgres://db.example/crawler"
+        assert DistributedOptions().dsn() == "postgresql://env.example/crawler"
+
+    @pytest.mark.parametrize("value", [None, "", "sqlite:///crawler.db"])
+    def test_without_a_database_of_postgresql_there_is_no_dsn(self, monkeypatch, value):
+        if value is None:
+            monkeypatch.delenv("CRAWLER_DATABASE_URL", raising=False)
+        else:
+            monkeypatch.setenv("CRAWLER_DATABASE_URL", value)
+
+        with pytest.raises(ConfigError) as error:
+            DistributedOptions().dsn()
+
+        (problem,) = error.value.problems
+        assert problem.startswith("distributed.database_url: a crawl job needs a PostgreSQL database")
+        assert "sqlite" not in problem
+
+
+class TestForWorker:
+    def test_name_of_the_worker_goes_into_the_paths_of_the_files_written(self):
+        config = CrawlerConfig.from_dict(
+            {
+                "storage": {"outputs": ["out/pages-{worker}.jsonl", "sqlite:///pages-{worker}.db"]},
+                "logging": {"file": "{worker}.log"},
+                "report": {"stats_json": "stats-{worker}.json", "html": "report-{worker}.html"},
+                "session": {"cookies_file": "cookies-{worker}.txt", "save_cookies": "saved-{worker}.txt"},
+            }
+        ).for_worker("w1")
+
+        assert config.storage.outputs == ("out/pages-w1.jsonl", "sqlite:///pages-w1.db")
+        assert (config.logging.file, config.report.stats_json, config.report.html) == (
+            "w1.log",
+            "stats-w1.json",
+            "report-w1.html",
+        )
+        assert config.session.save_cookies == "saved-w1.txt"
+        # A file that is read is the same for every worker.
+        assert config.session.cookies_file == "cookies-{worker}.txt"
+
+    def test_configuration_without_the_name_is_the_same(self):
+        config = CrawlerConfig.from_dict(FULL)
+
+        assert config.for_worker("w1") == config

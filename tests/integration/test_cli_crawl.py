@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -67,6 +69,16 @@ async def test_crawl_by_a_file_and_options(url, config_file, tmp_path, capsys):
     assert f"Log: {out / 'crawler.log'}\n" in summary
     # The progress line goes to stderr and ends with the crawl done.
     assert "| 4/100 pages, 1 failed |" in captured.err.splitlines()[-1]
+
+
+async def test_json_console_gets_no_progress_line(config_file, capsys):
+    argv = ["--config", config_file(logging={"level": "INFO", "console_format": "json"})]
+
+    assert await run(build_config(parse_args(argv))) == 0
+
+    entries = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert entries
+    assert all(entry["level"] in {"INFO", "WARNING"} for entry in entries)
 
 
 async def test_options_limit_the_crawl_of_the_file(url, site, config_file, capsys):
@@ -207,6 +219,57 @@ async def test_interrupted_crawl_saves_and_reports_the_pages_it_fetched(url, sit
     assert "=== Crawl interrupted (" in summary
     assert f"Saved: 1 pages to {pages}\n" in summary
     assert f"Reports: {stats_file}\n" in summary
+
+
+async def test_sigterm_stops_the_crawl_as_ctrl_c_does_and_leaves_no_handler(url, site, config_file, tmp_path, capsys):
+    pages = tmp_path / "pages.jsonl"
+    argv = [
+        "--config", config_file(urls=[url("/ok"), url("/delay/30")], storage={"batch_size": 100}),
+        "--max-depth", "0",
+        "--output", str(pages),
+    ]  # fmt: skip
+    task = asyncio.create_task(run(build_config(parse_args(argv)), progress=True))
+    async with asyncio.timeout(10):
+        while "1/100 pages" not in capsys.readouterr().err:
+            await asyncio.sleep(0.05)
+
+    os.kill(os.getpid(), signal.SIGTERM)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert saved_urls(pages) == {url("/ok")}
+    assert "=== Crawl interrupted (" in capsys.readouterr().out
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+async def test_crawl_runs_where_the_event_loop_has_no_signal_handlers(url, site, config_file, monkeypatch):
+    def add_signal_handler(sig, callback, *args):
+        raise NotImplementedError  # as on Windows
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "add_signal_handler", add_signal_handler)
+
+    assert await run(build_config(parse_args(["--config", config_file(), "--max-depth", "0"])), progress=False) == 0
+    assert site.hits.total() == 1
+
+
+async def test_command_stopped_with_sigterm_saves_the_pages_and_exits_with_143(url, site, config_file, tmp_path):
+    pages, stats_file = tmp_path / "pages.jsonl", tmp_path / "stats.json"
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, str(Path(main.__file__)),
+        "--config", config_file(urls=[url("/ok"), url("/delay/30")], storage={"batch_size": 100}),
+        "--max-depth", "0", "--output", str(pages), "--stats-json", str(stats_file),
+        cwd=tmp_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )  # fmt: skip
+    async with asyncio.timeout(30):
+        while b"1/100 pages" not in await process.stderr.readline():  # /ok is fetched, /delay/30 is in flight
+            pass
+    process.send_signal(signal.SIGTERM)
+    output, errors = await asyncio.wait_for(process.communicate(), timeout=30)
+
+    assert process.returncode == 143, errors.decode()
+    assert saved_urls(pages) == {url("/ok")}
+    assert json.loads(stats_file.read_text(encoding="utf-8"))["successful"] == 1
+    assert "=== Crawl interrupted (" in output.decode()
 
 
 async def test_summary_lists_only_the_reports_that_were_written(url, config_file, tmp_path, capsys):

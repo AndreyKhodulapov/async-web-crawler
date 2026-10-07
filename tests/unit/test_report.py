@@ -165,6 +165,31 @@ def test_html_report_without_rendering_does_not_mention_it(stats):
     assert "Rendering" not in render_html(stats.get_stats())
 
 
+def test_html_report_lists_the_workers_of_a_crawl_job():
+    workers = {
+        "w1": {"state": "stopped", "pages": 1200, "failed": 3, "pages_per_second": 4.5, "active_seconds": 266.7},
+        "<b>w2</b>": {"state": "lost", "pages": 7, "failed": 0, "pages_per_second": 0.25, "active_seconds": 0.5},
+    }
+    html = render_html(empty_stats() | {"workers": workers})
+
+    assert "<h2>Workers</h2>" in html
+    assert "<b>" not in html
+    assert cells(html) == [
+        *("w1", "stopped", "1,200", "3", "4.50", "4m 27s"),
+        *("<b>w2</b>", "lost", "7", "0", "0.25", "500 ms"),
+    ]
+
+
+def test_html_report_of_a_crawl_job_no_worker_has_started_says_so():
+    html = render_html(empty_stats() | {"workers": {}})
+
+    assert '<h2>Workers</h2>\n<p class="empty">No worker has started.</p>' in html
+
+
+def test_html_report_without_workers_does_not_mention_them(stats):
+    assert "Workers" not in render_html(stats.get_stats())
+
+
 def test_html_report_of_an_empty_crawl_has_no_charts():
     html = render_html(empty_stats())
 

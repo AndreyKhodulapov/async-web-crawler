@@ -4,6 +4,7 @@ import dataclasses
 import difflib
 import json
 import math
+import os
 import re
 import sys
 import types
@@ -18,6 +19,7 @@ import yaml
 from crawler.client import AsyncCrawler
 from crawler.exceptions import ConfigError
 from crawler.filters import extension_problem, normalize_extension
+from crawler.logging_setup import CONSOLE_FORMATS
 from crawler.proxy import Proxy, ProxyPool, proxy_url_problem
 from crawler.rendering import RESOURCE_TYPES, WAIT_STATES, Rendering, playwright_problem
 from crawler.robots import product_token
@@ -30,7 +32,7 @@ from crawler.session import (
     load_cookies_file,
     make_cookie,
 )
-from crawler.storage import CompositeStorage, DataStorage, storage_from_output
+from crawler.storage import DATABASE_URL_VARIABLE, CompositeStorage, DataStorage, storage_from_output
 from crawler.urls import is_valid_http_url
 
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -131,6 +133,10 @@ def _rotation(value: str) -> str | None:
     return None if value in ("per_host", "per_request") else "expected per_host or per_request"
 
 
+def _console_format(value: str) -> str | None:
+    return None if value in CONSOLE_FORMATS else f"expected one of {', '.join(CONSOLE_FORMATS)}"
+
+
 def _render_mode(value: str) -> str | None:
     return None if value in RENDER_MODES else f"expected one of {', '.join(RENDER_MODES)}"
 
@@ -145,6 +151,11 @@ def _resource_type(value: str) -> str | None:
 
 def _cookie_path(value: str) -> str | None:
     return None if value.startswith("/") and value.isprintable() else 'expected a path that starts with "/"'
+
+
+def _postgresql_url(value: str) -> str | None:
+    scheme, separator, _ = value.partition("://")
+    return None if separator and scheme.lower() in ("postgresql", "postgres") else "expected a postgresql:// URL"
 
 
 def _file_path(value: str) -> str | None:
@@ -359,12 +370,13 @@ class StorageOptions:
 
 @dataclass(frozen=True)
 class LoggingOptions:
-    """Section `logging`: the level of the log and the file it is also written to."""
+    """Section `logging`: the level of the log, the file it is also written to and the format of the console."""
 
     level: str = _option("INFO", check=_log_level, normalize=str.upper)
     file: str | None = _option(None, check=_file_path)
     max_bytes: int = _option(10 * 1024 * 1024, minimum=0)  # the file is rotated at this size; 0 never rotates it
     backup_count: int = _option(5, minimum=0)  # rotated files that are kept; 0 never rotates the file
+    console_format: str = _option("text", check=_console_format)  # json: JSON Lines on the console, as in the file
 
 
 @dataclass(frozen=True)
@@ -375,6 +387,40 @@ class ReportOptions:
     html: str | None = _option(None, check=_file_path)
     title: str = "Crawl report"
     top_domains: int = _option(10, minimum=1)
+
+
+@dataclass(frozen=True)
+class DistributedOptions:
+    """Section `distributed`: the database of the crawl jobs and how a worker holds its pages, see `PostgresFrontier`.
+
+    Each worker has its own: it is not a part of the job.
+    """
+
+    database_url: str | None = _option(
+        None, check=_postgresql_url, secret=True
+    )  # postgresql://user:password@host:5432/database; null: the one of CRAWLER_DATABASE_URL
+    lease_seconds: float = _option(60.0, above=0)  # a page of a worker that stopped is crawled again after this long
+    heartbeat_seconds: float = _option(20.0, above=0)  # how often a worker renews the leases of its pages
+    max_attempts: int = _option(3, minimum=1)  # leases of a page that may expire before it fails
+    poll_interval: float = _option(1.0, above=0)  # how often a worker with no page looks for one at least
+    pool_size: int = _option(4, minimum=1)  # connections of a worker to the database of the job
+
+    def dsn(self, environ: Mapping[str, str] | None = None) -> str:
+        """The URL of the database: `database_url`, or the one of `CRAWLER_DATABASE_URL`. `environ` replaces `os.environ`.
+
+        Raises:
+            ConfigError: there is neither, or the variable names a database other than PostgreSQL.
+        """
+        if self.database_url is not None:
+            return self.database_url
+        url = (os.environ if environ is None else environ).get(DATABASE_URL_VARIABLE) or ""
+        if _postgresql_url(url) is not None:
+            # Not the URL itself: it may hold a password.
+            got = f"{DATABASE_URL_VARIABLE} is not a postgresql:// URL" if url else f"nor is {DATABASE_URL_VARIABLE}"
+            raise ConfigError(
+                [f"distributed.database_url: a crawl job needs a PostgreSQL database; the key is not set, {got}"]
+            )
+        return url
 
 
 @dataclass(frozen=True)
@@ -406,6 +452,7 @@ class CrawlerConfig:
     storage: StorageOptions = field(default_factory=StorageOptions)
     logging: LoggingOptions = field(default_factory=LoggingOptions)
     report: ReportOptions = field(default_factory=ReportOptions)
+    distributed: DistributedOptions = field(default_factory=DistributedOptions)
 
     @classmethod
     def from_dict(cls, mapping: Mapping[str, Any], *, source: str | None = None) -> Self:
@@ -432,6 +479,28 @@ class CrawlerConfig:
         leaves out: it is not for logs.
         """
         return _plain(dataclasses.asdict(self))
+
+    def for_worker(self, name: str) -> Self:
+        """The configuration with "{worker}" in the paths of the files written replaced by `name`.
+
+        Those are the outputs of the storage, the log file, the reports and
+        `session.save_cookies`: workers of one crawl job can write files of
+        their own side by side, such as "pages-{worker}.jsonl". A file that
+        is read, such as `session.cookies_file`, stays as it is.
+        """
+
+        def named(path: str | None) -> str | None:
+            return None if path is None else path.replace("{worker}", name)
+
+        return dataclasses.replace(
+            self,
+            storage=dataclasses.replace(self.storage, outputs=tuple(map(named, self.storage.outputs))),
+            logging=dataclasses.replace(self.logging, file=named(self.logging.file)),
+            report=dataclasses.replace(
+                self.report, stats_json=named(self.report.stats_json), html=named(self.report.html)
+            ),
+            session=dataclasses.replace(self.session, save_cookies=named(self.session.save_cookies)),
+        )
 
 
 def load_config(path: str | Path, overrides: Mapping[str, Any] | None = None) -> CrawlerConfig:
@@ -697,6 +766,12 @@ def _check_together(config: CrawlerConfig, problems: list[str]) -> None:
     missing = playwright_problem() if rendering.mode != "off" else None
     if missing is not None:
         problems.append(f"rendering.mode: {missing}")
+    distributed = config.distributed
+    if distributed.heartbeat_seconds >= distributed.lease_seconds:
+        problems.append(
+            f"distributed.heartbeat_seconds: must be less than distributed.lease_seconds ({distributed.lease_seconds}), "
+            f"got {distributed.heartbeat_seconds}"
+        )
     try:
         "".encode(config.storage.csv_encoding)
     except (LookupError, ValueError):  # ValueError: a name with a null character, or the codec "undefined"

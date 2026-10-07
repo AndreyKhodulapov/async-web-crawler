@@ -407,3 +407,45 @@ PAGES  SYNC TIME  SYNC PAGES/S  ASYNC TIME  ASYNC PAGES/S  SPEEDUP  SYNC MEMORY 
 
 What the numbers mean, the bottlenecks they showed and what was done about
 them is in [performance.md](performance.md).
+
+### scale --workers
+
+```bash
+export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler  # docker compose up -d postgres
+python src/demo_main.py scale 1000 --workers 1 2 4
+```
+
+Compares a crawl of one process with crawl jobs in PostgreSQL crawled by 1,
+2 and 4 worker processes, in place of the synchronous crawler. Each crawl
+has a local site of its own; each worker is a process of the command line,
+`python src/main.py worker`, with `--concurrency` requests in flight, and
+the local crawl has as many. The job, named `scale`, is created anew for
+every crawl, with no rate limit, robots.txt or retries, as the local crawl.
+The time of a job is that of its database, from the start of its first
+worker to its end: starting Python in every process is not counted.
+`SPEEDUP` is against the job of the fewest workers; the line under the
+rows of a site is what the database costs a page of one worker. A crawl
+job that requests a page more than once, or a crawl that misses pages, is
+reported there as well. Memory is not measured.
+
+In compose, next to the database (the output below):
+
+```bash
+docker compose run --rm --no-deps --entrypoint python worker src/demo_main.py scale 1000 --workers 1 2 4
+```
+
+```
+=== Scale: one process vs crawl jobs of 1, 2, 4 worker processes, 20 requests at once in each (the site answers in 50 ms) ===
+PAGES  CRAWL            TIME   PAGES/S  SPEEDUP
+ 1000  local           6.23s     160.4        -
+ 1000  1 worker        6.97s     143.5     1.0x
+ 1000  2 workers       4.48s     223.0     1.6x
+ 1000  4 workers       4.19s     238.8     1.7x
+  a page of one worker takes 0.7 ms more than a local one
+The time of a job is that of its database, from the start of its first worker to its end; SPEEDUP is against the job of the fewest workers.
+```
+
+The database must be PostgreSQL: `--database-url`, or `CRAWLER_DATABASE_URL`.
+Ctrl-C stops the workers, which put their pages back. Why four workers
+are no faster than two is in
+[performance.md](performance.md#crawl-jobs-of-several-workers).

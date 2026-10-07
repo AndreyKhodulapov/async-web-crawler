@@ -4,9 +4,15 @@
 fixed delay, as a remote server would. `SyncCrawler` crawls it the plain
 way, one request after another; `AsyncCrawler` crawls the same pages
 concurrently. `measure` times both and takes their peak memory.
+`crawl_job` crawls the site as a crawl job in PostgreSQL with worker
+processes, and `compare_workers` sets it against a crawl of one process.
 """
 
 import asyncio
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 import time
 import tracemalloc
@@ -15,11 +21,15 @@ import urllib.request
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Self
 
+import yaml
 from aiohttp import web
 
-from crawler import AsyncCrawler, CircuitBreaker, HTMLParser, ParsedPage, ParseError, RetryStrategy
+from crawler import AsyncCrawler, CircuitBreaker, CrawlerConfig, HTMLParser, ParsedPage, ParseError, RetryStrategy
+from crawler.distributed import JobMode, create_job, job_stats
+from crawler.storage import DATABASE_URL_VARIABLE
 from crawler.urls import get_host, is_same_host, normalize_url
 
 # Links of a page to the pages below it: the site is a tree this wide.
@@ -320,3 +330,138 @@ def compare(
         concurrent=measure(lambda site: crawl_async(site, concurrency, stop=stop), pages, delay, memory=memory),
         lean_memory=lean,
     )
+
+
+@dataclass(frozen=True)
+class WorkersComparison:
+    """A site of `pages` pages crawled by one process and as crawl jobs of a number of worker processes."""
+
+    pages: int
+    local: Run
+    jobs: dict[int, Run]  # by the number of workers, fewest first
+    requests: dict[int, int]  # those of each job to the site: more than `pages` is a page crawled twice
+
+    def speedup(self, workers: int) -> float:
+        """How much faster the job of `workers` workers is than that of the fewest."""
+        fewest = self.jobs[min(self.jobs)]
+        run = self.jobs[workers]
+        return fewest.elapsed / run.elapsed if run.elapsed > 0 else 0.0
+
+    @property
+    def database_cost(self) -> float | None:
+        """Seconds a page of the job of one worker takes over a page of the local crawl; None without that job."""
+        if 1 not in self.jobs:
+            return None
+        return (self.jobs[1].elapsed - self.local.elapsed) / self.pages
+
+
+def crawl_job(
+    site: ScaleSite,
+    workers: int,
+    concurrency: int,
+    *,
+    dsn: str,
+    job: str = "scale",
+    stop: threading.Event | None = None,
+) -> Run:
+    """Crawl the whole site as the crawl job `job` with `workers` worker processes; return the run.
+
+    The job is created anew in the database of `dsn`, as bare as
+    `crawl_async`. Each worker is a process of the command line,
+    `main.py worker`, with `concurrency` requests in flight, as a container
+    of the job runs it; it finds the database in CRAWLER_DATABASE_URL, so
+    that the password is not on a command line. A worker with nothing to
+    take looks again within a tenth of a second: the crawl starts from one
+    page, and the others wait for its links.
+
+    The time is that of the job in its database, from the start of its
+    first worker to its end: starting Python and importing in every
+    process is not a part of it. Memory is not measured.
+
+    Raises:
+        asyncio.CancelledError: `stop` was set; the workers are stopped
+            with SIGTERM, which puts their pages back, and waited for.
+        RuntimeError: a worker failed; its log, on stderr, tells why.
+        FrontierError: the database cannot be reached or failed.
+    """
+    settings = {
+        "urls": [site.url],
+        "crawler": {"max_pages": site.pages, "max_depth": site.pages, "rate_limit": None, "respect_robots": False},
+        "retry": {"max_retries": 0},
+        "circuit_breaker": {"failure_threshold": None},
+    }
+    asyncio.run(create_job(CrawlerConfig.from_dict(settings), job, dsn=dsn, mode=JobMode.RESTART))
+    worker = {
+        "crawler": {"max_concurrent": concurrency},
+        "distributed": {"poll_interval": 0.1},
+        # Not the warning that nothing is saved, nor a line a page that would cost time.
+        "logging": {"level": "ERROR"},
+    }
+    with tempfile.TemporaryDirectory() as directory:
+        config = Path(directory, "worker.yaml")
+        config.write_text(yaml.safe_dump(worker), encoding="utf-8")
+        command = [sys.executable, str(Path(__file__).with_name("main.py")), "worker", "--job", job, "--config"]
+        processes = {
+            name: subprocess.Popen(
+                [*command, str(config), "--name", name],
+                env={**os.environ, DATABASE_URL_VARIABLE: dsn},
+                stdout=subprocess.DEVNULL,
+            )
+            for name in (f"{job}-{number}" for number in range(1, workers + 1))
+        }
+        _wait_for(list(processes.values()), stop)
+    failed = [f"{name} ({process.returncode})" for name, process in processes.items() if process.returncode != 0]
+    if failed:
+        raise RuntimeError(f"workers of crawl job {job} failed, with the exit codes: {', '.join(failed)}")
+    stats = asyncio.run(job_stats(dsn, job))
+    return Run(pages=stats["successful"], failed=stats["failed"], elapsed=stats["elapsed_seconds"], peak_memory=None)
+
+
+def _wait_for(processes: list[subprocess.Popen], stop: threading.Event | None) -> None:
+    """Wait for the processes to exit; stop them with SIGTERM once `stop` is set, or if waiting fails."""
+    try:
+        for process in processes:
+            while True:
+                try:
+                    process.wait(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if stop is not None and stop.is_set():
+                        raise asyncio.CancelledError from None
+    except BaseException:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            process.wait()
+        raise
+
+
+def compare_workers(
+    pages: int,
+    delay: float,
+    concurrency: int,
+    workers: list[int],
+    *,
+    dsn: str,
+    stop: threading.Event | None = None,
+) -> WorkersComparison:
+    """Crawl a site of `pages` pages with one process, then as crawl jobs of each number of `workers`.
+
+    Every crawl has a site of its own and `concurrency` requests in flight
+    in each process; the local one does not keep its pages, as workers do
+    not. The database is that of `dsn`.
+
+    Raises:
+        asyncio.CancelledError: `stop` was set.
+        RuntimeError, FrontierError: as `crawl_job`.
+    """
+    local = measure(
+        lambda site: crawl_async(site, concurrency, keep_pages=False, stop=stop), pages, delay, memory=False
+    )
+    jobs, requests = {}, {}
+    for count in sorted(set(workers)):
+        with ScaleSite(pages, delay) as site:
+            jobs[count] = crawl_job(site, count, concurrency, dsn=dsn, stop=stop)
+            requests[count] = site.requests
+    return WorkersComparison(pages=pages, local=local, jobs=jobs, requests=requests)

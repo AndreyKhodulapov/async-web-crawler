@@ -1,0 +1,15 @@
+# Only what the image is built from: requirements.txt, pyproject.toml, README.md and src.
+.git
+.venv
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.egg-info
+out
+tests
+docs
+examples
+*.jsonl
+*.csv
+*.db
+*.log

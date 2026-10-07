@@ -37,4 +37,5 @@ def test_a_recipe_is_a_valid_configuration(recipe, tmp_path):
 
     config = load_config(path)  # raises ConfigError with every problem
 
-    assert config.urls
+    # A worker of a crawl job takes its URLs from the job; its files are named by "{worker}".
+    assert config.urls or "{worker}" in recipe

@@ -1,5 +1,6 @@
 """Unit tests for the command line of the crawler: options, their priority over the configuration file, exit codes."""
 
+import asyncio
 import io
 import json
 import sys
@@ -8,8 +9,12 @@ import pytest
 import yaml
 
 import main
-from crawler import ConfigError, CrawlerConfig, StorageError
-from main import build_config, config_overrides, parse_args
+from crawler import ConfigError, CrawlerConfig, FrontierError, JobError, StorageError
+from crawler.distributed import JobMode, JobProgress, format_job_progress
+from crawler.stats import CrawlerStats
+from main import build_config, config_overrides, parse_args, parse_command_args
+
+DSN = "postgresql://crawler:secret@db.example/crawler"
 
 
 def write_config(tmp_path, data, name="config.yaml"):
@@ -404,6 +409,7 @@ def test_invalid_lines_of_the_urls_file_exit_with_2_before_anything_runs(tmp_pat
         (OSError("cannot open the log"), 1),
         (StorageError("pages.jsonl is not JSON Lines of this storage"), 1),
         (KeyboardInterrupt(), 130),
+        (asyncio.CancelledError(), 143),
     ],
 )
 def test_exit_code_follows_the_run(outcome, code, monkeypatch, capsys):
@@ -450,3 +456,437 @@ def test_chromium_is_not_looked_for_without_rendering(monkeypatch):
     monkeypatch.setattr(main, "AdvancedCrawler", Crawler)
 
     assert main.main(["--urls", "https://example.com/", "--no-progress"]) == 1
+
+
+def test_help_of_a_crawl_names_the_commands_of_crawl_jobs(capsys):
+    with pytest.raises(SystemExit):
+        parse_args(["--help"])
+
+    assert "job create --help, worker --help, report --help and status --help" in " ".join(
+        capsys.readouterr().out.split()
+    )
+
+
+def test_job_create_takes_a_configuration_and_a_name():
+    args = parse_command_args(["job", "create", "--config", "job.yaml", "--name", "books"])
+
+    assert (args.command, args.action, args.config, args.name, args.mode) == (
+        "job",
+        "create",
+        "job.yaml",
+        "books",
+        JobMode.NEW,
+    )
+
+
+@pytest.mark.parametrize(("option", "mode"), [("--resume", JobMode.RESUME), ("--restart", JobMode.RESTART)])
+def test_job_create_resumes_or_restarts_a_job(option, mode):
+    assert parse_command_args(["job", "create", "--config", "job.yaml", "--name", "books", option]).mode is mode
+
+
+def test_worker_takes_a_job_and_optionally_the_rest():
+    args = parse_command_args(["worker", "--job", "books"])
+    assert (args.command, args.job, args.config, args.concurrency, args.name) == ("worker", "books", None, None, None)
+
+    args = parse_command_args(["worker", "--job", "books", "--config", "w.yaml", "--concurrency", "4", "--name", "w-1"])
+    assert (args.config, args.concurrency, args.name) == ("w.yaml", 4, "w-1")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["job"],
+        ["job", "delete", "--name", "books"],
+        ["job", "create", "--name", "books"],
+        ["job", "create", "--config", "job.yaml"],
+        ["job", "create", "--config", "job.yaml", "--name", "books", "--resume", "--restart"],
+        ["worker"],
+        ["worker", "--job", "books", "--concurrency", "0"],
+        ["worker", "--job", "books", "--name", "../w"],
+        ["worker", "--job", "books", "--urls", "https://example.com/"],
+        ["report"],
+        ["report", "--job", "books", "--html", "report.html"],
+        ["status"],
+        ["status", "--job", "books", "--interval", "5"],
+        ["status", "--job", "books", "--watch", "--interval", "0"],
+    ],
+)
+def test_invalid_commands_are_usage_errors(argv, monkeypatch, capsys):
+    monkeypatch.setattr(main, "run_command", None)  # would fail if called
+
+    with pytest.raises(SystemExit) as exit_info:
+        main.main(argv)
+
+    assert exit_info.value.code == 2
+    assert "usage:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code"),
+    [
+        ({}, 0),
+        (JobError('A crawl job named "books" exists already: resume or restart it'), 1),
+        (FrontierError("the database of crawl job books failed: OSError: refused"), 1),
+        (OSError("cannot open the log"), 1),
+        (ConfigError(["urls: nothing to crawl"]), 2),
+        (KeyboardInterrupt(), 130),
+        (asyncio.CancelledError(), 143),
+    ],
+)
+def test_exit_code_of_job_create_follows_the_job(outcome, code, tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    async def create_job(config, name, *, dsn, mode, configure_logging):
+        seen.update(urls=config.urls, name=name, dsn=dsn, mode=mode, configure_logging=configure_logging)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(main, "create_job", create_job)
+    path = write_config(tmp_path, {"urls": ["https://example.com/"], "distributed": {"database_url": DSN}})
+
+    assert main.main(["job", "create", "--config", path, "--name", "books", "--resume"]) == code
+
+    assert seen == {
+        "urls": ("https://example.com/",),
+        "name": "books",
+        "dsn": DSN,
+        "mode": JobMode.RESUME,
+        "configure_logging": True,
+    }
+    captured = capsys.readouterr()
+    assert captured.err == (f"error: {outcome}\n" if code in (1, 2) else "")
+    assert captured.out == (
+        "Crawl job books is ready: start its workers with worker --job books\n" if code == 0 else ""
+    )
+
+
+def test_job_create_names_the_sitemaps_it_could_not_read(tmp_path, monkeypatch, capsys):
+    async def create_job(config, name, **options):
+        return {"https://a.example/sitemap.xml": "HTTP 404", "https://b.example/sitemap.xml": "not XML"}
+
+    monkeypatch.setattr(main, "create_job", create_job)
+    path = write_config(tmp_path, {"urls": ["https://example.com/"], "distributed": {"database_url": DSN}})
+
+    assert main.main(["job", "create", "--config", path, "--name", "books"]) == 0
+
+    assert capsys.readouterr().out.splitlines()[0] == (
+        "Sitemaps not read: https://a.example/sitemap.xml (HTTP 404), https://b.example/sitemap.xml (not XML)"
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["job", "create", "--config", "{path}", "--name", "books"],
+        ["worker", "--job", "books", "--config", "{path}"],
+        ["report", "--job", "books", "--config", "{path}", "--report", "report.html"],
+        ["status", "--job", "books", "--config", "{path}"],
+    ],
+)
+def test_command_without_a_database_exits_with_2_before_anything_runs(command, tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("CRAWLER_DATABASE_URL", raising=False)
+    monkeypatch.setattr(main, "create_job", None)  # would fail if called
+    monkeypatch.setattr(main, "AdvancedCrawler", None)
+    monkeypatch.setattr(main, "job_stats", None)
+    monkeypatch.setattr(main, "job_progress", None)
+    path = write_config(tmp_path, {"urls": ["https://example.com/"]})
+
+    assert main.main([part.replace("{path}", path) for part in command]) == 2
+
+    assert capsys.readouterr().err.startswith(
+        "error: Invalid configuration: distributed.database_url: a crawl job needs a PostgreSQL database"
+    )
+
+
+def test_job_create_with_an_invalid_configuration_exits_with_2(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(main, "create_job", None)  # would fail if called
+
+    assert main.main(["job", "create", "--config", str(tmp_path / "missing.yaml"), "--name", "books"]) == 2
+
+    assert "missing.yaml: cannot read the file" in capsys.readouterr().err
+
+
+def worker_stats(**changes):
+    return {**CrawlerStats().get_stats(), "worker": "w-1", "saved": 0, "save_failed": 0, **changes}
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code"),
+    [
+        (worker_stats(), 0),
+        (worker_stats(save_failed=1), 1),
+        (JobError('There is no crawl job named "books"'), 1),
+        (FrontierError("the database of crawl job books failed: OSError: refused"), 1),
+        (StorageError("pages-w-1.jsonl is not JSON Lines of this storage"), 1),
+        (OSError("cannot open the log"), 1),
+        (ConfigError(["storage.outputs[0]: put {worker} in the name"]), 2),
+        (KeyboardInterrupt(), 130),
+        (asyncio.CancelledError(), 143),
+    ],
+)
+def test_exit_code_of_a_worker_follows_its_run(outcome, code, monkeypatch, capsys):
+    seen = {}
+
+    async def run_worker(config, job, *, worker):
+        seen.update(job=job, worker=worker)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(main, "run_worker", run_worker)
+
+    assert main.main(["worker", "--job", "books", "--name", "w-1"]) == code
+
+    assert seen == {"job": "books", "worker": "w-1"}
+    assert capsys.readouterr().err == (f"error: {outcome}\n" if isinstance(outcome, Exception) else "")
+
+
+def test_worker_takes_its_own_configuration_and_concurrency(tmp_path, monkeypatch):
+    seen = {}
+
+    async def run_worker(config, job, *, worker):
+        seen.update(config=config, worker=worker)
+        return worker_stats()
+
+    monkeypatch.setattr(main, "run_worker", run_worker)
+    path = write_config(tmp_path, {"storage": {"outputs": ["pages-{worker}.jsonl"]}, "crawler": {"max_concurrent": 3}})
+
+    assert main.main(["worker", "--job", "books", "--config", path, "--concurrency", "7"]) == 0
+
+    config = seen["config"]
+    assert (config.storage.outputs, config.crawler.max_concurrent, config.urls) == (("pages-{worker}.jsonl",), 7, ())
+    assert seen["worker"] is None
+
+
+def test_worker_without_a_configuration_takes_the_defaults(monkeypatch):
+    seen = {}
+
+    async def run_worker(config, job, *, worker):
+        seen["config"] = config
+        return worker_stats()
+
+    monkeypatch.setattr(main, "run_worker", run_worker)
+
+    assert main.main(["worker", "--job", "books"]) == 0
+    assert seen["config"] == CrawlerConfig()
+
+
+def test_summary_of_a_worker_counts_its_own_pages(tmp_path, monkeypatch, capsys):
+    stats = worker_stats(
+        total_pages=5, successful=4, failed=1, elapsed_seconds=2.5, status_codes={200: 4, 500: 1}, saved=4
+    )
+
+    async def run_worker(config, job, *, worker):
+        return stats
+
+    monkeypatch.setattr(main, "run_worker", run_worker)
+    path = write_config(tmp_path, {"storage": {"outputs": ["pages-{worker}.jsonl"]}})
+
+    assert main.main(["worker", "--job", "books", "--config", path]) == 0
+
+    summary = capsys.readouterr().out
+    assert "=== Worker w-1 finished on crawl job books (2.50s) ===\n" in summary
+    assert "Pages: 5 (4 successful, 1 failed, 0 skipped)" in summary
+    assert "Status codes: 200: 4, 500: 1\n" in summary
+    assert summary.endswith("Saved: 4 pages\n")
+
+
+def job_stats_of(**changes):
+    return {
+        "job": "books",
+        "state": "finished",
+        **CrawlerStats().get_stats(),
+        "queued": 0,
+        "in_progress": 0,
+        "workers": {},
+        **changes,
+    }
+
+
+def test_report_takes_a_job_and_optionally_the_files():
+    args = parse_command_args(["report", "--job", "books"])
+    assert (args.command, args.job, args.config, args.stats_json, args.report) == ("report", "books", None, None, None)
+
+    args = parse_command_args(
+        ["report", "--job", "books", "--config", "c.yaml", "--stats-json", "s.json", "--report", "r.html"]
+    )
+    assert (args.config, args.stats_json, args.report) == ("c.yaml", "s.json", "r.html")
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code"),
+    [
+        (job_stats_of(), 0),
+        (JobError('There is no crawl job named "books"'), 1),
+        (FrontierError("the database of crawl job books failed: OSError: refused"), 1),
+        (KeyboardInterrupt(), 130),
+    ],
+)
+def test_exit_code_of_report_follows_the_job(outcome, code, tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    async def job_stats(dsn, job, *, top_domains):
+        seen.update(dsn=dsn, job=job, top_domains=top_domains)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(main, "job_stats", job_stats)
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)
+    stats_json = tmp_path / "out" / "stats.json"
+
+    assert main.main(["report", "--job", "books", "--stats-json", str(stats_json)]) == code
+
+    assert seen == {"dsn": DSN, "job": "books", "top_domains": 10}
+    assert stats_json.exists() is (code == 0)
+    assert capsys.readouterr().err == (f"error: {outcome}\n" if code == 1 else "")
+
+
+def test_report_that_cannot_be_written_exits_with_1(tmp_path, monkeypatch, capsys):
+    async def job_stats(dsn, job, **options):
+        return job_stats_of()
+
+    monkeypatch.setattr(main, "job_stats", job_stats)
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)
+
+    assert main.main(["report", "--job", "books", "--report", str(tmp_path)]) == 1  # a directory
+
+    assert capsys.readouterr().err.startswith("error: [Errno")
+
+
+def test_report_takes_its_files_title_and_domains_from_the_configuration(tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    async def job_stats(dsn, job, *, top_domains):
+        seen.update(dsn=dsn, top_domains=top_domains)
+        return job_stats_of()
+
+    monkeypatch.setattr(main, "job_stats", job_stats)
+    html = tmp_path / "report.html"
+    report = {"html": str(html), "stats_json": str(tmp_path / "unused.json"), "title": "Books", "top_domains": 3}
+    path = write_config(tmp_path, {"distributed": {"database_url": DSN}, "report": report})
+    stats_json = tmp_path / "stats.json"
+
+    assert main.main(["report", "--job", "books", "--config", path, "--stats-json", str(stats_json)]) == 0
+
+    assert seen == {"dsn": DSN, "top_domains": 3}
+    assert "<title>Books: books</title>" in html.read_text(encoding="utf-8")
+    assert stats_json.exists() and not (tmp_path / "unused.json").exists()
+    assert capsys.readouterr().out.endswith(f"Reports: {stats_json}, {html}\n")
+
+
+def test_report_with_no_file_to_write_exits_with_2(monkeypatch, capsys):
+    monkeypatch.setattr(main, "job_stats", None)  # would fail if called
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)
+
+    assert main.main(["report", "--job", "books"]) == 2
+
+    assert "report: nothing to write, give --stats-json or --report" in capsys.readouterr().err
+
+
+def test_summary_of_a_report_counts_the_pages_of_all_workers(tmp_path, monkeypatch, capsys):
+    workers = {
+        "w-1": {"state": "running", "pages": 4, "failed": 1, "pages_per_second": 2.0, "active_seconds": 2.0},
+        "w-2": {"state": "lost", "pages": 1, "failed": 0, "pages_per_second": 0.5, "active_seconds": 2.0},
+    }
+    stats = job_stats_of(
+        state="running", total_pages=5, successful=4, failed=1, elapsed_seconds=2.5, queued=7, in_progress=2
+    )
+
+    async def job_stats(dsn, job, **options):
+        return {**stats, "workers": workers}
+
+    monkeypatch.setattr(main, "job_stats", job_stats)
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)
+
+    assert main.main(["report", "--job", "books", "--stats-json", str(tmp_path / "stats.json")]) == 0
+
+    summary = capsys.readouterr().out
+    assert summary.startswith("=== Crawl job books: running (2.50s) ===\n")
+    assert "Pages: 5 (4 successful, 1 failed, 0 skipped)" in summary
+    assert "Workers: w-1 (running, 4 pages, 2.0 pages/s), w-2 (lost, 1 pages, 0.5 pages/s)\n" in summary
+    assert "Left: 7 pages queued, 2 in progress\n" in summary
+
+
+def job_progress_of(**changes):
+    fields = {
+        "state": "running",
+        "done": 30,
+        "total": 100,
+        "failed": 2,
+        "percent": 30.0,
+        "pages_per_second": 5.0,
+        "eta": 14.0,
+        "workers": 2,
+        "lost": 0,
+        "in_progress": 4,
+        "queued": 66,
+        "elapsed": 6.0,
+    }
+    return JobProgress(**fields | changes)
+
+
+def test_status_takes_a_job_and_optionally_watches():
+    args = parse_command_args(["status", "--job", "books"])
+    assert (args.command, args.job, args.config, args.watch, args.interval) == ("status", "books", None, False, None)
+
+    args = parse_command_args(["status", "--job", "books", "--config", "c.yaml", "--watch", "--interval", "0.5"])
+    assert (args.config, args.watch, args.interval) == ("c.yaml", True, 0.5)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code"),
+    [
+        (job_progress_of(), 0),
+        (JobError('There is no crawl job named "books"'), 1),
+        (FrontierError("the database of crawl job books failed: OSError: refused"), 1),
+        (KeyboardInterrupt(), 130),
+    ],
+)
+def test_status_prints_the_progress_line_of_the_job(outcome, code, monkeypatch, capsys):
+    seen = {}
+
+    async def job_progress(dsn, job):
+        seen.update(dsn=dsn, job=job)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(main, "job_progress", job_progress)
+    monkeypatch.setattr(main, "watch_job", None)  # would fail if called
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)
+
+    assert main.main(["status", "--job", "books"]) == code
+
+    assert seen == {"dsn": DSN, "job": "books"}
+    captured = capsys.readouterr()
+    assert captured.out == (f"{format_job_progress(outcome)}\n" if code == 0 else "")
+    assert captured.err == (f"error: {outcome}\n" if code == 1 else "")
+
+
+@pytest.mark.parametrize(
+    ("options", "interval", "outcome", "code"),
+    [
+        ([], 2.0, None, 0),
+        (["--interval", "0.5"], 0.5, None, 0),
+        ([], 2.0, JobError('There is no crawl job named "books"'), 1),
+        ([], 2.0, KeyboardInterrupt(), 130),
+        ([], 2.0, asyncio.CancelledError(), 143),
+    ],
+)
+def test_status_watch_follows_the_job_until_it_is_finished(options, interval, outcome, code, tmp_path, monkeypatch):
+    seen = {}
+
+    async def watch_job(dsn, job, *, interval):
+        seen.update(dsn=dsn, job=job, interval=interval)
+        if outcome is not None:
+            raise outcome
+
+    monkeypatch.setattr(main, "watch_job", watch_job)
+    monkeypatch.setattr(main, "job_progress", None)  # would fail if called
+    path = write_config(tmp_path, {"distributed": {"database_url": DSN}})
+
+    assert main.main(["status", "--job", "books", "--config", path, "--watch", *options]) == code
+
+    assert seen == {"dsn": DSN, "job": "books", "interval": interval}

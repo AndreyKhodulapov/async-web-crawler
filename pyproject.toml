@@ -21,11 +21,12 @@ pythonpath = ["src", "tests"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "-m 'not network and not postgres and not browser'"
+addopts = "-m 'not network and not postgres and not browser and not docker'"
 markers = [
     "network: tests that require real internet access (deselected by default)",
     "postgres: tests that require a PostgreSQL server, see docker-compose.yml (deselected by default)",
     "browser: tests that require Playwright and Chromium, see `make install` (deselected by default)",
+    "docker: tests that build the images of the Dockerfile and run them (deselected by default)",
 ]
 
 [tool.ruff]

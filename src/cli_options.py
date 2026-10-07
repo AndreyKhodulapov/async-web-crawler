@@ -8,6 +8,7 @@ from collections.abc import Callable
 
 from crawler import is_valid_http_url, storage_from_url
 from crawler.config import http_url_problem
+from crawler.distributed.worker import check_worker_name
 from crawler.proxy import proxy_url_problem
 
 
@@ -57,6 +58,14 @@ def proxy_url(raw: str) -> str:
     # The value is not repeated: it may hold a password.
     if (problem := proxy_url_problem(raw)) is not None:
         raise argparse.ArgumentTypeError(problem)
+    return raw
+
+
+def worker_name(raw: str) -> str:
+    try:
+        check_worker_name(raw)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
     return raw
 
 

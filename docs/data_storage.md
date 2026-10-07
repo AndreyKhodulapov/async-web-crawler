@@ -112,10 +112,20 @@ blocking the event loop, losing pages or writing them twice.
   the lock, and every worker would wait for them. After a failed write
   **back off for a cooldown** and only buffer; an explicit flush still
   writes at once.
+- **Tell the caller the storage is down** (`write_failed`): a crawl of one
+  process can buffer through an outage, but a worker of a shared crawl
+  should stop taking pages, as every page it buffers is one the other
+  workers cannot take until its lease expires (backpressure).
 - Keep only what a retry can cure. A batch that fails with any other error
   (a value the database refuses, a record that cannot be serialized) is a
-  **poison batch**: kept in the buffer, it fails every later write. Drop it,
-  log it and raise.
+  **poison batch**: kept in the buffer, it fails every later write. But the
+  poison is usually one record, and dropping the whole batch loses up to
+  `batch_size` good pages with it. Write the batch again **one record at a
+  time** and drop only the records that fail on their own: log each with
+  its URL and raise the error of the first. This is safe only because a
+  batch is written whole or not at all (one transaction, or a file write
+  that starts where the last good one ended): otherwise the records of the
+  failed batch that did get written would be written twice.
 - **Saving must not kill the crawl**: catch at the boundary of one page, log,
   count, go on. Fetched pages are expensive, a failed save is not a reason to
   throw away the rest.
@@ -131,6 +141,15 @@ blocking the event loop, losing pages or writing them twice.
   "written": the record may sit in the buffer, and one failed flush is many
   pages. Count what the storage has actually written out and derive the
   failures from that.
+- **Tell the caller what is stored.** A crawl whose queue outlives the
+  process (a shared queue, a resumed crawl) must not count a page done
+  while its record is in the buffer. The storage reports the URLs of
+  every batch written, and of the records dropped, to a callback
+  (`on_settled`); the records still in the buffer, and those lost when a
+  failed close gives up on them, are not reported, so their pages are
+  crawled again. `CompositeStorage` reports a record once every one of its
+  storages has settled it. A failure of the callback is logged, not
+  raised: the records are written all the same.
 - **Close in `finally`**: flush, then release the file or the connection
   even if the flush failed. Make `close` idempotent. An async generator that
   holds a cursor must be closed too (`contextlib.aclosing`), or a reader that

@@ -4,6 +4,7 @@ from crawler.advanced import AdvancedCrawler
 from crawler.circuit_breaker import BreakerCall, CircuitBreaker, CircuitState
 from crawler.client import AsyncCrawler
 from crawler.config import CrawlerConfig, load_config, load_urls
+from crawler.distributed import PostgresFrontier
 from crawler.exceptions import (
     CertificateError,
     CircuitOpenError,
@@ -12,8 +13,11 @@ from crawler.exceptions import (
     DNSError,
     FetchError,
     FetchTimeoutError,
+    FrontierError,
+    HostHeldBackError,
     HTTPStatusError,
     InvalidURLError,
+    JobError,
     NetworkError,
     NoProxyError,
     PageTooLargeError,
@@ -35,6 +39,16 @@ from crawler.exceptions import (
     error_kind,
 )
 from crawler.filters import UrlFilter
+from crawler.frontier import (
+    Admission,
+    Frontier,
+    FrontierPage,
+    FrontierStats,
+    GivenUp,
+    HostFailures,
+    MemoryFrontier,
+    Outcome,
+)
 from crawler.logging_setup import configure_logging
 from crawler.models import (
     CircuitStats,
@@ -77,6 +91,7 @@ from crawler.storage import (
 from crawler.urls import get_host, is_same_host, is_valid_http_url
 
 __all__ = [
+    "Admission",
     "AdvancedCrawler",
     "AsyncCrawler",
     "BreakerCall",
@@ -102,18 +117,29 @@ __all__ = [
     "FetchError",
     "FetchResult",
     "FetchTimeoutError",
+    "Frontier",
+    "FrontierError",
+    "FrontierPage",
+    "FrontierStats",
+    "GivenUp",
     "HTMLParser",
     "HTTPStatusError",
+    "HostFailures",
+    "HostHeldBackError",
     "InvalidURLError",
     "JSONStorage",
+    "JobError",
+    "MemoryFrontier",
     "NetworkError",
     "NoProxyError",
+    "Outcome",
     "PageRecord",
     "PageTooLargeError",
     "ParseError",
     "ParsedPage",
     "PermanentError",
     "PermanentHTTPError",
+    "PostgresFrontier",
     "PostgresStorage",
     "Progress",
     "ProgressTracker",

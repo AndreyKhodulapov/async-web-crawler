@@ -3,7 +3,7 @@
 
 PYTHON ?= .venv/bin/python
 
-.PHONY: install test test-all lint format db check
+.PHONY: install test test-all test-docker lint format db docker-build check
 
 install:  # the crawler, the tools of development and the browser that renders JavaScript
 	$(PYTHON) -m pip install -e . -r requirements-dev.txt
@@ -12,8 +12,11 @@ install:  # the crawler, the tools of development and the browser that renders J
 test:  # the default tests: unit and integration, no internet or database needed
 	$(PYTHON) -m pytest -q
 
-test-all:  # every test, the network, postgres and browser ones too
-	$(PYTHON) -m pytest -q -m ""
+test-all:  # every test but the docker ones: the network, postgres and browser ones too
+	$(PYTHON) -m pytest -q -m "not docker"
+
+test-docker:  # build the images of the Dockerfile and crawl the test site in containers
+	$(PYTHON) -m pytest -q -m docker
 
 lint:
 	$(PYTHON) -m ruff check src tests
@@ -24,5 +27,9 @@ format:
 
 db:  # start the PostgreSQL of docker-compose.yml and wait until it is ready
 	docker compose up -d --wait
+
+docker-build:  # the image of the crawler, and the one with Chromium
+	docker build -t async-web-crawler .
+	docker build --target js -t async-web-crawler:js .
 
 check: lint test-all  # what a change must pass before a commit

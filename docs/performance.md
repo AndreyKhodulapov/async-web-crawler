@@ -1,4 +1,4 @@
-# Performance: synchronous vs asynchronous crawling, memory and bottlenecks
+# Performance: synchronous vs asynchronous crawling, workers, memory and bottlenecks
 
 Short notes on what concurrency buys a crawler, where it
 stops helping and what the measurements of this project show.
@@ -134,7 +134,8 @@ the small pages, and from 7.6 to 10.5 on the large ones.
   ceiling. It costs pickling every page both ways and a pool to manage.
   The next step if one process is not enough is several crawler processes
   sharing a queue: parsing, the HTTP client and the event loop all scale
-  that way, not the parser alone.
+  that way, not the parser alone. Crawl jobs do that now (see
+  [Crawl jobs of several workers](#crawl-jobs-of-several-workers)).
 - **BeautifulSoup itself.** Its tree is now most of the cost of a page
   (34 ms of 56 on a large one), and the extractors working on `lxml`
   directly would be several times faster. That is a rewrite of the parser
@@ -159,6 +160,141 @@ the small pages, and from 7.6 to 10.5 on the large ones.
   and so shares its GIL: a real remote server would leave the crawler a
   little more CPU. The numbers are a lower bound.
 
+## Crawl jobs of several workers
+
+One process stops at about 250 pages per second, bound by its core. A
+crawl job keeps its frontier in PostgreSQL (see
+[architecture.md](architecture.md#the-frontier-in-a-database)), and any
+number of worker processes crawl it together.
+
+### How it was measured
+
+- `python src/demo_main.py scale 1000 --workers 1 2 4` crawls the same
+  site of 1000 pages (50 ms a response) once in one process, then as a
+  job of 1, 2 and 4 worker processes (`python src/main.py worker`), 20
+  requests at once in each. No rate limit, robots.txt or retries, as above.
+- The time of a job is that of the database, from its first worker
+  joining to the job's end: starting Python is not counted. The demo
+  counts the requests of its site, so a page requested twice would show.
+- Two setups. **On the host**: the crawler, the workers and the site on
+  macOS, PostgreSQL 17 in the VM of Docker Desktop behind a forwarded port
+  (about 0.5 ms a query). **In compose**: all of them in the crawler's
+  container, the database a service of the same network:
+  `docker compose run --rm --no-deps --entrypoint python worker src/demo_main.py scale 1000 --workers 1 2 4`.
+- Intel Core i7-1068NG7: 4 cores, 8 threads; the VM has 8 vCPU and 8 GB.
+  A range is over 3 or 4 runs.
+
+### Results
+
+Pages per second:
+
+| Setup | Local crawl | 1 worker | 2 workers | 4 workers |
+|-------|------------:|---------:|----------:|----------:|
+| On the host, first version | 314 | 86 | 83 | 72 |
+| On the host, one round trip per operation | 230–300 | 105–134 | 68–74 | 64 |
+| On the host, and commits that do not wait for the disk | 230–271 | 138–156 | 138–224 | 138–190 |
+| In compose | 155–160 | 133–146 | 223–241 | 224–239 |
+
+### What the numbers say
+
+- **The first version was slower with more workers.** Every page changes
+  the row of its job three times (admitted, its links added, finished),
+  and a transaction made from the client held the row over 4 to 8 round
+  trips: some 7 ms of every page, for all the workers together.
+- **One function call per operation** shortened the hold, yet two and four
+  workers got slower still. The row is held until COMMIT, and COMMIT
+  waited for the WAL to reach the disk; with up to 40 connections waiting
+  for one row, every hand-over of its lock took longer: a lock convoy.
+  Sampled every 10 ms with four workers, 26 sessions waited for a lock on
+  average and 3 ran.
+- **Commits that do not wait for the disk and 4 connections a worker**
+  broke the convoy: 4.7 sessions wait now. A page of one worker costs the
+  database 0.4 to 1.1 ms over a local crawl (8.4 ms at first). What both
+  changes are and what they risk is in
+  [architecture.md](architecture.md#the-frontier-in-a-database).
+- **In compose two workers are 1.6 to 1.7 times as fast as one, and four
+  are no faster than two.** That is the ceiling of the design, below.
+- **The local crawl is slower in the container** (155–160 against
+  230–271): it is bound by one core, and a core of the VM is slower. The
+  workers are faster there and vary less: a query does not cross from the
+  host into the VM, and a lock is handed over sooner.
+
+### Where the ceiling is
+
+- **Not the CPU.** Four workers use 1 to 3 cores of 8 between them, the
+  site 2 to 17% of one, and the database has 2.5 sessions on a CPU on
+  average.
+- **The row of the job.** Admitting a page, adding its links and finishing
+  it update the counts of the job (`requested`, `unfinished`) in its one
+  row of `crawl_jobs`, one transaction at a time. With four workers, the
+  sessions waiting for a lock wait mostly in `frontier_admit` (2.2 on
+  average) and `frontier_finish` (1.9). By Little's law, 4.7 waiting at
+  190 pages per second × 3 operations is about 8 ms of waiting an
+  operation, for a row held 1.5 to 2 ms each time. A site of one host
+  adds one shared row of `hosts`.
+- **More cores would not move it**: the row is one whatever the number of
+  cores. A Linux server with 8 cores of its own and no VM would give
+  higher numbers (an estimate, not measured: 1.5 to 2 times), and the
+  curve would still flatten at 2 to 4 workers.
+
+### Why real sites rarely reach it
+
+- A real page takes 200 to 1000 ms and a host gets about one request a
+  second; a wide crawl spreads over many hosts, whose rows are not
+  shared. Four workers of 20 requests at 500 ms a page make about 160
+  pages per second, under the ceiling. A very wide one meets another
+  limit first, below.
+- A page of a real size takes 56 ms to parse (see
+  [Pages of a real size](#pages-of-a-real-size)): one process does about
+  10 pages per second, and there workers are how a crawl uses more cores,
+  far below the 240 pages per second of the job.
+- In compose, three workers crawled 300 pages of `books.toscrape.com` and
+  `quotes.toscrape.com` (`examples/docker`, 2 requests a second per host)
+  in 77 s: 3.9 pages per second, the rate limit of two hosts, which all
+  workers share. Each page was crawled once.
+- The demo site (50 ms, one host, no rate limit) hits the shared row on
+  purpose.
+
+### Many hosts
+
+To hand out a page, `frontier_take` looks at every host of the job whose
+turn has come, with pages queued or not, and picks the one with the
+shallowest page. A take costs more with every host the job has met.
+Measured on the host as above, one worker taking pages one after
+another, one page per host and no interval:
+
+| Hosts in the job | 100 | 1 000 | 5 000 | 20 000 |
+|------------------|----:|------:|------:|-------:|
+| ms a take | 2–3 | 6 | 25 | 137 |
+
+- At 20 000 hosts a connection hands out at most 7 pages a second, a
+  worker of 4 connections about 30, whatever the rate limits allow.
+- A job just seeded is slower still until PostgreSQL has statistics of
+  its new rows: 130 ms a take at 1 000 hosts, 1.8 s at 20 000, before
+  autovacuum analyzes the tables (or `ANALYZE` is run).
+- A crawl of a few sites (`same_domain_only: true`, the default) keeps
+  to the hosts of its start URLs and never comes near it. A wide crawl with
+  `same_domain_only: false` meets a new host on almost every page.
+
+### What would lift it
+
+- **Leave the row of the job alone on most pages.** Admit and finish the
+  pages of a worker in batches, one call for many pages; hand a worker its
+  share of `max_pages` in chunks (say 50 pages, the rest given back when it
+  stops); count unfinished pages from the rows of the frontier or with
+  counters split into several rows. The same for the row of a host.
+- Large crawlers work so: their global counts are approximate or sharded,
+  and an exact limit is kept with a margin. It was left out here: the
+  ceiling is above what the rate limits of real sites allow, and batches
+  make the counts of a job late and `max_pages` exact only through
+  reservations.
+- **Keep the ready hosts in an index.** A host row could hold the depth
+  and order of its next queued page, kept up to date as pages are added
+  and taken, and an index in that order: a take would read the hosts
+  from the shallowest page on and stop at the first whose turn has come,
+  instead of reading every host. Left out for the same reason: crawls
+  of a few sites do not need it.
+
 ## Rules of thumb
 
 - Measure before optimizing: the two fixes that mattered most (trees,
@@ -175,3 +311,8 @@ the small pages, and from 7.6 to 10.5 on the large ones.
   to storage instead of collecting them.
 - More concurrency is not free even when it does not help: 50 requests at
   once load the remote site 50 times as much for the same speed.
+- A count that every worker updates is a lock that every worker waits for.
+  Find the rows all of them share before adding workers.
+- Measure where the program will run. The same workers were up to 1.7
+  times as fast next to the database as across the port of a VM, and the
+  same local crawl about a third slower.

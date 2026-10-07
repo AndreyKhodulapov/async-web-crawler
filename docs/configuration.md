@@ -66,7 +66,7 @@ Sitemaps whose pages are crawled along with the start URLs; see
 |-----|------|---------|---------|
 | `urls` | list of URLs | `[]` | sitemaps or sitemap indexes, plain or gzipped |
 | `from_robots` | true or false | `false` | also read the sitemaps that robots.txt of the start URLs' sites names; needs `crawler.respect_robots` |
-| `max_urls` | whole number, >= 1 | `50000` | pages taken from one sitemap, its index included |
+| `max_urls` | whole number, >= 1 | `50000` | pages taken from one sitemap, its index included; a crawl stops reading sitemaps sooner once its queue is full |
 
 ### `crawler`
 
@@ -393,6 +393,13 @@ Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
 | `pages.db`, `pages.sqlite`, `pages.sqlite3` | SQLite |
 | `sqlite:///pages.db`, `postgresql://user:password@host:5432/database` | the database of the URL |
 
+`{worker}` in a file name, such as `pages-{worker}.jsonl`, is the name of
+the worker of a crawl job, and `local` in a crawl of its own; so it is in
+`logging.file`, the files of `report` and `session.save_cookies`. A worker
+refuses a file of the storage, SQLite included, without it: workers write
+side by side, and one page may be saved by two of them (see
+[Crawl jobs](api.md#crawl-jobs)).
+
 ### `logging`
 
 See [Logging](api.md#logging).
@@ -403,11 +410,15 @@ See [Logging](api.md#logging).
 | `file` | string or `null` | `null` | also write the log to this file, as JSON Lines; the console gets it either way |
 | `max_bytes` | whole number, >= 0 | `10485760` | the file is rotated at this size; 0 never rotates it |
 | `backup_count` | whole number, >= 0 | `5` | rotated files that are kept; 0 never rotates the file |
+| `console_format` | string | `text` | `text` or `json`: the console gets JSON Lines too, as the file does, for a log collector reading the output of a container; the progress line of a crawl is not shown then |
 
 ### `report`
 
 Files the statistics are written to after the crawl; see
-[Page statistics](api.md#page-statistics).
+[Page statistics](api.md#page-statistics). A worker of a crawl job writes
+those of its own pages after its crawl; the command `report` writes those
+of the whole job by the same keys, its title followed by the name of the
+job (see [Crawl jobs](api.md#crawl-jobs)).
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
@@ -415,6 +426,25 @@ Files the statistics are written to after the crawl; see
 | `html` | string or `null` | `null` | an HTML report with tables and charts |
 | `title` | string | `Crawl report` | the title of the HTML report |
 | `top_domains` | whole number, >= 1 | `10` | hosts listed in the statistics |
+
+### `distributed`
+
+The database of the crawl jobs and how a worker holds its pages; see
+[Crawl jobs](api.md#crawl-jobs). Each worker has its own section: it is not
+a part of the job, and a crawl of its own ignores it. On the command line,
+`job create --config`, `worker --config`, `report --config` and
+`status --config` read it (see the
+[README](../README.md#crawl-jobs-on-the-command-line)); a worker,
+`report` and `status` need no file when `CRAWLER_DATABASE_URL` is set.
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `database_url` | string or `null` | `null` | `postgresql://user:password@host:5432/database`; `null` takes the one of `CRAWLER_DATABASE_URL`. A secret: never shown in messages |
+| `lease_seconds` | number, > 0 | `60.0` | a page of a worker that stopped is crawled again after this long |
+| `heartbeat_seconds` | number, > 0 | `20.0` | how often a worker renews the leases of its pages and its own; less than `lease_seconds` |
+| `max_attempts` | whole number, >= 1 | `3` | leases of a page that may expire before it fails |
+| `poll_interval` | number, > 0 | `1.0` | how often a worker with no page looks for one at least |
+| `pool_size` | whole number, >= 1 | `4` | connections of a worker to the database; its other tasks wait for one in the process, see [Architecture](architecture.md) |
 
 ## Validation
 
@@ -641,3 +671,47 @@ so `max_concurrent` bounds the browser too, and `max_open_pages` the tabs
 open at once. For one run, `--render` renders every page instead. The
 recipes add up: with `session` and `proxy`, the browser gets the cookies,
 the headers and the proxy of the crawler.
+
+A crawl in four containers: one crawl job, four workers of it, all of
+[docker-compose.yml](../docker-compose.yml). The job keeps what to crawl
+([examples/docker/job.yaml](../examples/docker/job.yaml)):
+
+```yaml
+urls:
+  - https://books.toscrape.com/index.html
+  - https://quotes.toscrape.com/
+crawler:
+  max_pages: 300
+  max_depth: 3
+  rate_limit: 2.0           # per host, for all the workers together
+```
+
+and each worker how to crawl and where to write
+([examples/docker/worker.yaml](../examples/docker/worker.yaml)):
+
+```yaml
+crawler:
+  max_concurrent: 10        # requests in flight of this worker
+storage:
+  outputs:
+    - out/pages-{worker}.jsonl   # a file of its own: {worker} is its name
+logging:
+  console_format: json      # a JSON object a line, for a log collector
+```
+
+```bash
+export CRAWLER_POSTGRES_PORT=55432          # only if port 5432 is taken
+docker compose run --rm job                 # create the job "books", seed it
+docker compose up --scale worker=4 worker   # until no page is left
+docker compose run --rm job status --job books
+docker compose run --rm job report --job books --report out/report.html
+```
+
+The workers share the rate of a host: four of them crawl two hosts at
+4 pages per second, as one would; they pay off on many hosts or on a site
+without a rate limit. A worker killed leaves its pages to the others once
+their leases expire (`distributed.lease_seconds`), so a page may be in the
+files of two workers; `outputs: ['postgresql://...']` keeps one row per
+URL instead. On Linux, create `./out` first and export
+`CRAWLER_USER=$(id -u):$(id -g)`. What sharing a crawl costs and how it
+behaves when things fail is in [distributed.md](distributed.md).

@@ -192,7 +192,7 @@ class TestSaveErrors:
         assert (stats.processed, stats.saved, stats.save_failed) == (5, 0, 5)
         assert "Failed to save " in caplog.text
         assert "failed to write 2 records: disk full" in caplog.text
-        assert "Failed to save the last pages of the crawl" in caplog.text
+        assert "Failed to save the pages the storage buffers" in caplog.text
         assert "Failed to close MemoryStorage" in caplog.text
         assert storage.released == 1
 
@@ -224,6 +224,17 @@ class TestSaveErrors:
         assert (stats.processed, stats.saved, stats.save_failed) == (5, 0, 5)
         assert "Unexpected error while saving " in caplog.text
         assert "TypeError: not serializable" in caplog.text
+
+    async def test_page_that_cannot_be_saved_is_the_only_one_lost(self, url, caplog):
+        storage = MemoryStorage(refused={url("/site/b.html")})
+
+        with caplog.at_level(logging.ERROR, logger="crawler"):
+            crawler = await crawl(storage, url("/site/"))
+
+        assert set(saved_records(storage)) == set(crawler.processed_urls) - {url("/site/b.html")}
+        stats = crawler.crawl_stats()
+        assert (stats.processed, stats.saved, stats.save_failed) == (5, 4, 1)
+        assert f"Dropped the record of {url('/site/b.html')}" in caplog.text
 
     async def test_closed_storage_fails_the_crawl_before_it_requests_anything(self, url, site):
         storage = MemoryStorage()

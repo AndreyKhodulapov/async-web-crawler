@@ -216,6 +216,19 @@ class TestBothLayouts:
         with pytest.raises(StorageError, match="failed to write 1 records"):
             await storage.flush()
 
+    async def test_record_that_is_not_utf_8_is_dropped_alone(self, tmp_path, indent):
+        path = tmp_path / "pages"
+        records = make_records(10)
+        records[4]["text"] = "broken \ud83d emoji"  # a lone surrogate
+
+        async with JSONStorage(path, indent=indent, batch_size=10) as storage:
+            with pytest.raises(UnicodeEncodeError):
+                for record in records:
+                    await storage.save(record)
+
+            assert storage.written == 9
+            assert await read_all(storage) == records[:4] + records[5:]
+
     async def test_record_that_is_not_json_is_refused(self, tmp_path, indent):
         storage = JSONStorage(tmp_path / "pages", indent=indent, batch_size=1)
 
