@@ -220,7 +220,10 @@ run against it; what it adds is what sharing needs.
   host at once, and a worker never waits for a host that another one
   holds: it takes a page of another host. The order is breadth-first
   among the ready hosts: a page at depth 2 of a ready host comes before
-  one at depth 1 of a host that has to wait.
+  one at depth 1 of a host that has to wait. To pick the host, `take`
+  reads every host of the job whose turn has come, so a take costs more
+  the more hosts the job has met (see
+  [performance.md](performance.md#many-hosts)).
 - **The interval of a host is the longer of the job's and its
   Crawl-delay.** The job's comes from its rate limit (`host_interval`);
   the Crawl-delay is in `hosts.interval`, and holds under

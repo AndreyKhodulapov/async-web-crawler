@@ -240,9 +240,10 @@ Pages per second:
 ### Why real sites rarely reach it
 
 - A real page takes 200 to 1000 ms and a host gets about one request a
-  second; a wide crawl has many hosts, and their rows are not shared.
-  Four workers of 20 requests at 500 ms a page make about 160 pages per
-  second, under the ceiling.
+  second; a wide crawl spreads over many hosts, whose rows are not
+  shared. Four workers of 20 requests at 500 ms a page make about 160
+  pages per second, under the ceiling. A very wide one meets another
+  limit first, below.
 - A page of a real size takes 56 ms to parse (see
   [Pages of a real size](#pages-of-a-real-size)): one process does about
   10 pages per second, and there workers are how a crawl uses more cores,
@@ -253,6 +254,27 @@ Pages per second:
   workers share. Each page was crawled once.
 - The demo site (50 ms, one host, no rate limit) hits the shared row on
   purpose.
+
+### Many hosts
+
+To hand out a page, `frontier_take` looks at every host of the job whose
+turn has come, with pages queued or not, and picks the one with the
+shallowest page. A take costs more with every host the job has met.
+Measured on the host as above, one worker taking pages one after
+another, one page per host and no interval:
+
+| Hosts in the job | 100 | 1 000 | 5 000 | 20 000 |
+|------------------|----:|------:|------:|-------:|
+| ms a take | 2–3 | 6 | 25 | 137 |
+
+- At 20 000 hosts a connection hands out at most 7 pages a second, a
+  worker of 4 connections about 30, whatever the rate limits allow.
+- A job just seeded is slower still until PostgreSQL has statistics of
+  its new rows: 130 ms a take at 1 000 hosts, 1.8 s at 20 000, before
+  autovacuum analyzes the tables (or `ANALYZE` is run).
+- A crawl of a few sites (`same_domain_only: true`, the default) keeps
+  to the hosts of its start URLs and never comes near it. A wide crawl with
+  `same_domain_only: false` meets a new host on almost every page.
 
 ### What would lift it
 
@@ -266,6 +288,12 @@ Pages per second:
   ceiling is above what the rate limits of real sites allow, and batches
   make the counts of a job late and `max_pages` exact only through
   reservations.
+- **Keep the ready hosts in an index.** A host row could hold the depth
+  and order of its next queued page, kept up to date as pages are added
+  and taken, and an index in that order: a take would read the hosts
+  from the shallowest page on and stop at the first whose turn has come,
+  instead of reading every host. Left out for the same reason: crawls
+  of a few sites do not need it.
 
 ## Rules of thumb
 

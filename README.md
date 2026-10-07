@@ -546,6 +546,11 @@ storages. All of it is described in the [API reference](docs/api.md).
   pages per second on the machine measured, where four workers are no
   faster than two. A rate limit per host keeps a crawl of real sites far
   below it; see [docs/performance.md](docs/performance.md#crawl-jobs-of-several-workers).
+- **A job is for a few sites, not the whole web.** To hand out a page,
+  the frontier reads every host of the job whose turn has come: a take
+  costs 6 ms at 1 000 hosts and 137 ms at 20 000. A crawl with
+  `same_domain_only: false` that meets thousands of hosts slows down
+  with them; see [docs/performance.md](docs/performance.md#many-hosts).
 - **Some limits are each worker's.** The rate of a host and `max_pages`
   are the job's; `max_concurrent`, `max_per_domain` and the jitter are
   each worker's, so with `rate_limit: null` a host gets up to the number

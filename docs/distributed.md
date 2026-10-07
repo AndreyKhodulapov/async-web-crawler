@@ -124,6 +124,11 @@ operations a second on one job exceed what one row allows (below).
   per host, a crawl needs hundreds of ready hosts to send 240 requests a
   second, and a page of a real size is parsed at about 10 per second per
   process.
+- A very wide crawl meets another limit first: to hand out a page, the
+  frontier looks at every host of the job whose turn has come, so a take
+  costs 6 ms at 1 000 hosts and 137 ms at 20 000 (see
+  [performance.md](performance.md#many-hosts)). A crawl of a few sites
+  keeps to the hosts of its start URLs.
 - Large crawlers lift it by not touching a global count on every page:
   workers admit and finish pages in batches, take their share of the
   page limit in chunks and give back the rest, and keep counts split
