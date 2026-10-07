@@ -222,6 +222,14 @@ class PostgresFrontier(Frontier):
     that the inserts of other workers check their foreign keys on it
     without waiting (see docs/architecture.md).
 
+    The frontier commits without waiting for the disk, so the rows of the
+    job and its hosts are let go sooner. A crash of the database itself
+    loses its last changes, of up to three times `wal_writer_delay`
+    (0.6 s by default), and nothing else: those pages are handed out or
+    finished once more, as after a lease expires. A storage commits in
+    full before its pages are `saved`; a `saved` lost leaves them
+    `saving` until their leases expire.
+
     An operation fails with one of `ERRORS` when the database cannot be
     reached or refuses it; it is not tried again: the worker stops, and
     its pages come back to the others once their leases expire.
@@ -285,17 +293,26 @@ class PostgresFrontier(Frontier):
         max_attempts: int = 3,
         host_interval: float = 0.0,
         poll_interval: float = 1.0,
-        pool_size: int = 10,
+        pool_size: int = 4,
     ) -> "PostgresFrontier":
         """Connect a worker to the job named `job`; the limits are those of the job.
 
         `worker` names this worker in the database; by default it is made
-        of the host name, the process id and a random part.
+        of the host name, the process id and a random part. The worker
+        holds at most `pool_size` connections: its other tasks wait for one
+        in the process, not for the row of the job in the database. They
+        commit without waiting for the disk (`synchronous_commit` off).
 
         Raises:
             JobError: there is no job of that name.
         """
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=pool_size, reset=_keep_session)
+        pool = await asyncpg.create_pool(
+            dsn,
+            min_size=1,
+            max_size=pool_size,
+            reset=_keep_session,
+            server_settings={"synchronous_commit": "off"},
+        )
         try:
             async with pool.acquire() as connection:
                 await create_schema(connection)
@@ -800,7 +817,8 @@ async def _keep_session(connection: asyncpg.Connection) -> None:
     """Leave a connection as it is when it goes back to the pool, saving a round trip an operation.
 
     asyncpg would reset the session: the frontier sets nothing in it that
-    outlives a transaction (no settings, session locks, cursors or LISTEN).
+    outlives a transaction (no settings but those it connects with, session
+    locks, cursors or LISTEN).
     A transaction left open is still rolled back.
     """
 

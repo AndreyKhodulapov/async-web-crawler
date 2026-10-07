@@ -337,6 +337,22 @@ run against it; what it adds is what sharing needs.
   taken back only when there are some. A connection that goes back to
   the pool is not reset either, which would be one more round trip: the
   frontier leaves nothing in a session.
+- **Commits that do not wait for the disk, and few connections.** A
+  function runs in a fraction of a millisecond, but its transaction keeps
+  the row of the job until COMMIT, and COMMIT waits for the WAL to be
+  flushed (slow in Docker on macOS). With four workers some 26 sessions
+  waited for that one row at a time, and the more of them wait, the
+  longer each hand-over of the lock takes: a lock convoy, slower than
+  one worker. So the connections of the frontier set
+  `synchronous_commit` off: a crash of the database itself (not of a
+  worker) loses up to 3 × `wal_writer_delay` (0.6 s by default) of
+  frontier changes and stays consistent; those pages are handed out or
+  finished once more, which "at least once" allows already. The storage
+  keeps synchronous commits, and its records are written before a page is
+  `saved`: a `saved` lost leaves the page `saving` until its lease
+  expires. A worker has 4 connections by default
+  (`distributed.pool_size`): its other tasks wait for one in the process
+  rather than for the row of the job in the database.
 - **Locks in one order, and no waits where the order cannot be kept.**
   Every operation on a page locks the row of the page, then the job,
   then the host; adding links locks the job first and only inserts new

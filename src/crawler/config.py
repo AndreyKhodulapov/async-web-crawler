@@ -397,6 +397,7 @@ class DistributedOptions:
     heartbeat_seconds: float = _option(20.0, above=0)  # how often a worker renews the leases of its pages
     max_attempts: int = _option(3, minimum=1)  # leases of a page that may expire before it fails
     poll_interval: float = _option(1.0, above=0)  # how often a worker with no page looks for one at least
+    pool_size: int = _option(4, minimum=1)  # connections of a worker to the database of the job
 
     def dsn(self, environ: Mapping[str, str] | None = None) -> str:
         """The URL of the database: `database_url`, or the one of `CRAWLER_DATABASE_URL`. `environ` replaces `os.environ`.

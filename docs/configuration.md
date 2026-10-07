@@ -443,6 +443,7 @@ a part of the job, and a crawl of its own ignores it. On the command line,
 | `heartbeat_seconds` | number, > 0 | `20.0` | how often a worker renews the leases of its pages and its own; less than `lease_seconds` |
 | `max_attempts` | whole number, >= 1 | `3` | leases of a page that may expire before it fails |
 | `poll_interval` | number, > 0 | `1.0` | how often a worker with no page looks for one at least |
+| `pool_size` | whole number, >= 1 | `4` | connections of a worker to the database; its other tasks wait for one in the process, see [Architecture](architecture.md) |
 
 ## Validation
 

@@ -129,3 +129,4 @@ distributed:
   heartbeat_seconds: 20.0  # how often a worker renews the leases of its pages; less than lease_seconds
   max_attempts: 3       # leases of a page that may expire before it fails
   poll_interval: 1.0    # how often a worker with no page looks for one at least
+  pool_size: 4          # connections of a worker to the database; its other tasks wait for one

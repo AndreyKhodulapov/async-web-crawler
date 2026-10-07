@@ -268,6 +268,40 @@ class TestRoundTrips:
         assert (job["requested"], job["unfinished"]) == (0, 2)
 
 
+class TestConnections:
+    async def test_frontier_commits_without_waiting_for_the_disk(self, open_frontier):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/a"])
+        await take(frontier)
+
+        async with frontier._pool.acquire() as connection:
+            assert await connection.fetchval("SHOW synchronous_commit") == "off"
+
+    async def test_worker_holds_four_connections_by_default(self, open_frontier):
+        frontier = await open_frontier("worker")
+
+        assert frontier._pool.get_max_size() == 4
+
+    async def test_tasks_of_a_worker_with_one_connection_wait_for_it(self, open_frontier):
+        """Taking, admitting and finishing pages, adding links and the heartbeat share the one connection."""
+        frontier = await open_frontier("worker", pool_size=1, heartbeat_seconds=0.05)
+        await frontier.seed([f"http://site/{i}" for i in range(20)])
+
+        async def crawl() -> None:
+            while (page := await frontier.take()) is not None:
+                assert await frontier.admit(page) is Admission.ADMITTED
+                if page.depth == 0:
+                    await frontier.add([f"{page.url}/link"], depth=1)
+                await frontier.finish(page, Outcome.PROCESSED)
+
+        async with asyncio.timeout(10):
+            await asyncio.gather(*(crawl() for _ in range(8)))
+
+        assert frontier._pool.get_max_size() == 1
+        assert await fetch("SELECT url FROM frontier WHERE state <> 'processed'") == []
+        assert len(await fetch("SELECT url FROM frontier")) == 40
+
+
 class TestCounts:
     async def test_counts_of_the_job_and_its_hosts_are_those_of_its_rows(self, open_frontier):
         """Pages put off, uncounted, over the limits and of hosts given up, by many tasks of three workers at once."""

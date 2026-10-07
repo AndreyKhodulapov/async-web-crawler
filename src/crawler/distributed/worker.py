@@ -96,6 +96,7 @@ async def run_worker(
                 max_attempts=options.max_attempts,
                 host_interval=host_interval(config.crawler),
                 poll_interval=options.poll_interval,
+                pool_size=options.pool_size,
             )
         logger.info("Worker %s started on crawl job %s", name, job)
         try:

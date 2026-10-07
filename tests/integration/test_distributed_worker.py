@@ -806,6 +806,24 @@ async def test_file_of_the_storage_without_the_name_of_the_worker_is_refused(url
     assert list(tmp_path.iterdir()) == []
 
 
+async def test_connections_of_a_worker_are_those_of_its_configuration(url, site, monkeypatch):
+    await create_job(make_config(urls=[url("/wide/0")], crawler={"max_pages": 5}), "test", dsn=POSTGRES_DSN)
+    config = worker_config(distributed={"pool_size": 2})
+    opened = []
+    open_frontier = PostgresFrontier.open.__func__
+
+    async def recorded(cls, *args, **kwargs):
+        frontier = await open_frontier(cls, *args, **kwargs)
+        opened.append(frontier)
+        return frontier
+
+    monkeypatch.setattr(PostgresFrontier, "open", classmethod(recorded))
+    await run_workers(config, 1)
+
+    assert [frontier._pool.get_max_size() for frontier in opened] == [2]
+    assert await job_state() == "finished"
+
+
 async def test_worker_of_a_job_that_does_not_exist_is_refused():
     with pytest.raises(JobError, match='no crawl job named "missing"'):
         await run_worker(worker_config(), "missing", configure_logging=False)

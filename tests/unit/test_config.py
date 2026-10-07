@@ -111,6 +111,7 @@ FULL = {
         "heartbeat_seconds": 30.0,
         "max_attempts": 5,
         "poll_interval": 0.5,
+        "pool_size": 2,
     },
 }
 
@@ -169,7 +170,12 @@ class TestDefaults:
             block_resources=("image", "font", "media"),
         )
         assert config.distributed == DistributedOptions(
-            database_url=None, lease_seconds=60.0, heartbeat_seconds=20.0, max_attempts=3, poll_interval=1.0
+            database_url=None,
+            lease_seconds=60.0,
+            heartbeat_seconds=20.0,
+            max_attempts=3,
+            poll_interval=1.0,
+            pool_size=4,
         )
 
     def test_defaults_are_those_of_the_components(self):
@@ -211,7 +217,7 @@ class TestDefaults:
         for name in ("rotation", "max_failures", "cooldown"):
             assert getattr(ProxyOptions(), name) == pool[name], name
         frontier = defaults(PostgresFrontier.open)
-        for name in ("lease_seconds", "heartbeat_seconds", "max_attempts", "poll_interval"):
+        for name in ("lease_seconds", "heartbeat_seconds", "max_attempts", "poll_interval", "pool_size"):
             assert getattr(DistributedOptions(), name) == frontier[name], name
         assert RenderingOptions(mode="always").build() == Rendering()
 
@@ -1028,6 +1034,7 @@ class TestDistributed:
             ({"heartbeat_seconds": 0}, "distributed.heartbeat_seconds: must be > 0, got 0.0"),
             ({"max_attempts": 0}, "distributed.max_attempts: must be >= 1, got 0"),
             ({"poll_interval": 0}, "distributed.poll_interval: must be > 0, got 0.0"),
+            ({"pool_size": 0}, "distributed.pool_size: must be >= 1, got 0"),
             (
                 {"lease_seconds": 20, "heartbeat_seconds": 20},
                 "distributed.heartbeat_seconds: must be less than distributed.lease_seconds (20.0), got 20.0",

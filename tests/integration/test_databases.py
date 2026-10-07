@@ -295,6 +295,13 @@ class TestPostgres:
         assert types["crawled_at"] == "timestamp with time zone"
 
     @pytest.mark.postgres
+    async def test_writes_wait_for_the_disk(self):
+        """Unlike those of a frontier: a page is marked saved once its record is written for good."""
+        async with PostgresStorage(POSTGRES_DSN) as storage:
+            await storage.init_db()
+            assert await storage._driver._pool.fetchval("SHOW synchronous_commit") == "on"
+
+    @pytest.mark.postgres
     async def test_json_is_queryable_in_the_database(self):
         await run_in_postgres("DROP TABLE IF EXISTS pages")
         async with PostgresStorage(POSTGRES_DSN) as storage:
