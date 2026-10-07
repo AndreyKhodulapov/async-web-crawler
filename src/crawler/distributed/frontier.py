@@ -22,7 +22,8 @@ logger = logging.getLogger(__name__)
 
 # The ready host with the shallowest page, locked so that no other worker
 # takes a page of it at the same moment; the page locked and leased; the
-# host's next turn moved on by its interval. The page is read from the
+# host's next turn moved on by the interval of the job, or by its own if
+# that is longer. The page is read from the
 # snapshot of the statement: another worker may have taken it since, and
 # may hold its row, waiting for the host this one holds. So its row is
 # locked skipping, never waited for, and is leased only if still queued;
@@ -63,7 +64,7 @@ WITH page AS (
     RETURNING f.url, f.depth, f.host, f.waits
 ), turn AS (
     UPDATE hosts AS h
-    SET next_allowed_at = now() + make_interval(secs => $4)
+    SET next_allowed_at = now() + make_interval(secs => greatest($4, h.interval))
     FROM leased
     WHERE h.job = $1 AND h.host = leased.host AND h.given_up_outcome IS NULL
 )
@@ -183,6 +184,16 @@ SET next_allowed_at = greatest(h.next_allowed_at, excluded.next_allowed_at),
     END
 """
 
+# The interval of a host, never shorter than it was; its next page waits
+# that long from now, as a request is about to be sent to it.
+_SET_INTERVAL = """
+INSERT INTO hosts AS h (job, host, interval, next_allowed_at)
+VALUES ($1, $2, $3, now() + make_interval(secs => $3))
+ON CONFLICT (job, host) DO UPDATE
+SET interval = greatest(h.interval, excluded.interval),
+    next_allowed_at = greatest(h.next_allowed_at, excluded.next_allowed_at)
+"""
+
 # The failures of a host one worker saw, added to those of the job; with
 # $5, robots.txt was read since the failures counted, which start from
 # zero. The host may have no pages yet: the target of a redirect, say.
@@ -264,7 +275,8 @@ class PostgresFrontier(Frontier):
     worker stopped, is queued again and uncounted, and fails once it has
     expired `max_attempts` times: at least once, not exactly once. A page
     processed with `pending_save` is `saving`, leased all the same, until
-    `saved`. A host has one page taken every `host_interval` seconds,
+    `saved`. A host has one page taken every `host_interval` seconds, or
+    its own interval from `set_host_interval` if that is longer,
     whichever worker takes it, and none while it is held back by
     `hold_host`. The failures of a host count over the whole job; a host
     given up has its pages finished, those queued at once and the others
@@ -670,6 +682,10 @@ class PostgresFrontier(Frontier):
         # A statement of its own: it locks the host alone, so it may wait
         # for a take() or admit() that holds it, but takes part in no deadlock.
         await self._pool.execute(_HOLD_HOST, self.job_id, host, float(seconds), reason)
+
+    async def set_host_interval(self, host: str, seconds: float) -> None:
+        # A statement of its own on the host alone, as in hold_host.
+        await self._pool.execute(_SET_INTERVAL, self.job_id, host, float(seconds))
 
     async def count_host_failures(
         self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False

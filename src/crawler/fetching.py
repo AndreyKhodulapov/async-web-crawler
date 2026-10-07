@@ -53,7 +53,8 @@ class Fetcher:
     count the attempts since the last `reset_stats()`. A host held back
     after a Retry-After, or for the pause before a retry that the whole
     host waits out, is told to `on_host_held`, if it is set: the crawl of
-    several processes holds the host back in all of them.
+    several processes holds the host back in all of them. So is a
+    Crawl-delay of a host longer than any known before, to `on_crawl_delay`.
     """
 
     MAX_TIMEOUT_GROWTH = 4.0
@@ -90,6 +91,8 @@ class Fetcher:
         self.retries = 0
         # Called with the host, the seconds it is held back for and why; see tell_host_held.
         self.on_host_held: Callable[[str, float, str | None], Awaitable[None]] | None = None
+        # Called with the host and its Crawl-delay when the delay grew; see check_robots.
+        self.on_crawl_delay: Callable[[str, float], Awaitable[None]] | None = None
         self._closed = False
 
     @property
@@ -333,6 +336,26 @@ class Fetcher:
         except Exception:
             logger.warning("Could not tell the other workers that %s is held back", host, exc_info=True)
 
+    def crawl_delay(self, url: str) -> float:
+        """Crawl-delay of the site of `url` for this client; 0 if unset or robots.txt is not respected.
+
+        robots.txt of the site must have been fetched.
+        """
+        return 0.0 if self.robots is None else self.robots.get_crawl_delay(url, self._user_agent)
+
+    async def _tell_crawl_delay(self, host: str, seconds: float) -> None:
+        """Tell `on_crawl_delay`, if it is set, that requests to `host` are to be `seconds` apart.
+
+        A failure to tell is logged: the rate limiter of this process keeps
+        its own requests apart all the same.
+        """
+        if self.on_crawl_delay is None:
+            return
+        try:
+            await self.on_crawl_delay(host, seconds)
+        except Exception:
+            logger.warning("Could not tell the other workers the Crawl-delay of %s", host, exc_info=True)
+
     def _timeout_for(self, retries: int) -> aiohttp.ClientTimeout:
         """Timeouts of a request after `retries` failed attempts."""
         try:
@@ -364,9 +387,9 @@ class Fetcher:
             return type(error)(url, error.message)
         except TimeoutError:
             return RobotsUnreachableError(url, "robots.txt is being downloaded")
-        crawl_delay = self.robots.get_crawl_delay(url, self._user_agent)
-        if crawl_delay:
-            self.rate_limiter.set_delay(host, crawl_delay)
+        crawl_delay = self.crawl_delay(url)
+        if crawl_delay and self.rate_limiter.set_delay(host, crawl_delay):
+            await self._tell_crawl_delay(host, crawl_delay)
         if allowed:
             return None
         unreachable = self.robots.unreachable_reason(url)

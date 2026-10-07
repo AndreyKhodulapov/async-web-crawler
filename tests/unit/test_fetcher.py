@@ -17,7 +17,12 @@ URL = "https://a.test/"
 
 
 def make_fetcher(
-    transport: ScriptedTransport, *, max_retry_after: float = 600, breaker: CircuitBreaker | None = None, **retry
+    transport: ScriptedTransport,
+    *,
+    max_retry_after: float = 600,
+    breaker: CircuitBreaker | None = None,
+    respect_robots: bool = False,
+    **retry,
 ) -> Fetcher:
     return Fetcher(
         transport,
@@ -25,7 +30,7 @@ def make_fetcher(
         rate_limiter=RateLimiter(None, True),
         retry_strategy=RetryStrategy(**{"max_retries": 1, "base_delay": 0.001, **retry}),
         circuit_breaker=breaker or CircuitBreaker(),
-        respect_robots=False,
+        respect_robots=respect_robots,
         timeout=TIMEOUT,
         timeout_growth=1.5,
         max_retry_after=max_retry_after,
@@ -182,3 +187,78 @@ class TestMaxWait:
 
         assert result.error is None
         assert time.monotonic() - began >= 0.19
+
+
+def robots_txt(url: str, crawl_delay: float | None) -> Response:
+    content = "User-agent: *\nAllow: /\n" + ("" if crawl_delay is None else f"Crawl-delay: {crawl_delay}\n")
+    return Response(status=200, content=content, size=len(content), final_url=url, content_type="text/plain")
+
+
+class DelayRecorder:
+    """An `on_crawl_delay` callback that records what it is told."""
+
+    def __init__(self) -> None:
+        self.delays: list[tuple[str, float]] = []
+
+    async def __call__(self, host: str, seconds: float) -> None:
+        self.delays.append((host, seconds))
+
+
+class TestCrawlDelay:
+    """A Crawl-delay that spaces the requests to a host further than before is told to `on_crawl_delay`."""
+
+    async def test_crawl_delay_of_a_host_is_told_once(self) -> None:
+        robots = "https://a.test/robots.txt"
+        other = "https://a.test/other"
+        transport = ScriptedTransport({robots: robots_txt(robots, 0.01), URL: page(URL), other: page(other)})
+        fetcher = make_fetcher(transport, respect_robots=True)
+        fetcher.on_crawl_delay = recorder = DelayRecorder()
+
+        await fetcher.fetch(URL)
+        await fetcher.fetch(other)
+
+        assert transport.requests == [robots, URL, other]
+        assert recorder.delays == [("a.test", 0.01)]
+
+    async def test_only_a_longer_crawl_delay_of_another_site_of_the_host_is_told(self) -> None:
+        sites = {"https://a.test/": 0.01, "https://a.test:8443/": 0.02, "https://a.test:8444/": 0.015}
+        script: dict[str, Response | Exception] = {}
+        for site, delay in sites.items():
+            script[site + "robots.txt"] = robots_txt(site + "robots.txt", delay)
+            script[site] = page(site)
+        fetcher = make_fetcher(ScriptedTransport(script), respect_robots=True)
+        fetcher.on_crawl_delay = recorder = DelayRecorder()
+
+        for site in sites:
+            await fetcher.fetch(site)
+
+        assert recorder.delays == [("a.test", 0.01), ("a.test", 0.02)]
+        assert fetcher.rate_limiter.interval_for("a.test") == 0.02
+
+    async def test_site_without_a_crawl_delay_tells_nothing(self) -> None:
+        robots = "https://a.test/robots.txt"
+        fetcher = make_fetcher(
+            ScriptedTransport({robots: robots_txt(robots, None), URL: page(URL)}), respect_robots=True
+        )
+        fetcher.on_crawl_delay = recorder = DelayRecorder()
+
+        await fetcher.fetch(URL)
+
+        assert recorder.delays == []
+
+    async def test_failure_to_tell_is_logged_and_the_delay_kept_all_the_same(self, caplog) -> None:
+        robots = "https://a.test/robots.txt"
+        transport = ScriptedTransport({robots: robots_txt(robots, 0.01), URL: page(URL)})
+        fetcher = make_fetcher(transport, respect_robots=True)
+
+        async def broken(host: str, seconds: float) -> None:
+            raise ConnectionResetError("the database went away")
+
+        fetcher.on_crawl_delay = broken
+        with caplog.at_level(logging.WARNING, logger="crawler.fetching"):
+            result = await fetcher.fetch(URL)
+
+        assert result.error is None
+        assert fetcher.rate_limiter.interval_for("a.test") == 0.01
+        assert "Could not tell the other workers the Crawl-delay of a.test" in caplog.text
+        assert "the database went away" in caplog.text

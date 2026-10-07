@@ -125,6 +125,14 @@ class TestDomainDelays:
         limiter.set_delay("a", 1.0)
         assert limiter.interval_for("a") == 5.0
 
+    def test_set_delay_tells_whether_the_delay_grew(self, clock):
+        limiter = RateLimiter(2.0, clock=clock)
+        assert limiter.set_delay("a", 3.0)
+        assert not limiter.set_delay("a", 3.0)
+        assert not limiter.set_delay("a", 1.0)
+        assert limiter.set_delay("a", 4.0)
+        assert not limiter.set_delay("b", 0.0)
+
     def test_penalty_holds_back_one_domain(self, clock):
         limiter = RateLimiter(2.0, clock=clock)
         limiter.reserve("a")

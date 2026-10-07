@@ -99,7 +99,7 @@ run against it; what it adds is what sharing needs.
   they are checked against: pages requested, pages unfinished, links
   dropped), `frontier` (every URL of a job once: the primary key
   `(job, url)` is the deduplication), `hosts` (when a host may be
-  requested next and, if it is held back, why; how many of its pages
+  requested next, its Crawl-delay and, if it is held back, why; how many of its pages
   were accepted and requested; its failures that count toward giving it
   up, and the outcome of a host given up),
   `job_scope` and `out_of_scope` (below). Workers take the limits from
@@ -160,6 +160,30 @@ run against it; what it adds is what sharing needs.
   holds: it takes a page of another host. The order is breadth-first
   among the ready hosts: a page at depth 2 of a ready host comes before
   one at depth 1 of a host that has to wait.
+- **The interval of a host is the longer of the job's and its
+  Crawl-delay.** The job's comes from its rate limit (`host_interval`);
+  the Crawl-delay is in `hosts.interval`, and holds under
+  `per_domain_rate: false` too, as it does in the rate limiter. A worker
+  learns it from robots.txt and tells it when it is longer than the one
+  it knew (`Fetcher.on_crawl_delay`, `set_host_interval`): once per host
+  and worker. The interval never goes down, as a host may serve several
+  sites with a robots.txt each, and the next page of the host waits the
+  delay from then, as the worker is about to send its request.
+  - The pages of the host taken before the delay reached the database
+    are not called back: a request per page in progress, as with a hold.
+    A crawl from one start URL has one page in progress then. Seeding
+    closes the gap for the start sites whose robots.txt it reads
+    (`sitemaps.from_robots`): their delay is in the job before any
+    worker takes a page.
+  - The requests are paced twice: by the database as pages are taken,
+    and by the rate limiter of each worker, as in a local crawl. The
+    limiter stays: robots.txt and sitemaps are downloaded without `take`,
+    the jitter is its own, and a delay that cannot reach the database is
+    logged and still keeps the requests of that worker apart. The cost is
+    a request that waits in the limiter after its page is taken: the
+    first page of a worker waits the delay after the worker downloads
+    robots.txt, so it may come close to the next request of another
+    worker, while the rate of the host holds over any run of requests.
 - **A host held back is held back for all workers.** A host that asks
   to wait (Retry-After), or answers so that the whole host waits out the
   pause before a retry (HTTP 429, a timeout), is held back in the rate
@@ -276,7 +300,7 @@ run against it; what it adds is what sharing needs.
   reports, `max_concurrent`), opens a `PostgresFrontier` and runs the
   same `CrawlRun` as a local crawl through `crawl_frontier`, which reads
   no sitemaps. The interval of a host is that of the rate limit of the
-  job (`host_interval`); each worker keeps its own requests apart too. Its
+  job (`host_interval`) or its Crawl-delay, see above. Its
   files have `{worker}` in their names, as two workers may save one page.
   The order at the end matters: the storage writes its buffer and the
   pages are `saved`, then the frontier is closed (its leases put back,

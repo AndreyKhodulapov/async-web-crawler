@@ -161,8 +161,10 @@ class CrawlRun:
             self.storage.on_settled = self._frontier.saved
             self._frontier.on_waiting = self._flush_storage
         if self._frontier.shared:
-            # A host held back by this process is held back by the others too.
+            # A host held back by this process is held back by the others
+            # too, and its Crawl-delay spaces the requests of all of them.
             self._fetcher.on_host_held = self._frontier.hold_host
+            self._fetcher.on_crawl_delay = self._frontier.set_host_interval
         try:
             await self.seed(
                 start_urls, url_filter=url_filter, sitemap_urls=sitemap_urls, robots_sitemaps=robots_sitemaps
@@ -177,6 +179,7 @@ class CrawlRun:
                 self._frontier.on_waiting = None
             if self._frontier.shared:
                 self._fetcher.on_host_held = None
+                self._fetcher.on_crawl_delay = None
             self._crawl_finished = time.perf_counter()
             self.stats.finish()
             # A site given up on is given up for this crawl only: a
@@ -299,6 +302,7 @@ class CrawlRun:
             while True:
                 rules = await self.robots.fetch_robots(url)
                 if rules["unreachable"] is None:
+                    await self._seed_crawl_delay(url)
                     return rules["sitemaps"]
                 reason = f"robots.txt is unreachable ({rules['unreachable']})"
                 if (delay := self._robots_wait(url)) is None:
@@ -309,6 +313,16 @@ class CrawlRun:
             reason = f"{type(error).__name__}: {error.message}"
         logger.warning("No sitemaps from robots.txt of %s: %s", url, reason)
         return []
+
+    async def _seed_crawl_delay(self, url: str) -> None:
+        """In a frontier shared by several processes, space the pages of the host of `url` by its Crawl-delay before they are taken.
+
+        Otherwise the workers would learn it from the first pages they take,
+        those of the start URLs among them, and request them all at once.
+        """
+        host = get_host(url)
+        if self._frontier.shared and host is not None and (delay := self._fetcher.crawl_delay(url)):
+            await self._frontier.set_host_interval(host, delay)
 
     async def _read_sitemap(self, url: str) -> AsyncGenerator[list[str], None]:
         """The pages a sitemap lists, in the batches of `SitemapParser.iter_pages`; none if it cannot be read, which is logged.

@@ -387,6 +387,54 @@ class TestHoldHost:
         assert row["accepted"] == 1
 
 
+class TestHostInterval:
+    async def test_interval_of_a_host_spaces_its_pages_for_all_workers_together(self, open_frontier):
+        workers = [await open_frontier(f"worker-{i}", host_interval=0.05) for i in range(2)]
+        await workers[0].seed([f"http://slow/{i}" for i in range(4)])
+        await workers[0].set_host_interval("slow", 0.2)
+        taken_at = []
+
+        async def crawl(frontier: PostgresFrontier) -> None:
+            while (page := await frontier.take()) is not None:
+                (row,) = await fetch(
+                    "SELECT extract(epoch FROM lease_until) AS until FROM frontier WHERE url = $1", page.url
+                )
+                taken_at.append(float(row["until"]) - frontier.lease_seconds)
+                await frontier.finish(page, Outcome.PROCESSED)
+
+        await asyncio.gather(*(crawl(frontier) for frontier in workers for _ in range(2)))
+
+        taken_at.sort()
+        assert len(taken_at) == 4
+        assert min(later - earlier for earlier, later in itertools.pairwise(taken_at)) >= 0.2 - 1e-6
+
+    async def test_interval_of_the_job_holds_for_a_host_that_asks_for_less(self, open_frontier):
+        frontier = await open_frontier("worker", host_interval=60)
+        await frontier.seed(["http://a/1", "http://a/2"])
+
+        assert await take(frontier) == FrontierPage("http://a/1", 0)
+        await frontier.set_host_interval("a", 0.01)
+
+        assert await still_waiting(frontier.take())
+
+    async def test_interval_never_goes_down_nor_shortens_a_hold(self, open_frontier):
+        # Told before any page of the host is queued, as at seeding: the next page waits the interval from now.
+        frontier = await open_frontier("worker")
+        await frontier.set_host_interval("a", 60)
+        held = await host_of("a")
+        assert 59 < held["left"] <= 60
+
+        await frontier.set_host_interval("a", 1)
+        await frontier.hold_host("a", 120, "HTTP 429 Too Many Requests, Retry-After 120s")
+        await frontier.set_host_interval("a", 2)
+
+        (row,) = await fetch("SELECT interval FROM hosts WHERE host = 'a'")
+        assert row["interval"] == 60
+        held = await host_of("a")
+        assert 119 < held["left"] <= 120
+        assert held["hold_reason"] == "HTTP 429 Too Many Requests, Retry-After 120s"
+
+
 class TestHostFailures:
     async def test_failures_of_a_host_told_by_workers_add_up_over_the_job(self, open_frontier):
         first, second = await open_frontier("first"), await open_frontier("second")

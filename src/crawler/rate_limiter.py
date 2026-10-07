@@ -103,19 +103,21 @@ class RateLimiter:
             return self.interval
         return max(self.interval, self._delays.get(domain, 0.0))
 
-    def set_delay(self, domain: str, delay: float) -> None:
-        """Keep requests to `domain` at least `delay` seconds apart, e.g. its Crawl-delay.
+    def set_delay(self, domain: str, delay: float) -> bool:
+        """Keep requests to `domain` at least `delay` seconds apart, e.g. its Crawl-delay; whether its delay grew.
 
         A delay never goes down: a host may serve several sites (ports,
         schemes), each with a robots.txt of its own, and the longest delay wins.
         """
         _check_seconds("delay", delay)
-        delay = max(delay, self._delays.get(domain, 0.0))
+        if delay <= self._delays.get(domain, 0.0):
+            return False
         self._delays[domain] = delay
         # The request that fetched robots.txt has already booked the next
         # start with the old interval: move it.
         if domain in self._last_start:
             self._next_start[domain] = max(self._next_start[domain], self._last_start[domain] + delay)
+        return True
 
     def penalize(self, domain: str, seconds: float) -> None:
         """Let no request to `domain` start in the next `seconds`, e.g. after HTTP 429.

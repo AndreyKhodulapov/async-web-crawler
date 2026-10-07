@@ -179,6 +179,41 @@ async def test_requests_to_a_host_are_spaced_out_by_all_workers_together(url, si
     assert times[-1] - times[0] >= 4 * 0.2
 
 
+async def test_crawl_delay_of_a_host_spaces_out_the_requests_of_all_workers_together(url, site):
+    # The one start URL is taken by one worker, which reads robots.txt
+    # before it asks for the page: the Crawl-delay is in the database
+    # before the links of the page are found. A worker crawls one page at
+    # a time, so that both of them take pages of the host.
+    site.robots = "User-agent: *\nCrawl-delay: 0.5"
+    await create_job(
+        make_config(urls=[url("/wide/0")], crawler={"max_pages": 6, "respect_robots": True}), "test", dsn=POSTGRES_DSN
+    )
+
+    stats = await run_workers(worker_config(crawler={"max_concurrent": 1}), 2)
+
+    times = [moment for path, moment in site.log if path.startswith("/wide/")]
+    assert len(times) == 6
+    assert all(worker["total_pages"] for worker in stats)
+    # The pages after the first are taken 0.5 s apart; a request may start
+    # later than its page is taken, e.g. the first one of a worker waits
+    # after its own download of robots.txt, so two requests may come close.
+    # About 1.5 s if each worker kept its own requests apart only.
+    assert times[-1] - times[0] >= 4 * 0.5 - EPSILON
+    (host,) = await fetch("SELECT interval FROM hosts")
+    assert host["interval"] == 0.5
+
+
+async def test_seeding_spaces_the_pages_of_a_start_site_by_the_crawl_delay_of_its_robots_txt(url, site):
+    site.robots = "User-agent: *\nCrawl-delay: 0.5"
+    config = make_config(urls=[url("/wide/0")], crawler={"respect_robots": True}, sitemaps={"from_robots": True})
+
+    await create_job(config, "test", dsn=POSTGRES_DSN)
+
+    assert [path for path, _ in site.log] == ["/robots.txt"]
+    (host,) = await fetch("SELECT interval, next_allowed_at > now() AS held FROM hosts")
+    assert (host["interval"], host["held"]) == (0.5, True)
+
+
 def held_job(url, first: str, *, crawler: dict | None = None, **sections) -> tuple[list[str], list[str], CrawlerConfig]:
     """A job whose first page, `first`, asks its host to wait; the URLs of that host, those of another one and the job.
 

@@ -229,6 +229,15 @@ class Frontier(ABC):
         that process, and its pages are put off with a delay of their own.
         """
 
+    async def set_host_interval(self, host: str, seconds: float) -> None:
+        """Hand out the pages of `host` at least `seconds` apart, to all processes together, e.g. its Crawl-delay.
+
+        An interval never goes down. The next page of the host waits for
+        `seconds` from now: the process that tells the interval is about to
+        send a request to the host. A frontier of one process does nothing:
+        the rate limiter of that process keeps its requests apart.
+        """
+
     async def count_host_failures(
         self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
     ) -> HostFailures:

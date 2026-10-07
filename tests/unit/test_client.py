@@ -1355,8 +1355,8 @@ class SharedMemoryFrontier(MemoryFrontier):
     is held comes back when the hold ends, as a frontier in a database
     hands it out. It counts the failures of hosts in `failures`, as other
     processes would have too, keeps what it was told in `told` (host,
-    circuit openings, robots.txt failures, robots.txt read) and the hosts
-    given up in `given_up_hosts`.
+    circuit openings, robots.txt failures, robots.txt read), the hosts
+    given up in `given_up_hosts` and the intervals of hosts in `intervals`.
     """
 
     shared = True
@@ -1368,7 +1368,11 @@ class SharedMemoryFrontier(MemoryFrontier):
         self.failures: dict[str, HostFailures] = {}
         self.told: list[tuple[str, int, int, bool]] = []
         self.given_up_hosts: list[tuple[str, PageOutcome, str]] = []
+        self.intervals: list[tuple[str, float]] = []
         self._held_until: dict[str, float] = {}
+
+    async def set_host_interval(self, host: str, seconds: float) -> None:
+        self.intervals.append((host, seconds))
 
     async def count_host_failures(
         self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
@@ -1609,6 +1613,54 @@ class TestCrawlSharedFrontier:
 
         assert set(crawler.unreachable_urls) == {"http://a/1"}
         assert set(crawler.failed_urls) == {"http://b/1"}
+        assert told == []
+
+    async def test_crawl_delay_of_a_host_is_told_once(self, make_crawler, fake_session):
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(
+            b"User-agent: *\nCrawl-delay: 0.01", content_type="text/plain"
+        )
+        frontier = SharedMemoryFrontier()
+
+        pages = await crawler.crawl_frontier(frontier, ["http://a/1", "http://a/2", "http://b/1"])
+
+        assert set(pages) == {"http://a/1", "http://a/2", "http://b/1"}
+        assert frontier.intervals == [("a", 0.01)]
+
+    async def test_seeding_tells_the_crawl_delay_of_a_start_site_whose_robots_txt_it_reads(
+        self, make_crawler, fake_session
+    ):
+        # Before any worker takes the start URLs, all of the host at once.
+        crawler = make_crawler(respect_robots=True)
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(
+            b"User-agent: *\nCrawl-delay: 2", content_type="text/plain"
+        )
+        frontier = SharedMemoryFrontier()
+
+        await crawler.seed(frontier, ["http://a/1", "http://b/1"], robots_sitemaps=True)
+
+        assert frontier.intervals == [("a", 2.0)]
+        assert set(fake_session.requested) == {"http://a/robots.txt", "http://b/robots.txt"}
+
+    async def test_crawl_of_one_process_tells_its_frontier_no_crawl_delay(
+        self, make_crawler, fake_session, monkeypatch
+    ):
+        # Its rate limiter keeps the requests to the host apart.
+        told = []
+
+        async def tell(self, host, seconds):
+            told.append(host)
+
+        monkeypatch.setattr(MemoryFrontier, "set_host_interval", tell)
+        crawler = make_crawler(respect_robots=True, max_depth=0)
+        fake_session.routes["http://a/robots.txt"] = FakeResponse(
+            b"User-agent: *\nCrawl-delay: 0.01", content_type="text/plain"
+        )
+
+        await crawler.crawl(["http://a/1", "http://a/2"], robots_sitemaps=True)
+
+        assert set(crawler.processed_urls) == {"http://a/1", "http://a/2"}
+        assert crawler.rate_limiter.interval_for("a") == 0.01
         assert told == []
 
     async def test_crawl_of_one_process_waits_in_the_rate_limiter(self, make_crawler, fake_session, caplog):

@@ -511,3 +511,13 @@ class TestHoldHost:
 
         assert not frontier.shared
         assert await take(frontier) == FrontierPage("http://a/1", 0)
+
+    async def test_frontier_of_one_process_keeps_no_interval_of_a_host(self):
+        # The rate limiter of the one process keeps its requests apart.
+        frontier = MemoryFrontier()
+        await frontier.seed(["http://a/1", "http://a/2"])
+
+        await frontier.set_host_interval("a", 60)
+
+        assert await take(frontier) == FrontierPage("http://a/1", 0)
+        assert await take(frontier) == FrontierPage("http://a/2", 0)
