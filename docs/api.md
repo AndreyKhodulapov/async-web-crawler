@@ -962,8 +962,10 @@ worker crawls it again, following its redirect again if it had one. So a databas
 suits workers best. Files are each worker's own: every file of the
 storage, SQLite databases included, must have `{worker}` in its name, or
 `run_worker` raises `ConfigError`; a page may then be in the files of two
-workers. The log and the reports of a worker without `{worker}` in their
-names are written over by the last worker.
+workers. The reports of a worker without `{worker}` in their names are
+written over by the last worker; a log file without it is shared, the
+lines of all workers mixed, and its rotation, made by each process on
+its own, may lose lines.
 
 The workers ask a host together at the rate of the job: the frontier hands
 out a page of a host every `host_interval` seconds, or every Crawl-delay of

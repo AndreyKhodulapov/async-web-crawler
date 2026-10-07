@@ -671,3 +671,47 @@ so `max_concurrent` bounds the browser too, and `max_open_pages` the tabs
 open at once. For one run, `--render` renders every page instead. The
 recipes add up: with `session` and `proxy`, the browser gets the cookies,
 the headers and the proxy of the crawler.
+
+A crawl in four containers: one crawl job, four workers of it, all of
+[docker-compose.yml](../docker-compose.yml). The job keeps what to crawl
+([examples/docker/job.yaml](../examples/docker/job.yaml)):
+
+```yaml
+urls:
+  - https://books.toscrape.com/index.html
+  - https://quotes.toscrape.com/
+crawler:
+  max_pages: 300
+  max_depth: 3
+  rate_limit: 2.0           # per host, for all the workers together
+```
+
+and each worker how to crawl and where to write
+([examples/docker/worker.yaml](../examples/docker/worker.yaml)):
+
+```yaml
+crawler:
+  max_concurrent: 10        # requests in flight of this worker
+storage:
+  outputs:
+    - out/pages-{worker}.jsonl   # a file of its own: {worker} is its name
+logging:
+  console_format: json      # a JSON object a line, for a log collector
+```
+
+```bash
+export CRAWLER_POSTGRES_PORT=55432          # only if port 5432 is taken
+docker compose run --rm job                 # create the job "books", seed it
+docker compose up --scale worker=4 worker   # until no page is left
+docker compose run --rm job status --job books
+docker compose run --rm job report --job books --report out/report.html
+```
+
+The workers share the rate of a host: four of them crawl two hosts at
+4 pages per second, as one would; they pay off on many hosts or on a site
+without a rate limit. A worker killed leaves its pages to the others once
+their leases expire (`distributed.lease_seconds`), so a page may be in the
+files of two workers; `outputs: ['postgresql://...']` keeps one row per
+URL instead. On Linux, create `./out` first and export
+`CRAWLER_USER=$(id -u):$(id -g)`. What sharing a crawl costs and how it
+behaves when things fail is in [distributed.md](distributed.md).
