@@ -495,7 +495,8 @@ links from start pages, `errors` crawls a local site that fails on purpose,
 `save` writes crawled pages to JSON, CSV and a database, `parse` extracts
 data from pages, `benchmark` compares sequential and concurrent fetching,
 and `scale` measures the crawler against a synchronous one on sites of 100,
-500 and 1000 pages.
+500 and 1000 pages, or, with `--workers`, a crawl of one process against
+crawl jobs of several worker processes.
 
 ```bash
 python src/demo_main.py crawl https://books.toscrape.com/ --max-depth 1 --max-pages 20 --same-domain
@@ -559,7 +560,7 @@ src/
 ├── demo_main.py            # demo CLI: `crawl`, `errors`, `save`, `parse`, `benchmark` and `scale` commands
 ├── demo_urls.yaml          # URLs the demo commands use when none are given
 ├── demo_site.py            # DemoSite: a local site that fails on purpose, for `errors` and `save`
-├── demo_scale.py           # ScaleSite, SyncCrawler and the measurements of the `scale` command
+├── demo_scale.py           # ScaleSite, SyncCrawler, crawl jobs of worker processes and the measurements of `scale`
 └── crawler/
     ├── advanced.py         # AdvancedCrawler: the crawler, storage, statistics, reports and log by a configuration
     ├── client.py           # AsyncCrawler: the public API — fetch_*, crawl(), statistics, close()

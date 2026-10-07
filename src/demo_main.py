@@ -7,6 +7,9 @@ Usage:
     python src/demo_main.py errors [options] [URL ...]      # crawl a local site that fails on purpose
     python src/demo_main.py save [options] [URL ...]        # save crawled pages to JSON, CSV and a database
     python src/demo_main.py scale [options] [PAGES ...]     # synchronous vs asynchronous crawl of 100, 500, 1000 pages
+    python src/demo_main.py scale --workers 1 2 4 [PAGES ...]  # one process vs worker processes of a crawl job
+
+`scale --workers` needs PostgreSQL: --database-url, or CRAWLER_DATABASE_URL.
 """
 
 import argparse
@@ -40,12 +43,15 @@ from crawler import (
     CircuitBreaker,
     CircuitState,
     CompositeStorage,
+    ConfigError,
+    CrawlerConfig,
     CrawlStats,
     CSVStorage,
     DatabaseStorage,
     DataStorage,
     FetchError,
     FetchResult,
+    FrontierError,
     HTMLParser,
     HTTPStatusError,
     JSONStorage,
@@ -63,7 +69,7 @@ from crawler.logging_setup import configure_logging
 from crawler.progress import show_progress
 from crawler.storage import DATABASE_URL_VARIABLE, DEFAULT_DATABASE_URL
 from crawler.urls import hide_password
-from demo_scale import Comparison, compare
+from demo_scale import Comparison, WorkersComparison, compare, compare_workers
 from demo_site import DemoSite
 
 # The longest pause between retries; a longer --retry-delay would not be doubled.
@@ -343,12 +349,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--concurrency", type=positive(int), default=20, help="parallel requests of the asynchronous crawler"
     )
     scale.add_argument("--no-memory", action="store_true", help="skip the runs that measure peak memory")
+    scale.add_argument(
+        "--workers",
+        nargs="+",
+        type=positive(int),
+        metavar="N",
+        help="compare a crawl of one process with crawl jobs of N worker processes each, "
+        "in place of the synchronous crawler; memory is not measured",
+    )
+    scale.add_argument(
+        "--database-url",
+        metavar="URL",
+        help=f"postgresql://user:password@host:port/database of the crawl jobs (default: ${DATABASE_URL_VARIABLE})",
+    )
     scale.add_argument("--json", type=Path, metavar="PATH", help="save the results to a JSON file")
     # A log line per page would cost time that is not the crawler's.
     scale.add_argument("--log-level", type=str.upper, choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="WARNING")
 
     args = parser.parse_args(argv)
     if args.command == "scale":
+        if args.database_url is not None and not args.workers:
+            parser.error("--database-url is the database of the crawl jobs of --workers")
+        if args.workers:
+            try:
+                # The check of a configuration file, CRAWLER_DATABASE_URL included.
+                options = CrawlerConfig.from_dict({"distributed": {"database_url": args.database_url}}).distributed
+                args.database_url = options.dsn()
+            except ConfigError:
+                parser.error(f"--workers needs a postgresql:// URL in --database-url or ${DATABASE_URL_VARIABLE}")
         return args
     # The other commands crawl a local site.
     if not args.urls and args.command in ("benchmark", "parse", "crawl"):
@@ -874,7 +902,87 @@ def save_scale_json(path: Path, args: argparse.Namespace, results: list[Comparis
     print(f"\nResults saved to {path}")
 
 
+def worker_count(workers: int) -> str:
+    return "1 worker" if workers == 1 else f"{workers} workers"
+
+
+def workers_rows(comparison: WorkersComparison) -> list[str]:
+    def row(crawl: str, elapsed: float, pages_per_second: float, speedup: str) -> str:
+        return f"{comparison.pages:>5}  {crawl:<10}  {elapsed:>8.2f}s  {pages_per_second:>8.1f}  {speedup:>7}"
+
+    local = comparison.local
+    rows = [row("local", local.elapsed, local.pages_per_second, "-")]
+    for workers, run in comparison.jobs.items():
+        rows.append(
+            row(worker_count(workers), run.elapsed, run.pages_per_second, f"{comparison.speedup(workers):.1f}x")
+        )
+    return rows
+
+
+def save_workers_json(path: Path, args: argparse.Namespace, results: list[WorkersComparison]) -> None:
+    report = {
+        "delay": args.delay,
+        "concurrency": args.concurrency,
+        "workers": sorted(set(args.workers)),
+        "results": [
+            {
+                **dataclasses.asdict(comparison),
+                "speedup": {workers: round(comparison.speedup(workers), 2) for workers in comparison.jobs},
+                "database_cost": comparison.database_cost,
+            }
+            for comparison in results
+        ],
+    }
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"\nResults saved to {path}")
+
+
+async def run_scale_workers(args: argparse.Namespace) -> None:
+    counts = sorted(set(args.workers))
+    print(
+        f"\n=== Scale: one process vs crawl jobs of {', '.join(map(str, counts))} worker processes, "
+        f"{args.concurrency} requests at once in each (the site answers in {args.delay * 1000:g} ms) ==="
+    )
+    print(f"{'PAGES':>5}  {'CRAWL':<10}  {'TIME':>9}  {'PAGES/S':>8}  {'SPEEDUP':>7}")
+    results = []
+    for pages in args.pages:
+        print(f"Crawling a site of {pages} pages locally and as crawl jobs...", file=sys.stderr)
+        # In a thread, as the other crawls of the command: waiting for the workers blocks.
+        stop = threading.Event()
+        try:
+            comparison = await asyncio.to_thread(
+                compare_workers, pages, args.delay, args.concurrency, counts, dsn=args.database_url, stop=stop
+            )
+        except asyncio.CancelledError:
+            stop.set()
+            raise
+        except (FrontierError, RuntimeError) as error:
+            sys.exit(f"error: {error}")
+        results.append(comparison)
+        print("\n".join(workers_rows(comparison)), flush=True)
+        runs = {"the local crawl": comparison.local} | {
+            f"the crawl job of {worker_count(workers)}": run for workers, run in comparison.jobs.items()
+        }
+        for name, run in runs.items():
+            if run.pages != pages:
+                print(f"  {name} fetched {run.pages} of {pages} pages, {run.failed} failed")
+        for workers, requests in comparison.requests.items():
+            if requests != pages:
+                print(f"  the crawl job of {worker_count(workers)} made {requests} requests for {pages} pages")
+        if comparison.database_cost is not None:
+            print(f"  a page of one worker takes {comparison.database_cost * 1000:.1f} ms more than a local one")
+    print(
+        "The time of a job is that of its database, from the start of its first worker to its end; "
+        "SPEEDUP is against the job of the fewest workers."
+    )
+    if args.json is not None:
+        save_workers_json(args.json, args, results)
+
+
 async def run_scale(args: argparse.Namespace) -> None:
+    if args.workers:
+        await run_scale_workers(args)
+        return
     print(
         f"\n=== Scale: one request at a time vs {args.concurrency} at once "
         f"(the site answers in {args.delay * 1000:g} ms) ==="
