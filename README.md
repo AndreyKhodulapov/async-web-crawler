@@ -473,7 +473,7 @@ storages. All of it is described in the [API reference](docs/api.md).
 | [docs/api.md](docs/api.md) | API reference: fetching and crawling, politeness, retries, the circuit breaker, timeouts, cookies and headers, proxies, rendering, statistics, `AdvancedCrawler`, progress, logging, storages, the parsed page, the internal layers |
 | [docs/configuration.md](docs/configuration.md) | configuration guide: every key with its type and default, validation, overrides, recipes |
 | [docs/demo.md](docs/demo.md) | the demo commands and their output |
-| [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler, memory, bottlenecks found and fixed |
+| [docs/performance.md](docs/performance.md) | measurements against a synchronous crawler and of the workers of a crawl job, memory, bottlenecks found and fixed |
 | [config.example.yaml](config.example.yaml) | every configuration key with its default |
 | [examples/](examples/) | a crawl from Python by a configuration file; what rendering adds to a page |
 
@@ -630,7 +630,7 @@ docs/
 ├── data_storage.md         # notes on saving data: files, databases, batching, failed writes
 ├── error_handling.md       # notes on error kinds, retries, timeouts and circuit breakers
 ├── html_parsing.md         # notes on HTML parsing and URL handling
-├── performance.md          # sync vs async measurements, memory, bottlenecks found and fixed
+├── performance.md          # sync vs async, workers of a job, memory, bottlenecks
 ├── politeness.md           # notes on rate limiting, robots.txt and backoff
 └── sessions_proxies_rendering.md  # notes on cookies, proxies and a headless browser
 ```

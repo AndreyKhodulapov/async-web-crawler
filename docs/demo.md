@@ -428,16 +428,24 @@ rows of a site is what the database costs a page of one worker. A crawl
 job that requests a page more than once, or a crawl that misses pages, is
 reported there as well. Memory is not measured.
 
+In compose, next to the database (the output below):
+
+```bash
+docker compose run --rm --no-deps --entrypoint python worker src/demo_main.py scale 1000 --workers 1 2 4
+```
+
 ```
 === Scale: one process vs crawl jobs of 1, 2, 4 worker processes, 20 requests at once in each (the site answers in 50 ms) ===
 PAGES  CRAWL            TIME   PAGES/S  SPEEDUP
- 1000  local           3.19s     313.8        -
- 1000  1 worker       11.57s      86.4     1.0x
- 1000  2 workers      12.05s      83.0     1.0x
- 1000  4 workers      13.99s      71.5     0.8x
-  a page of one worker takes 8.4 ms more than a local one
+ 1000  local           6.23s     160.4        -
+ 1000  1 worker        6.97s     143.5     1.0x
+ 1000  2 workers       4.48s     223.0     1.6x
+ 1000  4 workers       4.19s     238.8     1.7x
+  a page of one worker takes 0.7 ms more than a local one
 The time of a job is that of its database, from the start of its first worker to its end; SPEEDUP is against the job of the fewest workers.
 ```
 
 The database must be PostgreSQL: `--database-url`, or `CRAWLER_DATABASE_URL`.
-Ctrl-C stops the workers, which put their pages back.
+Ctrl-C stops the workers, which put their pages back. Why four workers
+are no faster than two is in
+[performance.md](performance.md#crawl-jobs-of-several-workers).
