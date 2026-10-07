@@ -304,9 +304,14 @@ class PostgresFrontier(Frontier):
     inserts new rows only; giving a host up locks the job, the host, then
     its pages queued; `take` and the taking back of expired leases skip
     the rows other workers hold (see docs/architecture.md).
+
+    An operation fails with one of `ERRORS` when the database cannot be
+    reached or refuses it; it is not tried again: the worker stops, and
+    its pages come back to the others once their leases expire.
     """
 
     shared = True
+    ERRORS = (asyncpg.PostgresError, asyncpg.InterfaceError, OSError)
 
     def __init__(
         self,
@@ -769,7 +774,9 @@ class PostgresFrontier(Frontier):
 
         Pages pending their save stay leased: their records may still be
         written, and if not, the pages come back once the leases expire.
-        The job is finished if this worker had its last pages.
+        The job is finished if this worker had its last pages. A database
+        that cannot be reached is logged, not raised: the pages in progress
+        come back once their leases expire too.
         """
         if self._closed:
             return
@@ -785,6 +792,12 @@ class PostgresFrontier(Frontier):
                     await self._uncount_all(connection, [row["host"] for row in rows if row["counted"]])
                 # The last pages of the job may have been pending their save until now.
                 await self._finish_job(connection)
+        except self.ERRORS as error:
+            logger.warning(
+                "Could not put back the pages worker %s has in progress: %s; they come back once their leases expire",
+                self.worker,
+                error,
+            )
         finally:
             self._held.clear()
             self._given_up.clear()

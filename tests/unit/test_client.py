@@ -24,6 +24,7 @@ from crawler import (
     DNSError,
     FetchResult,
     FetchTimeoutError,
+    FrontierError,
     HostFailures,
     HTMLParser,
     HTTPStatusError,
@@ -1674,6 +1675,156 @@ class TestCrawlSharedFrontier:
 
         assert set(crawler.processed_urls) == {"http://a/2"}
         assert not [r for r in caplog.records if r.getMessage().startswith("Deferred http://a/2")]
+
+
+class Unreachable(Exception):
+    """The error of a frontier kept elsewhere that cannot be reached."""
+
+
+class TestCrawlSharedFrontierFailures:
+    """A worker of a shared frontier whose storage cannot write, or whose frontier cannot be reached."""
+
+    # A write fails 4 times before StorageError: the write and 3 retries.
+    FAILED_WRITE = [OSError("disk full")] * 4
+
+    @staticmethod
+    def taking(storage: MemoryStorage) -> tuple[SharedMemoryFrontier, list[int]]:
+        """A shared frontier, and the failures of `storage` still to come at each page taken."""
+        failures_left: list[int] = []
+
+        class Taking(SharedMemoryFrontier):
+            async def take(self):
+                failures_left.append(len(storage.failures))
+                return await super().take()
+
+        return Taking(), failures_left
+
+    async def test_no_page_is_taken_while_the_storage_cannot_write(self, make_crawler, fake_session, caplog):
+        # a/1 is saved, and its write fails; the next try fails too, the one after succeeds.
+        caplog.set_level(logging.INFO, logger="crawler")
+        storage = MemoryStorage(batch_size=1, cooldown=0.05, failures=self.FAILED_WRITE * 2)
+        crawler = make_crawler(storage=storage, max_concurrent=1, max_depth=1)
+        fake_session.routes["http://a/1"] = FakeResponse(b'<a href="http://a/2">2</a><a href="http://a/3">3</a>')
+        frontier, failures_left = self.taking(storage)
+
+        await crawler.crawl_frontier(frontier, ["http://a/1"])
+
+        # Taken before the first write, then only once the storage writes again.
+        assert failures_left[0] == 8
+        assert set(failures_left[1:]) == {0}
+        assert storage.urls == [["http://a/1"], ["http://a/2"], ["http://a/3"]]
+        messages = [r.getMessage() for r in caplog.records]
+        assert "MemoryStorage cannot write 1 records: no page is taken until it can; trying again in 0.05s" in messages
+        assert any(m.startswith("MemoryStorage still cannot write 1 records: failed to write") for m in messages)
+        assert "MemoryStorage writes again: pages are taken again" in messages
+
+    async def test_each_try_waits_twice_as_long_up_to_the_longest_pause(self, make_crawler, fake_session, caplog):
+        caplog.set_level(logging.WARNING, logger="crawler.crawl_run")
+        storage = MemoryStorage(batch_size=1, cooldown=0.01, failures=self.FAILED_WRITE * 5)
+        crawler = make_crawler(storage=storage, max_depth=0)
+        crawler.MAX_STORAGE_PAUSE = 0.03
+
+        await crawler.crawl_frontier(SharedMemoryFrontier(), ["http://a/1"])
+
+        pauses = [r.getMessage().rsplit(" ", 1)[1] for r in caplog.records if "trying again in" in r.getMessage()]
+        assert pauses == ["0.01s", "0.02s", "0.03s", "0.03s", "0.03s"]
+        assert storage.urls == [["http://a/1"]]
+
+    async def test_worker_stops_only_once_the_pages_it_buffers_are_written(self, make_crawler, fake_session):
+        # The write at the end of the crawl fails, and the next try.
+        storage = MemoryStorage(batch_size=10, cooldown=0.01, failures=self.FAILED_WRITE * 2)
+        crawler = make_crawler(storage=storage, max_depth=0)
+
+        await crawler.crawl_frontier(SharedMemoryFrontier(), ["http://a/1", "http://a/2"])
+
+        assert sorted(storage.urls[0]) == ["http://a/1", "http://a/2"]
+        assert storage.pending == 0
+
+    async def test_crawl_of_one_process_takes_pages_while_the_storage_cannot_write(
+        self, make_crawler, fake_session, caplog
+    ):
+        # Its frontier is not shared: the pages wait in the buffer as before.
+        caplog.set_level(logging.WARNING, logger="crawler")
+        storage = MemoryStorage(batch_size=1, failures=self.FAILED_WRITE * 3)
+        crawler = make_crawler(storage=storage, max_concurrent=1, max_depth=0)
+
+        await crawler.crawl(["http://a/1", "http://a/2", "http://a/3"])
+
+        assert storage.attempts == 13  # three failed writes, then the flush at the end
+        assert [len(batch) for batch in storage.batches] == [3]
+        assert not [r for r in caplog.records if "no page is taken" in r.getMessage()]
+
+    async def test_frontier_that_cannot_be_reached_stops_the_crawl(self, make_crawler, fake_session, caplog):
+        # a/2 cannot be finished: it is not failed for that, the crawl stops,
+        # and a/1, done before, is written out.
+        caplog.set_level(logging.INFO, logger="crawler")
+
+        class Failing(SharedMemoryFrontier):
+            ERRORS = (Unreachable,)
+
+            async def finish(self, page, outcome, reason=None, *, uncount=False, pending_save=False):
+                if page.url == "http://a/2":
+                    raise Unreachable("connection refused")
+                await super().finish(page, outcome, reason, uncount=uncount, pending_save=pending_save)
+
+        storage = MemoryStorage(batch_size=10)
+        crawler = make_crawler(storage=storage, max_concurrent=1, max_depth=1)
+        fake_session.routes["http://a/1"] = FakeResponse(b'<a href="http://a/2">2</a><a href="http://a/3">3</a>')
+
+        with pytest.raises(FrontierError, match="the frontier failed: Unreachable: connection refused") as raised:
+            await crawler.crawl_frontier(Failing(), ["http://a/1"])
+
+        assert isinstance(raised.value.__cause__, Unreachable)
+        assert storage.urls == [["http://a/1"]]
+        assert crawler.failed_urls == {}
+        assert "http://a/3" not in fake_session.requested
+        messages = [r.getMessage() for r in caplog.records]
+        assert "The crawl stops: its frontier failed: Unreachable: connection refused" in messages
+        assert not [m for m in messages if m.startswith("Unexpected error while crawling")]
+
+    async def test_frontier_that_cannot_be_reached_stops_every_worker(self, make_crawler, fake_session):
+        # The other workers are cancelled with their pages in progress.
+        started = asyncio.Event()
+
+        async def slow_page() -> FakeResponse:
+            started.set()
+            await asyncio.sleep(10)
+            return FakeResponse()
+
+        class Failing(SharedMemoryFrontier):
+            ERRORS = (Unreachable,)
+
+            async def admit(self, page):
+                if page.url == "http://a/2":
+                    await started.wait()
+                    raise Unreachable("connection reset")
+                return await super().admit(page)
+
+        fake_session.routes["http://a/1"] = slow_page
+        crawler = make_crawler(max_concurrent=2, max_depth=0)
+
+        async with asyncio.timeout(2):
+            with pytest.raises(FrontierError, match="connection reset"):
+                await crawler.crawl_frontier(Failing(), ["http://a/1", "http://a/2"])
+
+        assert crawler.failed_urls == {}
+
+    async def test_error_of_a_frontier_in_memory_fails_the_page_only(self, make_crawler, fake_session, caplog):
+        # A frontier of one process lists no errors: any error is a bug, the page fails and the crawl goes on.
+        caplog.set_level(logging.ERROR, logger="crawler")
+
+        class Buggy(MemoryFrontier):
+            async def admit(self, page):
+                if page.url == "http://a/1":
+                    raise Unreachable("bug")
+                return await super().admit(page)
+
+        crawler = make_crawler(max_concurrent=1, max_depth=0)
+
+        await crawler.crawl_frontier(Buggy(), ["http://a/1", "http://a/2"])
+
+        assert list(crawler.failed_urls) == ["http://a/1"]
+        assert list(crawler.processed_urls) == ["http://a/2"]
 
 
 class TestCrawlStorage:

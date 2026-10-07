@@ -8,12 +8,13 @@ pending their save, the host interval and the limits held by all workers togethe
 import asyncio
 import functools
 import itertools
+import logging
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import asyncpg
 import pytest
-from helpers import POSTGRES_DSN, drop_frontier_tables, make_job
+from helpers import POSTGRES_DSN, DatabaseLink, drop_frontier_tables, make_job
 
 from crawler import Admission, FrontierPage, HostFailures, JobError, Outcome, PostgresFrontier
 
@@ -780,3 +781,39 @@ class TestStats:
         await asyncio.sleep(0.3)
 
         assert watching.stats().queued == 2
+
+
+class TestDatabaseGone:
+    async def test_operations_fail_with_the_errors_of_the_frontier(self, open_frontier):
+        await open_frontier("seeder")
+        async with DatabaseLink() as link:
+            frontier = await PostgresFrontier.open(link.dsn, job="test", worker="cut-off")
+            try:
+                await frontier.seed(["http://site/1", "http://site/2"])
+                page = await take(frontier)
+                await link.cut()
+
+                with pytest.raises(PostgresFrontier.ERRORS):
+                    await frontier.finish(page, Outcome.PROCESSED)
+                with pytest.raises(PostgresFrontier.ERRORS):
+                    await frontier.take()
+            finally:
+                await frontier.close()
+
+    async def test_close_without_the_database_leaves_the_pages_to_their_leases(self, open_frontier, caplog):
+        caplog.set_level(logging.WARNING, logger="crawler")
+        other = await open_frontier("other")
+        async with DatabaseLink() as link:
+            frontier = await PostgresFrontier.open(link.dsn, job="test", worker="cut-off", lease_seconds=0.5)
+            await frontier.seed(["http://site/1"])
+            await take(frontier)
+            await link.cut()
+
+            async with asyncio.timeout(5):
+                await frontier.close()
+
+        assert "Could not put back the pages worker cut-off has in progress" in caplog.text
+        assert (await row_of("http://site/1"))["state"] == "leased"
+        # Its lease expires: another worker takes the page.
+        async with asyncio.timeout(5):
+            assert await take(other) == FrontierPage("http://site/1", 0)

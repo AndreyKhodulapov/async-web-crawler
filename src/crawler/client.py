@@ -224,6 +224,7 @@ class AsyncCrawler:
     MAX_WAITS_PER_PAGE = CrawlRun.MAX_WAITS_PER_PAGE
     MAX_ROBOTS_RETRIES = CrawlRun.MAX_ROBOTS_RETRIES
     ROBOTS_POLL = CrawlRun.ROBOTS_POLL
+    MAX_STORAGE_PAUSE = CrawlRun.MAX_STORAGE_PAUSE
     FRONTIER_FACTOR = Frontier.FRONTIER_FACTOR
     # In crawl(), longer links are not followed: they are mostly generated ones.
     MAX_URL_LENGTH = 2048
@@ -736,11 +737,19 @@ class AsyncCrawler:
         `failed_urls`, `skipped_urls`, `blocked_urls`, `unreachable_urls`
         and `url_depths` are empty, unless it is a `MemoryFrontier`.
 
+        With a `shared` frontier, no page is taken while the storage cannot
+        write (`DataStorage.write_failed`): the storage is written again,
+        after longer and longer pauses up to `MAX_STORAGE_PAUSE`, until it
+        can, and the crawl does not end before it is.
+
         Raises:
             TypeError: as crawl().
             ValueError: as crawl(), but for the limits, which are those of the frontier.
             RuntimeError: another crawl is running on this crawler.
             StorageError: as crawl().
+            FrontierError: an operation of the frontier failed with one of
+                its `ERRORS`: the crawl stopped, the pages it had in progress
+                left as they are; what the storage buffers is written first.
         """
         start_urls, sitemap_urls = self._crawl_urls(start_urls, sitemap_urls, robots_sitemaps=False)
         self._check_idle()

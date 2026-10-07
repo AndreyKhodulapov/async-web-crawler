@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 from crawler.queue import CrawlerQueue, queue_form
 from crawler.urls import get_host
@@ -82,6 +82,11 @@ class Frontier(ABC):
     accepted (nor remembered), and a host has at most `frontier_factor`
     times `max_pages_per_host` pages accepted in the whole crawl. None
     means no limit.
+
+    A frontier kept outside the process lists in `ERRORS` the exceptions
+    its operations fail with when it cannot be reached. A crawl stops on
+    them instead of failing the page: the pages it has in progress are not
+    finished, and other processes crawl them once their leases expire.
     """
 
     # Room for the pages that do not count toward max_pages, such as those robots.txt disallows.
@@ -89,6 +94,9 @@ class Frontier(ABC):
     # Whether other processes take pages of this frontier too: what holds a
     # host back in one of them is then told to the frontier, see `hold_host`.
     shared = False
+    # The errors of a frontier kept outside the process, such as in a
+    # database, when it cannot be reached: a crawl stops on them.
+    ERRORS: ClassVar[tuple[type[Exception], ...]] = ()
 
     def __init__(
         self,

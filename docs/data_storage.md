@@ -112,6 +112,10 @@ blocking the event loop, losing pages or writing them twice.
   the lock, and every worker would wait for them. After a failed write
   **back off for a cooldown** and only buffer; an explicit flush still
   writes at once.
+- **Tell the caller the storage is down** (`write_failed`): a crawl of one
+  process can buffer through an outage, but a worker of a shared crawl
+  should stop taking pages, as every page it buffers is one the other
+  workers cannot take until its lease expires (backpressure).
 - Keep only what a retry can cure. A batch that fails with any other error
   (a value the database refuses, a record that cannot be serialized) is a
   **poison batch**: kept in the buffer, it fails every later write. But the

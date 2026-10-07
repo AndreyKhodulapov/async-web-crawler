@@ -1,9 +1,11 @@
 """A worker of a crawl job: crawls the pages of the job's frontier side by side with the other workers."""
 
+import contextlib
 import dataclasses
 import json
 import logging
 import re
+from collections.abc import Iterator
 from typing import Any
 
 import asyncpg
@@ -13,7 +15,7 @@ from crawler.config import CrawlerConfig, CrawlOptions
 from crawler.distributed.frontier import PostgresFrontier, worker_name
 from crawler.distributed.job import JOB_SECTIONS, config_differences, job_config
 from crawler.distributed.schema import create_schema
-from crawler.exceptions import ConfigError, JobError
+from crawler.exceptions import ConfigError, FrontierError, JobError
 from crawler.storage import storage_from_output
 
 logger = logging.getLogger(__name__)
@@ -49,11 +51,20 @@ async def run_worker(
     crawl is over, the storage has been written, the frontier is closed,
     which finishes the job if no page is left, then the crawler.
 
+    The worker takes no page while its storage cannot write, and tries it
+    again until it can: the pages it buffers stay leased, and the worker
+    does not stop before they are written. The database failing stops the
+    worker at once (`FrontierError`): what its storage buffers is written,
+    and the pages it had in progress come back to the other workers once
+    their leases expire. Running it again is the business of whatever
+    started it, such as a restart policy of the container.
+
     Raises:
         ConfigError: there is no database, a file of the storage is
             without "{worker}", or the part of the job cannot be used here,
             such as rendering without Playwright.
         JobError: there is no crawl job of that name.
+        FrontierError: the database cannot be reached or failed an operation.
         ValueError: `worker` cannot be a part of a file name.
         StorageError: the storage cannot be opened; nothing is requested.
     """
@@ -61,22 +72,25 @@ async def run_worker(
         raise ValueError(f"a worker name may hold letters, digits, '.', '_' and '-' only, got {worker!r}")
     dsn = config.distributed.dsn()
     _check_files(config)
-    config = _worker_config(config, job, await _job_settings(dsn, job))
+    with _database_errors(job):
+        settings = await _job_settings(dsn, job)
+    config = _worker_config(config, job, settings)
     name = worker or worker_name()
     options = config.distributed
     async with AdvancedCrawler(config, configure_logging=configure_logging, worker=name) as crawler:
         if crawler.storage is None:
             logger.warning("Worker %s has no storage: the pages it crawls are not saved", name)
-        frontier = await PostgresFrontier.open(
-            dsn,
-            job=job,
-            worker=name,
-            lease_seconds=options.lease_seconds,
-            heartbeat_seconds=options.heartbeat_seconds,
-            max_attempts=options.max_attempts,
-            host_interval=host_interval(config.crawler),
-            poll_interval=options.poll_interval,
-        )
+        with _database_errors(job):
+            frontier = await PostgresFrontier.open(
+                dsn,
+                job=job,
+                worker=name,
+                lease_seconds=options.lease_seconds,
+                heartbeat_seconds=options.heartbeat_seconds,
+                max_attempts=options.max_attempts,
+                host_interval=host_interval(config.crawler),
+                poll_interval=options.poll_interval,
+            )
         logger.info("Worker %s started on crawl job %s", name, job)
         try:
             await crawler.crawl_frontier(frontier)
@@ -90,6 +104,15 @@ def host_interval(options: CrawlOptions) -> float:
     if not options.per_domain_rate:
         return 0.0
     return max(0.0 if options.rate_limit is None else 1 / options.rate_limit, options.min_delay)
+
+
+@contextlib.contextmanager
+def _database_errors(job: str) -> Iterator[None]:
+    """Raise the errors of the database of the job as FrontierError, as a crawl of its frontier does."""
+    try:
+        yield
+    except PostgresFrontier.ERRORS as error:
+        raise FrontierError(f"the database of crawl job {job} failed: {type(error).__name__}: {error}") from error
 
 
 def _check_files(config: CrawlerConfig) -> None:

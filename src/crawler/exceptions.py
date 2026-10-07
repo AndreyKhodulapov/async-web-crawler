@@ -29,8 +29,8 @@ retried.
 `NoProxyError`: they say nothing about the site.
 
 `StorageError` is not about a URL at all: it reports a failure to save the
-pages already crawled. Nor is `JobError`, about a crawl job of distributed
-workers.
+pages already crawled. Nor are `JobError` and `FrontierError`, about a
+crawl job of distributed workers.
 """
 
 from collections.abc import Sequence
@@ -199,6 +199,10 @@ class StorageError(Exception):
 
 class JobError(Exception):
     """A crawl job cannot be created, resumed or joined: its name is taken, there is no such job, or its configuration differs."""
+
+
+class FrontierError(Exception):
+    """The database of a crawl job failed a worker: the worker stopped, and its pages come back once their leases expire."""
 
 
 class ConfigError(ValueError):

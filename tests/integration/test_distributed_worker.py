@@ -8,18 +8,28 @@ from collections.abc import Awaitable, Callable
 
 import asyncpg
 import pytest
-from helpers import POSTGRES_DSN, UNTHROTTLED, drop_frontier_tables, make_config, urlset
+from helpers import (
+    POSTGRES_DSN,
+    UNTHROTTLED,
+    DatabaseLink,
+    MemoryStorage,
+    drop_frontier_tables,
+    make_config,
+    urlset,
+)
 
 from crawler import (
     AdvancedCrawler,
     AsyncCrawler,
     ConfigError,
     CrawlerConfig,
+    FrontierError,
     JobError,
     Outcome,
     PostgresFrontier,
     RobotsParser,
 )
+from crawler.config import StorageOptions
 from crawler.distributed import create_job, run_worker
 
 pytestmark = pytest.mark.postgres
@@ -598,6 +608,95 @@ async def test_page_that_keeps_asking_to_wait_fails_after_the_waits_of_all_worke
     (row,) = await fetch("SELECT state, reason, waits FROM frontier WHERE url = $1", page)
     assert (row["state"], row["reason"]) == ("failed", "TransientHTTPError: HTTP 429 Too Many Requests")
     assert row["waits"] == AsyncCrawler.MAX_WAITS_PER_PAGE
+
+
+class Unwritable(MemoryStorage):
+    """A storage whose every write fails with OSError while it is `down`."""
+
+    down = True
+
+    async def _write_batch(self, records):
+        if self.down:
+            raise OSError("disk full")
+        await super()._write_batch(records)
+
+
+async def pages_taken() -> int:
+    """The pages taken by a worker so far, whatever became of them."""
+    (row,) = await fetch("SELECT count(*) FROM frontier WHERE state NOT IN ('queued', 'seen')")
+    return row["count"]
+
+
+async def test_worker_whose_storage_cannot_write_takes_no_pages_until_it_can(url, site, monkeypatch):
+    await create_job(make_config(urls=[url("/wide/0")]), "test", dsn=POSTGRES_DSN)
+    storage = Unwritable(batch_size=5, cooldown=0.1)
+    monkeypatch.setattr(StorageOptions, "build", lambda self: storage)
+    config = worker_config(crawler={"max_concurrent": 2}, distributed={"lease_seconds": 0.5, "heartbeat_seconds": 0.1})
+    worker = asyncio.create_task(run_worker(config, "test", worker="w", configure_logging=False))
+    async with asyncio.timeout(5):
+        while not storage.write_failed:
+            await asyncio.sleep(0.01)
+    taken = await pages_taken()
+
+    # Longer than a lease: the heartbeat keeps the pages of the buffer leased meanwhile.
+    await asyncio.sleep(1.0)
+
+    assert await pages_taken() == taken
+    assert await fetch("SELECT url FROM frontier WHERE attempts > 0") == []
+    storage.down = False
+    async with asyncio.timeout(10):
+        await worker
+    saved = [page for batch in storage.urls for page in batch]
+    assert len(saved) == WIDE_PAGES
+    assert set(saved) == await urls_in("processed")
+    assert await job_state() == "finished"
+
+
+async def test_worker_whose_database_is_gone_stops_and_the_others_crawl_its_pages(url, site, tmp_path, caplog):
+    # The first worker reaches the database through a link cut once it has crawled a few pages.
+    caplog.set_level(logging.WARNING, logger="crawler")
+    await create_job(make_config(urls=[url("/wide/0")], crawler={"rate_limit": 20}), "test", dsn=POSTGRES_DSN)
+    storage = {"outputs": [str(tmp_path / "pages-{worker}.jsonl")]}
+    leases = {"lease_seconds": 0.5, "heartbeat_seconds": 0.1}
+    async with DatabaseLink() as link:
+        config = worker_config(storage=storage, distributed={"database_url": link.dsn, **leases})
+        first = asyncio.create_task(run_worker(config, "test", worker="cut-off", configure_logging=False))
+        async with asyncio.timeout(5):
+            while len(await urls_in("saving")) < 5:
+                await asyncio.sleep(0.02)
+        await link.cut()
+
+        async with asyncio.timeout(5):
+            with pytest.raises(FrontierError, match="the frontier failed"):
+                await first
+
+    # The pages it crawled are written all the same; none failed for the database.
+    assert len(saved_urls(tmp_path)) >= 5
+    assert await urls_in("failed") == set()
+    assert "Unexpected error while crawling" not in caplog.text
+    await run_worker(
+        worker_config(storage=storage, distributed=leases), "test", worker="other", configure_logging=False
+    )
+    processed = await urls_in("processed")
+    assert len(processed) == WIDE_PAGES
+    assert set(saved_urls(tmp_path)) == processed
+    assert await job_state() == "finished"
+
+
+async def test_worker_whose_database_cannot_be_reached_is_refused(tmp_path):
+    async with DatabaseLink() as link:
+        await link.cut()
+        config = worker_config(
+            distributed={"database_url": link.dsn}, storage={"outputs": [str(tmp_path / "pages-{worker}.jsonl")]}
+        )
+
+        with pytest.raises(
+            FrontierError, match="the database of crawl job test failed: .*Connect call failed"
+        ) as raised:
+            await run_worker(config, "test", configure_logging=False)
+
+    assert isinstance(raised.value.__cause__, OSError)
+    assert list(tmp_path.iterdir()) == []
 
 
 async def test_job_sections_of_the_configuration_of_a_worker_give_way_to_those_of_the_job(url, site, caplog):

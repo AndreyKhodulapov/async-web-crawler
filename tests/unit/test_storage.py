@@ -374,6 +374,38 @@ class TestCooldown:
 
         assert storage.attempts == 8
 
+    async def test_write_failed_tells_of_records_a_write_could_not_take(self):
+        storage = MemoryStorage(batch_size=1, failures=[OSError("disk full")] * 4)
+        assert not storage.write_failed
+
+        with pytest.raises(StorageError):
+            await save_pages(storage, "a")
+        assert storage.write_failed
+
+        await storage.flush()
+        assert not storage.write_failed
+        assert storage.urls == [["a"]]
+
+    async def test_write_failed_is_cleared_once_the_records_are_gone(self):
+        # The record left by the failed write is then one no write can take: dropped.
+        storage = MemoryStorage(batch_size=1, failures=[OSError("disk full")] * 4 + [TypeError("not serializable")])
+        with pytest.raises(StorageError):
+            await save_pages(storage, "a")
+
+        with pytest.raises(TypeError):
+            await storage.flush()
+
+        assert not storage.write_failed
+        assert storage.pending == 0
+
+    async def test_record_that_cannot_be_written_is_no_failed_write(self):
+        storage = MemoryStorage(batch_size=2, refused={"a"})
+
+        with pytest.raises(ValueError):
+            await save_pages(storage, "a", "b")
+
+        assert not storage.write_failed
+
     def test_negative_cooldown_is_refused(self):
         with pytest.raises(ValueError, match="cooldown"):
             MemoryStorage(cooldown=-1)

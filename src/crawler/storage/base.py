@@ -36,7 +36,8 @@ class DataStorage(ABC):
     records stay in the buffer, so the next write takes them along. For
     `cooldown` seconds after that `save` only buffers the records, so that
     a storage that is down does not make every save wait for the retries;
-    `flush` and `close` write at once all the same. Any
+    `flush` and `close` write at once all the same. `write_failed` tells
+    that the buffer holds records a write could not take. Any
     other error is one no retry cures, and kept in the buffer the batch
     would fail every later write: the batch is written again a record at
     a time, and only the records that fail on their own are dropped, each
@@ -79,6 +80,7 @@ class DataStorage(ABC):
         self.cooldown = cooldown
         self._clock = clock
         self._paused_until = 0.0
+        self._failing = False
         self.retry_strategy = retry_strategy or RetryStrategy(retry_on=self.WRITE_ERRORS, base_delay=0.1)
         self._buffer: list[PageRecord] = []
         # Keeps the batches in order and a record out of two writes at once.
@@ -91,6 +93,11 @@ class DataStorage(ABC):
     def pending(self) -> int:
         """The number of records saved but not written out yet."""
         return len(self._buffer)
+
+    @property
+    def write_failed(self) -> bool:
+        """Whether the buffer holds records a write could not take, retries included, until a write takes them."""
+        return self._failing and bool(self._buffer)
 
     @property
     def written(self) -> int:
@@ -206,6 +213,7 @@ class DataStorage(ABC):
             return
         self._buffer = []
         self._paused_until = 0.0
+        self._failing = False
         self._written += len(batch)
         logger.debug("Wrote %d records to %s", len(batch), type(self).__name__)
         await self._settle(batch)
@@ -219,6 +227,7 @@ class DataStorage(ABC):
     def _write_failed(self, records: int, error: Exception) -> StorageError:
         """Pause the writes for `cooldown` after a write error that outlasted the retries; the error to raise."""
         self._paused_until = self._clock() + self.cooldown
+        self._failing = True
         return StorageError(f"failed to write {records} records: {error}")
 
     async def _write_one_by_one(self, batch_error: Exception) -> None:
@@ -253,6 +262,7 @@ class DataStorage(ABC):
             self._buffer = self._buffer[1:]
             await self._settle([record])
         self._paused_until = 0.0
+        self._failing = False
         if first_error is not None:
             raise first_error
         logger.warning("%s wrote its records one by one: none of them failed on its own", type(self).__name__)

@@ -22,9 +22,9 @@ class CompositeStorage(DataStorage):
     those that failed.
 
     A page counts as `written` once every storage has written it, and as
-    `pending` while any of them still buffers it, and is reported to
-    `on_settled` once every storage has written or dropped it. `read` gives
-    the records of the first storage.
+    `pending` while any of them still buffers it; `write_failed` is that
+    of any of them. A page is reported to `on_settled` once every storage
+    has written or dropped it. `read` gives the records of the first storage.
     """
 
     def __init__(self, *storages: DataStorage) -> None:
@@ -43,6 +43,10 @@ class CompositeStorage(DataStorage):
     @property
     def written(self) -> int:
         return min(storage.written for storage in self.storages)
+
+    @property
+    def write_failed(self) -> bool:
+        return any(storage.write_failed for storage in self.storages)
 
     async def open(self) -> None:
         await self._for_each(lambda storage: storage.open(), "open")

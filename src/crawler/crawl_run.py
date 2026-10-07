@@ -13,6 +13,7 @@ from crawler.exceptions import (
     CircuitOpenError,
     CrawlerClosedError,
     FetchError,
+    FrontierError,
     HostHeldBackError,
     HTTPStatusError,
     ParseError,
@@ -63,6 +64,9 @@ class CrawlRun:
     # robots.txt, then it is put off for this long at a time while the
     # download goes on: a site that is slow to fail holds no worker back.
     ROBOTS_POLL = 2.0
+    # In a crawl of several processes, a storage that cannot write is tried
+    # again after its cooldown, then after twice as long each time, up to this.
+    MAX_STORAGE_PAUSE = 60.0
     # The constants above that AsyncCrawler hands over from itself to every run.
     SETTINGS = (
         "MAX_CIRCUIT_OPENINGS",
@@ -70,6 +74,7 @@ class CrawlRun:
         "MAX_WAITS_PER_PAGE",
         "MAX_ROBOTS_RETRIES",
         "ROBOTS_POLL",
+        "MAX_STORAGE_PAUSE",
     )
 
     def __init__(
@@ -110,6 +115,7 @@ class CrawlRun:
         self._crawl_failures: dict[str, HostFailures] = {}
         self._hosts_given_up: set[str] = set()  # hosts this process gave up in a shared frontier
         self._pages_to_save = 0
+        self._storage_retry = asyncio.Lock()  # one worker writes the storage again, the others wait for it
         self._written_before = 0
         self._pending_before = 0
         self._crawl_started: float | None = None
@@ -165,13 +171,19 @@ class CrawlRun:
             self._fetcher.on_host_held = self._frontier.hold_host
             self._fetcher.on_crawl_delay = self._frontier.set_host_interval
         try:
-            await self.seed(
-                start_urls, url_filter=url_filter, sitemap_urls=sitemap_urls, robots_sitemaps=robots_sitemaps
-            )
-            async with asyncio.TaskGroup() as group:
-                for _ in range(self.max_concurrent):
-                    group.create_task(self._crawl_worker(url_filter))
+            try:
+                await self.seed(
+                    start_urls, url_filter=url_filter, sitemap_urls=sitemap_urls, robots_sitemaps=robots_sitemaps
+                )
+                await self._crawl_pages(url_filter)
+            except self._frontier.ERRORS as error:
+                logger.error("The crawl stops: its frontier failed: %s: %s", type(error).__name__, error)
+                # The pages done so far are stored all the same; those in progress come back to others.
+                await self._flush_storage()
+                raise FrontierError(f"the frontier failed: {type(error).__name__}: {error}") from error
             await self._flush_storage()
+            # A worker of a shared frontier stops only once the pages it did are stored.
+            await self._wait_for_storage()
         finally:
             if self.storage is not None:
                 self.storage.on_settled = None
@@ -210,6 +222,17 @@ class CrawlRun:
                 "Saved %d pages to %s, %d not saved", stats.saved, type(self.storage).__name__, stats.save_failed
             )
         return self.processed_urls
+
+    async def _crawl_pages(self, url_filter: UrlFilter) -> None:
+        """Crawl the pages of the frontier with `max_concurrent` workers; an error of the frontier stops them all."""
+        try:
+            async with asyncio.TaskGroup() as group:
+                for _ in range(self.max_concurrent):
+                    group.create_task(self._crawl_worker(url_filter))
+        except ExceptionGroup as errors:
+            if (error := _first_of(errors, self._frontier.ERRORS)) is None:
+                raise
+            raise error from None
 
     async def seed(
         self, start_urls: list[str], *, url_filter: UrlFilter, sitemap_urls: list[str], robots_sitemaps: bool
@@ -387,7 +410,10 @@ class CrawlRun:
 
     async def _crawl_worker(self, url_filter: UrlFilter) -> None:
         frontier = self._frontier
-        while (page := await frontier.take()) is not None:
+        while True:
+            await self._wait_for_storage()
+            if (page := await frontier.take()) is None:
+                return
             url = page.url
             self._sync_scope(url_filter)
             try:
@@ -438,6 +464,10 @@ class CrawlRun:
                         await self._skip_page(page, reason)
                         continue
                 await self._crawl_page(page, url_filter)
+            except frontier.ERRORS:
+                # The frontier cannot be reached: the page stays in progress
+                # there, and comes back to another process once its lease expires.
+                raise
             except Exception as exc:
                 # Fetcher.fetch() reports expected failures in the result, so this
                 # is a bug; it must not kill the worker, and the page
@@ -676,6 +706,45 @@ class CrawlRun:
             logger.error("Failed to save the pages the storage buffers: %s", error)
         except Exception:
             logger.exception("Unexpected error while saving the pages the storage buffers")
+
+    async def _wait_for_storage(self) -> None:
+        """In a shared frontier, take no page while the storage cannot write; a worker writes it again meanwhile.
+
+        The pages the storage buffers stay in progress in the frontier, so
+        that no other process takes them, until they are written. The first
+        try is after the storage's `cooldown`, then each pause is twice as
+        long, up to `MAX_STORAGE_PAUSE`; it goes on for as long as it takes.
+        """
+        storage = self.storage
+        if storage is None or not self._frontier.shared or not storage.write_failed:
+            return
+        async with self._storage_retry:
+            if not storage.write_failed:
+                return  # another worker of this process wrote it meanwhile
+            pause = storage.cooldown
+            logger.warning(
+                "%s cannot write %d records: no page is taken until it can; trying again in %gs",
+                type(storage).__name__,
+                storage.pending,
+                pause,
+            )
+            while storage.write_failed:
+                await asyncio.sleep(pause)
+                pause = min(2 * pause, self.MAX_STORAGE_PAUSE)
+                try:
+                    await storage.flush()
+                except StorageError as error:
+                    logger.warning(
+                        "%s still cannot write %d records: %s; trying again in %gs",
+                        type(storage).__name__,
+                        storage.pending,
+                        error,
+                        pause,
+                    )
+                except Exception:
+                    # Records no write can take are dropped: the others are written.
+                    logger.exception("Unexpected error while saving the pages the storage buffers")
+            logger.info("%s writes again: pages are taken again", type(storage).__name__)
 
     def _check_probes_left(self, url: str) -> CircuitOpenError | None:
         """In a crawl, a host whose circuit has opened `MAX_CIRCUIT_OPENINGS` times gets no more probes.
@@ -1025,6 +1094,14 @@ class CrawlRun:
         else:
             await self._put_off_page(page, 1.0, refusal.message, uncount=counted)
         return True
+
+
+def _first_of(errors: BaseExceptionGroup, kinds: tuple[type[Exception], ...]) -> BaseException | None:
+    """The first exception of `errors`, nested groups included, that is one of `kinds`; None if there is none."""
+    matched = errors.subgroup(kinds)
+    while isinstance(matched, BaseExceptionGroup):
+        matched = matched.exceptions[0]
+    return matched
 
 
 def _page_record(result: FetchResult, page: ParsedPage, depth: int) -> PageRecord:

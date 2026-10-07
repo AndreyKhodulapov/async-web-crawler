@@ -8,6 +8,8 @@ from collections.abc import AsyncIterator, Collection, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
+from typing import Self
+from urllib.parse import urlsplit
 
 import asyncpg
 
@@ -60,6 +62,53 @@ async def drop_frontier_tables() -> None:
         )
     finally:
         await connection.close()
+
+
+class DatabaseLink:
+    """A TCP relay to the database of the tests that can be cut, as when the database or the network goes down.
+
+    `dsn` reaches the database through it. Once cut, the connections
+    through it are reset and new ones refused.
+    """
+
+    def __init__(self) -> None:
+        self._server: asyncio.Server | None = None
+        self._writers: set[asyncio.StreamWriter] = set()
+        self.dsn = ""
+
+    async def __aenter__(self) -> Self:
+        self._server = await asyncio.start_server(self._relay, "127.0.0.1", 0)
+        port = self._server.sockets[0].getsockname()[1]
+        parts = urlsplit(POSTGRES_DSN)
+        self.dsn = parts._replace(netloc=f"{parts.username}:{parts.password}@127.0.0.1:{port}").geturl()
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.cut()
+
+    async def cut(self) -> None:
+        assert self._server is not None
+        self._server.close()
+        for writer in self._writers:
+            writer.transport.abort()
+        self._writers.clear()
+
+    async def _relay(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        database = urlsplit(POSTGRES_DSN)
+        upstream_reader, upstream_writer = await asyncio.open_connection(database.hostname, database.port)
+        self._writers |= {writer, upstream_writer}
+
+        async def pipe(source: asyncio.StreamReader, target: asyncio.StreamWriter) -> None:
+            try:
+                while chunk := await source.read(65536):
+                    target.write(chunk)
+                    await target.drain()
+            except OSError:
+                pass
+            finally:
+                target.transport.abort()
+
+        await asyncio.gather(pipe(reader, upstream_writer), pipe(upstream_reader, writer))
 
 
 async def make_job(

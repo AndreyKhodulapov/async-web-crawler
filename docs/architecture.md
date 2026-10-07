@@ -167,6 +167,34 @@ run against it; what it adds is what sharing needs.
   crawl writes out the buffer of its storage. It is not called while a
   worker only waits for the turn of a host: the batches of the storage
   would shrink to a page.
+- **A worker whose storage cannot write takes no pages.** A local crawl
+  goes on and keeps the pages in the buffer; a worker doing so would
+  hold more and more pages `saving` that it may never store, while the
+  other workers could crawl them. So once a write fails after its
+  retries (`DataStorage.write_failed`), the worker stops taking pages:
+  one of its tasks writes the buffer again after the storage's
+  `cooldown`, then after twice as long each time, up to
+  `MAX_STORAGE_PAUSE` (60 s), for as long as it takes, while the
+  heartbeat keeps the pages of the buffer leased. The pages already in
+  progress are finished into the buffer. The worker does not stop either
+  before its buffer is written: its pages would wait for their leases,
+  and there may be no other worker to take them then.
+- **A database that fails stops the worker.** An operation of the
+  frontier that fails with one of `PostgresFrontier.ERRORS` (the database
+  is down, the connection broke, a query was refused) is not tried again
+  and does not fail the page: the crawl stops all its tasks, the storage
+  writes what it buffers, and `run_worker` raises `FrontierError`. The
+  pages in progress stay `leased` and come back to the other workers
+  once their leases expire; `close` tries to put them back at once and
+  only logs if it cannot. Starting the worker again is the business of
+  whatever runs it (a restart policy of compose, a Kubernetes Job), as
+  in crash-only software: a worker that tried to ride out an outage would
+  need to tell a short one from a long one, and a page from a bug, and
+  the leases already bring back what it had. The calls that only tell
+  the others something (the heartbeat, `saved`, `hold_host`,
+  `set_host_interval`) log their errors: what they lose comes back
+  through the leases too, and if the database is down, the next
+  operation stops the worker anyway.
 - **A host has one turn for all workers.** `take` picks the ready host
   with the shallowest page, locks the host row with
   `FOR UPDATE SKIP LOCKED` and moves its `next_allowed_at` on by the

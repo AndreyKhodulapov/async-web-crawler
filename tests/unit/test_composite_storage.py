@@ -183,6 +183,11 @@ class TestCounters:
             await storage.save(make_record())
 
         assert (storage.pending, storage.written) == (1, 0)
+        assert storage.write_failed
+
+        broken.failures = []
+        await storage.flush()
+        assert not storage.write_failed
 
 
 class TestSettled:

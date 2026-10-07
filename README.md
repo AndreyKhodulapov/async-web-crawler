@@ -522,7 +522,7 @@ src/
     ├── parser.py           # HTMLParser
     ├── urls.py             # URL validation, normalization, resolution
     ├── models.py           # FetchResult, ParsedPage, PageRecord, CrawlStats, ErrorStats, RateStats, CircuitStats, ProxyStats, RenderStats
-    ├── exceptions.py       # FetchError hierarchy, StorageError, JobError, ConfigError
+    ├── exceptions.py       # FetchError hierarchy, StorageError, JobError, FrontierError, ConfigError
     ├── distributed/
     │   ├── frontier.py     # PostgresFrontier: the frontier of a crawl job shared by workers — leases, heartbeat, host turns
     │   ├── job.py          # create_job: a crawl job created, seeded, resumed or restarted
