@@ -5,7 +5,7 @@ import io
 
 import asyncpg
 import pytest
-from helpers import POSTGRES_DSN, drop_frontier_tables, make_job
+from helpers import POSTGRES_DSN, READ_ONLY_DSN, drop_frontier_tables, frontier_tables_exist, make_job
 
 from crawler import Admission, FrontierError, JobError, Outcome, PostgresFrontier
 from crawler.distributed import job_progress, watch_job
@@ -236,6 +236,19 @@ class TestJobProgress:
         with pytest.raises(JobError, match='no crawl job named "test"'):
             await job_progress(POSTGRES_DSN, "test")
 
+    async def test_progress_of_a_database_without_jobs_fails_and_makes_no_tables(self):
+        with pytest.raises(JobError, match='no crawl job named "test"'):
+            await job_progress(POSTGRES_DSN, "test")
+
+        assert not await frontier_tables_exist()
+
+    async def test_progress_is_read_by_a_session_that_may_not_write(self):
+        await make_job("test", max_pages=10)
+
+        progress = await job_progress(READ_ONLY_DSN, "test")
+
+        assert (progress.state, progress.done, progress.total) == ("running", 0, 10)
+
     async def test_progress_without_the_database_fails_as_the_frontier_does(self):
         dsn = f"postgresql://crawler:crawler@127.0.0.1:{free_port()}/crawler"
 
@@ -282,3 +295,11 @@ class TestWatchJob:
 
         with pytest.raises(JobError):
             await watch_job(POSTGRES_DSN, "test", stream=io.StringIO())
+
+    async def test_watched_by_a_session_that_may_not_write(self):
+        await make_job("test", max_pages=10, state="finished")
+        stream = io.StringIO()
+
+        await watch_job(READ_ONLY_DSN, "test", interval=0.02, stream=stream)
+
+        assert "| done |" in stream.getvalue()

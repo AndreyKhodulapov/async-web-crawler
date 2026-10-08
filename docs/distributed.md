@@ -161,9 +161,11 @@ operations a second on one job exceed what one row allows (below).
   A file in the container dies with it.
 - **Metrics**: pages per second, pages queued and in progress, leases
   expired, hosts held back and given up, storage failures. Here `status`
-  and `report` read the first of them from the database; a production
-  setup exports them to Prometheus and alerts on a queue that stops
-  shrinking or leases that keep expiring.
+  and `report` read the first of them from the database, and only read:
+  a role that may not write is enough for them, and they never change
+  the tables or functions the workers run on. A production setup exports
+  them to Prometheus and alerts on a queue that stops shrinking or
+  leases that keep expiring.
 - **Secrets in the environment**, not in files baked into the image:
   `CRAWLER_DATABASE_URL` here.
 - **One image, many roles**: the same image creates the job, runs the

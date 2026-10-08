@@ -4,7 +4,7 @@ import asyncio
 import json
 
 import pytest
-from helpers import POSTGRES_DSN, drop_frontier_tables, make_config, make_job
+from helpers import POSTGRES_DSN, READ_ONLY_DSN, drop_frontier_tables, frontier_tables_exist, make_config, make_job
 
 from crawler import AdvancedCrawler, FrontierError, JobError, Outcome, PostgresFrontier
 from crawler.distributed import create_job, export_job_stats, job_stats, run_worker
@@ -146,6 +146,21 @@ async def test_statistics_of_a_job_that_does_not_exist_fail():
 
     with pytest.raises(JobError, match='There is no crawl job named "test"'):
         await job_stats(POSTGRES_DSN, "test")
+
+
+async def test_statistics_of_a_database_without_jobs_fail_and_make_no_tables():
+    with pytest.raises(JobError, match='There is no crawl job named "test"'):
+        await job_stats(POSTGRES_DSN, "test")
+
+    assert not await frontier_tables_exist()
+
+
+async def test_statistics_are_read_by_a_session_that_may_not_write():
+    await make_job("test")
+
+    stats = await job_stats(READ_ONLY_DSN, "test")
+
+    assert (stats["job"], stats["state"], stats["workers"]) == ("test", "running", {})
 
 
 async def test_statistics_without_the_database_fail_as_the_frontier_does():

@@ -9,7 +9,7 @@ import asyncpg
 
 from crawler.advanced import make_directory
 from crawler.distributed.job import database_errors
-from crawler.distributed.schema import Connection, create_schema
+from crawler.distributed.schema import Connection
 from crawler.exceptions import JobError
 from crawler.report import render_html, render_json
 
@@ -112,7 +112,6 @@ async def job_stats(dsn: str, job: str, *, top_domains: int = 10) -> dict[str, A
     with database_errors(job):
         connection = await asyncpg.connect(dsn)
         try:
-            await create_schema(connection)
             # One snapshot: the workers go on meanwhile.
             async with connection.transaction(isolation="repeatable_read", readonly=True):
                 return await _read_stats(connection, job, top_domains)
@@ -120,10 +119,22 @@ async def job_stats(dsn: str, job: str, *, top_domains: int = 10) -> dict[str, A
             await connection.close()
 
 
-async def _read_stats(connection: Connection, job: str, top_domains: int) -> dict[str, Any]:
-    row = await connection.fetchrow(_JOB, job)
+async def fetch_job(connection: Connection, query: str, job: str) -> asyncpg.Record:
+    """The row `query` reads of the crawl job named `job`; raises JobError if there is none.
+
+    Only reads: the tables are made by the first job created, not by those who look at it.
+    """
+    try:
+        row = await connection.fetchrow(query, job)
+    except asyncpg.UndefinedTableError:
+        row = None
     if row is None:
         raise JobError(f'There is no crawl job named "{job}"')
+    return row
+
+
+async def _read_stats(connection: Connection, job: str, top_domains: int) -> dict[str, Any]:
+    row = await fetch_job(connection, _JOB, job)
     job_id = row["id"]
     pages = await connection.fetchrow(_PAGES, job_id, FINISHED)
     total = pages["successful"] + pages["failed"] + pages["skipped"]
