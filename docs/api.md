@@ -1227,7 +1227,9 @@ All of them share the behavior of `DataStorage`:
   `close()`. Several workers may save at once.
 - A failed write is retried by the storage's own `retry_strategy`: by default
   3 times with exponential backoff from 0.1 s, for the errors a retry can
-  cure (I/O errors, a locked SQLite database, a lost PostgreSQL connection).
+  cure (I/O errors, a locked SQLite database; for PostgreSQL a lost
+  connection, a full disk, a `statement_timeout`, a server shutting down, a
+  deadlock or serialization failure, a read-only standby after a failover).
   When the retries run out, `StorageError` is raised and the records stay in
   the buffer, so the next write takes them along. A repeated write does not
   duplicate records. For `cooldown` seconds after that (5 by default)

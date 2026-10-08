@@ -4,10 +4,11 @@ import asyncio
 from collections.abc import AsyncIterator, Sequence
 from datetime import datetime
 
+import asyncpg
 import pytest
 from helpers import make_record
 
-from crawler import DatabaseDriver, DatabaseStorage, RetryStrategy, StorageError
+from crawler import DatabaseDriver, DatabaseStorage, PostgresStorage, RetryStrategy, StorageError
 
 
 class RecordingDriver(DatabaseDriver):
@@ -184,6 +185,42 @@ class TestWriting:
 
         with pytest.raises(StorageError, match="failed to write 1 records: connection refused"):
             await storage.save(make_record())
+
+
+class TestPostgresWriteErrors:
+    @pytest.mark.parametrize(
+        "error",
+        [
+            asyncpg.DiskFullError("could not extend file"),
+            asyncpg.OutOfMemoryError("out of memory"),
+            asyncpg.QueryCanceledError("canceling statement due to statement timeout"),
+            asyncpg.AdminShutdownError("terminating connection due to administrator command"),
+            asyncpg.SerializationError("could not serialize access"),
+            asyncpg.ReadOnlySQLTransactionError("cannot execute INSERT in a read-only transaction"),
+        ],
+        ids=type,
+    )
+    async def test_batch_the_database_cannot_take_for_now_stays_in_the_buffer(self, error):
+        driver = RecordingDriver()
+        retries = RetryStrategy(max_retries=0, retry_on=PostgresStorage.WRITE_ERRORS)
+        storage = PostgresStorage("postgresql://crawler@localhost/crawler", batch_size=2, retry_strategy=retries)
+        storage._driver = driver
+        await storage.init_db()
+        settled = []
+
+        async def on_settled(urls: list[str]) -> None:
+            settled.extend(urls)
+
+        storage.on_settled = on_settled
+        driver.failures = [error]
+
+        await storage.save(make_record("a"))
+        with pytest.raises(StorageError):
+            await storage.save(make_record("b"))
+
+        assert (storage.pending, storage.written, settled) == (2, 0, [])
+        await storage.flush()
+        assert (storage.pending, storage.written, settled) == (0, 2, ["a", "b"])
 
 
 class TestReading:

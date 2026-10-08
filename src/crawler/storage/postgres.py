@@ -48,16 +48,20 @@ class PostgresStorage(DatabaseStorage):
 
     `dsn` is a connection URL: "postgresql://user:password@host:5432/database".
     See `DatabaseStorage`. A write is retried when the server cannot be
-    reached, drops the connection, has no free connections or picks the
-    transaction as the victim of a deadlock.
+    reached or drops the connection; runs out of disk, memory or free
+    connections; cancels the query (`statement_timeout`) or shuts down;
+    rolls the transaction back over a deadlock or a serialization failure;
+    or accepts only reads, as a standby after a failover does. Such a
+    batch stays in the buffer instead of being dropped.
     """
 
     WRITE_ERRORS = (
         OSError,
         asyncpg.PostgresConnectionError,
-        asyncpg.CannotConnectNowError,
-        asyncpg.TooManyConnectionsError,
-        asyncpg.DeadlockDetectedError,
+        asyncpg.InsufficientResourcesError,
+        asyncpg.OperatorInterventionError,
+        asyncpg.TransactionRollbackError,
+        asyncpg.ReadOnlySQLTransactionError,
     )
 
     def __init__(
