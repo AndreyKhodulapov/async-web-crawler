@@ -190,6 +190,7 @@ class TestOutOfRotation:
             raised.value.message == "no proxy available: all 3 proxies are out of rotation, the first is back in 30.0s"
         )
         assert raised.value.url == PAGE
+        assert raised.value.seconds == 30.0
 
     def test_a_pool_of_one_names_its_proxy(self, clock):
         pool = ProxyPool(["http://user:secret@proxy:3128"], max_failures=1, clock=clock)

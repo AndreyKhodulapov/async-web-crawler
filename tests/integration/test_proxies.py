@@ -22,6 +22,7 @@ from crawler import (
     NetworkError,
     NoProxyError,
     Proxy,
+    ProxyError,
     ProxyNetworkError,
     ProxyPool,
     ProxyStats,
@@ -180,27 +181,30 @@ async def test_a_proxy_out_of_rotation_waits_for_its_cooldown(url, make_proxy):
     assert len(proxy.requests) == 3
 
 
-async def test_the_crawl_ends_when_every_proxy_is_out(url, site):
+async def test_the_crawl_ends_when_the_proxies_never_come_back(url, site, caplog):
+    # Each page waits for the proxies to come back as many times as for a host held back, then fails.
     site.robots = "User-agent: *\nAllow: /\n"
-    pool = ProxyPool([dead_proxy(), dead_proxy()], max_failures=1)
+    pool = ProxyPool([dead_proxy(), dead_proxy()], max_failures=1, cooldown=0.05)
     retries = {"retry_strategy": RetryStrategy(max_retries=3, base_delay=0.01)}
+    caplog.set_level(logging.INFO, logger="crawler.crawl_run")
     async with AsyncCrawler(**UNTHROTTLED | BREAKER | retries | {"respect_robots": True}, proxies=pool) as crawler:
         await crawler.crawl([url("/site/"), url("/site/a.html")], max_pages=10)
         failed = dict(crawler.failed_urls)
         circuit = crawler.circuit_breaker.state("127.0.0.1")
-        with pytest.raises(NoProxyError):
+        with pytest.raises(ProxyError):
             await crawler.robots.fetch_robots(url("/"))
         with pytest.raises(LookupError):  # no answer of the site: nothing is cached
             crawler.robots.unreachable_reason(url("/"))
 
     assert set(failed) == {url("/site/"), url("/site/a.html")}
     assert {reason.split(":")[0] for reason in failed.values()} <= {"ProxyNetworkError", "NoProxyError"}
+    assert caplog.text.count(f"Deferred {url('/site/')} for ") == AsyncCrawler.MAX_WAITS_PER_PAGE
     assert circuit is CircuitState.CLOSED
 
 
 async def test_sitemaps_of_robots_txt_are_given_up_when_every_proxy_is_out(url, site):
     site.robots = f"Sitemap: {url('/sitemaps/pages.xml')}\nUser-agent: *\nAllow: /\n"
-    pool = ProxyPool([dead_proxy()], max_failures=1)
+    pool = ProxyPool([dead_proxy()], max_failures=1, cooldown=0.01)
     async with AsyncCrawler(**UNTHROTTLED | {"respect_robots": True}, proxies=pool) as crawler:
         pages = await crawler.crawl([url("/site/")], max_pages=5, robots_sitemaps=True)
         failed = dict(crawler.failed_urls)

@@ -70,7 +70,7 @@ def test_http_error_subclass_keeps_its_own_kind():
         (RobotsUnreachableError(URL, "robots.txt is unreachable (HTTP 503)"), None),
         (UnexpectedError(URL, "KeyError: 'x'"), None),
         (ProxyNetworkError(URL, "cannot connect to the proxy"), NetworkError),
-        (NoProxyError(URL, "no proxy available"), None),
+        (NoProxyError(URL, "no proxy available", seconds=60.0), None),
         (HostHeldBackError(URL, "site is held back for 5.0s", seconds=5.0), None),
         (RenderError(URL, "the browser crashed"), None),
         (RenderTimeoutError(URL, "rendering timeout (30.0s)"), TransientError),
@@ -92,7 +92,7 @@ def test_errors_have_one_kind_at_most(error, kind):
         (UnexpectedError(URL, "KeyError: 'x'"), "other"),
         (CrawlerClosedError(URL, "crawler is closed"), "other"),
         (ProxyNetworkError(URL, "cannot connect to the proxy"), "NetworkError"),
-        (NoProxyError(URL, "no proxy available"), "other"),
+        (NoProxyError(URL, "no proxy available", seconds=60.0), "other"),
         (RenderError(URL, "the browser crashed"), "other"),
         (RenderTimeoutError(URL, "rendering timeout (30.0s)"), "TransientError"),
         (KeyError("x"), "other"),
@@ -102,6 +102,8 @@ def test_error_kind(error, kind):
     assert error_kind(error) == kind
 
 
-@pytest.mark.parametrize("error_type", [ProxyNetworkError, NoProxyError])
-def test_errors_of_proxies_share_a_base(error_type):
-    assert isinstance(error_type(URL, "proxy failed"), ProxyError)
+@pytest.mark.parametrize(
+    "error", [ProxyNetworkError(URL, "proxy failed"), NoProxyError(URL, "no proxy available", seconds=60.0)]
+)
+def test_errors_of_proxies_share_a_base(error):
+    assert isinstance(error, ProxyError)

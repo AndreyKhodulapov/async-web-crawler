@@ -160,8 +160,8 @@ leaves a failing site alone.
   failed request is retried through another proxy at once. There is no
   half-open probe: the next request after the cooldown is the probe, and
   one failure takes the proxy out again. When every proxy is out, a
-  request fails at once without being sent, rather than waiting for one
-  to come back.
+  request fails at once without being sent, and a page of a crawl waits
+  for the first proxy to come back, a few times at most.
 - **Retries under a breaker**: a request counts once, however many attempts
   it takes. Its first failure counts at once, so a dead host opens its
   circuit after a few pages, not after their retries; a failed retry adds

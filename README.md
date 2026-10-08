@@ -37,7 +37,8 @@ configuration file, by command-line options, or from Python.
 - **Proxies**: http and https proxies with a password, a site kept on one
   proxy or the proxies taking turns per request, `HTTP_PROXY` and
   `NO_PROXY` of the environment; a proxy that keeps failing is taken out
-  of rotation for a while without blocking the sites behind it; requests
+  of rotation for a while without blocking the sites behind it, and the
+  pages wait while every proxy is out; requests
   and failures per proxy in the summary and the reports, passwords hidden
 - **JavaScript rendering** in a headless Chromium (Playwright):
   every HTML page or those matching patterns, waiting for an event or a

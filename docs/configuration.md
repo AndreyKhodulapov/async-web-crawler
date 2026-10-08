@@ -249,11 +249,12 @@ failures in a row it is out of rotation for `cooldown` seconds, and the
 requests go through the other proxies; any response through it clears
 the count. Once back, one more failure takes it out again. The request
 that failed is retried through the next proxy at once, and with
-`per_host` its host stays on that proxy. When every proxy is out, a page
-fails at once with "no proxy available" and is not retried, and the crawl
-ends instead of waiting. A proxy that answers, whatever the site says
+`per_host` its host stays on that proxy. When every proxy is out, a
+request is not sent ("no proxy available") and not retried; its page is
+put off until the first proxy is back, at most three times, then fails,
+so proxies that never come back still end the crawl. A proxy that answers, whatever the site says
 through it, is up: a 404, a 503 or a refused CONNECT (the proxy cannot or
-may not reach the site) count against the site, and so does a timeout,
+may not reach the site) count against the site, and so does a read timeout,
 since the proxy and the site cannot be told apart then.
 
 `from_env` reads the variables once, when the crawler is made, in either

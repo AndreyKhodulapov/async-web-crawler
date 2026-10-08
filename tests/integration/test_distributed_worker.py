@@ -13,6 +13,7 @@ from helpers import (
     UNTHROTTLED,
     DatabaseLink,
     MemoryStorage,
+    dead_proxy,
     drop_frontier_tables,
     make_config,
     urlset,
@@ -684,6 +685,25 @@ async def test_page_put_back_after_its_redirect_follows_it_again_with_the_next_w
 
     assert await state_of(start) == "processed"
     assert site.hits[target] == 2
+    assert await job_state() == "finished"
+
+
+async def test_page_no_proxy_is_left_for_goes_back_to_the_queue_for_any_worker(url, site):
+    # The proxies of a worker are its own: the next one, without them, crawls the page.
+    page = url("/site/")
+    job = make_config(urls=[page], crawler={"max_depth": 0}, retry={"max_retries": 1, "base_delay": 0.01})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    async def put_off() -> bool:
+        (row,) = await fetch("SELECT state, waits FROM frontier WHERE url = $1", page)
+        return (row["state"], row["waits"]) == ("queued", 1)
+
+    proxy = {"urls": [dead_proxy()], "max_failures": 1, "cooldown": 0.5}
+    await run_worker_until(worker_config(proxy=proxy), put_off)
+    await run_worker(worker_config(), "test", worker="next", configure_logging=False)
+
+    assert site.hits["/site/"] == 1
+    assert await state_of(page) == "processed"
     assert await job_state() == "finished"
 
 

@@ -140,10 +140,12 @@ class AsyncCrawler:
     a request fails it with `ProxyNetworkError`, a network error that is
     retried, through another proxy at once; when every proxy is out of
     rotation, requests fail with `NoProxyError` without being sent, and
-    are not retried. The circuit breaker counts neither: a dead proxy
-    must not block the sites behind it. robots.txt that cannot be
-    downloaded for this reason is not cached as unreachable: the page
-    fails with the error of the proxy. `proxy_stats()` counts the
+    are not retried; a page of `crawl()` is put off until the first proxy
+    is back, at most `MAX_WAITS_PER_PAGE` times. The circuit breaker
+    counts neither: a dead proxy must not block the sites behind it.
+    robots.txt that cannot be downloaded for this reason is not cached as
+    unreachable: the page fails with the error of the proxy, or waits for
+    a proxy. `proxy_stats()` counts the
     requests and failures of every proxy; the proxies out of rotation
     stay out from one `crawl()` to the next.
 

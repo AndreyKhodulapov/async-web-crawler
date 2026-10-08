@@ -235,7 +235,7 @@ class ProxyPool:
                 f"no proxy available: all {len(candidates)} proxies are out of rotation,"
                 f" the first is back in {back_in:.1f}s"
             )
-        raise NoProxyError(url, message)
+        raise NoProxyError(url, message, seconds=back_in)
 
     def record(self, proxy: Proxy, url: str, error: FetchError | None) -> None:
         """How a request to `url` through `proxy` went.

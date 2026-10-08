@@ -16,6 +16,7 @@ from crawler.exceptions import (
     FrontierError,
     HostHeldBackError,
     HTTPStatusError,
+    NoProxyError,
     ParseError,
     PermanentError,
     ProxyError,
@@ -110,6 +111,7 @@ class CrawlRun:
         self._scope_synced = 0  # hosts of Frontier.scope_hosts() the filter has
         self._failed_sitemaps: dict[str, str] = {}
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
+        self._proxies_back_at = 0.0  # time.monotonic() at which a proxy is back after all of them were out
         # In a shared frontier: the failures of a host this process told it of, and the counts of the crawl it answered.
         self._failures_told: dict[str, HostFailures] = {}
         self._crawl_failures: dict[str, HostFailures] = {}
@@ -467,6 +469,9 @@ class CrawlRun:
                             await frontier.finish(page, Outcome.UNREACHABLE, reason)
                     elif isinstance(refusal, CircuitOpenError):
                         await self._defer_or_fail(page, refusal)
+                    elif isinstance(refusal, NoProxyError):
+                        if not await self._wait_for_proxy(page, refusal, uncount=False):
+                            await self._fail_page(page, refusal)
                     else:
                         await self._fail_page(page, refusal)
                     continue
@@ -526,6 +531,8 @@ class CrawlRun:
             requested = sent or refusal is not result.error
             if not await self._defer_or_fail(page, refusal, result, counted=True, requested=requested):
                 await self._forget_redirects(url, targets)
+            return
+        if isinstance(result.error, NoProxyError) and await self._wait_for_proxy(page, result.error, uncount=True):
             return
         if self._outwaits_retries(result.error) and await self._wait_for_host(page, result.error):
             return
@@ -1060,6 +1067,25 @@ class CrawlRun:
         # The request was answered, but not with the page: it is not a page requested.
         await self._put_off_for_host(page, error.url, delay, error.message, uncount=True, waited=True)
         self._warn_once_held_back(error.url, delay)
+        return True
+
+    async def _wait_for_proxy(self, page: FrontierPage, error: NoProxyError, *, uncount: bool) -> bool:
+        """Put off a page that no proxy was left for, until the first one is back.
+
+        The request was not sent: with `uncount`, the page is uncounted
+        from the limits. The proxies are those of this process: in a
+        frontier shared by several processes the page goes back to the
+        queue for any of them, and its host is not held back. Proxies that
+        never come back end the crawl: once a page has waited
+        `MAX_WAITS_PER_PAGE` times, False is returned and the caller fails it.
+        """
+        if self._frontier.waits(page) >= self.MAX_WAITS_PER_PAGE:
+            return False
+        now = time.monotonic()
+        if now >= self._proxies_back_at:
+            logger.warning("Pages are put off until a proxy is back: %s", error.message)
+        self._proxies_back_at = now + error.seconds
+        await self._put_off_page(page, error.seconds, error.message, uncount=uncount, waited=True)
         return True
 
     def _circuit_refusal(self, result: FetchResult) -> CircuitOpenError | None:

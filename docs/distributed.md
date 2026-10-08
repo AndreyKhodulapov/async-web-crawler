@@ -83,7 +83,9 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
   has its own circuit breaker, and each slows a host down after the 429
   it gets. A host gets a few more requests than from
   one process; sharing them would cost a database round trip at every
-  request.
+  request. The proxies are each worker's too: a page none of them was
+  left for goes back to the queue for any worker, without holding its
+  host back.
 
 ## Failures
 

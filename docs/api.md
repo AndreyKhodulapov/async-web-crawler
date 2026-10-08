@@ -448,7 +448,7 @@ takes it out again. A request through a proxy fails with:
 | Error | When | Retried |
 |-------|------|---------|
 | `ProxyNetworkError` (a `ProxyError` and a `NetworkError`) | the proxy cannot be reached, its name does not resolve, the TLS of an `https://` proxy fails, the connection to it (for an `https://` URL, with its answer to CONNECT) takes longer than the connect timeout, or it answers HTTP 407 to CONNECT or to the request of an `http://` URL (inside the tunnel of an `https://` URL the site answers) | yes, through the next proxy at once; with `per_host` the host stays on that proxy |
-| `NoProxyError` (a `ProxyError`) | every proxy for the URL is out of rotation: the request is not sent; the message says when the first is back | no |
+| `NoProxyError` (a `ProxyError`) | every proxy for the URL is out of rotation: the request is not sent; the message says when the first is back, and `seconds` how long until then | no; `crawl()` puts the page off until then, at most `MAX_WAITS_PER_PAGE` times, then fails it |
 | `NetworkError` | the proxy answered CONNECT with another status: it cannot or may not reach the site | yes, as any network error of the site |
 | `FetchTimeoutError` | a read or total timeout: the proxy and the site cannot be told apart | yes, as any timeout of the site |
 
@@ -457,7 +457,8 @@ and the proxy is up. The circuit breaker counts no `ProxyError`: a dead
 proxy does not open the circuits of healthy sites. A download of robots.txt
 that a proxy failed is retried through the other proxies as the request
 of a page is; one that fails with a `ProxyError` all the same is not
-cached: the page fails with the error of the proxy. `error_stats()` counts these errors under their own classes,
+cached: the page fails with the error of the proxy, or waits for a proxy
+with `NoProxyError`. `error_stats()` counts these errors under their own classes,
 `ProxyNetworkError` as a `NetworkError`.
 
 The rate limit, robots.txt, Crawl-delay, `max_per_domain` and the circuit

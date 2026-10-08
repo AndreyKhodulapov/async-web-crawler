@@ -2748,6 +2748,41 @@ class TestProxies:
         assert fake_session.requested == ["http://a/"]
         assert crawler.error_stats().retries == 1
 
+    async def test_pages_no_proxy_is_left_for_wait_until_one_is_back(self, make_crawler, fake_session, caplog):
+        crawler = make_crawler(
+            proxies=ProxyPool(["http://proxy:3128"], max_failures=1, cooldown=0.05),
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+            max_concurrent=1,
+        )
+        fake_session.routes["http://a/1"] = [
+            aiohttp.ClientProxyConnectionError(MagicMock(), ConnectionRefusedError("connection refused")),
+            FakeResponse(),
+        ]
+        with caplog.at_level(logging.WARNING):
+            pages = await crawler.crawl(["http://a/1", "http://a/2"])
+
+        # /2 is taken while the proxy is out, and is put off too, sent once it is back.
+        assert set(pages) == {"http://a/1", "http://a/2"}
+        assert Counter(fake_session.requested) == {"http://a/1": 2, "http://a/2": 1}
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        prefix = "Pages are put off until a proxy is back: no proxy available: http://proxy:3128 is out of rotation"
+        assert len([message for message in warnings if message.startswith(prefix)]) == 1
+
+    async def test_page_fails_once_it_has_waited_for_proxies_that_never_come_back(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            proxies=ProxyPool(["http://proxy:3128"], max_failures=1, cooldown=0.01),
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+        )
+        fake_session.routes["http://a/"] = aiohttp.ClientProxyConnectionError(
+            MagicMock(), ConnectionRefusedError("connection refused")
+        )
+        pages = await crawler.crawl(["http://a/"])
+
+        assert pages == {}
+        # Each time it is taken, the proxy back from its cooldown fails once more and is out again.
+        assert fake_session.requested == ["http://a/"] * (1 + AsyncCrawler.MAX_WAITS_PER_PAGE)
+        assert crawler.failed_urls["http://a/"].startswith("NoProxyError: no proxy available")
+
     async def test_a_crawl_counts_the_proxies_anew(self, make_proxied, fake_session):
         crawler = make_proxied("http://proxy-1:3128", "http://proxy-2:3128")
         fake_session.routes["http://a/"] = aiohttp.ClientProxyConnectionError(

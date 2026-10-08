@@ -83,8 +83,9 @@ requests through other addresses and sees the pages JavaScript builds.
     a site sees all of them.
 - **A proxy has its own health**, like a circuit breaker per proxy: after
   N failures in a row it is out for a cooldown, and the request is
-  retried through another one at once. All out: fail the pages at once
-  and end the crawl instead of waiting.
+  retried through another one at once. All out: put the pages off until
+  the first proxy is back, a few times at most, so that proxies that
+  never come back still end the crawl.
 - **Blame the right party.** A dead proxy must not open the circuits of
   the sites behind it, so a proxy error is not the site's. Only what is
   surely the proxy's counts against it: cannot connect, its name does not

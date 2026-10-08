@@ -162,7 +162,14 @@ class ProxyNetworkError(ProxyError, NetworkError):
 
 
 class NoProxyError(ProxyError):
-    """Every proxy for the URL is out of rotation: the request was not sent."""
+    """Every proxy for the URL is out of rotation: the request was not sent.
+
+    `seconds` is how long until the first of them is back.
+    """
+
+    def __init__(self, url: str, message: str, *, seconds: float) -> None:
+        super().__init__(url, message)
+        self.seconds = seconds
 
 
 class RenderError(FetchError):

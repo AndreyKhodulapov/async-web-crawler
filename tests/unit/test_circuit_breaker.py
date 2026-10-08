@@ -109,7 +109,7 @@ class TestClosed:
     def test_errors_of_proxies_count_neither_way(self, breaker):
         # A dead proxy must not block the sites behind it.
         proxy_failed = ProxyNetworkError(URL, "cannot connect to the proxy")
-        request(breaker, *[proxy_failed, NoProxyError(URL, "no proxy available")] * 3)
+        request(breaker, *[proxy_failed, NoProxyError(URL, "no proxy available", seconds=60.0)] * 3)
         assert breaker.state("a.test") is CircuitState.CLOSED
         assert breaker.get_stats()["a.test"] == CircuitStats(state="closed")
 

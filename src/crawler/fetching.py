@@ -20,6 +20,7 @@ from crawler.exceptions import (
     HostHeldBackError,
     HTTPStatusError,
     InvalidURLError,
+    NoProxyError,
     ProxyError,
     ProxyNetworkError,
     RenderTimeoutError,
@@ -382,8 +383,10 @@ class Fetcher:
             return None  # an invalid URL fails in the transport with InvalidURLError
         try:
             allowed = await self.robots.is_allowed(url, self._user_agent, wait=wait)
+        # Raised for the robots.txt URL; the page is refused for the same reason under its own.
+        except NoProxyError as error:
+            return NoProxyError(url, error.message, seconds=error.seconds)
         except (CrawlerClosedError, CircuitOpenError, ProxyError) as error:
-            # Raised for the robots.txt URL; the page fails for the same reason under its own.
             return type(error)(url, error.message)
         except TimeoutError:
             return RobotsUnreachableError(url, "robots.txt is being downloaded")
