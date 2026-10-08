@@ -1356,7 +1356,8 @@ class SharedMemoryFrontier(MemoryFrontier):
     is held comes back when the hold ends, as a frontier in a database
     hands it out. It counts the failures of hosts in `failures`, as other
     processes would have too, keeps what it was told in `told` (host,
-    circuit openings, robots.txt failures, robots.txt read), the hosts
+    circuit openings, robots.txt failures, robots.txt read) and how far
+    apart failures are to count in `apart` (circuit, robots.txt), the hosts
     given up in `given_up_hosts` (host, outcome, reason, error) and the
     intervals of hosts in `intervals`.
     """
@@ -1369,6 +1370,7 @@ class SharedMemoryFrontier(MemoryFrontier):
         self.put_backs: list[tuple[str, bool, bool]] = []
         self.failures: dict[str, HostFailures] = {}
         self.told: list[tuple[str, int, int, bool]] = []
+        self.apart: list[tuple[float, float]] = []
         self.given_up_hosts: list[tuple[str, PageOutcome, str, str | None]] = []
         self.intervals: list[tuple[str, float]] = []
         self._held_until: dict[str, float] = {}
@@ -1377,9 +1379,17 @@ class SharedMemoryFrontier(MemoryFrontier):
         self.intervals.append((host, seconds))
 
     async def count_host_failures(
-        self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
+        self,
+        host: str,
+        *,
+        circuit_openings: int = 0,
+        robots_failures: int = 0,
+        robots_read: bool = False,
+        circuit_apart: float = 0.0,
+        robots_apart: float = 0.0,
     ) -> HostFailures:
         self.told.append((host, circuit_openings, robots_failures, robots_read))
+        self.apart.append((circuit_apart, robots_apart))
         known = self.failures.get(host, HostFailures())
         self.failures[host] = HostFailures(
             known.circuit_openings + circuit_openings, (0 if robots_read else known.robots_failures) + robots_failures
@@ -1589,6 +1599,27 @@ class TestCrawlSharedFrontier:
         assert frontier.given_up_hosts == [("a", PageOutcome.FAILED, reason, "CircuitOpenError")]
         assert frontier.told == [("a", 1, 0, False)]
         assert set(crawler.failed_urls) == {"http://a/1", "http://a/2"}
+
+    async def test_failures_of_a_host_count_in_the_crawl_half_a_cooldown_or_a_robots_txt_retry_apart(
+        self, make_crawler, fake_session
+    ):
+        # Failures of other processes told sooner are the same failure.
+        crawler = make_crawler(
+            respect_robots=True,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.2),
+        )
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = [
+            FakeResponse(status=503),
+            FakeResponse(b"", content_type="text/plain"),
+        ]
+        frontier = SharedMemoryFrontier()
+
+        await crawler.crawl_frontier(frontier, ["http://a/1"])
+
+        assert frontier.told
+        assert set(frontier.apart) == {(0.1, 0.025)}
 
     async def test_crawl_of_one_process_tells_its_frontier_of_no_failure_of_a_host(
         self, make_crawler, fake_session, monkeypatch

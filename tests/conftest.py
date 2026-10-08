@@ -27,7 +27,8 @@ class SiteState:
     body of /robots.txt, served with `robots_status`; None means 404; the
     first `robots_failures` requests for it answer 503 whatever it is, or
     the first `robots_failures_by_host[host]` requests from the hosts named
-    there; `robots_hits` counts its requests by host.
+    there; `robots_hits` counts its requests by host. It answers after
+    `robots_latency` seconds.
     With `robots_endless`, comment lines follow the body for as long as
     the client reads them. `robots_by_host` gives other hosts of the server
     a robots.txt of their own.
@@ -49,6 +50,7 @@ class SiteState:
         self.robots_failures = 0
         self.robots_failures_by_host: dict[str, int] = {}
         self.robots_hits: Counter[str] = Counter()
+        self.robots_latency = 0.0
         self.robots_endless = False
         self.robots_by_host: dict[str, str] = {}
         self.sitemaps: dict[str, bytes] = {}
@@ -131,6 +133,7 @@ async def robots_txt(request: web.Request) -> web.StreamResponse:
     state.record(request)
     host = request.url.host or ""
     state.robots_hits[host] += 1
+    await asyncio.sleep(state.robots_latency)
     if state.robots_hits[host] <= state.robots_failures_by_host.get(host, state.robots_failures):
         raise web.HTTPServiceUnavailable()
     if request.url.host in state.robots_by_host:

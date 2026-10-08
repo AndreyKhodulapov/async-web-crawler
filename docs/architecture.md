@@ -288,8 +288,15 @@ run against it; what it adds is what sharing needs.
     one statement that adds them and returns the counts of the job; of
     the workers that fail at once, one sees a count reach
     `MAX_CIRCUIT_OPENINGS` or pass `MAX_ROBOTS_RETRIES`, and gives the
-    host up (`give_up_host`). A host name that does not resolve is given
-    up at its first failure. The queued pages of the host are finished
+    host up (`give_up_host`). Failures told within half a cooldown of the
+    circuit breaker, or half of `UNREACHABLE_TTL` for robots.txt, of the
+    last ones counted are not counted (`hosts.circuit_counted_at`,
+    `robots_counted_at`): a wave of workers that fail at once is one
+    failure. A circuit opens at most once per cooldown and robots.txt is
+    downloaded again at most once per `UNREACHABLE_TTL`, so the limits
+    keep the time a host fails in a local crawl; half, as the failures of
+    one worker reach the database a little more or less than that apart.
+    A host name that does not resolve is given up at its first failure. The queued pages of the host are finished
     in one statement, failed or unreachable with the reason; a page of it
     handed out later (put back, its lease expired, a link found since)
     comes with that outcome, whatever the hold, and is finished without a

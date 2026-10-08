@@ -76,7 +76,8 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
   move the host's next allowed time in the database; the pages of the
   host stay in the queue instead of being taken and put back. A host
   that keeps failing is given up for the job, by counts all workers add
-  to.
+  to. Failures several workers meet at once count as one: a host down for
+  a few seconds is not given up because many workers saw it.
 - **What is cheap to repeat stays in each worker**: robots.txt is
   downloaded and cached by every worker once per host, and each worker
   has its own circuit breaker. A host gets a few more requests than from

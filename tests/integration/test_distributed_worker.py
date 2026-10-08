@@ -543,6 +543,26 @@ async def test_failed_downloads_of_robots_txt_by_all_workers_give_its_host_up(ur
     assert await urls_in("processed") == set(other)
 
 
+async def test_robots_txt_that_fails_for_all_workers_at_once_counts_as_one_failure(url, site, monkeypatch):
+    # Four workers take the pages of 127.0.0.1 at once and each downloads
+    # its robots.txt, which answers 503 to all four: one failure of the
+    # site, not the four that would pass MAX_ROBOTS_RETRIES. The next
+    # downloads, 2 s later, read it.
+    monkeypatch.setattr(RobotsParser, "UNREACHABLE_TTL", 2.0)
+    site.robots, site.robots_failures_by_host, site.robots_latency = "", {"127.0.0.1": 4}, 1.0
+    pages = [url(f"/wide/{n}") for n in range(1, 9)]
+    job = make_config(urls=pages, crawler={"max_depth": 0, "respect_robots": True})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    await run_workers(worker_config(crawler={"max_concurrent": 2}), 4)
+
+    downloads = [moment for path, moment in site.log if path == "/robots.txt"]
+    assert downloads[3] - downloads[0] < 1.0
+    assert await given_up("127.0.0.1") == (None, None)
+    assert await urls_in("processed") == set(pages)
+    assert await job_state() == "finished"
+
+
 async def test_page_of_a_host_given_up_found_later_is_finished_without_a_request(url, site):
     await create_job(
         make_config(urls=[url("/wide/1", "localhost")], crawler={"max_depth": 0}), "test", dsn=POSTGRES_DSN

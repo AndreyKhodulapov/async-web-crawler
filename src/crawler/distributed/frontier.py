@@ -106,13 +106,37 @@ SET interval = greatest(h.interval, excluded.interval),
 
 # The failures of a host one worker saw, added to those of the job; with
 # $5, robots.txt was read since the failures counted, which start from
-# zero. The host may have no pages yet: the target of a redirect, say.
+# zero. Failures told less than $6 (circuit) or $7 (robots.txt) seconds
+# after the last ones counted are the same failure, seen by several
+# workers at once: they are not counted, and the moment stays. The host
+# may have no pages yet: the target of a redirect, say.
 _COUNT_FAILURES = """
-INSERT INTO hosts AS h (job, host, circuit_openings, robots_failures)
-VALUES ($1, $2, $3, $4)
+INSERT INTO hosts AS h (job, host, circuit_openings, robots_failures, circuit_counted_at, robots_counted_at)
+VALUES (
+    $1, $2, $3, $4,
+    CASE WHEN $3 > 0 THEN now() ELSE '-infinity' END,
+    CASE WHEN $4 > 0 THEN now() ELSE '-infinity' END
+)
 ON CONFLICT (job, host) DO UPDATE
-SET circuit_openings = h.circuit_openings + excluded.circuit_openings,
-    robots_failures = CASE WHEN $5::boolean THEN 0 ELSE h.robots_failures END + excluded.robots_failures
+SET circuit_openings = CASE
+        WHEN h.circuit_counted_at <= now() - make_interval(secs => $6) THEN h.circuit_openings + excluded.circuit_openings
+        ELSE h.circuit_openings
+    END,
+    circuit_counted_at = CASE
+        WHEN excluded.circuit_openings > 0 AND h.circuit_counted_at <= now() - make_interval(secs => $6) THEN now()
+        ELSE h.circuit_counted_at
+    END,
+    robots_failures = CASE
+        WHEN $5::boolean THEN excluded.robots_failures
+        WHEN h.robots_counted_at <= now() - make_interval(secs => $7) THEN h.robots_failures + excluded.robots_failures
+        ELSE h.robots_failures
+    END,
+    robots_counted_at = CASE
+        WHEN excluded.robots_failures > 0
+            AND ($5::boolean OR h.robots_counted_at <= now() - make_interval(secs => $7)) THEN now()
+        WHEN $5::boolean THEN '-infinity'
+        ELSE h.robots_counted_at
+    END
 RETURNING circuit_openings, robots_failures
 """
 
@@ -682,11 +706,25 @@ class PostgresFrontier(Frontier):
 
     @_database_operation
     async def count_host_failures(
-        self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
+        self,
+        host: str,
+        *,
+        circuit_openings: int = 0,
+        robots_failures: int = 0,
+        robots_read: bool = False,
+        circuit_apart: float = 0.0,
+        robots_apart: float = 0.0,
     ) -> HostFailures:
         # A statement of its own on the host alone, as in hold_host.
         row = await self._pool.fetchrow(
-            _COUNT_FAILURES, self.job_id, host, circuit_openings, robots_failures, robots_read
+            _COUNT_FAILURES,
+            self.job_id,
+            host,
+            circuit_openings,
+            robots_failures,
+            robots_read,
+            float(circuit_apart),
+            float(robots_apart),
         )
         return HostFailures(row["circuit_openings"], row["robots_failures"])
 

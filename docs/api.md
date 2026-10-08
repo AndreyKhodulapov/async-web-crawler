@@ -1020,7 +1020,12 @@ failed downloads of robots.txt toward `MAX_ROBOTS_RETRIES` (counted from zero
 again once a worker reads it). Each worker tells the frontier of its new
 failures (`Frontier.count_host_failures`, which returns the counts of the
 job); the one whose failure reaches the limit gives the host up
-(`Frontier.give_up_host`). Its queued pages are finished at once, failed or
+(`Frontier.give_up_host`). Failures told less than half a cooldown of the
+circuit breaker (robots.txt: half of `RobotsParser.UNREACHABLE_TTL`) after
+the last ones counted are not counted (`circuit_apart`, `robots_apart`):
+they are the same failure, seen by several workers at once. One process
+fails no more often than that, so the limits stay a time the host keeps
+failing, as in a local crawl, rather than a number of workers. Its queued pages are finished at once, failed or
 unreachable with the reason, and a page of it taken later says so
 (`Frontier.given_up`) and is finished without a request. Pages of the host
 other workers have in progress then cost at most one request each. A local

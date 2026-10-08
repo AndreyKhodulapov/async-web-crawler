@@ -285,14 +285,24 @@ class Frontier(ABC):
         """
 
     async def count_host_failures(
-        self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
+        self,
+        host: str,
+        *,
+        circuit_openings: int = 0,
+        robots_failures: int = 0,
+        robots_read: bool = False,
+        circuit_apart: float = 0.0,
+        robots_apart: float = 0.0,
     ) -> HostFailures:
         """Add the failures of `host` a process saw to those of the crawl; the counts of the crawl after it.
 
         `circuit_openings` counts the times its circuit opened anew,
         `robots_failures` the downloads of its robots.txt that failed anew;
         with `robots_read`, robots.txt was read since the failures told
-        before, and they are counted from zero. The counts are added in one
+        before, and they are counted from zero. Failures told less than
+        `circuit_apart` or `robots_apart` seconds after the last ones the
+        crawl counted are not counted: they are the same failure of the
+        host, seen by several processes at once. The counts are added in one
         step: of the processes that count failures of a host at once, one
         sees the count reach a limit, and gives the host up (see
         `give_up_host`). A frontier of one process

@@ -799,6 +799,15 @@ class CrawlRun:
         counts them from zero. With nothing new to tell, the counts are those
         the frontier answered last: the process whose failure brings a
         count to a limit is the one that gives the host up (see `_give_up_host`).
+
+        A circuit opens at most once per cooldown, and an unreachable
+        robots.txt is downloaded at most once per `UNREACHABLE_TTL`: in a
+        crawl of one process, the limits are a time the host keeps failing.
+        In a shared frontier, failures told within half of that of the last
+        ones counted are the same failure, seen by several processes at
+        once: a wave of them would otherwise give the host up in seconds.
+        Half, as the failures of one process, a full cooldown apart, reach
+        the frontier a little more or less than that apart.
         """
         host = get_host(url)
         assert host is not None  # the frontier holds valid URLs only
@@ -820,6 +829,8 @@ class CrawlRun:
             circuit_openings=here.circuit_openings - told.circuit_openings,
             robots_failures=here.robots_failures - (0 if read else told.robots_failures),
             robots_read=read,
+            circuit_apart=self.circuit_breaker.cooldown / 2,
+            robots_apart=0.0 if self.robots is None else self.robots.UNREACHABLE_TTL / 2,
         )
         self._crawl_failures[host] = failures
         return failures

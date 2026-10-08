@@ -818,6 +818,51 @@ class TestHostFailures:
         # The circuit openings stay.
         assert failures == HostFailures(1, 1)
 
+    async def test_failures_workers_tell_at_once_count_as_one(self, open_frontier):
+        workers = [await open_frontier(f"w{number}") for number in range(4)]
+        apart = {"circuit_apart": 60.0, "robots_apart": 60.0}
+
+        await asyncio.gather(
+            *(worker.count_host_failures("a", circuit_openings=1, robots_failures=1, **apart) for worker in workers)
+        )
+
+        assert await workers[0].count_host_failures("a", **apart) == HostFailures(1, 1)
+
+    async def test_failure_told_after_the_last_one_counted_is_counted_once_far_enough_apart(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.count_host_failures("a", circuit_openings=1, circuit_apart=0.3)
+
+        await asyncio.sleep(0.2)
+        # Within the time of the first: not counted, and the time stays.
+        assert await second.count_host_failures("a", circuit_openings=1, circuit_apart=0.3) == HostFailures(1, 0)
+        await asyncio.sleep(0.15)
+        assert await second.count_host_failures("a", circuit_openings=1, circuit_apart=0.3) == HostFailures(2, 0)
+
+    async def test_failures_of_each_kind_are_apart_on_their_own(self, open_frontier):
+        frontier = await open_frontier("first")
+        apart = {"circuit_apart": 60.0, "robots_apart": 60.0}
+        await frontier.count_host_failures("a", circuit_openings=1, **apart)
+
+        assert await frontier.count_host_failures("a", robots_failures=1, **apart) == HostFailures(1, 1)
+
+    async def test_robots_txt_read_counts_its_next_failure_whenever_it_comes(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.count_host_failures("a", robots_failures=1, robots_apart=60.0)
+
+        failures = await second.count_host_failures("a", robots_failures=1, robots_read=True, robots_apart=60.0)
+        assert failures == HostFailures(0, 1)
+        assert await first.count_host_failures("a", robots_failures=1, robots_apart=60.0) == HostFailures(0, 1)
+
+    async def test_table_of_hosts_made_before_the_moments_of_failures_gets_them(self, open_frontier):
+        first = await open_frontier("first")
+        await first.count_host_failures("a", circuit_openings=1)
+        await fetch("ALTER TABLE hosts DROP COLUMN circuit_counted_at, DROP COLUMN robots_counted_at")
+
+        second = await open_frontier("second")
+
+        assert await second.count_host_failures("a", circuit_openings=1, circuit_apart=60.0) == HostFailures(2, 0)
+        assert await second.count_host_failures("a", circuit_openings=1, circuit_apart=60.0) == HostFailures(2, 0)
+
     async def test_host_given_up_has_its_pages_queued_finished_and_the_job_may_end(self, open_frontier):
         first, second = await open_frontier("first"), await open_frontier("second")
         await first.seed(["http://a/1", "http://a/2", "http://a/3", "http://b/1"])
