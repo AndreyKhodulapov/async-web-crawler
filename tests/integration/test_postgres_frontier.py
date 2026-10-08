@@ -12,6 +12,7 @@ import itertools
 import logging
 import random
 import time
+import types
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import asyncpg
@@ -552,6 +553,63 @@ class TestLease:
         (job,) = await fetch("SELECT requested FROM crawl_jobs")
         (host,) = await fetch("SELECT requested FROM hosts")
         assert (job["requested"], host["requested"]) == (0, 0)
+
+    @staticmethod
+    def answer_put_back_late(
+        frontier: PostgresFrontier,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        before: Callable[[], Awaitable[None]] | None = None,
+        after: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Make `put_back` of `frontier` await `before` ahead of the database and `after` once it queued the page, unanswered."""
+        pool = frontier._pool
+
+        async def fetchrow(query: str, *parameters: object) -> asyncpg.Record:
+            put_back = "frontier_put_back" in query
+            if put_back and before is not None:
+                await before()
+            row = await pool.fetchrow(query, *parameters)
+            if put_back and after is not None:
+                await after()
+            return row
+
+        monkeypatch.setattr(frontier, "_pool", types.SimpleNamespace(acquire=pool.acquire, fetchrow=fetchrow))
+
+    async def test_page_put_back_is_taken_by_another_task_before_the_answer_comes(self, open_frontier, monkeypatch):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+        page = await take(frontier)
+        taken = []
+
+        async def take_meanwhile() -> None:
+            taken.append(await asyncio.wait_for(frontier.take(), 2))
+
+        self.answer_put_back_late(frontier, monkeypatch, after=take_meanwhile)
+        await frontier.put_back(page, uncount=True)
+
+        assert taken == [page]
+        assert frontier.in_progress(page)
+        await frontier.finish(page, Outcome.PROCESSED)
+        assert await asyncio.wait_for(frontier.take(), 2) is None
+        assert (await row_of(page.url))["state"] == "processed"
+
+    async def test_task_waiting_while_a_page_is_put_back_keeps_waiting_for_it(self, open_frontier, monkeypatch):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+        page = await take(frontier)
+        other_task = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0.1)
+
+        async def look_meanwhile() -> None:
+            # Let go, not yet queued: the other task looks a few times.
+            await asyncio.sleep(0.1)
+            assert not other_task.done()
+
+        self.answer_put_back_late(frontier, monkeypatch, before=look_meanwhile)
+        await frontier.put_back(page, uncount=True)
+
+        assert await asyncio.wait_for(other_task, 2) == page
 
 
 class TestWaits:

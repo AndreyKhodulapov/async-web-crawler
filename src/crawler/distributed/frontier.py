@@ -345,6 +345,7 @@ class PostgresFrontier(Frontier):
         self._held: dict[str, int] = {}  # pages taken and not finished, with their waits
         self._given_up: dict[str, GivenUp] = {}  # pages held whose host is given up
         self._counted: set[str] = set()  # pages held and counted toward the limits
+        self._putting_back = 0  # pages let go whose put_back the database has not answered yet
         # Set by an operation of this frontier, then replaced: each `take`
         # waits for the one it saw before it looked, which no other clears.
         self._wakeup = asyncio.Event()
@@ -555,6 +556,11 @@ class PostgresFrontier(Frontier):
     async def put_back(self, page: FrontierPage, delay: float = 0.0, *, uncount: bool, waited: bool = False) -> None:
         self._check_held(page)
         uncount = uncount and page.url in self._counted
+        # Let go before it is queued: another task of this worker may take
+        # it once the database queues it, before the answer comes here.
+        # Still held then, it would be left to this task, which is done with it.
+        self._release(page)
+        self._putting_back += 1
         try:
             row = await self._pool.fetchrow(
                 "SELECT * FROM frontier_put_back($1, $2, $3, $4, $5, $6)",
@@ -566,7 +572,7 @@ class PostgresFrontier(Frontier):
                 waited,
             )
         finally:
-            self._release(page)
+            self._putting_back -= 1
         self._left(page, row, uncount)
 
     @_database_operation
@@ -936,7 +942,7 @@ class PostgresFrontier(Frontier):
             return due if state["others_counted"] else None
         if state["ready"]:
             return _RETRY_DELAY
-        if state["queued"] or self._held or state["others_busy"]:
+        if state["queued"] or self._held or self._putting_back or state["others_busy"]:
             return due
         return None
 

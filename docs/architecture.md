@@ -149,6 +149,10 @@ run against it; what it adds is what sharing needs.
   row per URL does. A lease that expired while the worker was slow, not
   gone, may come back to that worker through another of its tasks: the
   page is left to the task that crawls it, not crawled a second time.
+  So a task lets go of a page it puts back before the database queues
+  it: another task of the worker may take it before the answer comes,
+  and would otherwise leave it to the first one, done with it, while
+  the heartbeat kept it leased for good.
 - **The target of a redirect is seen from its page.** A redirect marks
   its target seen, so that a link to it is not crawled a second time,
   and the row keeps the page it was seen from (`frontier.seen_from`). A
