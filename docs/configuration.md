@@ -179,9 +179,11 @@ required so that a cookie never goes to a host it is not for:
 `example.com` is that host only, `.example.com` the host and its subdomains,
 as in a `cookies.txt` file. The cookies of `cookies_file` come first, those
 of `cookies` win over them. A cookie of an expired date in the file is left
-out; one without a date lasts for the crawl. aiohttp keeps no cookies of IP
-addresses, so a cookie for `127.0.0.1` is an error here and is left out of
-the file with a warning: reach such a site by its name, e.g. `localhost`.
+out; one without a date lasts for the crawl. A date past the year 9999 is
+read as milliseconds, as some exporters write it. aiohttp keeps no cookies
+of IP addresses, so a cookie for `127.0.0.1` is an error here and is left
+out of the file with a warning: reach such a site by its name, e.g.
+`localhost`.
 
 ```yaml
 session:

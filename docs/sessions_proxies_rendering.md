@@ -32,6 +32,11 @@ requests through other addresses and sees the pages JavaScript builds.
   browser, export its cookies** to a Netscape `cookies.txt` (browser
   extensions and `curl -c` write it) and give the file to the crawler.
   Save the cookies after the crawl: the site may have renewed the session.
+- Some exporters write the expiry dates in milliseconds. Read as seconds,
+  such a date is tens of thousands of years away: an expired cookie would
+  look alive, and neither aiohttp nor Chromium takes the date. No date in
+  seconds is past the year 9999 and a date after 1978 in milliseconds
+  always is, so the file is read by that.
 - Do not follow the logout link: the crawl would end its own session.
 - A session tied to the browser (its User-Agent, its address) may end
   when the crawler rotates User-Agents or proxies.

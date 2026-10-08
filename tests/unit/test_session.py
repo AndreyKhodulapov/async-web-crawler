@@ -59,6 +59,38 @@ class TestLoad:
         assert [cookie.name for cookie in cookies] == ["curl_session", "python_session"]
         assert all(cookie.expires is None and cookie.discard for cookie in cookies)
 
+    def test_expiry_dates_in_milliseconds_are_read_as_seconds(self, tmp_path, caplog):
+        later = int(time.time()) + 3600
+        path = cookies_file(
+            tmp_path / "cookies.txt",
+            line("example.com", "in_milliseconds", "1", expires=str(later * 1000)),
+            line("example.com", "in_seconds", "2", expires=str(later)),
+            line("example.com", "expired", "3", expires="1700000000000"),
+        )
+
+        with caplog.at_level(logging.INFO, logger="crawler.session"):
+            cookies = load_cookies_file(path)
+
+        assert [(cookie.name, cookie.expires) for cookie in cookies] == [
+            ("in_milliseconds", later),
+            ("in_seconds", later),
+        ]
+        assert "Read the expiry dates of 2 cookies" in caplog.text
+
+    def test_cookie_whose_expiry_date_is_out_of_range_is_left_out_and_logged(self, tmp_path, caplog):
+        path = cookies_file(
+            tmp_path / "cookies.txt",
+            line("example.com", "far", "secret-1", expires=str(10**17)),
+            line("example.com", "ok", "2"),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="crawler.session"):
+            cookies = load_cookies_file(path)
+
+        assert [cookie.name for cookie in cookies] == ["ok"]
+        assert "'far' of example.com" in caplog.text and "expiry date" in caplog.text
+        assert "secret" not in caplog.text
+
     def test_cookies_that_cannot_be_sent_are_left_out_and_logged(self, tmp_path, caplog):
         path = cookies_file(
             tmp_path / "cookies.txt",
@@ -246,6 +278,13 @@ class TestCookieJar:
 
         assert summary(exported) == summary(cookies)
         assert [cookie.expires for cookie in sorted(exported, key=lambda cookie: cookie.name)] == [later, None]
+
+    async def test_added_cookie_dated_past_max_time_is_kept_until_max_time(self):
+        jar = CookieJar()
+        jar.add([make_cookie("sid", "1", "example.com", expires=10**17)])
+
+        assert sent(jar, "http://example.com/") == {"sid": "1"}
+        assert [cookie.expires for cookie in jar.export()] == [CookieJar.MAX_TIME]
 
     async def test_removed_cookies_go_by_domain_path_and_name(self):
         jar = CookieJar()

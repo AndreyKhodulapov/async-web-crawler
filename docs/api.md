@@ -378,7 +378,7 @@ async with AsyncCrawler(cookies=cookies, headers={"Accept-Language": "en"}) as c
 | `AsyncCrawler(keep_cookies=False)` | no cookies sent or kept (aiohttp's `DummyCookieJar`); with `cookies` it is a `ValueError` |
 | `export_cookies()` | the cookies the crawler keeps, those sites set included, as `http.cookiejar.Cookie`; also after `close()`. A cookie is for its host only if aiohttp sends it so: a cookie set without `Domain`, until the host sets it again with one |
 | `make_cookie(name, value, domain, path=, secure=, expires=, http_only=)` | a cookie; `example.com` is that host only, `.example.com` also its subdomains |
-| `load_cookies_file(path)` | the cookies of a Netscape `cookies.txt` file; expired ones are left out, session ones kept, those the crawler cannot send (of an IP address, with an invalid name) left out with a warning. A malformed file raises `ValueError` whose message does not quote it |
+| `load_cookies_file(path)` | the cookies of a Netscape `cookies.txt` file; expired ones are left out, session ones kept, those the crawler cannot send (of an IP address, with an invalid name, with an expiry date out of range) left out with a warning. An expiry date past the year 9999 is read as milliseconds, which some exporters write. A malformed file raises `ValueError` whose message does not quote it |
 | `save_cookies_file(cookies, path)` | writes a `cookies.txt` file with mode `0600`, session cookies included; an existing file is replaced whole, so it gets that mode too |
 
 The `cookies.txt` format is read and written by `http.cookiejar`, never with
