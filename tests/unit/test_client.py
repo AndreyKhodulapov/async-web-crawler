@@ -1992,7 +1992,7 @@ class TestCrawlStorage:
 
     @staticmethod
     def recording_frontier(monkeypatch) -> list[tuple[str, ...]]:
-        """The pages the crawl finishes as processed, and those it reports saved, in order."""
+        """The pages the crawl finishes as processed, and those it reports saved or dropped, in order."""
         events: list[tuple[str, ...]] = []
 
         class Recording(MemoryFrontier):
@@ -2003,6 +2003,9 @@ class TestCrawlStorage:
 
             async def saved(self, urls):
                 events.append(("saved", *urls))
+
+            async def dropped(self, urls):
+                events.append(("dropped", *urls))
 
         monkeypatch.setattr("crawler.client.MemoryFrontier", Recording)
         return events
@@ -2024,6 +2027,22 @@ class TestCrawlStorage:
         ]
         # The storage reports to the frontier of its crawl only.
         assert storage.on_settled is None
+
+    async def test_page_whose_record_is_dropped_is_reported_dropped(self, make_crawler, fake_session, monkeypatch):
+        events = self.recording_frontier(monkeypatch)
+        storage = MemoryStorage(batch_size=2, refused={"http://a/2"})
+        crawler = make_crawler(storage=storage, max_concurrent=1, max_depth=1)
+        fake_session.routes["http://a/1"] = FakeResponse(b'<a href="http://a/2">2</a>')
+
+        await crawler.crawl(["http://a/1"])
+
+        assert events == [
+            ("pending save", "http://a/1"),
+            ("pending save", "http://a/2"),
+            ("saved", "http://a/1"),
+            ("dropped", "http://a/2"),
+        ]
+        assert storage.on_dropped is None
 
     async def test_without_a_storage_pages_are_processed_at_once(self, make_crawler, fake_session, monkeypatch):
         events = self.recording_frontier(monkeypatch)

@@ -414,13 +414,16 @@ class TestCooldown:
 class TestSettled:
     @staticmethod
     def listened(storage: DataStorage) -> list[list[str]]:
-        """The URLs `on_settled` is called with, a list per call."""
+        """The URLs `on_settled` is called with, a list per call, and those of `on_dropped` marked "dropped"."""
         calls: list[list[str]] = []
 
         async def on_settled(urls: list[str]) -> None:
             calls.append(urls)
 
-        storage.on_settled = on_settled
+        async def on_dropped(urls: list[str]) -> None:
+            calls.append(["dropped", *urls])
+
+        storage.on_settled, storage.on_dropped = on_settled, on_dropped
         return calls
 
     async def test_urls_of_a_written_batch_are_reported(self):
@@ -444,7 +447,7 @@ class TestSettled:
 
         assert calls == [["a", "b"]]
 
-    async def test_records_dropped_are_reported_with_those_written(self):
+    async def test_records_dropped_are_reported_apart_from_those_written(self):
         names = [f"page-{number}" for number in range(4)]
         storage = MemoryStorage(batch_size=4, refused={"page-1"})
         calls = self.listened(storage)
@@ -452,8 +455,8 @@ class TestSettled:
         with pytest.raises(ValueError):
             await save_pages(storage, *names)
 
-        # Written one by one: each is settled once written or dropped.
-        assert calls == [[name] for name in names]
+        # Written one by one: each is reported once written or dropped.
+        assert calls == [["page-0"], ["dropped", "page-1"], ["page-2"], ["page-3"]]
 
     async def test_batch_of_one_record_dropped_is_reported(self):
         storage = MemoryStorage(batch_size=1, refused={"a"})
@@ -462,7 +465,7 @@ class TestSettled:
         with pytest.raises(ValueError):
             await save_pages(storage, "a")
 
-        assert calls == [["a"]]
+        assert calls == [["dropped", "a"]]
 
     async def test_records_lost_at_close_are_not_reported(self):
         storage = MemoryStorage(batch_size=2, failures=[OSError("disk full")] * 4)
@@ -486,3 +489,16 @@ class TestSettled:
 
         assert storage.urls == [["a"], ["b"]]
         assert "Failed to report 1 records settled by MemoryStorage" in caplog.text
+
+    async def test_error_of_the_listener_of_drops_is_logged(self, caplog):
+        storage = MemoryStorage(batch_size=1, refused={"a"})
+
+        async def on_dropped(urls: list[str]) -> None:
+            raise RuntimeError("frontier is down")
+
+        storage.on_dropped = on_dropped
+        with caplog.at_level(logging.ERROR, logger="crawler.storage"), pytest.raises(ValueError):
+            await save_pages(storage, "a")
+
+        assert storage.pending == 0
+        assert "Failed to report 1 records dropped by MemoryStorage" in caplog.text

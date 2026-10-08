@@ -54,12 +54,13 @@ class DataStorage(ABC):
     `WRITE_ERRORS` the exceptions its writes fail with; `_open_storage`
     does what the first write would otherwise do to open the storage.
 
-    `on_settled`, if set, is called with the URLs of the records settled:
-    written, or dropped as ones no write can take. A crawl uses it to mark
-    its pages done once they are stored. Records that stay in the buffer
-    after a failed write are reported once a later write takes them, and
-    those lost when `close` cannot write them are not reported. An error
-    of `on_settled` is logged and does not fail the write.
+    `on_settled`, if set, is called with the URLs of the records written,
+    and `on_dropped` with those dropped as ones no write can take. A crawl
+    uses them to mark its pages done once they are stored, and failed once
+    they cannot be. Records that stay in the buffer after a failed write
+    are reported once a later write takes them, and those lost when
+    `close` cannot write them are not reported. An error of either
+    callback is logged and does not fail the write.
     """
 
     WRITE_ERRORS: ClassVar[tuple[type[Exception], ...]] = (OSError,)
@@ -88,6 +89,7 @@ class DataStorage(ABC):
         self._closed = False
         self._written = 0
         self.on_settled: Callable[[list[str]], Awaitable[None]] | None = None
+        self.on_dropped: Callable[[list[str]], Awaitable[None]] | None = None
 
     @property
     def pending(self) -> int:
@@ -207,7 +209,7 @@ class DataStorage(ABC):
             if len(batch) == 1:
                 self._buffer = []
                 self._log_dropped(batch[0], error)
-                await self._settle(batch)
+                await self._settle(batch, dropped=True)
                 raise
             await self._write_one_by_one(error)
             return
@@ -248,6 +250,7 @@ class DataStorage(ABC):
         first_error: Exception | None = None
         while self._buffer:
             record = self._buffer[0]
+            dropped = False
             try:
                 await self._write_with_retries([record])
             except self.WRITE_ERRORS as error:
@@ -255,26 +258,33 @@ class DataStorage(ABC):
             except Exception as error:  # noqa: BLE001 - raised once the other records are written
                 self._log_dropped(record, error)
                 first_error = first_error or error
+                dropped = True
             else:
                 self._written += 1
             # Gone from the buffer as soon as it is written or dropped, so
             # that a cancelled flush does not write it twice.
             self._buffer = self._buffer[1:]
-            await self._settle([record])
+            await self._settle([record], dropped=dropped)
         self._paused_until = 0.0
         self._failing = False
         if first_error is not None:
             raise first_error
         logger.warning("%s wrote its records one by one: none of them failed on its own", type(self).__name__)
 
-    async def _settle(self, records: Sequence[PageRecord]) -> None:
-        """Report the records written or dropped to `on_settled`; its error is logged, not raised."""
-        if self.on_settled is None:
+    async def _settle(self, records: Sequence[PageRecord], *, dropped: bool = False) -> None:
+        """Report the records written to `on_settled`, or those dropped to `on_dropped`; an error is logged, not raised."""
+        report = self.on_dropped if dropped else self.on_settled
+        if report is None:
             return
         try:
-            await self.on_settled([record["url"] for record in records])
+            await report([record["url"] for record in records])
         except Exception:
-            logger.exception("Failed to report %d records settled by %s", len(records), type(self).__name__)
+            logger.exception(
+                "Failed to report %d records %s by %s",
+                len(records),
+                "dropped" if dropped else "settled",
+                type(self).__name__,
+            )
 
     def _log_dropped(self, record: PageRecord, error: Exception) -> None:
         logger.error("Dropped the record of %s: %s cannot write it: %s", record["url"], type(self).__name__, error)

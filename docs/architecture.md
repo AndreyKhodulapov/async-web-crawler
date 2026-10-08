@@ -81,11 +81,14 @@ listed in the [API reference](api.md#internals).
     batches, so a page processed may wait in its buffer: a process that
     stops then leaves it done in a shared queue with no record, and the
     next run never fetches it again. The crawl finishes such a page with
-    `pending_save`; the storage reports the records it has written (or
-    dropped as ones no write can take) through `on_settled`, and the
-    crawl passes them on to `Frontier.saved`. Until then the database
-    frontier keeps the page leased, and hands it out again if the lease
-    runs out. The storage knows nothing of the frontier: a callback of
+    `pending_save`; the storage reports the records it has written
+    through `on_settled`, and those it dropped as ones no write can take
+    through `on_dropped`; the crawl passes them on to `Frontier.saved`
+    and `Frontier.dropped`. Until then the database frontier keeps the
+    page leased, and hands it out again if the lease runs out. A page
+    whose record is dropped fails: counted processed, it would stand for
+    a record the job does not have, and left `saving`, the heartbeat
+    would renew its lease and keep the job from finishing. The storage knows nothing of the frontier: a callback of
     URLs is all it offers, so any storage works, not only a table in the
     same database as the queue.
 

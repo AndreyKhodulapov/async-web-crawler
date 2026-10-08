@@ -640,6 +640,29 @@ class TestPendingSave:
 
         assert (await row_of(page.url))[:2] == ("saving", "saving")
 
+    async def test_page_whose_record_is_dropped_fails_and_lets_the_job_finish(self, open_frontier):
+        saving, other = await open_frontier("saving"), await open_frontier("other")
+        await saving.seed(["http://site/"])
+        page = await take(saving)
+        await saving.finish(page, Outcome.PROCESSED, pending_save=True, status=200)
+
+        await saving.dropped([page.url])
+
+        (row,) = await fetch("SELECT state, error, status, lease_until FROM frontier WHERE url = $1", page.url)
+        assert tuple(row) == ("failed", "RecordDropped", 200, None)
+        assert await other.take() is None
+        assert await job_state() == "finished"
+
+    async def test_dropped_fails_only_the_pages_of_its_worker(self, open_frontier):
+        saving, other = await open_frontier("saving"), await open_frontier("other")
+        await saving.seed(["http://site/"])
+        page = await take(saving)
+        await saving.finish(page, Outcome.PROCESSED, pending_save=True)
+
+        await other.dropped([page.url])
+
+        assert (await row_of(page.url))["state"] == "saving"
+
 
 class TestHosts:
     async def test_host_interval_holds_for_all_workers_together(self, open_frontier):

@@ -161,9 +161,11 @@ class CrawlRun:
         self._crawl_started, self._crawl_finished = time.perf_counter(), None
         self.stats.start()
         if self.storage is not None:
-            # A page saved is done in the frontier once its record is written;
-            # other processes that wait for it are not kept waiting by the buffer.
+            # A page saved is done in the frontier once its record is written,
+            # and failed once it is dropped; other processes that wait for it
+            # are not kept waiting by the buffer.
             self.storage.on_settled = self._frontier.saved
+            self.storage.on_dropped = self._frontier.dropped
             self._frontier.on_waiting = self._flush_storage
         if self._frontier.shared:
             # A host held back by this process is held back by the others
@@ -199,6 +201,7 @@ class CrawlRun:
         finally:
             if self.storage is not None:
                 self.storage.on_settled = None
+                self.storage.on_dropped = None
                 self._frontier.on_waiting = None
             if self._frontier.shared:
                 self._fetcher.on_host_held = None

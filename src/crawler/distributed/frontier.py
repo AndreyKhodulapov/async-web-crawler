@@ -222,10 +222,11 @@ class PostgresFrontier(Frontier):
     worker stopped, is queued again and uncounted, and fails once it has
     expired `max_attempts` times: at least once, not exactly once. A page
     processed with `pending_save` is `saving`, leased all the same, until
-    `saved`. A host has one page taken every `host_interval` seconds, or
-    its own interval from `set_host_interval` if that is longer,
-    whichever worker takes it, and none while it is held back by
-    `hold_host`. The failures of a host count over the whole job; a host
+    `saved`, or `dropped`: failed then, with the error `RecordDropped`.
+    A host has one page taken every `host_interval` seconds, or its own
+    interval from `set_host_interval` if that is longer, whichever worker
+    takes it, and none while it is held back by `hold_host`. The failures
+    of a host count over the whole job; a host
     given up has its pages finished, those queued at once and the others
     by the worker that takes them. Once nothing is left to hand out and no page
     is in progress, the job is finished; so it is once max_pages pages are
@@ -553,6 +554,21 @@ class PostgresFrontier(Frontier):
         async with self._rows_lock:
             await self._pool.execute(
                 "UPDATE frontier SET state = 'processed', lease_until = NULL"
+                " WHERE job = $1 AND worker = $2 AND state = 'saving' AND url = ANY($3::text[])",
+                self.job_id,
+                self.worker,
+                urls,
+            )
+
+    @_database_operation
+    async def dropped(self, urls: Iterable[str]) -> None:
+        urls = list(urls)
+        if not urls:
+            return
+        async with self._rows_lock:
+            await self._pool.execute(
+                "UPDATE frontier SET state = 'failed', reason = 'its record could not be stored',"
+                " error = 'RecordDropped', lease_until = NULL"
                 " WHERE job = $1 AND worker = $2 AND state = 'saving' AND url = ANY($3::text[])",
                 self.job_id,
                 self.worker,

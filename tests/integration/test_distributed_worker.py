@@ -732,6 +732,23 @@ async def test_worker_whose_storage_cannot_write_takes_no_pages_until_it_can(url
     assert await job_state() == "finished"
 
 
+async def test_page_whose_record_no_write_takes_fails_in_the_job_and_the_job_finishes(url, site, monkeypatch):
+    await create_job(make_config(urls=[url("/wide/0")]), "test", dsn=POSTGRES_DSN)
+    refused = url("/wide/7")
+    storage = MemoryStorage(batch_size=5, refused={refused})
+    monkeypatch.setattr(StorageOptions, "build", lambda self: storage)
+
+    async with asyncio.timeout(10):
+        await run_workers(worker_config(), 1)
+
+    saved = {page for batch in storage.urls for page in batch}
+    assert len(saved) == WIDE_PAGES - 1
+    assert saved == await urls_in("processed")
+    assert await urls_in("failed") == {refused}
+    assert (await job_stats(POSTGRES_DSN, "test"))["errors"] == {"RecordDropped": 1}
+    assert await job_state() == "finished"
+
+
 async def test_worker_whose_database_is_gone_stops_and_the_others_crawl_its_pages(url, site, tmp_path, caplog):
     # The first worker reaches the database through a link cut once it has crawled a few pages.
     caplog.set_level(logging.WARNING, logger="crawler")
