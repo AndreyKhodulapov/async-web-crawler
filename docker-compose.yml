@@ -70,7 +70,11 @@ services:
     command: ["worker", "--job", "${CRAWLER_JOB:-books}", "--config", "/config/worker.yaml"]
     # A worker the database failed (exit code 1) starts again and takes up
     # the job; the pages it had in progress come back once their leases expire.
-    restart: on-failure:5
+    # No limit: Docker waits up to a minute between the starts, so a restart of
+    # PostgreSQL is ridden out. A worker that ends with its job (exit code 0)
+    # or is stopped is not started again; one with a wrong configuration
+    # (exit code 2) is, every minute, until it is fixed.
+    restart: on-failure
     depends_on:
       postgres:
         condition: service_healthy

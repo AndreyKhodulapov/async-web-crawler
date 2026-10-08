@@ -172,8 +172,8 @@ docker compose run --rm job report --job books --report out/report.html
 The crawler services are started by their names only: `docker compose
 up -d --wait` starts PostgreSQL alone, for the tests. The workers log
 JSON Lines; `docker compose stop worker` puts their pages back in the
-queue, and a worker the database failed is started again (up to 5
-times). The job is made once: to crawl it anew, `docker compose run --rm
+queue, and a worker the database failed is started again until the
+database is back (one with a wrong configuration too, every minute). The job is made once: to crawl it anew, `docker compose run --rm
 job job create --config /config/job.yaml --name books --restart`.
 `CRAWLER_JOB` names another job; `CRAWLER_TARGET=js` builds and runs the
 image with Chromium, which the workers of a job that renders its pages

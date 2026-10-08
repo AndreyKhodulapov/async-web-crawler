@@ -101,7 +101,12 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
 - **The database fails**: the worker stops with exit code 1 rather than
   trying to ride out the outage (crash-only design). Its leases bring
   its pages back, and starting it again is the job of whatever runs it: a
-  restart policy, a Kubernetes Job.
+  restart policy, a Kubernetes Job. The compose file restarts it on any
+  failure with no limit: Docker doubles the pause between the starts up
+  to a minute, so an outage of minutes is ridden out, and a worker that
+  starts on a finished job takes nothing and exits with 0. The price: a
+  wrong configuration (exit code 2) is retried every minute too, seen in
+  `docker compose ps` and the logs.
 - **The job is restarted under its workers** (`job create --restart`):
   each worker of the old job stops the same way, exit code 1, once the
   database tells it the job is gone. It writes what its storage buffers
