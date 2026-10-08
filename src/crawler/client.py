@@ -90,9 +90,9 @@ class AsyncCrawler:
       was too long to retry comes back once the host may be asked again.
     - A host whose requests keep failing is left alone for a while, as
       `circuit_breaker` says: by default once half of at least 5 requests
-      in a minute have failed with a transient or network error, its
-      requests fail with `CircuitOpenError` for 30 seconds without being
-      sent (see `CircuitBreaker`). A request counts once in the window of
+      in a minute have failed with a transient or network error (HTTP 429
+      aside: the host is up), its requests fail with `CircuitOpenError`
+      for 30 seconds without being sent (see `CircuitBreaker`). A request counts once in the window of
       the breaker, however many attempts it took: a page made good by a
       retry is a success of the host. A retry the breaker would refuse is
       not made: the request fails with the error of its last attempt.

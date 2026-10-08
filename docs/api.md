@@ -212,10 +212,13 @@ once with `CircuitOpenError`: they are not sent, not retried and not
 counted in `error_stats()`. After that one request goes through as a probe
 (half-open): its success closes the circuit, its failure opens it again.
 
-Failures are timeouts, network errors, HTTP 408, 429 and any 5xx, even
+Failures are timeouts, network errors, HTTP 408 and any 5xx, even
 one that is not retried, such as 501; any other response, a 404 too, is a
-success, so broken links do not block a site. A request counts once,
-however many attempts it takes, robots.txt downloads included: its first
+success, so broken links do not block a site. HTTP 429 counts neither way:
+the site is up and asks for fewer requests, which the pause before the
+retry gives it; a probe answered with 429 lets the next request probe.
+A request counts once, however many attempts it takes, robots.txt
+downloads included: its first
 failure counts at once, so a host that goes down is spotted after its
 first failed requests; a failed retry adds nothing; a retry that
 succeeds turns the failure into a success. So one broken URL retried
@@ -250,7 +253,8 @@ In a crawl, a page the breaker refuses is not failed: it is put off until
 the circuit may let a probe through, or for a second while the probe is in
 flight, and the workers go on with other pages meanwhile. So is a page
 whose request was sent and failed while the circuit opened, on its own
-failure or on those of the other requests in flight: the breaker refused
+failure or on those of the other requests in flight (with HTTP 429 too,
+though the breaker does not count it): the breaker refused
 the retries it would have had, so it is requested again when the host may
 be probed, instead of being the page lost to the outage. The probe is
 such a retry: a page whose probe failed is failed with its own error and

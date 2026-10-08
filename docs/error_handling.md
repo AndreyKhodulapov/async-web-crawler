@@ -142,9 +142,12 @@ leaves a failing site alone.
   one failed request out of one is not a broken site. Hystrix used a rolling
   percentage; resilience4j offers count-based and time-based windows.
 - **What counts as a failure**: only what says the host is in trouble, i.e.
-  timeouts, network errors, 429 and any 5xx, even a 501 that is not
+  timeouts, network errors and any 5xx, even a 501 that is not
   retried. A 404 is a healthy server answering; counting it would block a
-  site for its broken links.
+  site for its broken links. So is a 429: the site is up and asks for fewer
+  requests. Blocking it would give it none for a cooldown and then the
+  same burst again, and the third time the host would be given up; slowing
+  down is for the rate limiter.
 - **Per host**: one dead site must not stop the crawl of the others, and a
   host that is down fails all of its pages, so a circuit per URL learns too late.
 - **Keep the errors of proxies out of it.** A dead proxy would otherwise

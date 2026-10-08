@@ -1072,16 +1072,18 @@ class CrawlRun:
         about the host. The probe of the host, though, is the retry the
         breaker gave the page: a page whose probe failed fails with its error.
         So does a page with a `PermanentError`, such as HTTP 501: it would
-        have had no retries.
+        have had no retries. HTTP 429 is not a failure to the breaker, but
+        it speaks for the host as much and would have been retried.
         """
         error = result.error
         if isinstance(error, CircuitOpenError):
             return error
         breaker = self.circuit_breaker
+        too_many_requests = isinstance(error, HTTPStatusError) and error.status == 429
         if (
             error is None
             or isinstance(error, PermanentError)
-            or not breaker.is_failure(error)
+            or not (breaker.is_failure(error) or too_many_requests)
             or breaker.opened_by_probe(error.url)
         ):
             return None

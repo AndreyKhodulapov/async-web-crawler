@@ -26,7 +26,7 @@ politeness options:
 | `--no-robots` | off | do not check robots.txt; `errors` and `save` do not check it unless given `--robots` |
 | `--retries` | 2 (0 for `benchmark`, 3 for `errors` and `save`) | retries of timeouts, network errors, 408, 429, 500, 502-504 and 520-524 |
 | `--retry-delay` | 1 (0.2 for `errors` and `save`) | seconds before the first retry, doubled for every next one up to 30 s, see [Retries](api.md#retries) |
-| `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 408, 429 or 5xx |
+| `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 408 or 5xx |
 | `--breaker-cooldown` | 30 (1 for `errors` and `save`) | seconds a blocked host is left alone before a probe request |
 | `--no-breaker` | off | never block a host |
 | `--user-agent` | `AsyncWebCrawler/0.1 (+repo URL)` | repeat to rotate several; all must share the bot name |

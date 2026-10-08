@@ -26,6 +26,7 @@ TIMEOUT = FetchTimeoutError(URL, "timed out")
 REFUSED = NetworkError(URL, "connection refused")
 NOT_FOUND = HTTPStatusError(URL, 404, "Not Found")
 BAD_CERTIFICATE = CertificateError(URL, "certificate verify failed")
+TOO_MANY_REQUESTS = HTTPStatusError(URL, 429, "Too Many Requests")
 
 
 @pytest.fixture
@@ -72,7 +73,7 @@ class TestClosed:
         request(breaker, TIMEOUT)
         assert breaker.state("a.test") is CircuitState.OPEN
 
-    @pytest.mark.parametrize("status", [408, 429, 500, 503, 522])
+    @pytest.mark.parametrize("status", [408, 500, 503, 522])
     def test_transient_http_errors_are_failures(self, breaker, status):
         request(breaker, *[HTTPStatusError(URL, status, "Error")] * 4)
         assert breaker.state("a.test") is CircuitState.OPEN
@@ -98,6 +99,12 @@ class TestClosed:
         request(breaker, *[RenderTimeoutError(URL, "rendering timeout (30.0s)")] * 6)
         assert breaker.state("a.test") is CircuitState.CLOSED
         assert breaker.get_stats()["a.test"] == CircuitStats(state="closed")
+
+    def test_too_many_requests_count_neither_way(self, breaker):
+        # The host is up and asks for fewer requests: it is slowed down, not blocked.
+        request(breaker, *[TOO_MANY_REQUESTS] * 6, TIMEOUT)
+        assert breaker.state("a.test") is CircuitState.CLOSED
+        assert breaker.get_stats()["a.test"] == CircuitStats(state="closed", requests=1, failures=1)
 
     def test_errors_of_proxies_count_neither_way(self, breaker):
         # A dead proxy must not block the sites behind it.
@@ -271,6 +278,12 @@ class TestHalfOpen:
         request(half_open, None)
         assert half_open.state("a.test") is CircuitState.CLOSED
 
+    def test_probe_answered_with_too_many_requests_lets_another_request_probe(self, half_open):
+        request(half_open, TOO_MANY_REQUESTS)
+        assert half_open.state("a.test") is CircuitState.HALF_OPEN
+        request(half_open, None)
+        assert half_open.state("a.test") is CircuitState.CLOSED
+
     def test_probe_is_taken_on_entry(self, half_open):
         with half_open.call(URL) as probe:
             with pytest.raises(CircuitOpenError, match="half-open"):
@@ -395,8 +408,9 @@ def test_is_failure_says_what_counts_against_a_host(error, failure):
         BAD_CERTIFICATE,
         ProxyNetworkError(URL, "cannot connect to the proxy"),
         RenderTimeoutError(URL, "rendering timeout (30.0s)"),
+        TOO_MANY_REQUESTS,
     ],
-    ids=["success", "certificate", "proxy", "rendering"],
+    ids=["success", "certificate", "proxy", "rendering", "429"],
 )
 def test_what_counts_neither_way_is_not_a_failure(outcome):
     assert CircuitBreaker.is_failure(outcome) is False

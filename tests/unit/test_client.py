@@ -1136,6 +1136,50 @@ class TestCrawlBlockedHost:
         assert len(fake_session.requested) == 6
         assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
 
+    async def test_host_that_answers_too_many_requests_is_not_given_up(self, make_crawler, fake_session):
+        # The host asks for fewer requests: its 429s pause it, but do not
+        # block it, and every page comes through on a retry.
+        crawler = make_crawler(
+            max_concurrent=4,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(failure_threshold=0.5, min_requests=2, cooldown=0.05),
+        )
+        pages = [f"http://a/{page}" for page in range(8)]
+        for page in pages:
+            fake_session.routes[page] = [FakeResponse(status=429), FakeResponse(status=429), FakeResponse()]
+        fake_session.latency = 0.01
+
+        await crawler.crawl(pages)
+
+        assert crawler.failed_urls == {}
+        assert set(crawler.processed_urls) == set(pages)
+        assert crawler.circuit_breaker.times_opened("a") == 0
+
+    async def test_page_answered_with_too_many_requests_while_the_circuit_opens_is_put_off(
+        self, make_crawler, fake_session
+    ):
+        # The 503s of a/0 and a/1 open the circuit, and the breaker refuses
+        # the retry a/2 would have had for its 429: the page is put off
+        # with the others, not lost to the outage.
+        crawler = make_crawler(
+            max_concurrent=3,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=0.05),
+        )
+        pages = ["http://a/0", "http://a/1", "http://a/2"]
+        fake_session.routes["http://a/0"] = [FakeResponse(status=503), FakeResponse()]
+        fake_session.routes["http://a/1"] = [FakeResponse(status=503), FakeResponse()]
+        fake_session.routes["http://a/2"] = [FakeResponse(status=429), FakeResponse()]
+        fake_session.latency = 0.01
+
+        await crawler.crawl(pages)
+
+        assert crawler.failed_urls == {}
+        assert set(crawler.processed_urls) == set(pages)
+        assert crawler.circuit_breaker.times_opened("a") == 1
+
     async def test_page_whose_probe_fails_is_not_put_off_again(self, make_crawler, fake_session):
         # One page of a healthy host answers 500 every time, and opens the
         # circuit. Put off again after its probe failed, it would probe the
