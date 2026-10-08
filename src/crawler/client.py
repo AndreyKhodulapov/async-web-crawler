@@ -164,12 +164,13 @@ class AsyncCrawler:
     the filters of `crawl()` and `MAX_REDIRECTS` apply to it. A page the
     browser takes longer than `rendering.timeout` to render fails with
     `RenderTimeoutError`, a timeout that is retried and not held against
-    the host; one it cannot render (not installed, crashed) with
-    `RenderError`, which is not retried. The circuit breaker counts
-    neither. robots.txt and sitemaps are never rendered.
-    The browser starts with the first page to render and is closed by
-    `close()`. `render_stats()` counts the pages rendered and failed, and
-    the time the browser took for them.
+    the host; one that crashes the browser with `RenderError`, which is
+    not retried. The circuit breaker counts neither. robots.txt and
+    sitemaps are never rendered. The browser starts with the first page
+    to render and is closed by `close()`; once it is given up (it crashed
+    again or is not installed), pages are taken as downloaded.
+    `render_stats()` counts the pages rendered, failed and taken as
+    downloaded, and the time the browser took for them.
 
     `error_stats()` counts the errors of page requests and their retries
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not

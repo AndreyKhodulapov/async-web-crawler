@@ -308,8 +308,8 @@ class AdvancedCrawler:
 
         With proxies, `proxies` too: label (the URL with the password
         hidden) -> `state`, `requests`, `failures` and `times_removed`, see
-        `ProxyStats`. With rendering, `rendering` too: `rendered`, `failed`
-        and `avg_render_time`, see `RenderStats`.
+        `ProxyStats`. With rendering, `rendering` too: `rendered`, `failed`,
+        `unrendered` and `avg_render_time`, see `RenderStats`.
         """
         stats = self.crawler.stats.get_stats()
         if self.crawler.proxies is not None:

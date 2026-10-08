@@ -10,11 +10,13 @@ import contextlib
 import importlib.util
 import logging
 import os
+import re
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from http.cookiejar import HTTPONLY_ATTR, Cookie
 from typing import TYPE_CHECKING, Any, NamedTuple
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -27,7 +29,7 @@ from crawler.session import cookie_domain_problem, cookie_name_problem, cookie_v
 from crawler.transport import Response, Transport
 
 if TYPE_CHECKING:
-    from playwright.async_api import Browser, BrowserContext, Page, Playwright, Request, Route
+    from playwright.async_api import Browser, BrowserContext, Page, Playwright, Request, Route, WebSocketRoute
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +70,9 @@ class Rendering:
       `WAIT_STATES`: "load", "domcontentloaded" or "networkidle" (no
       request for half a second).
     - `wait_for`: a CSS selector to wait for after that, if any.
-    - `timeout`: seconds the browser has for a page, the waits included;
-      the download of the page itself has the timeouts of the crawler.
+    - `timeout`: seconds the browser has for a page, the waits and the
+      reading of its HTML included; the download of the page itself has
+      the timeouts of the crawler.
     - `max_open_pages`: pages rendered at once; each is a browser tab of
       50 to 100 MB.
     - `block_resources`: the types of requests the browser does not make
@@ -340,19 +343,21 @@ class BrowserTransport:
     before every page, and they get those the page set (by JavaScript or
     in the responses to its requests) after it, see `CookieSync`. With
     `keep_cookies=False` nothing goes between them, and each page has a
-    browser of its own. The requests of the browser carry `user_agent`
-    and the `headers`, and go through the proxy the document of their
-    page came through (`Response.proxy`), or directly if it came so; the
-    hosts `no_proxy` names (as the NO_PROXY variable does) are reached
-    directly. They are not requests of the crawler: their failures are
-    neither those of the proxy nor of the site.
+    browser of its own. The requests of the browser carry `user_agent`,
+    those to the origin of their page the `headers` too, and go through
+    the proxy the document of their page came through (`Response.proxy`),
+    or directly if it came so; the hosts `no_proxy` names (as the
+    NO_PROXY variable does) are reached directly. They are not requests
+    of the crawler: their failures are neither those of the proxy nor of
+    the site.
 
     A rendered page keeps the status, the headers and the final URL of
     its download; its content is the HTML of the page once rendered,
     which fails with `PageTooLargeError` over `max_page_size` bytes. A
     page that takes the browser longer than `rendering.timeout` fails
-    with `RenderTimeoutError`; a browser that is not installed, cannot
-    start or crashes fails it with `RenderError` (see `Renderer`).
+    with `RenderTimeoutError`; a browser that crashes fails it with
+    `RenderError`. Once the browser is given up (see `Renderer`), a page
+    comes back as it was downloaded.
     """
 
     def __init__(
@@ -396,6 +401,8 @@ class BrowserTransport:
         if not is_html_content_type(response.content_type) or not self.rendering.renders(url):
             return response
         rendered = await self.renderer.render(url, response)
+        if rendered is None:
+            return response
         if rendered.location is not None:
             logger.info("%s went to %s in the browser", url, rendered.location)
             return Response(
@@ -435,14 +442,19 @@ class BrowserTransport:
 
 
 class _LaunchError(Exception):
-    """The browser could not start; the message says why, for every page that needed it."""
+    """The browser could not start; the message says why."""
+
+
+class _GivenUp(Exception):
+    """The browser is not started any more: it crashed `Renderer.MAX_LAUNCHES` times or could not start."""
 
 
 class _Tab:
     """A page in the browser: the document it is to get, and where it went on its own."""
 
-    def __init__(self, document: Response) -> None:
+    def __init__(self, url: str, document: Response) -> None:
         self.document = document
+        self.origin = _origin(url)
         self.served = False
         self.crashed = False
         self.navigated: asyncio.Future[str] = asyncio.get_running_loop().create_future()
@@ -459,20 +471,22 @@ class Renderer:
     transport of the crawler, around every page (see `CookieSync`), and
     so go from one context to the others. Without `cookies`, each page
     has a context of its own, closed after it: nothing goes from one page
-    to the next. The requests of the browser carry the `user_agent` and
-    the `headers` of the crawler; the hosts of `no_proxy` (see
-    `bypass_rules`) are reached without a proxy. Every request of a page
-    goes through `_route`: the page gets its document as downloaded, its
-    own navigations are stopped and reported, frames and pop-ups get
-    nothing, and the `block_resources` are not requested.
+    to the next. The requests of the browser carry the `user_agent` of
+    the crawler, and those to the origin of their page its `headers` too;
+    the hosts of `no_proxy` (see `bypass_rules`) are reached without a
+    proxy. Every request of a page goes through `_route`: the
+    page gets its document as downloaded, its own navigations are
+    stopped and reported, frames and pop-ups get nothing, and the
+    `block_resources` are not requested (web sockets are closed).
 
     A browser that crashes fails the pages being rendered with
-    `RenderError` and is started again for the next one, once: after
-    that, and after a browser that could not start, every page fails
-    with `RenderError` at once.
+    `RenderError` and is started again for the next one, once. After
+    that, and after a browser that could not start, the browser is given
+    up: `render` returns None for every page at once, for the caller to
+    take the page as it was downloaded.
 
-    `stats()` counts the pages rendered and failed, and the time the
-    browser took for them, see `RenderStats`.
+    `stats()` counts the pages rendered, failed and not rendered, and the
+    time the browser took for them, see `RenderStats`.
     """
 
     MAX_LAUNCHES = 2
@@ -489,6 +503,7 @@ class Renderer:
         self.rendering = rendering
         self._user_agent = user_agent
         self._headers = dict(headers or {})
+        self._header_names = {name.lower() for name in self._headers}
         self._cookies = cookies
         self._bypass = bypass_rules(no_proxy)
         self._pages = asyncio.Semaphore(rendering.max_open_pages)
@@ -499,18 +514,20 @@ class Renderer:
         self._contexts: dict[str | None, tuple[BrowserContext, CookieSync]] = {}
         self._tabs: dict[Page, _Tab] = {}
         self._launches = 0
-        self._failure: str | None = None  # why the browser is not used any more
+        self._given_up = False  # the browser could not start
         self._closed = False
         self.reset_stats()
 
     def stats(self) -> RenderStats:
         """The pages rendered since the stats were last reset."""
         average = self._render_time / self._rendered if self._rendered else 0.0
-        return RenderStats(rendered=self._rendered, failed=self._failed, avg_render_time=average)
+        return RenderStats(
+            rendered=self._rendered, failed=self._failed, unrendered=self._unrendered, avg_render_time=average
+        )
 
     def reset_stats(self) -> None:
         """Count the pages anew."""
-        self._rendered = self._failed = 0
+        self._rendered = self._failed = self._unrendered = 0
         self._render_time = 0.0
 
     @property
@@ -518,16 +535,21 @@ class Renderer:
         """Whether a browser is running."""
         return self._browser is not None and self._browser.is_connected()
 
-    async def render(self, url: str, document: Response) -> Rendered:
+    async def render(self, url: str, document: Response) -> Rendered | None:
         """Load `document`, downloaded from `url`, in a browser tab and return what it became.
+
+        None once the browser is given up: the page is not rendered.
 
         Raises:
             RenderTimeoutError: the page took longer than `rendering.timeout`.
-            RenderError: the browser is not installed, could not start or crashed.
+            RenderError: the browser or the page crashed.
             CrawlerClosedError: the renderer is closed.
         """
         try:
             rendered, elapsed = await self._render(url, document)
+        except _GivenUp:
+            self._unrendered += 1
+            return None
         except (RenderTimeoutError, RenderError):
             self._failed += 1
             raise
@@ -543,7 +565,7 @@ class Renderer:
             from playwright.async_api import Error as PlaywrightError
             from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-            tab = _Tab(document)
+            tab = _Tab(url, document)
             page: Page | None = None
             try:
                 if sync is not None:
@@ -552,9 +574,11 @@ class Renderer:
                 self._tabs[page] = tab
                 page.on("crash", lambda _: setattr(tab, "crashed", True))
                 page.on("popup", self._close_popup)
-                rendered = await self._load(page, url, tab)
+                # Also bounds the reading of the HTML, which a page that blocks its scripts would hold forever.
+                async with asyncio.timeout(self.rendering.timeout):
+                    rendered = await self._load(page, url, tab)
                 return rendered, time.monotonic() - started
-            except PlaywrightTimeoutError as exc:
+            except (PlaywrightTimeoutError, TimeoutError) as exc:
                 raise RenderTimeoutError(url, f"rendering timeout ({self.rendering.timeout:.1f}s)") from exc
             except PlaywrightError as exc:
                 raise self._error(url, tab, exc) from exc
@@ -622,7 +646,11 @@ class Renderer:
         from playwright.async_api import Error
 
         load = asyncio.ensure_future(self._wait(page, url))
-        await asyncio.wait({load, tab.navigated}, return_when=asyncio.FIRST_COMPLETED)
+        try:
+            await asyncio.wait({load, tab.navigated}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            load.cancel()
+            raise
         if tab.navigated.done():
             load.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -682,7 +710,15 @@ class Renderer:
             if tab is None or request.resource_type in self.rendering.block_resources:
                 await route.abort()
                 return
+            if self._headers and _origin(request.url) == tab.origin:
+                await route.continue_(headers=self._with_headers(request))
+                return
             await route.continue_()
+
+    def _with_headers(self, request: "Request") -> dict[str, str]:
+        """The headers of `request`, with the `headers` of the crawler in place of those of the browser."""
+        own = {name: value for name, value in request.headers.items() if name.lower() not in self._header_names}
+        return own | self._headers
 
     async def _close_popup(self, popup: "Page") -> None:
         with contextlib.suppress(Exception):
@@ -709,7 +745,7 @@ class Renderer:
             if self._closed:
                 raise CrawlerClosedError(url, "crawler is closed")
             if not self.running:
-                await self._start(url)
+                await self._start()
             browser = self._browser
             assert browser is not None
             from playwright.async_api import Error
@@ -724,20 +760,19 @@ class Renderer:
             except Error as exc:
                 raise self._error(url, None, exc) from exc
 
-    async def _start(self, url: str) -> None:
-        """Start the browser, for the first time or after it crashed, unless it may not be any more."""
-        if self._failure is None and self._launches == self.MAX_LAUNCHES:
-            self._failure = f"the browser crashed {self._launches} times; pages are not rendered any more"
-        if self._failure is not None:
-            raise RenderError(url, self._failure)
+    async def _start(self) -> None:
+        """Start the browser, for the first time or after it crashed, unless it is given up."""
+        if self._given_up or self._launches == self.MAX_LAUNCHES:
+            raise _GivenUp
         await self._shutdown()  # what is left of a crashed browser
         self._launches += 1
         try:
             await self._launch()
         except _LaunchError as error:
-            self._failure = str(error)
+            self._given_up = True
             await self._shutdown()
-            raise RenderError(url, self._failure) from error.__cause__
+            logger.error("Pages are taken as downloaded, without rendering: %s", error)
+            raise _GivenUp from error.__cause__
 
     async def _launch(self) -> None:
         try:
@@ -765,11 +800,12 @@ class Renderer:
             if self._bypass is not None:
                 settings["proxy"]["bypass"] = self._bypass
         # Service workers would take requests past the routing of the context.
-        context = await browser.new_context(
-            user_agent=self._user_agent, extra_http_headers=self._headers, service_workers="block", **settings
-        )
+        context = await browser.new_context(user_agent=self._user_agent, service_workers="block", **settings)
         try:
             await context.route("**/*", self._route)
+            if "websocket" in self.rendering.block_resources:
+                # Web sockets go past `route`.
+                await context.route_web_socket(re.compile(".*"), _close_web_socket)
         except BaseException:
             with contextlib.suppress(Exception):
                 await context.close()
@@ -784,7 +820,7 @@ class Renderer:
         if self._launches < self.MAX_LAUNCHES:
             logger.error("The browser crashed; it is started again for the next page")
         else:
-            logger.error("The browser crashed again; pages are not rendered any more")
+            logger.error("The browser crashed again; pages are not rendered any more, they are taken as downloaded")
 
     async def close(self) -> None:
         """Close the browser. Safe to call more than once; later pages fail with `CrawlerClosedError`."""
@@ -807,6 +843,16 @@ class Renderer:
                     await close()
         self._browser = self._playwright = None
         self._contexts.clear()
+
+
+async def _close_web_socket(socket: "WebSocketRoute") -> None:
+    """Close a web socket of a page before it reaches its server."""
+    await socket.close()
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    parts = urlsplit(url)
+    return parts.scheme, parts.hostname, parts.port
 
 
 def _first_line(exc: BaseException) -> str:

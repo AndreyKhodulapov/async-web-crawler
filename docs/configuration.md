@@ -296,9 +296,9 @@ it, [the note on the headless browser](sessions_proxies_rendering.md#headless-br
 | `include` | list of regular expressions | `[]` | with `mode: patterns`, the URLs to render, searched anywhere in the URL as in `filters`; required there, an error with another `mode` |
 | `wait_until` | `load`, `domcontentloaded` or `networkidle` | `load` | the event of the page to wait for; `networkidle` is no request for half a second |
 | `wait_for` | CSS selector or `null` | `null` | an element to wait for after that, e.g. `"#content"` |
-| `timeout` | number, > 0 | `30.0` | seconds the browser has for a page, the waits included |
+| `timeout` | number, > 0 | `30.0` | seconds the browser has for a page, the waits and the reading of its HTML included |
 | `max_open_pages` | whole number, >= 1 | `2` | pages rendered at once; a browser tab takes 50 to 100 MB |
-| `block_resources` | list of resource types | `[image, font, media]` | requests the browser does not make: `image`, `font`, `media`, `stylesheet`, `script`, `xhr`, `fetch`, `websocket`, `eventsource`, `manifest`, `texttrack`, `other` |
+| `block_resources` | list of resource types | `[image, font, media]` | requests the browser does not make: `image`, `font`, `media`, `stylesheet`, `script`, `xhr`, `fetch`, `websocket`, `eventsource`, `manifest`, `texttrack`, `other`; a web socket is closed before it connects |
 
 ```yaml
 rendering:
@@ -337,7 +337,8 @@ the page set, by JavaScript or in the responses to its requests: they go
 with the next download and to `save_cookies`. Only the changes go each
 way, so two pages rendered at once do not undo each other's cookies; when
 both change the same cookie, the browser wins. The requests of the
-browser carry `crawler.user_agent` and `session.headers`, and go through
+browser carry `crawler.user_agent`, those to the origin of their page
+`session.headers` too, and go through
 the proxy the document of the page came through: every proxy has a
 browser context of its own (cookies, cache), so with `per_host` a site
 and its scripts stay on one address. The hosts of `NO_PROXY` are reached
@@ -360,10 +361,11 @@ over `max_page_size` once rendered fails with `PageTooLargeError`, one
 the browser takes longer than `timeout` to render fails with a timeout
 (`RenderTimeoutError`) and is retried as one, with the same `timeout`
 (it does not grow with the retries); the site is not held to blame for
-it, since the document came in time. A browser that cannot start or
-crashes fails the pages
-with `RenderError`, which is not retried and not held against the site;
-a crashed browser is started again for the next page, once.
+it, since the document came in time. A browser that crashes fails the
+pages it was rendering with `RenderError`, which is not retried and not
+held against the site, and is started again for the next page, once.
+After that, or if it cannot start, the browser is given up with an error
+in the log, and the pages are taken as downloaded, without rendering.
 
 `wait_until: load` is enough for a page that builds itself from its own
 scripts; a page that loads its data afterwards needs `networkidle` or,
@@ -373,7 +375,8 @@ the site serves its scripts and data too. Use `patterns` when only some
 pages need it.
 
 The summary, the JSON statistics and the HTML report count the pages
-rendered and failed (a timeout, a browser that failed) and the average
+rendered and failed (a timeout, a browser that failed), those taken as
+downloaded once the browser was given up, and the average
 time the browser took for a rendered page, without the wait for a free
 tab.
 

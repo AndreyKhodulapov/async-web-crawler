@@ -42,7 +42,8 @@ requests through other addresses and sees the pages JavaScript builds.
   when the crawler rotates User-Agents or proxies.
 - An API token goes in a header (`Authorization`). Extra headers go to
   every request, so with links to other sites the token leaks: keep the
-  crawl on its own domain.
+  crawl on its own domain. A rendered page calls CDNs and analytics: the
+  browser gives the headers to the page's own origin only.
 
 ## Cookies are secrets
 
@@ -139,7 +140,11 @@ requests through other addresses and sees the pages JavaScript builds.
   the pages that need it. The site serves the scripts and data too, and
   no browser asks robots.txt for them.
 - **The pitfalls**:
-  - a browser that crashes: restart it, but not forever;
+  - a browser that crashes: restart it, but not forever, then take the
+    pages as downloaded rather than fail them all;
+  - a script that never yields: the page's HTML cannot be read, so the
+    deadline covers the whole page, not only the waits;
+  - web sockets go past the routing of requests (`route_web_socket`);
   - Chromium's Local Network Access: a page the browser got from the
     crawler looks public, so its requests to another origin on a
     loopback or private address are refused;

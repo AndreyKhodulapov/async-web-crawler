@@ -147,7 +147,7 @@ async def test_stats_of_rendering_with_rendering(url, tmp_path):
         await crawler.crawl()
         stats = crawler.get_stats()
 
-    assert stats["rendering"] == {"rendered": 0, "failed": 0, "avg_render_time": 0.0}
+    assert stats["rendering"] == {"rendered": 0, "failed": 0, "unrendered": 0, "avg_render_time": 0.0}
     assert json.loads((out / "stats.json").read_text(encoding="utf-8"))["rendering"] == stats["rendering"]
     assert "<h2>Rendering</h2>" in (out / "report.html").read_text(encoding="utf-8")
 

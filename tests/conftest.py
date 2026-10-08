@@ -313,7 +313,8 @@ async def site_page(request: web.Request) -> web.Response:
 async def js_page(request: web.Request) -> web.Response:
     """The pages of JS_PAGES, their script and image; any other path under /js/ is a plain page.
 
-    /js/cookie-read sets a cookie for every parameter of its query, as /cookies/set does.
+    /js/cookie-read sets a cookie for every parameter of its query, as /cookies/set does. In a page,
+    {other_host} is the same site under the name localhost.
     """
     request.app[SITE_STATE].record(request)
     if request.path == "/js/app.js":
@@ -323,11 +324,22 @@ async def js_page(request: web.Request) -> web.Response:
     if request.path == "/js/to-private":
         raise web.HTTPFound("/js/private/page")
     html = JS_PAGES.get(request.path, f"<html><body><p>{request.path}</p></body></html>")
+    html = html.replace("{other_host}", f"http://localhost:{request.url.port}")
     response = web.Response(text=html, content_type="text/html")
     if request.path == "/js/cookie-read":
         for name, value in request.query.items():
             response.headers.add("Set-Cookie", f"{name}={value}")
     return response
+
+
+async def web_socket(request: web.Request) -> web.WebSocketResponse:
+    """A web socket, open until the client closes it."""
+    request.app[SITE_STATE].record(request)
+    socket = web.WebSocketResponse()
+    await socket.prepare(request)
+    async for _ in socket:
+        pass
+    return socket
 
 
 @pytest.fixture(scope="session")
@@ -395,6 +407,7 @@ def make_app() -> web.Application:
     app.router.add_get("/cookies/set", set_cookies)
     app.router.add_get("/cookies/echo", echo_cookies)
     app.router.add_get("/js/{path:.*}", js_page)
+    app.router.add_get("/socket", web_socket)
     return app
 
 

@@ -152,13 +152,20 @@ def test_html_report_without_proxies_has_no_table_of_them(stats):
 
 
 def test_html_report_shows_the_rendering():
-    rendering = {"rendered": 1200, "failed": 3, "avg_render_time": 0.84}
+    rendering = {"rendered": 1200, "failed": 3, "unrendered": 0, "avg_render_time": 0.84}
     html = render_html(empty_stats() | {"rendering": rendering})
 
     assert (
         '<h2>Rendering</h2>\n<dl class="summary"><div><dt>Pages rendered</dt><dd>1,200</dd></div>'
         "<div><dt>Failed</dt><dd>3</dd></div><div><dt>Average render time</dt><dd>840 ms</dd></div></dl>"
     ) in html
+
+
+def test_html_report_shows_the_pages_taken_as_downloaded_once_the_browser_was_given_up():
+    rendering = {"rendered": 10, "failed": 1, "unrendered": 25, "avg_render_time": 0.84}
+    html = render_html(empty_stats() | {"rendering": rendering})
+
+    assert "<div><dt>Not rendered</dt><dd>25</dd></div>" in html
 
 
 def test_html_report_without_rendering_does_not_mention_it(stats):

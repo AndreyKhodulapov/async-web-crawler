@@ -373,8 +373,9 @@ def print_stats(stats: dict[str, Any]) -> None:
         print(f"Proxies: {', '.join(proxies)}")
     if "rendering" in stats:
         rendering = stats["rendering"]
+        unrendered = f", {rendering['unrendered']} not rendered" if rendering["unrendered"] else ""
         print(
-            f"Rendering: {rendering['rendered']} pages rendered, {rendering['failed']} failed, "
+            f"Rendering: {rendering['rendered']} pages rendered, {rendering['failed']} failed{unrendered}, "
             f"average {rendering['avg_render_time']:.2f}s"
         )
     if stats.get("workers"):

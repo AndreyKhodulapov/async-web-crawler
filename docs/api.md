@@ -514,13 +514,13 @@ async with AsyncCrawler(rendering=rendering) as crawler:
 | `include` | regular expressions searched in the URL, as in `UrlFilter`; given, only the pages that match one are rendered; empty (the default), every HTML page |
 | `wait_until` | `"load"` (the default), `"domcontentloaded"` or `"networkidle"` (no request for half a second) |
 | `wait_for` | a CSS selector to wait for after that; `None` by default |
-| `timeout` | seconds the browser has for a page, the waits included; `30.0` |
+| `timeout` | seconds the browser has for a page, the waits and the reading of its HTML included; `30.0` |
 | `max_open_pages` | pages rendered at once, each a browser tab of 50 to 100 MB; `2` |
-| `block_resources` | types of requests the browser does not make (`RESOURCE_TYPES` of `crawler.rendering`: `"image"`, `"script"`, `"xhr"` ...); images, fonts and media by default |
+| `block_resources` | types of requests the browser does not make (`RESOURCE_TYPES` of `crawler.rendering`: `"image"`, `"script"`, `"xhr"` ...; with `"websocket"`, a web socket of the page is closed before it connects); images, fonts and media by default |
 | `renders(url)` | whether the page at `url` is rendered, if it is HTML |
 | `AsyncCrawler(rendering=)` | render pages as it says; `None`, the default, renders none |
 | `crawler.rendering` | the settings, `None` without rendering |
-| `render_stats()` | a `RenderStats`: `rendered` (pages the browser loaded to the end, those that went elsewhere on their own included), `failed` (a timeout, a `RenderError`), `avg_render_time` (seconds per rendered page, from a free tab in a running browser to the HTML); `None` without rendering. `crawl()` counts anew |
+| `render_stats()` | a `RenderStats`: `rendered` (pages the browser loaded to the end, those that went elsewhere on their own included), `failed` (a timeout, a `RenderError`), `unrendered` (pages taken as downloaded once the browser was given up), `avg_render_time` (seconds per rendered page, from a free tab in a running browser to the HTML); `None` without rendering. `crawl()` counts anew |
 | `browser_problem()`, `playwright_problem()` of `crawler.rendering` | why pages cannot be rendered here (Playwright or Chromium is not installed), with the command to install it; `None` if they can. `browser_problem()` is a coroutine that starts the driver of Playwright for a moment |
 
 Every request is made as without a browser first: the page is downloaded
@@ -555,7 +555,10 @@ document came through (one context per proxy, and one for the pages
 without a proxy, each for the life of the browser), so all its requests
 go through that proxy, with the password of it; the hosts of `NO_PROXY`
 of a `ProxyPool.from_env()` are reached directly. The requests carry the
-`user_agent` and the `headers`. Before a page, the context gets the
+`user_agent`; those to the origin of their page (its scheme, host and
+port) carry the `headers` too, so that an `Authorization` header does not
+reach the CDNs and the analytics the scripts call (a request of the page
+that is redirected goes on without them). Before a page, the context gets the
 cookies the crawler changed since the last page, and after it, the
 crawler gets those the context changed: cookies set by JavaScript and by
 the responses to the page's requests go with the next download, to
@@ -576,15 +579,18 @@ neither take a proxy out of rotation nor count in the circuit breaker.
 |-------|------|---------|-----------------|
 | `RenderTimeoutError` (a `FetchTimeoutError`) | the page took the browser longer than `timeout`: `rendering timeout (30.0s)` | yes, with the same `timeout`; the other requests to the host do not wait for the retry | does not count: the host answered in time, the page is slow in the browser |
 | `PageTooLargeError` | the rendered HTML is over `max_page_size` bytes | no | does not count, as without a browser |
-| `RenderError` | Playwright or Chromium is not installed (the message has the command to install it), the browser could not start, crashed, or the page crashed in it | no | does not count: the browser failed, not the site |
+| `RenderError` | the browser crashed, or the page crashed in it | no | does not count: the browser failed, not the site |
 | `CrawlerClosedError` | the crawler was closed while the page was rendered | no | does not count |
 
 The browser is started for the first page to render, so a crawl without
 such a page never starts it, and closed by `close()`. A browser that
 crashes fails the pages it was rendering and is started again for the
-next one, once (`Renderer.MAX_LAUNCHES`, 2 launches in all); after that,
-or after a browser that could not start, every page to render fails with
-`RenderError` at once. `error_stats()` counts `RenderError` as `other`.
+next one, once (`Renderer.MAX_LAUNCHES`, 2 launches in all). After that,
+or after a browser that could not start (Playwright or Chromium not
+installed: the message has the command to install it), the browser is
+given up: an error in the log says so, and every page to render comes
+back as it was downloaded, without its JavaScript run, counted as
+`unrendered` in `render_stats()`. `error_stats()` counts `RenderError` as `other`.
 
 `AdvancedCrawler` makes the settings of the `rendering` section (see the
 [configuration guide](configuration.md#rendering)). Why it works this way:
@@ -852,7 +858,7 @@ asyncio.run(main())
 | `await seed(frontier, sitemaps=True)` | queues the start URLs and the pages of the sitemaps of the configuration in `frontier` without crawling them, see `AsyncCrawler.seed`; `sitemaps=False` leaves the sitemaps unread |
 | `check_start()` | raises `ConfigError` if the configuration has neither `urls` nor `sitemaps.urls`; `crawl()`, `crawl_frontier()` and `seed()` call it |
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
-| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report; with rendering, `rendering`: `{rendered, failed, avg_render_time}` (see `render_stats()` in [Rendering](#rendering)), also in the JSON and the HTML report |
+| `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report; with rendering, `rendering`: `{rendered, failed, unrendered, avg_render_time}` (see `render_stats()` in [Rendering](#rendering)), also in the JSON and the HTML report |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
 | `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats`; `crawler.proxies` and `crawler.rendering` are the pool and the settings of rendering, `None` without them |

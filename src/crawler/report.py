@@ -146,6 +146,9 @@ def _rendering_section(rendering: Mapping[str, Any]) -> str:
         "Failed": _count(rendering["failed"]),
         "Average render time": _duration(rendering["avg_render_time"]),
     }
+    if rendering["unrendered"]:
+        # Pages taken as downloaded once the browser was given up.
+        numbers["Not rendered"] = _count(rendering["unrendered"])
     tiles = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in numbers.items())
     return f'<section>\n<h2>Rendering</h2>\n<dl class="summary">{tiles}</dl>\n</section>\n'
 

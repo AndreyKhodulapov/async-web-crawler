@@ -20,7 +20,6 @@ from crawler import (
     PageTooLargeError,
     ProxyPool,
     ProxyStats,
-    RenderError,
     Rendering,
     RenderStats,
     RenderTimeoutError,
@@ -161,6 +160,19 @@ async def test_a_page_rendered_too_slowly_times_out(url):
     assert crawler.render_stats() == RenderStats(failed=1)
 
 
+async def test_a_page_that_hangs_once_loaded_times_out_and_frees_its_tab(url):
+    # The page is idle half a second after it loaded, and its scripts hang before that: its HTML cannot be read.
+    rendering = Rendering(wait_until="networkidle", timeout=2.0, max_open_pages=1)
+    async with make_crawler(rendering) as crawler:
+        result = await asyncio.wait_for(crawler.fetch_result(url("/js/hang")), 10)
+        page = await asyncio.wait_for(crawler.fetch_and_parse(url("/js/links")), 10)
+
+    assert isinstance(result.error, RenderTimeoutError)
+    assert "rendering timeout (2.0s)" in result.error.message
+    assert "made by javascript" in page["text"]
+    assert (crawler.render_stats().rendered, crawler.render_stats().failed) == (1, 1)
+
+
 async def test_a_page_over_the_size_limit_once_rendered_fails(url):
     async with make_crawler(max_page_size=10_000) as crawler:
         result = await crawler.fetch_result(url("/js/big"))
@@ -179,24 +191,26 @@ async def test_robots_txt_and_other_types_are_not_rendered(url, site):
     assert data.startswith("{")
 
 
-async def test_the_browser_crashed_is_started_again_once(url, site):
+async def test_the_browser_crashed_is_started_again_once_then_pages_are_taken_as_downloaded(url, site, caplog):
     async with make_crawler(circuit_breaker=CircuitBreaker(0.5, min_requests=1)) as crawler:
         renderer = crawler._transport.renderer
-        assert "Target" in await crawler.fetch_url(url("/js/target"))
+        assert "made by javascript" in (await crawler.fetch_and_parse(url("/js/links")))["text"]
 
         await renderer._browser.close()  # as if it crashed
-        assert "Target" in await crawler.fetch_url(url("/js/target"))
+        assert "made by javascript" in (await crawler.fetch_and_parse(url("/js/links")))["text"]
 
-        await renderer._browser.close()
-        result = await crawler.fetch_result(url("/js/target"))
-        again = await crawler.fetch_result(url("/js/links"))
+        with caplog.at_level(logging.ERROR, logger="crawler.rendering"):
+            await renderer._browser.close()
+            pages = [await crawler.fetch_result(url("/js/links")) for _ in range(2)]
 
-    assert isinstance(result.error, RenderError)
-    assert "crashed 2 times" in result.error.message
-    assert isinstance(again.error, RenderError)
-    assert (crawler.render_stats().rendered, crawler.render_stats().failed) == (2, 2)
-    # Not retried, and the site is not to blame.
-    assert site.hits["/js/target"] == 3
+    assert all(page.error is None and "made by javascript" not in page.content for page in pages)
+    assert "<script" in pages[0].content
+    assert "pages are not rendered any more, they are taken as downloaded" in caplog.text
+    assert crawler.render_stats() == RenderStats(
+        rendered=2, unrendered=2, avg_render_time=crawler.render_stats().avg_render_time
+    )
+    assert renderer._launches == 2 and not renderer.running
+    assert site.hits["/js/links"] == 4
     breaker = crawler.circuit_breaker.get_stats()["127.0.0.1"]
     assert (breaker.state, breaker.failures) == ("closed", 0)
 
@@ -263,6 +277,30 @@ async def test_headers_of_the_crawler_reach_the_requests_of_the_browser(url, sit
     assert site.headers["/js/app.js"]["X-Key"] == "1"
     assert site.headers["/js/app.js"]["Accept-Language"] == "de"
     assert site.headers["/js/app.js"]["User-Agent"] == BOT
+
+
+async def test_headers_of_the_crawler_reach_only_the_origin_of_the_page(url, site, make_proxy):
+    # Through a proxy: Chromium sends no request of a page to another origin on a loopback address itself.
+    proxy = await make_proxy()
+    async with make_crawler(headers={"X-Key": "1"}, proxies=ProxyPool([proxy.url])) as crawler:
+        await crawler.fetch_url(url("/js/foreign"))
+
+    assert f"GET {url('/js/foreign.js', 'localhost')}" in proxy.requests
+    assert "X-Key" not in site.headers["/js/foreign.js"]
+    assert site.headers["/js/foreign.js"]["User-Agent"] == BOT
+    assert site.headers["/js/app.js"]["X-Key"] == "1"
+
+
+@pytest.mark.parametrize(("blocked", "outcome", "hits"), [(["websocket"], "closed", 0), ([], "open", 1)])
+async def test_web_sockets_are_blocked_when_named(url, site, make_proxy, blocked, outcome, hits):
+    # Through a proxy, as above: Chromium opens no web socket of such a page on a loopback address itself.
+    proxy = await make_proxy()
+    rendering = Rendering(wait_for="#done", block_resources=blocked)
+    async with make_crawler(rendering, proxies=ProxyPool([proxy.url])) as crawler:
+        page = await crawler.fetch_and_parse(url("/js/socket"))
+
+    assert outcome in page["text"]
+    assert site.hits["/socket"] == hits
 
 
 async def test_saved_cookies_hold_those_javascript_set(url, tmp_path):

@@ -45,8 +45,10 @@ configuration file, by command-line options, or from Python.
   CSS selector; the page itself downloaded as without a browser, images
   and fonts not loaded, navigations of a page checked against robots.txt
   and the filters like redirects; the browser shares the cookies, the
-  headers and the proxy of the crawler, and the cookies its scripts set
-  are saved; pages rendered and the time they took in the summary and
+  headers (only with the page's own origin) and the proxy of the crawler,
+  and the cookies its scripts set are saved; one deadline a page; a
+  browser that keeps crashing is given up and the pages are taken as
+  downloaded; pages rendered and the time they took in the summary and
   the reports
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that
@@ -254,7 +256,9 @@ WARNING` leaves the progress line and the failures. A password in a database
 or a proxy URL is shown as `***`. With proxies, the summary has a line of
 them: `Proxies: http://user:***@proxy-1:3128 (41 sent, 0 failed), ...`;
 with rendering, a line of the pages rendered: `Rendering: 12 pages
-rendered, 1 failed, average 0.84s` (the average of the rendered ones).
+rendered, 1 failed, average 0.84s` (the average of the rendered ones;
+`, 30 not rendered` when the browser was given up and pages were taken as
+downloaded).
 
 | Exit code | Meaning |
 |-----------|---------|
@@ -454,10 +458,13 @@ storages. All of it is described in the [API reference](docs/api.md).
 - **No cookies for IP addresses.** aiohttp keeps cookies of host names
   only, so a site reached as `http://127.0.0.1:8080/` cannot keep a session
   of the crawler; reach it as `http://localhost:8080/`.
-- **Extra headers go to every host.** The headers of `session.headers`
-  are sent to every request, robots.txt and other sites included: an
-  `Authorization` header reaches a third-party site that the crawl follows
-  a link or a redirect to. Use it with `same_domain_only`, the default.
+- **Extra headers go to every host the crawler requests.** The headers
+  of `session.headers` are sent to every request of the crawler,
+  robots.txt and other sites included: an `Authorization` header reaches
+  a third-party site that the crawl follows a link or a redirect to. Use
+  it with `same_domain_only`, the default. The browser sends them only to
+  the origin of the page it renders, not to the CDNs and the analytics its
+  scripts call.
 - **No SOCKS proxies.** Only http and https proxies; `socks5://` is a
   configuration error. A local bridge from HTTP to SOCKS (such as
   `gost` or `privoxy`) makes a SOCKS proxy usable.

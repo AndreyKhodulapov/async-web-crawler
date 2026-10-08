@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 import time
+from types import SimpleNamespace
 
 import aiohttp
 import pytest
@@ -26,6 +27,7 @@ from crawler.rendering import (
     CookieSync,
     Rendered,
     Renderer,
+    _Tab,
     browser_problem,
     bypass_rules,
     from_playwright,
@@ -62,6 +64,13 @@ class FakeRenderer:
 
     def reset_stats(self) -> None:
         self.pages.clear()
+
+
+class GivenUpRenderer(FakeRenderer):
+    """A renderer whose browser is given up: it renders nothing."""
+
+    async def render(self, url: str, document: Response) -> None:  # type: ignore[override]
+        self.pages.append((url, document))
 
 
 def make_transport(
@@ -213,6 +222,13 @@ class TestBrowserTransport:
             await get(transport)
         assert renderer.pages == []
 
+    async def test_a_page_comes_back_as_downloaded_once_the_browser_is_given_up(self) -> None:
+        downloaded = page(URL, "<p>page</p>")
+        transport, _, renderer = make_transport({URL: downloaded}, renderer=GivenUpRenderer())
+
+        assert await get(transport) is downloaded
+        assert [url for url, _ in renderer.pages] == [URL]
+
     async def test_close_closes_the_session_even_when_the_browser_fails_to_close(self) -> None:
         transport, http, renderer = make_transport({})
         with pytest.raises(RuntimeError):
@@ -256,16 +272,34 @@ class TestBrowserTransport:
 
 
 class TestRenderErrors:
-    async def test_without_playwright_pages_fail_with_the_command_to_install_it(self, monkeypatch) -> None:
+    async def test_without_playwright_pages_are_not_rendered_and_the_log_says_how_to_install_it(
+        self, monkeypatch, caplog
+    ) -> None:
         monkeypatch.setitem(sys.modules, "playwright.async_api", None)
         renderer = Renderer(Rendering(), user_agent="TestBot/1.0")
 
-        with pytest.raises(RenderError, match=r"Playwright is not installed; run: pip install -e \.$"):
-            await renderer.render(URL, page(URL, "page"))
-        with pytest.raises(RenderError, match="Playwright is not installed"):
-            await renderer.render(URL, page(URL, "page"))
+        with caplog.at_level(logging.ERROR, logger="crawler.rendering"):
+            assert await renderer.render(URL, page(URL, "page")) is None
+            assert await renderer.render(URL, page(URL, "page")) is None
+
         assert renderer._launches == 1  # not tried again
+        assert caplog.messages == [
+            "Pages are taken as downloaded, without rendering: Playwright is not installed; run: pip install -e ."
+        ]
+        assert renderer.stats() == RenderStats(unrendered=2)
         await renderer.close()
+
+    async def test_a_browser_that_crashed_again_is_not_started_any_more(self, monkeypatch) -> None:
+        renderer = Renderer(Rendering(), user_agent="TestBot/1.0")
+        renderer._launches = Renderer.MAX_LAUNCHES
+
+        async def launch() -> None:
+            raise AssertionError("the browser is started again")
+
+        monkeypatch.setattr(renderer, "_launch", launch)
+
+        assert await renderer.render(URL, page(URL, "page")) is None
+        assert renderer.stats() == RenderStats(unrendered=1)
 
     async def test_a_closed_renderer_fails_with_crawler_closed(self) -> None:
         renderer = Renderer(Rendering(), user_agent="TestBot/1.0")
@@ -759,6 +793,55 @@ class TestContextsOfProxies:
         assert renderer._contexts == {}
 
 
+class FakeRoute:
+    """Remembers what became of a request: ("continue", its headers) or ("abort", None)."""
+
+    def __init__(self) -> None:
+        self.outcome: tuple[str, dict[str, str] | None] | None = None
+
+    async def continue_(self, headers: dict[str, str] | None = None) -> None:
+        self.outcome = ("continue", headers)
+
+    async def abort(self) -> None:
+        self.outcome = ("abort", None)
+
+
+class FakeRequest:
+    """A request a script of a page makes."""
+
+    def __init__(self, url: str, page: object) -> None:
+        self.url = url
+        self.resource_type = "script"
+        self.frame = SimpleNamespace(page=page, parent_frame=None)
+        self.headers = {"user-agent": "TestBot/1.0", "accept-language": "en-US"}
+
+    def is_navigation_request(self) -> bool:
+        return False
+
+
+class TestRouting:
+    @pytest.mark.parametrize(
+        ("url", "headers"),
+        [
+            ("https://a.test/app.js", {"user-agent": "TestBot/1.0", "Accept-Language": "de", "X-Key": "1"}),
+            ("https://cdn.test/app.js", None),
+            ("http://a.test/app.js", None),
+            ("https://a.test:8443/app.js", None),
+        ],
+        ids=["same-origin", "other-host", "other-scheme", "other-port"],
+    )
+    async def test_the_headers_of_the_crawler_go_only_to_the_origin_of_the_page(self, url, headers) -> None:
+        pytest.importorskip("playwright")
+        renderer = Renderer(DEFAULT, user_agent="TestBot/1.0", headers={"Accept-Language": "de", "X-Key": "1"})
+        tab = object()
+        renderer._tabs[tab] = _Tab(URL, page(URL, "page"))  # type: ignore[index]
+        route = FakeRoute()
+
+        await renderer._route(route, FakeRequest(url, tab))  # type: ignore[arg-type]
+
+        assert route.outcome == ("continue", headers)
+
+
 class TabContext:
     """A context whose tabs do nothing."""
 
@@ -779,9 +862,9 @@ class TabCookieContext(CookieContext, TabContext):
 class TestRenderStats:
     LOAD = 0.05
 
-    def make_renderer(self, load, *, start=None, max_open_pages: int = 2) -> Renderer:
+    def make_renderer(self, load, *, start=None, max_open_pages: int = 2, timeout: float = 30.0) -> Renderer:
         """A renderer whose tabs take as long as `load` does, and whose contexts as long as `start`."""
-        renderer = Renderer(Rendering(max_open_pages=max_open_pages), user_agent="TestBot/1.0")
+        renderer = Renderer(Rendering(max_open_pages=max_open_pages, timeout=timeout), user_agent="TestBot/1.0")
 
         async def get_context(url, proxy):
             if start is not None:
@@ -837,12 +920,12 @@ class TestRenderStats:
             return await self.slow_page(url)
 
         async def start(url: str) -> None:
-            if url == "https://a.test/no-browser":
-                raise RenderError(url, "Chromium is not installed; run: playwright install chromium")
+            if url == "https://a.test/no-context":
+                raise RenderError(url, "browser: Target page, context or browser has been closed")
 
         renderer = self.make_renderer(load, start=start)
         errors = []
-        for url in (URL, *failures, "https://a.test/no-browser"):
+        for url in (URL, *failures, "https://a.test/no-context"):
             try:
                 await renderer.render(url, page(url, "page"))
             except (RenderError, RenderTimeoutError) as exc:
@@ -853,6 +936,23 @@ class TestRenderStats:
         assert (stats.rendered, stats.failed) == (1, 3)
         # The failures do not stretch the average.
         assert stats.avg_render_time < self.LOAD * 3
+
+    async def test_a_page_whose_html_never_comes_times_out_and_frees_its_tab(self) -> None:
+        pytest.importorskip("playwright")
+        hanging = "https://a.test/hangs"
+
+        async def load(url: str) -> Rendered:
+            if url == hanging:
+                await asyncio.Event().wait()  # as a page whose scripts never let its HTML be read
+            return await self.slow_page(url)
+
+        renderer = self.make_renderer(load, max_open_pages=1, timeout=self.LOAD * 2)
+
+        with pytest.raises(RenderTimeoutError, match=r"rendering timeout \(0\.1s\)"):
+            await asyncio.wait_for(renderer.render(hanging, page(hanging, "page")), 1)
+        await asyncio.wait_for(renderer.render(URL, page(URL, "page")), 1)
+
+        assert (renderer.stats().rendered, renderer.stats().failed) == (1, 1)
 
     async def test_a_page_of_a_closed_renderer_is_not_a_failure(self) -> None:
         async def start(url: str) -> None:

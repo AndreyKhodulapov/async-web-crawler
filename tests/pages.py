@@ -150,6 +150,19 @@ JS_PAGES = {
             fetch("/cookies/set?from_fetch=2").then(() => { document.body.innerHTML += '<p id="done">done</p>'; });
         </script></body></html>
     """,
+    "/js/foreign": """
+        <html><head><script src="{other_host}/js/foreign.js"></script><script src="/js/app.js"></script></head>
+        <body></body></html>
+    """,
+    "/js/hang": "<html><body><p>hang</p><script>setTimeout(() => { while (true) {} }, 100);</script></body></html>",
+    "/js/socket": """
+        <html><body><script>
+            const socket = new WebSocket("ws://" + location.host + "/socket");
+            const done = (outcome) => { document.body.innerHTML += '<p id="done">' + outcome + '</p>'; };
+            socket.onopen = () => done("open");
+            socket.onclose = () => done("closed");
+        </script></body></html>
+    """,
     "/js/cookie-delete": '<html><body><script>document.cookie = "sid=; path=/; max-age=0";</script></body></html>',
     "/js/popup": """
         <html><body><iframe src="/js/framed"></iframe>

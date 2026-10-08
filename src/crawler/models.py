@@ -198,13 +198,15 @@ class RenderStats:
 
     `rendered` counts the pages the browser loaded to the end, those that
     went to another URL on their own included; `failed` those it did not
-    (a timeout, a browser that is not installed or crashed).
-    `avg_render_time` is the average time in seconds the browser took for
-    a rendered page, without the wait for a free tab.
+    (a timeout, a browser or a page that crashed); `unrendered` those
+    taken as downloaded, once the browser was given up (it crashed again
+    or could not start). `avg_render_time` is the average time in seconds
+    the browser took for a rendered page, without the wait for a free tab.
     """
 
     rendered: int = 0
     failed: int = 0
+    unrendered: int = 0
     avg_render_time: float = 0.0
 
 

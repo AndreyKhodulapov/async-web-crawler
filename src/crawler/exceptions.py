@@ -173,7 +173,7 @@ class NoProxyError(ProxyError):
 
 
 class RenderError(FetchError):
-    """The headless browser failed to render the page: it is not installed, could not start or crashed.
+    """The headless browser failed to render the page: it or the page crashed in it.
 
     The site is not to blame: the circuit breaker of its host does not count it.
     """
