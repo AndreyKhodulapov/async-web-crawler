@@ -262,10 +262,12 @@ class PostgresFrontier(Frontier):
 
     Times are those of the database clock. `take` waits by polling, at
     least every `poll_interval` seconds, and at once after an operation of
-    this frontier. `stats` is a snapshot of the job, refreshed by the
-    heartbeat and by `refresh_stats`; `requested` is also brought up to
-    date by `admit`. Taking a page, admitting, putting back and finishing
-    it, and adding links are one call each, of a function in the database
+    this frontier. `stats` is a snapshot of the job, refreshed every
+    `stats_seconds` apart from the heartbeat, so that counting the pages
+    of a large job never holds up the leases, once more as `take` finds
+    nothing left for this worker, and by `refresh_stats`; `requested` is
+    also brought up to date by `admit`. Taking a page, admitting, putting
+    back and finishing it, and adding links are one call each, of a function in the database
     (see `procedures.py`): the rows of the job and the host are locked for
     as long as the function runs, not across round trips. Workers never
     deadlock: an operation on a page locks
@@ -324,6 +326,7 @@ class PostgresFrontier(Frontier):
         max_attempts: int,
         host_interval: float,
         poll_interval: float,
+        stats_seconds: float = 60.0,
     ) -> None:
         super().__init__(max_pages=max_pages, max_pages_per_host=max_pages_per_host, frontier_factor=frontier_factor)
         self.job = job
@@ -334,6 +337,7 @@ class PostgresFrontier(Frontier):
         self.max_attempts = max_attempts
         self.host_interval = float(host_interval)
         self.poll_interval = float(poll_interval)
+        self.stats_seconds = float(stats_seconds)
         self._pool = pool
         self._max_queued = None if max_pages is None else frontier_factor * max_pages
         self._max_host_queued = None if max_pages_per_host is None else frontier_factor * max_pages_per_host
@@ -351,6 +355,7 @@ class PostgresFrontier(Frontier):
         self._scope_hosts: list[str] = []
         self._drop_logged = False
         self._heartbeat: asyncio.Task[None] | None = None
+        self._refreshing: asyncio.Task[None] | None = None
         self._joined = False  # whether this worker is in the table of workers, see `take`
         self._closed = False
 
@@ -368,6 +373,7 @@ class PostgresFrontier(Frontier):
         host_interval: float = 0.0,
         poll_interval: float = 1.0,
         pool_size: int = 4,
+        stats_seconds: float = 60.0,
     ) -> "PostgresFrontier":
         """Connect a worker to the job named `job`; the limits are those of the job.
 
@@ -376,6 +382,7 @@ class PostgresFrontier(Frontier):
         holds at most `pool_size` connections: its other tasks wait for one
         in the process, not for the row of the job in the database. They
         commit without waiting for the disk (`synchronous_commit` off).
+        `stats` is refreshed every `stats_seconds`, see the class.
 
         Raises:
             JobError: there is no job of that name.
@@ -408,6 +415,7 @@ class PostgresFrontier(Frontier):
                 max_attempts=max_attempts,
                 host_interval=host_interval,
                 poll_interval=poll_interval,
+                stats_seconds=stats_seconds,
             )
             await frontier.refresh_stats()
             async with pool.acquire() as connection:
@@ -416,6 +424,7 @@ class PostgresFrontier(Frontier):
             await pool.close()
             raise
         frontier._heartbeat = asyncio.create_task(frontier._beat())
+        frontier._refreshing = asyncio.create_task(frontier._refresh())
         return frontier
 
     @_database_operation
@@ -493,7 +502,11 @@ class PostgresFrontier(Frontier):
                 delay = self._delay(state)
                 if delay is None:
                     await self._finish_job(connection)
-                    return None
+            if delay is None:
+                # The counts the summary of the crawl reports; on a connection
+                # of its own, once this one is back in the pool.
+                await self.refresh_stats()
+                return None
             if self.on_waiting is not None and _waits_for_others(state):
                 # Two workers, each with pages pending their save, would
                 # otherwise wait for each other for good: the heartbeat
@@ -800,10 +813,11 @@ class PostgresFrontier(Frontier):
         if self._closed:
             return
         self._closed = True
-        if self._heartbeat is not None:
-            self._heartbeat.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._heartbeat
+        for task in (self._heartbeat, self._refreshing):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         try:
             async with self._rows_lock, self._pool.acquire() as connection:
                 async with connection.transaction():
@@ -863,7 +877,7 @@ class PostgresFrontier(Frontier):
         await connection.execute(_UNCOUNT_HOSTS, self.job_id, list(by_host), list(by_host.values()))
 
     async def _beat(self) -> None:
-        """Renew the leases of this worker and of its pages and refresh the stats, every `heartbeat_seconds`."""
+        """Renew the leases of this worker and of its pages every `heartbeat_seconds`."""
         while True:
             await asyncio.sleep(self.heartbeat_seconds)
             try:
@@ -876,11 +890,20 @@ class PostgresFrontier(Frontier):
                         self.lease_seconds,
                     )
                 await self._pool.execute(_SEEN, self.job_id, self.worker, self.lease_seconds, False)
-                await self.refresh_stats()
             except Exception:
                 # The leases are renewed at the next beat; if the database
                 # is gone for longer, they expire and others crawl the pages.
                 logger.warning("Heartbeat of %s failed", self.worker, exc_info=True)
+
+    async def _refresh(self) -> None:
+        """Refresh the stats every `stats_seconds`: a task of its own, as counting the pages of a large job takes long."""
+        while True:
+            await asyncio.sleep(self.stats_seconds)
+            try:
+                await self.refresh_stats()
+            except FrontierDatabaseError as error:
+                # The stats stay as they were until the next refresh.
+                logger.warning("Stats of crawl job %s could not be refreshed: %s", self.job, error)
 
     def _delay(self, state: asyncpg.Record) -> float | None:
         """How long `take` waits before it looks again; None if there is nothing left to wait for."""

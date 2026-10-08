@@ -58,7 +58,10 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
   short one brings the pages of a dead worker back sooner, but a worker
   paused longer than the lease (a long garbage collection, a stalled
   disk) loses its pages to another one and they are crawled twice. The
-  heartbeat must come several times within a lease (here 20 s and 60 s).
+  heartbeat must come several times within a lease (here 20 s and 60 s),
+  and does nothing else: the counts of the job, a scan of all its pages,
+  are refreshed by a task of their own every minute, so a slow scan of a
+  large job never makes a lease late.
 - **A page that kills its workers** (a parser crash, a page too big for
   memory) would come back forever. Expiries are counted, and a page fails
   after a few (`max_attempts`).
