@@ -154,6 +154,73 @@ class TestDomainDelays:
         assert limiter.reserve("a") == 10.0
 
 
+class TestSlowDown:
+    def test_too_many_requests_double_the_interval_from_a_floor(self, clock):
+        limiter = RateLimiter(10.0, clock=clock)  # 0.1 s apart
+        assert limiter.slow_down("a", clock.now)
+        assert limiter.interval_for("a") == RateLimiter.MIN_SLOWDOWN
+        assert limiter.slow_down("a", clock.now)
+        assert limiter.interval_for("a") == 2 * RateLimiter.MIN_SLOWDOWN
+        assert limiter.interval_for("b") == 0.1
+        assert limiter.get_stats().domains == {}  # no request made, nothing counted
+
+    def test_slowdown_stops_at_a_ceiling(self, clock):
+        limiter = RateLimiter(1 / 40, clock=clock)  # 40 s apart
+        assert limiter.slow_down("a", clock.now)
+        assert limiter.interval_for("a") == RateLimiter.MAX_SLOWDOWN
+        assert not limiter.slow_down("a", clock.now)
+        assert limiter.interval_for("a") == RateLimiter.MAX_SLOWDOWN
+
+    def test_requests_sent_before_a_slowdown_do_not_slow_down_again(self, clock):
+        limiter = RateLimiter(10.0, clock=clock)
+        sent_at = clock.now
+        clock.now += 0.5
+        assert limiter.slow_down("a", sent_at)
+        # The other requests of the wave, answered after it.
+        clock.now += 0.5
+        assert not limiter.slow_down("a", sent_at)
+        assert not limiter.slow_down("a", sent_at + 0.4)
+        assert limiter.interval_for("a") == pytest.approx(1.0, rel=0.01)  # wearing off already
+
+    def test_slowdown_halves_over_time_down_to_the_interval_without_it(self, clock):
+        limiter = RateLimiter(2.0, clock=clock)  # 0.5 s apart
+        limiter.slow_down("a", clock.now)
+        limiter.slow_down("a", clock.now)
+        assert limiter.interval_for("a") == 2.0
+        clock.now += RateLimiter.SLOWDOWN_HALF_LIFE
+        assert limiter.interval_for("a") == 1.0
+        clock.now += 10 * RateLimiter.SLOWDOWN_HALF_LIFE
+        assert limiter.interval_for("a") == 0.5
+
+    def test_crawl_delay_is_kept_apart(self, clock):
+        limiter = RateLimiter(2.0, clock=clock)
+        limiter.set_delay("a", 3.0)
+        assert limiter.slow_down("a", clock.now)
+        assert limiter.interval_for("a") == 6.0
+        # A longer Crawl-delay is still news, and outlasts the slowdown.
+        assert limiter.set_delay("a", 4.0)
+        clock.now += 10 * RateLimiter.SLOWDOWN_HALF_LIFE
+        assert limiter.interval_for("a") == 4.0
+
+    def test_slowdown_moves_a_start_booked_before_it(self, clock):
+        limiter = RateLimiter(2.0, clock=clock)
+        limiter.reserve("a")
+        limiter.slow_down("a", clock.now)
+        assert waits(limiter, ["a", "b"]) == [1.0, 0.0]
+
+    def test_slowdown_under_a_global_limit_holds_back_its_domain_only(self, clock):
+        limiter = RateLimiter(2.0, per_domain=False, clock=clock)
+        limiter.reserve("a")
+        limiter.slow_down("a", clock.now)
+        assert (limiter.interval_for("a"), limiter.interval_for("b")) == (1.0, 0.5)
+        assert waits(limiter, ["b", "a"]) == [0.5, 1.0]
+
+    async def test_slot_gives_the_time_the_request_started(self, clock):
+        limiter = RateLimiter(None, clock=clock)
+        async with limiter.slot("a") as started:
+            assert started == clock.now
+
+
 class TestJitter:
     def test_jitter_is_added_on_top_of_the_interval(self, clock, monkeypatch):
         monkeypatch.setattr(random, "uniform", lambda low, high: high)

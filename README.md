@@ -25,7 +25,8 @@ configuration file, by command-line options, or from Python.
 - **Concurrency**: one connection pool, a global limit of requests in
   flight and an optional limit per host
 - **Politeness**: requests per second per host or overall, minimum delay
-  and jitter, robots.txt per RFC 9309 with Crawl-delay, `nofollow` and
+  and jitter, a host that answers HTTP 429 slowed down until it stops,
+  robots.txt per RFC 9309 with Crawl-delay, `nofollow` and
   `noindex` of links, robots meta tags and `X-Robots-Tag` (also those
   that name the crawler), a
   configurable User-Agent with rotation

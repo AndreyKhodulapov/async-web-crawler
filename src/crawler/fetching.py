@@ -460,7 +460,8 @@ class Fetcher:
         """Make one request under the breaker `call` of `url`, unless the circuit breaker of the host refuses it.
 
         Nor is it made when its host is held back longer than `max_wait`.
-        A probe of a half-open circuit it took is let go then.
+        A probe of a half-open circuit it took is let go then. HTTP 429
+        slows the requests to the host down (see `RateLimiter.slow_down`).
         """
         host = get_host(url)
 
@@ -483,11 +484,24 @@ class Fetcher:
                 # The rate limit is waited for before taking a concurrency slot,
                 # so a request waiting for its host does not hold a slot another
                 # host could use; inside the slot the interval is checked once more.
-                async with gate() if host is None else self.rate_limiter.slot(host, gate, max_wait=max_wait):
+                async with gate() if host is None else self.rate_limiter.slot(host, gate, max_wait=max_wait) as started:
                     result = await self._send(
                         url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout
                     )
                     call.record(result.error)
+                    error = result.error
+                    if (
+                        isinstance(error, HTTPStatusError)
+                        and error.status == 429
+                        and host is not None
+                        and started is not None
+                        and self.rate_limiter.slow_down(host, started)
+                    ):
+                        logger.info(
+                            "%s answered HTTP 429: requests to it are now %.1fs apart",
+                            host,
+                            self.rate_limiter.interval_for(host),
+                        )
                     return result
         except CircuitOpenError as error:
             return FetchResult.failure(url, error, 0.0)

@@ -116,6 +116,26 @@ def page(url: str) -> Response:
     return Response(status=200, content="page", size=4, final_url=url, content_type="text/html")
 
 
+class TestSlowDown:
+    async def test_too_many_requests_slow_the_host_down(self, caplog) -> None:
+        transport = ScriptedTransport({URL: HTTPStatusError(URL, 429, "Too Many Requests")})
+        fetcher = make_fetcher(transport, max_retries=0)
+
+        with caplog.at_level(logging.INFO, logger="crawler.fetching"):
+            await fetcher.fetch(URL)
+
+        assert 0.99 < fetcher.rate_limiter.interval_for("a.test") <= RateLimiter.MIN_SLOWDOWN
+        assert "a.test answered HTTP 429: requests to it are now 1.0s apart" in caplog.text
+
+    async def test_other_failures_do_not_slow_the_host_down(self) -> None:
+        transport = ScriptedTransport({URL: HTTPStatusError(URL, 503, "Service Unavailable")})
+        fetcher = make_fetcher(transport, max_retries=0)
+
+        await fetcher.fetch(URL)
+
+        assert fetcher.rate_limiter.interval_for("a.test") == 0.0
+
+
 class TestMaxWait:
     """A request whose host is held back longer than `max_wait` is not sent, nor waited for."""
 

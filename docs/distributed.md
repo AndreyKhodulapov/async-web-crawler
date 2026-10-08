@@ -79,8 +79,9 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
   to. Failures several workers meet at once count as one: a host down for
   a few seconds is not given up because many workers saw it.
 - **What is cheap to repeat stays in each worker**: robots.txt is
-  downloaded and cached by every worker once per host, and each worker
-  has its own circuit breaker. A host gets a few more requests than from
+  downloaded and cached by every worker once per host, each worker
+  has its own circuit breaker, and each slows a host down after the 429
+  it gets. A host gets a few more requests than from
   one process; sharing them would cost a database round trip at every
   request.
 

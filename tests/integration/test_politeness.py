@@ -14,6 +14,7 @@ from crawler import (
     CircuitBreaker,
     CircuitOpenError,
     MemoryFrontier,
+    RateLimiter,
     RetryStrategy,
     RobotsDisallowedError,
     RobotsParser,
@@ -51,9 +52,9 @@ def record_starts(crawler: AsyncCrawler) -> list[float]:
 
     @contextlib.asynccontextmanager
     async def recording_slot(*args, **kwargs):
-        async with slot(*args, **kwargs):
+        async with slot(*args, **kwargs) as started:
             starts.append(time.monotonic())
-            yield
+            yield started
 
     crawler.rate_limiter.slot = recording_slot
     return starts
@@ -367,7 +368,7 @@ class TestRetries:
         assert stats.retries == 1
         assert stats.requests == 2
 
-    async def test_backoff_after_429_holds_back_requests_already_waiting(self, url, site):
+    async def test_backoff_after_429_holds_back_requests_already_waiting(self, url, site, brief_slowdown):
         # HTTP 429 says the whole site is overloaded. The retry of /busy/0
         # waits 0.2..0.4 s; the pages had booked their turns before the
         # failure, and they wait for the retry too.
@@ -421,6 +422,24 @@ class TestRetries:
         assert crawler.crawl_stats().retries == 2
 
 
+class TestTooManyRequests:
+    async def test_crawl_slows_down_for_a_host_that_answers_too_many_requests(self, url, site, monkeypatch):
+        # The site serves a page at most every 0.15 s and answers HTTP 429
+        # without Retry-After to the rest. The pause before a retry is too
+        # short to help; the slowdown to 0.2 s between requests does.
+        monkeypatch.setattr(RateLimiter, "MIN_SLOWDOWN", 0.2)
+        site.throttle_gap = 0.15
+        pages = [url(f"/throttled/{n}") for n in range(6)]
+        options = {"max_concurrent": 3, "max_depth": 0, "retry_strategy": RetryStrategy(max_retries=1, base_delay=0.01)}
+        async with polite(**options) as crawler:
+            crawled = await crawler.crawl(pages)
+
+        assert crawler.failed_urls == {}
+        assert set(crawled) == set(pages)
+        # Only the requests sent at once at the start were refused.
+        assert sum(site.hits.values()) <= len(pages) + 2
+
+
 class TestRetryAfter:
     async def test_crawl_puts_off_the_pages_of_a_host_that_asked_to_wait(self, url, site):
         # The host asks for 2 s, longer than a retry may wait: the request is
@@ -450,7 +469,7 @@ class TestRetryAfter:
         assert set(pages) == {url("/overloaded/1/1"), url("/site/a.html")}
         assert site.hits["/overloaded/1/1"] == 2
 
-    async def test_crawl_gives_up_on_a_page_that_keeps_asking_to_wait(self, url, site):
+    async def test_crawl_gives_up_on_a_page_that_keeps_asking_to_wait(self, url, site, brief_slowdown):
         # Retry-After of 2 s is too long to retry and capped to 0.05 s of
         # holding the host back: the page comes back three times, then fails.
         options = {

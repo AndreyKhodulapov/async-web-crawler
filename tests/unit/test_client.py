@@ -1136,7 +1136,9 @@ class TestCrawlBlockedHost:
         assert len(fake_session.requested) == 6
         assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
 
-    async def test_host_that_answers_too_many_requests_is_not_given_up(self, make_crawler, fake_session):
+    async def test_host_that_answers_too_many_requests_is_not_given_up(
+        self, make_crawler, fake_session, brief_slowdown
+    ):
         # The host asks for fewer requests: its 429s pause it, but do not
         # block it, and every page comes through on a retry.
         crawler = make_crawler(
@@ -1357,7 +1359,9 @@ class TestCrawlHeldBackHost:
         assert set(crawler.processed_urls) == {"http://a/1"}
         assert crawler.crawl_stats().queued == 0
 
-    async def test_page_that_keeps_asking_to_wait_fails_in_the_end(self, make_crawler, fake_session, caplog):
+    async def test_page_that_keeps_asking_to_wait_fails_in_the_end(
+        self, make_crawler, fake_session, caplog, brief_slowdown
+    ):
         caplog.set_level(logging.INFO, logger="crawler")
         crawler = make_crawler(
             max_concurrent=1,

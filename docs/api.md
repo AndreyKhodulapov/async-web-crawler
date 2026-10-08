@@ -144,6 +144,14 @@ as long as it asks, up to `AsyncCrawler(max_retry_after=600.0)` seconds
 (10 minutes), even when the request is not retried; a request whose
 Retry-After is longer than `max_delay` of the retry strategy is not
 retried. Later `fetch_url()` calls to the host wait for that time too.
+HTTP 429 also slows the host down for good, not only for the pause: its
+interval is doubled, to at least `RateLimiter.MIN_SLOWDOWN` (1 second) and
+at most `RateLimiter.MAX_SLOWDOWN` (60 seconds), and the slowdown halves
+every `RateLimiter.SLOWDOWN_HALF_LIFE` (60 seconds) without another 429.
+The requests already in flight when it comes double it once, not once
+each. It is logged (`example.com answered HTTP 429: requests to it are now
+2.0s apart`), shows in the interval of the host in `crawl_stats()` and is
+kept apart from Crawl-delay.
 
 ## Retries
 
@@ -187,6 +195,9 @@ The building blocks work on their own too:
 ```python
 limiter = RateLimiter(requests_per_second=2.0, per_domain=True, min_delay=0.5, jitter=0.2)
 await limiter.acquire("example.com")      # returns when the request may start
+async with limiter.slot("example.com") as started:
+    ...                                   # the request, started at `started` by the limiter's clock
+limiter.slow_down("example.com", started) # after HTTP 429 to it
 
 robots = RobotsParser(fetch)              # fetch(url) -> (status, body)
 await robots.fetch_robots("https://example.com/")
@@ -1000,7 +1011,9 @@ the fetcher tells `on_host_held`, and the crawl holds the host back in the
 frontier (`Frontier.hold_host`, done only by a frontier that is `shared`).
 So is a host whose circuit has opened in one worker, until its probe is
 due, and one whose robots.txt one worker found unreachable, until it is
-downloaded again; the breaker and robots.txt stay each worker's own. The
+downloaded again; the breaker and robots.txt stay each worker's own. So
+does the slowdown of a host after HTTP 429: each worker slows down on the
+429 it gets, and the interval of the host in the job does not change. The
 page put off comes back with its host, without a delay of its own; a page
 that redirects to the held host waits as long itself. A
 worker that took a page of the host before the hold reached the database

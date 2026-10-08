@@ -15,6 +15,7 @@ from helpers import long_url
 from pages import ENCODING_PAGES, JS_PAGES, JS_SCRIPT, SITE_HEADERS, SITE_PAGES, fixture_html
 from proxy_server import ProxyServer
 
+from crawler import RateLimiter
 from crawler.logging_setup import reset_logging
 from demo_site import free_port
 
@@ -23,7 +24,7 @@ class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
-    /busy/, /shop/, /js/, sitemaps and robots.txt, in the order they arrived. `robots` is the
+    /busy/, /throttled/, /shop/, /js/, sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404; the
     first `robots_failures` requests for it answer 503 whatever it is, or
     the first `robots_failures_by_host[host]` requests from the hosts named
@@ -36,7 +37,9 @@ class SiteState:
     bodies; the first `sitemap_failures` requests for them answer 503.
     `sitemap_headers` are added to the responses with them.
     `headers` keeps the request headers of the latest request for each
-    path recorded, /cookies/ pages included.
+    path recorded, /cookies/ pages included. /throttled/ pages answer 429
+    to a request that comes within `throttle_gap` seconds of the last one
+    they served.
     """
 
     def __init__(self) -> None:
@@ -57,6 +60,8 @@ class SiteState:
         self.sitemap_failures = 0
         self.sitemap_headers: dict[str, str] = {}
         self.headers: dict[str, dict[str, str]] = {}
+        self.throttle_gap = 0.0
+        self.throttled_at: float | None = None
 
     def record(self, request: web.Request) -> None:
         self.hits[request.path] += 1
@@ -215,6 +220,17 @@ SHOP_PAGES = 20
 SHOP_SORTS = ("price", "name", "date")
 
 
+async def throttled(request: web.Request) -> web.Response:
+    """Answers 429 without Retry-After within `throttle_gap` seconds of the last page it served, else a page."""
+    state = request.app[SITE_STATE]
+    state.record(request)
+    now = time.monotonic()
+    if state.throttled_at is not None and now - state.throttled_at < state.throttle_gap:
+        raise web.HTTPTooManyRequests()
+    state.throttled_at = now
+    return web.Response(text="<title>Served</title>", content_type="text/html")
+
+
 async def shop_list(request: web.Request) -> web.Response:
     """Page N of a listing, under every sort order: an endless-looking URL space.
 
@@ -336,6 +352,13 @@ def clean_proxy_environment(monkeypatch) -> None:
 
 
 @pytest.fixture
+def brief_slowdown(monkeypatch) -> None:
+    """Slows a host that answers HTTP 429 down by milliseconds, for the tests of what else a 429 does."""
+    monkeypatch.setattr(RateLimiter, "MIN_SLOWDOWN", 0.01)
+    monkeypatch.setattr(RateLimiter, "MAX_SLOWDOWN", 0.05)
+
+
+@pytest.fixture
 def restore_logging():
     """Undoes `configure_logging` after the test: its handlers are removed and closed, the level is put back."""
     level = logging.getLogger().level
@@ -365,6 +388,7 @@ def make_app() -> web.Application:
     app.router.add_get("/flaky/{fails}", flaky)
     app.router.add_get("/busy/{seconds}", busy)
     app.router.add_get("/overloaded/{fails}/{seconds}", overloaded)
+    app.router.add_get("/throttled/{n}", throttled)
     app.router.add_get("/shop/list", shop_list)
     app.router.add_get("/shop/item/{n}", shop_item)
     app.router.add_get("/wide/{n}", wide_page)

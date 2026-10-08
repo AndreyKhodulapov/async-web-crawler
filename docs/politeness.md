@@ -176,6 +176,16 @@ sites it visits and follows their rules.
   `max_retry_after`): a misconfigured server must not stop the crawl for a
   day. And say so in the log: a crawl that makes no requests for minutes
   looks stuck to the user.
+- A 429 without Retry-After says "fewer requests", not "come back in a
+  while": a pause before the retry alone is not enough, as the crawl
+  returns to the old pace right after it and earns the next 429. Here the
+  interval of the host doubles on every 429 (to at least 1 and at most
+  60 seconds) and halves again every minute without one, the way Scrapy's
+  AutoThrottle or TCP's congestion control (AIMD) find the rate a server
+  takes. The requests in flight when the first 429 comes were sent at the
+  old pace: their 429s double the interval once, not once each. A 429 is
+  not a failure to the circuit breaker either: the site is up and asks to
+  slow down, and giving it up would be the opposite of what it asked.
 - A 500 or 502 on one URL, or a reset connection, more often means **one
   page** or one backend is broken. Let only that request wait for its
   retry: holding the host for every retry lets a few broken pages stall

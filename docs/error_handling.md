@@ -200,6 +200,7 @@ leaves a failing site alone.
   - backoff and jitter spread retries out in time;
   - retries at one layer, capped per request or by a budget;
   - a timeout or a 429 holds back the whole host, not only the failed request;
+  - a 429 slows the host down until it stops answering it;
   - Retry-After is honored;
   - a circuit breaker stops the traffic while the host is down, and a single
     probe tests its recovery.
