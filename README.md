@@ -139,7 +139,7 @@ the [configuration guide](docs/configuration.md) explains them.
 ```bash
 docker build -t async-web-crawler .                   # the crawler, about 700 MB
 docker build --target js -t async-web-crawler:js .    # with Chromium for rendering, about 2.2 GB
-docker run --rm -v "$PWD/out:/app/out" async-web-crawler \
+docker run --rm --init -v "$PWD/out:/app/out" async-web-crawler \
     --urls https://books.toscrape.com/ --max-pages 20 --output out/pages.jsonl --report out/report.html
 ```
 
@@ -147,10 +147,14 @@ The image runs `python src/main.py`: its arguments are those of the
 [command line](#command-line), `--help` without any. It works in `/app`
 as a user that is not root (uid 10001) and writes to `/app/out`, a
 volume; on Linux, give it a directory it can write to, or run it as
-yourself with `--user $(id -u):$(id -g)`. The image `js` renders pages in
-Chromium; run it with `--init --shm-size=1g`. `docker stop` stops a crawl
-as Ctrl-C does: what the storage buffers is written, the reports too,
-and the exit code is 143.
+yourself with `--user $(id -u):$(id -g)`. Run it with `--init`: without
+it Python is process 1 of the container, which ignores a SIGTERM it has
+no handler for, so a SIGTERM before the crawl starts, or the second one
+that ends a crawl at once, does nothing and `docker stop` kills the
+crawler 10 seconds later, without its reports. The image `js` renders
+pages in Chromium; run it with `--init --shm-size=1g`. `docker stop`
+stops a crawl as Ctrl-C does: what the storage buffers is written, the
+reports too, and the exit code is 143.
 
 [docker-compose.yml](docker-compose.yml) runs the crawler next to its
 PostgreSQL, with the configuration files of
@@ -229,7 +233,9 @@ when the configuration has sitemaps to crawl.
 Everything else (sitemaps, the other filters, retries, the circuit breaker, timeouts,
 the rotation of proxies, what and how to render) is set in the file. The command line never keeps the pages in memory
 (`crawler.keep_pages` is off whatever the file says): they go to `--output`.
-The log and the progress line go to stderr, the summary to stdout:
+The log and the progress line go to stderr, the summary to stdout. In a terminal
+the progress line is redrawn every second; when stderr is a file or a pipe, such as `docker logs`, a line
+is printed every 30 seconds and at the end:
 
 ```
 [####################] 100% | 8/8 pages, 0 failed | 1.1 pages/s | done | active 0 (0 in flight) | queued 0 | 8s
@@ -289,7 +295,7 @@ python src/main.py report --job books --stats-json out/stats.json --report out/r
 | `--resume` | go on with the job of that name: queue the start URLs it never queued; the configuration must not differ |
 | `--restart` | delete the job of that name with its pages and create it anew |
 | `worker --job NAME` | the job to crawl |
-| `worker --config PATH` | configuration of the worker: `distributed`, `session`, `proxy`, `storage`, `logging`, `report`; the keys of the job in it are ignored with a warning. Every file of the storage needs `{worker}` in its name, such as `pages-{worker}.jsonl` |
+| `worker --config PATH` | configuration of the worker: `distributed`, `session`, `proxy`, `storage`, `logging`, `report`; the keys of the job in it are ignored with a warning. Every file it writes (storage, log, reports, `session.save_cookies`) needs `{worker}` in its name, such as `pages-{worker}.jsonl` |
 | `--concurrency N` | pages crawled at a time, in place of `crawler.max_concurrent` |
 | `--name WORKER` | name of the worker in the database and for `{worker}`; by default the host name, the process id and a random part |
 | `report --job NAME` | the job to report on, finished or still running |

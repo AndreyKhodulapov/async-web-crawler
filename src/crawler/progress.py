@@ -154,25 +154,31 @@ async def show_progress(
     max_pages: int,
     *,
     interval: float = 1.0,
+    off_tty_interval: float = 30.0,
     stream: TextIO | None = None,
 ) -> None:
     """Print the progress of a crawl every `interval` seconds until `crawl_task` ends.
 
     `max_pages` is the limit given to `crawl()`. The line goes to `stream`,
     stderr by default. In a terminal it is redrawn in place; in a file or a
-    pipe every update goes on a line of its own. The last line shows the
-    crawl as it ended. The result or the error of the task is left to the
-    caller: await the task afterwards.
+    pipe, such as `docker logs`, every line printed stays, so a line goes
+    there every `off_tty_interval` seconds, while the speed is still
+    measured every `interval`. The last line shows the crawl as it ended.
+    The result or the error of the task is left to the caller: await the
+    task afterwards.
     """
     stream = sys.stderr if stream is None else stream
     live = stream.isatty()
     tracker = ProgressTracker(max_pages)
+    loop = asyncio.get_running_loop()
+    printed_at = None
     while True:
         await asyncio.wait({crawl_task}, timeout=interval)
         finished = crawl_task.done()
-        print_progress_line(
-            format_progress(tracker.update(crawler.crawl_stats(), finished=finished)), stream, live=live
-        )
+        progress = tracker.update(crawler.crawl_stats(), finished=finished)
+        if live or finished or printed_at is None or loop.time() - printed_at >= off_tty_interval:
+            print_progress_line(format_progress(progress), stream, live=live)
+            printed_at = loop.time()
         if finished:
             break
     if live:

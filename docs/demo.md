@@ -51,7 +51,8 @@ The default start pages are sandboxes made for crawling practice, and their
 robots.txt shows the rules at work. webscraper.io disallows its pagination
 and product pages, one of them with a wildcard rule (`/test-sites/pagination*?page=`),
 and web-scraping.dev sets `Crawl-delay: 2`.
-While it runs, a progress line is updated every second:
+While it runs, a progress line is updated every second (when stderr is a
+file or a pipe, a line is printed every 30 seconds):
 
 ```
 [######--------------]  30% | 9/30 pages, 1 failed | 1.6 pages/s | ETA 14s | active 6 (2 in flight) | queued 15 | 7s

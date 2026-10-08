@@ -198,8 +198,9 @@ def parse_command_args(argv: list[str]) -> argparse.Namespace:
         "worker",
         help="crawl the pages of a crawl job until none is left; start as many as wanted",
         epilog="The configuration of the job says what and how to crawl; that of the worker gives the rest: "
-        "distributed, session, proxy, storage, logging, report and crawler.max_concurrent. Every file of the "
-        "storage must have {worker} in its name, such as pages-{worker}.jsonl. The database is "
+        "distributed, session, proxy, storage, logging, report and crawler.max_concurrent. Every file it "
+        "writes, of the storage, the log, the reports and session.save_cookies, must have {worker} in its name, "
+        "such as pages-{worker}.jsonl. The database is "
         "distributed.database_url of the configuration, or the CRAWLER_DATABASE_URL variable.",
     )
     worker.add_argument("--job", required=True, metavar="NAME", help="name of the crawl job")

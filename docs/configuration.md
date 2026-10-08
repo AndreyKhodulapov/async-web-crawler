@@ -399,8 +399,9 @@ Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
 `{worker}` in a file name, such as `pages-{worker}.jsonl`, is the name of
 the worker of a crawl job, and `local` in a crawl of its own; so it is in
 `logging.file`, the files of `report` and `session.save_cookies`. A worker
-refuses a file of the storage, SQLite included, without it: workers write
-side by side, and one page may be saved by two of them (see
+refuses any of those files without it, a file of the storage, SQLite
+included, as well: workers write side by side, and one page may be saved
+by two of them (see
 [Crawl jobs](api.md#crawl-jobs)).
 
 ### `logging`

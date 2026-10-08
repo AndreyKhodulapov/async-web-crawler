@@ -903,6 +903,29 @@ async def test_file_of_the_storage_without_the_name_of_the_worker_is_refused(url
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("section", "option"),
+    [("logging", "file"), ("report", "stats_json"), ("report", "html"), ("session", "save_cookies")],
+)
+async def test_log_report_or_cookies_file_without_the_name_of_the_worker_is_refused(
+    url, site, tmp_path, section, option
+):
+    await create_job(make_config(urls=[url("/site/b.html")]), "test", dsn=POSTGRES_DSN)
+    files = {
+        "logging": {"file": str(tmp_path / "crawler-{worker}.log")},
+        "report": {"stats_json": str(tmp_path / "stats-{worker}.json"), "html": str(tmp_path / "report-{worker}.html")},
+        "session": {"save_cookies": str(tmp_path / "cookies-{worker}.txt")},
+    }
+    files[section][option] = str(tmp_path / "shared")
+
+    with pytest.raises(ConfigError) as refused:
+        await run_worker(worker_config(**files), "test", configure_logging=False)
+
+    assert [problem.split(":")[0] for problem in refused.value.problems] == [f"{section}.{option}"]
+    assert site.hits.total() == 0
+    assert list(tmp_path.iterdir()) == []
+
+
 async def test_connections_of_a_worker_are_those_of_its_configuration(url, site, monkeypatch):
     await create_job(make_config(urls=[url("/wide/0")], crawler={"max_pages": 5}), "test", dsn=POSTGRES_DSN)
     config = worker_config(distributed={"pool_size": 2})

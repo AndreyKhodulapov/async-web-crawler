@@ -978,13 +978,13 @@ workers may run elsewhere).
 A page is crawled at least once, not exactly once: the page of a worker
 that stopped goes back to the queue once its lease expires, and another
 worker crawls it again, following its redirect again if it had one. So a database storage, which keeps a row per URL,
-suits workers best. Files are each worker's own: every file of the
-storage, SQLite databases included, must have `{worker}` in its name, or
-`run_worker` raises `ConfigError`; a page may then be in the files of two
-workers. The reports of a worker without `{worker}` in their names are
-written over by the last worker; a log file without it is shared, the
-lines of all workers mixed, and its rotation, made by each process on
-its own, may lose lines.
+suits workers best. Files are each worker's own: every file it writes,
+of the storage (SQLite databases included), the log, the reports and
+`session.save_cookies`, must have `{worker}` in its name, or `run_worker`
+raises `ConfigError`; a page may then be in the files of two workers.
+Without it the reports of the last worker would replace those of the
+others, and a shared log file would lose lines, as each process rotates
+it on its own.
 
 A URL is a key of the database, which holds about 2.7 KB: the frontier
 keeps none longer than `PostgresFrontier.MAX_URL_LENGTH` (2048
@@ -1103,7 +1103,9 @@ config.yaml --name shop`, `python src/main.py worker --job shop` and
 ## Live progress
 
 `show_progress` prints a line about a running crawl every second, until the
-crawl ends:
+crawl ends. In a terminal the line is redrawn in place; in a file or a
+pipe, such as `docker logs`, a line goes there every 30 seconds
+(`off_tty_interval`), and the last one when the crawl ends:
 
 ```python
 import asyncio

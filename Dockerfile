@@ -1,9 +1,11 @@
 # The crawler in a container.
 #   docker build -t async-web-crawler .               # without a browser
 #   docker build --target js -t async-web-crawler:js .  # with Chromium, for rendering.mode
-#   docker run --rm async-web-crawler --urls https://books.toscrape.com/ --max-pages 20
+#   docker run --rm --init async-web-crawler --urls https://books.toscrape.com/ --max-pages 20
 # Files the crawl writes go to /app/out, e.g. --output out/pages.jsonl; mount
 # a directory there to keep them. docker-compose.yml runs crawl jobs.
+# --init: as process 1, Python ignores a SIGTERM it has no handler for, the
+# one before the crawl starts and the second one that ends it at once.
 
 ARG PYTHON_VERSION=3.14
 

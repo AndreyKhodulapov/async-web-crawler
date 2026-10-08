@@ -43,7 +43,8 @@ async def run_worker(
 
     `worker` names the worker in the database and stands for "{worker}" in
     the paths of the files it writes; by default it is made of the host
-    name, the process id and a random part. Every file of the storage must
+    name, the process id and a random part. Every file the worker writes,
+    of the storage, the log, the reports and `session.save_cookies`, must
     have "{worker}" in its name: workers write side by side, and a page of
     a worker that stopped is crawled again by another one, so a page may
     be in the files of two workers. A database keeps a row per URL.
@@ -67,7 +68,7 @@ async def run_worker(
     frontier and raises `CancelledError`.
 
     Raises:
-        ConfigError: there is no database, a file of the storage is
+        ConfigError: there is no database, a file the worker writes is
             without "{worker}", or the part of the job cannot be used here,
             such as rendering without Playwright or its Chromium; nothing
             is taken.
@@ -133,12 +134,23 @@ def host_interval(options: CrawlOptions) -> float:
 
 
 def _check_files(config: CrawlerConfig) -> None:
-    """Raises ConfigError if a file of the storage is not one of the worker's own."""
-    problems = [
-        f"storage.outputs[{index}]: workers of a crawl job write files of their own, "
-        "put {worker} in the name, such as pages-{worker}.jsonl"
+    """Raises ConfigError if a file the worker writes is not one of its own."""
+    files = {
+        f"storage.outputs[{index}]": output
         for index, output in enumerate(config.storage.outputs)
-        if "{worker}" not in output and getattr(storage_from_output(output), "path", None) is not None
+        if getattr(storage_from_output(output), "path", None) is not None
+    }
+    files |= {
+        "logging.file": config.logging.file,
+        "report.stats_json": config.report.stats_json,
+        "report.html": config.report.html,
+        "session.save_cookies": config.session.save_cookies,
+    }
+    problems = [
+        f"{key}: workers of a crawl job write files of their own, put {{worker}} in the name, such as "
+        "pages-{worker}.jsonl"
+        for key, path in files.items()
+        if path is not None and "{worker}" not in path
     ]
     if problems:
         raise ConfigError(problems)
