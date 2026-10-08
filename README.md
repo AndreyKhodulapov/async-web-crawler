@@ -454,11 +454,15 @@ storages. All of it is described in the [API reference](docs/api.md).
 - **No SOCKS proxies.** Only http and https proxies; `socks5://` is a
   configuration error. A local bridge from HTTP to SOCKS (such as
   `gost` or `privoxy`) makes a SOCKS proxy usable.
-- **A timeout through a proxy is the site's.** The crawler cannot tell a
-  slow proxy from a slow site, so a timeout counts against the site, in
-  its circuit breaker, and never takes the proxy out of rotation. A proxy
-  that loses packets looks like slow sites; a proxy that cannot be reached
-  or refuses the password is taken out as it should be.
+- **A read timeout through a proxy is the site's.** A connect timeout
+  is the proxy's: it did not accept the connection or, for an https URL,
+  did not answer CONNECT in time. Past that the crawler cannot tell a slow
+  proxy from a slow site, so a read or total timeout counts against the
+  site, in its circuit breaker, and never takes the proxy out of rotation.
+  A proxy that stalls mid-response looks like slow sites. The other way
+  round, a proxy that waits for an unreachable https site longer than
+  `connect_timeout` is blamed for it; any response through the proxy
+  clears its count, so only a crawl of such sites alone takes it out.
 - **An error page of an http proxy is the site's.** An `http://` URL is
   asked of the proxy itself, which answers for the site: its own 502 or
   503, when it cannot reach the site or fails, cannot be told from the

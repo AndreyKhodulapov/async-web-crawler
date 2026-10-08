@@ -242,7 +242,7 @@ class ProxyPool:
 
         None: a response came through, whatever its status; a
         `ProxyNetworkError`: the proxy failed. Any other error, such as a
-        timeout, counts the request, but neither way: it may be the site's.
+        read timeout, counts the request, but neither way: it may be the site's.
         """
         state = self._states[proxy.label]
         state.requests += 1

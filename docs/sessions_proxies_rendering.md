@@ -88,7 +88,8 @@ requests through other addresses and sees the pages JavaScript builds.
 - **Blame the right party.** A dead proxy must not open the circuits of
   the sites behind it, so a proxy error is not the site's. Only what is
   surely the proxy's counts against it: cannot connect, its name does not
-  resolve, HTTP 407. A timeout, an error page of the proxy, a refused
+  resolve, HTTP 407, no connection or no answer to CONNECT within the
+  connect timeout. A read timeout, an error page of the proxy, a refused
   CONNECT may be the site's: they count against the site.
 - **Politeness goes by the site, not by the proxy**: rate limits,
   robots.txt and the circuit breaker are per host of the URL, whatever

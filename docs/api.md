@@ -447,10 +447,10 @@ takes it out again. A request through a proxy fails with:
 
 | Error | When | Retried |
 |-------|------|---------|
-| `ProxyNetworkError` (a `ProxyError` and a `NetworkError`) | the proxy cannot be reached, its name does not resolve, the TLS of an `https://` proxy fails, or it answers HTTP 407 to CONNECT or to the request of an `http://` URL (inside the tunnel of an `https://` URL the site answers) | yes, through the next proxy at once; with `per_host` the host stays on that proxy |
+| `ProxyNetworkError` (a `ProxyError` and a `NetworkError`) | the proxy cannot be reached, its name does not resolve, the TLS of an `https://` proxy fails, the connection to it (for an `https://` URL, with its answer to CONNECT) takes longer than the connect timeout, or it answers HTTP 407 to CONNECT or to the request of an `http://` URL (inside the tunnel of an `https://` URL the site answers) | yes, through the next proxy at once; with `per_host` the host stays on that proxy |
 | `NoProxyError` (a `ProxyError`) | every proxy for the URL is out of rotation: the request is not sent; the message says when the first is back | no |
 | `NetworkError` | the proxy answered CONNECT with another status: it cannot or may not reach the site | yes, as any network error of the site |
-| `FetchTimeoutError` | a timeout: the proxy and the site cannot be told apart | yes, as any timeout of the site |
+| `FetchTimeoutError` | a read or total timeout: the proxy and the site cannot be told apart | yes, as any timeout of the site |
 
 Whatever the site answers through a proxy (a 404, a 503) is the site's,
 and the proxy is up. The circuit breaker counts no `ProxyError`: a dead

@@ -44,11 +44,13 @@ leaves a failing site alone.
   (`ProxyNetworkError`). A 407 or a bad certificate inside the tunnel of
   an https URL is the site's. Any other response through a proxy is the
   site's too, whatever its status, and so is a
-  refused CONNECT (the proxy cannot reach the site). A timeout cannot be
-  told apart: over https the connect step includes the CONNECT, so a slow
-  proxy and a slow site look alike. It is put on the site, as without a
-  proxy; put on the proxy, one dead site would take every proxy out in
-  turn. A proxy that loses packets then looks like slow sites.
+  refused CONNECT (the proxy cannot reach the site). A connect timeout is
+  the proxy's: the connection to it, and over https its answer to CONNECT,
+  did not come in time; a proxy that stays silent is the most common way
+  a pool degrades. A read or total timeout cannot be told apart, since a
+  slow proxy and a slow site look alike: it is put on the site, as without
+  a proxy; put on the proxy, one dead site would take every proxy out in
+  turn. A proxy that stalls mid-response then looks like slow sites.
   A browser that cannot start or crashes is a failure of the crawler, not
   of the site (`RenderError`): it is not retried, since another attempt meets the
   same browser, and the circuit breaker does not count it. A page the
