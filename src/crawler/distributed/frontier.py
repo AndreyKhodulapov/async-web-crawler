@@ -287,7 +287,10 @@ class PostgresFrontier(Frontier):
     An operation fails with `FrontierDatabaseError`, its one `ERRORS`,
     when the database cannot be reached or refuses it, the error of the
     database as its cause; it is not tried again: the worker stops, and
-    its pages come back to the others once their leases expire.
+    its pages come back to the others once their leases expire. So it
+    fails, with a `JobError` as its cause, once the job is deleted or
+    restarted under the worker: its rows, those of its pages and hosts
+    with them, are gone.
 
     A worker that takes back a page of its own whose lease expired, while
     another of its tasks still crawls it, leaves the page to that task:
@@ -486,7 +489,7 @@ class PostgresFrontier(Frontier):
                     if row["scope_version"] != self._scope_version:
                         await self._read_scope(connection)
                     return FrontierPage(row["url"], row["depth"])
-                state = await connection.fetchrow(_WAIT_STATE, self.job_id, self.worker)
+                state = self._job_row(await connection.fetchrow(_WAIT_STATE, self.job_id, self.worker))
                 delay = self._delay(state)
                 if delay is None:
                     await self._finish_job(connection)
@@ -647,7 +650,9 @@ class PostgresFrontier(Frontier):
     async def full(self) -> bool:
         if self._max_queued is None:
             return False
-        job = await self._pool.fetchrow("SELECT requested, unfinished FROM crawl_jobs WHERE id = $1", self.job_id)
+        job = self._job_row(
+            await self._pool.fetchrow("SELECT requested, unfinished FROM crawl_jobs WHERE id = $1", self.job_id)
+        )
         return not self._closed_at(job["requested"]) and job["unfinished"] + job["requested"] >= self._max_queued
 
     @_database_operation
@@ -761,9 +766,12 @@ class PostgresFrontier(Frontier):
                     "SELECT state, count(*) FROM frontier WHERE job = $1 GROUP BY state", self.job_id
                 )
             )
-            job = await connection.fetchrow(
-                "SELECT requested, over_host_limit, links_dropped, links_dropped_by_host FROM crawl_jobs WHERE id = $1",
-                self.job_id,
+            job = self._job_row(
+                await connection.fetchrow(
+                    "SELECT requested, over_host_limit, links_dropped, links_dropped_by_host"
+                    " FROM crawl_jobs WHERE id = $1",
+                    self.job_id,
+                )
             )
         self._stats = FrontierStats(
             queued=counts.get("queued", 0),
@@ -888,6 +896,13 @@ class PostgresFrontier(Frontier):
         if state["queued"] or self._held or state["others_busy"]:
             return due
         return None
+
+    def _job_row(self, row: asyncpg.Record | None) -> asyncpg.Record:
+        """`row`, read from the row of the job; raises FrontierDatabaseError if the job was deleted, or restarted, under this worker."""
+        if row is None:
+            error = JobError(f'Crawl job "{self.job}" no longer exists: it was deleted or restarted')
+            raise FrontierDatabaseError(f"{type(error).__name__}: {error}") from error
+        return row
 
     def _closed_at(self, requested: int) -> bool:
         """Whether `requested` pages reach max_pages: no page is handed out or accepted until one is uncounted."""

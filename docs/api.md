@@ -941,7 +941,7 @@ await watch_job(dsn, "shop", interval=2)   # the line every 2 seconds until the 
 | `JobMode.RESTART` | deletes the job and its pages, then creates it anew |
 | `job_config(config)` | the part of a configuration the job keeps and every worker shares: the sections of `JOB_SECTIONS` (`urls`, `sitemaps`, `crawler`, `retry`, `circuit_breaker`, `filters`, `rendering`) without `crawler.max_concurrent` |
 | `PostgresFrontier.open(dsn, *, job, worker=None, ...)` | connects a worker to the job, with the limits of the job; `JobError` if there is no such job |
-| `run_worker(config, job, *, worker=None, configure_logging=True)` | crawls the pages of the job with `AdvancedCrawler.crawl_frontier` until none is left, then closes the frontier and the crawler; returns the statistics of this worker (`AdvancedCrawler.get_stats()` with `worker`, its name, `saved` and `save_failed`, the pages its storage wrote and could not); `FrontierError` if the database fails; cancelled, it writes the buffer of the storage, queues the pages it had in flight again, writes its reports and cookies and raises `CancelledError` |
+| `run_worker(config, job, *, worker=None, configure_logging=True)` | crawls the pages of the job with `AdvancedCrawler.crawl_frontier` until none is left, then closes the frontier and the crawler; returns the statistics of this worker (`AdvancedCrawler.get_stats()` with `worker`, its name, `saved` and `save_failed`, the pages its storage wrote and could not); `FrontierError` if the database fails, or the job is deleted or restarted under it; cancelled, it writes the buffer of the storage, queues the pages it had in flight again, writes its reports and cookies and raises `CancelledError` |
 | `job_stats(dsn, job, *, top_domains=10)` | the statistics of the job from the database, in one snapshot: the keys of `CrawlerStats.get_stats()` over the pages of all workers, and `job`, `state`, `queued`, `in_progress` and `workers` (name -> `state`, `started_at`, `active_seconds`, `pages`, `successful`, `failed`, `skipped`, `pages_per_second`); `JobError` if there is no such job, `FrontierError` if the database fails |
 | `job_progress(dsn, job, *, window=30.0)` | the progress of the job from the database, in one snapshot: a `JobProgress` with `state`, `done` (pages requested and finished, by any worker), `total` (`max_pages` of the job), `failed`, `percent`, `pages_per_second` (pages done in the last `window` seconds), `eta`, `workers` (running), `lost`, `in_progress`, `queued` and `elapsed`; `JobError` if there is no such job, `FrontierError` if the database fails |
 | `watch_job(dsn, job, *, interval=2.0, window=30.0, stream=None)` | prints the line of `format_job_progress` to `stream` (stdout) every `interval` seconds until the job is finished; redrawn in place in a terminal, a line per update in a file or a pipe |
@@ -1057,7 +1057,9 @@ then after twice as long each time, up to `AsyncCrawler.MAX_STORAGE_PAUSE`
 before they are written. A local crawl goes on taking pages as before.
 
 A worker whose database fails stops at once: `run_worker` raises
-`FrontierError`, with the error of the database as its cause. An operation
+`FrontierError`, with the error of the database as its cause; so does a
+worker whose job is deleted or restarted under it, with a `JobError` as
+the cause. An operation
 of the frontier failing with `FrontierDatabaseError`, the one
 `PostgresFrontier.ERRORS` (`Frontier.ERRORS` of a frontier kept outside the
 process, raised by its operations alone), stops the crawl rather than fail

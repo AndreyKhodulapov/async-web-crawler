@@ -31,7 +31,7 @@ from crawler import (
     RobotsParser,
 )
 from crawler.config import StorageOptions
-from crawler.distributed import create_job, job_stats, run_worker
+from crawler.distributed import JobMode, create_job, job_stats, run_worker
 from crawler.distributed import worker as worker_module
 from crawler.distributed.frontier import DATABASE_ERRORS
 
@@ -821,6 +821,31 @@ async def test_worker_whose_database_is_gone_stops_and_the_others_crawl_its_page
     assert len(processed) == WIDE_PAGES
     assert set(saved_urls(tmp_path)) == processed
     assert await job_state() == "finished"
+
+
+async def test_worker_whose_job_is_restarted_under_it_stops_and_writes_its_pages(url, site, tmp_path, caplog):
+    # Two pages a second, and no links past the start page: the worker mostly waits for the turn of the host.
+    config = make_config(urls=[url("/wide/0")], crawler={"rate_limit": 2, "max_depth": 1})
+    await create_job(config, "test", dsn=POSTGRES_DSN)
+    storage = {"outputs": [str(tmp_path / "pages-{worker}.jsonl")]}
+    worker = asyncio.create_task(
+        run_worker(worker_config(storage=storage), "test", worker="old", configure_logging=False)
+    )
+    async with asyncio.timeout(5):
+        while len(await urls_in("saving")) < 3:
+            await asyncio.sleep(0.02)
+
+    await create_job(config, "test", dsn=POSTGRES_DSN, mode=JobMode.RESTART)
+
+    async with asyncio.timeout(5):
+        with pytest.raises(FrontierError, match='JobError: Crawl job "test" no longer exists') as raised:
+            await worker
+    assert isinstance(raised.value.__cause__, JobError)
+    assert len(saved_urls(tmp_path)) >= 3
+    assert "Unexpected error" not in caplog.text
+    # The new job is left to the workers that join it.
+    assert await urls_in("queued") == {url("/wide/0")}
+    assert await fetch("SELECT url FROM frontier WHERE state <> 'queued'") == []
 
 
 async def test_os_error_of_a_worker_outside_the_database_fails_its_page_alone(url, site, monkeypatch, caplog):

@@ -99,6 +99,10 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
   trying to ride out the outage (crash-only design). Its leases bring
   its pages back, and starting it again is the job of whatever runs it: a
   restart policy, a Kubernetes Job.
+- **The job is restarted under its workers** (`job create --restart`):
+  each worker of the old job stops the same way, exit code 1, once the
+  database tells it the job is gone. It writes what its storage buffers
+  first, and touches nothing of the new job; started again, it joins it.
 - **The database crashes itself**: the frontier commits without waiting
   for the disk, so up to 0.6 s of its changes may be lost; those pages
   are handed out or finished once more, which "at least once" allows.

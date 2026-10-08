@@ -73,7 +73,8 @@ async def run_worker(
             such as rendering without Playwright or its Chromium; nothing
             is taken.
         JobError: there is no crawl job of that name.
-        FrontierError: the database cannot be reached or failed an operation.
+        FrontierError: the database cannot be reached or failed an operation,
+            or the job was deleted or restarted under the worker.
         ValueError: `worker` cannot be a part of a file name.
         StorageError: the storage cannot be opened; nothing is requested.
     """
