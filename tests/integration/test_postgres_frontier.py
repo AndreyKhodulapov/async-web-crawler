@@ -1020,17 +1020,55 @@ class TestWaiting:
         await busy.seed(["http://site/a", "http://site/b"])
         held_by_busy, held_by_waiting = await take(busy), await take(waiting)
 
+        other_tasks = []
+
         async def on_waiting() -> None:
             waiting.on_waiting = None
             await busy.finish(held_by_busy, Outcome.PROCESSED)
-            other_task = asyncio.create_task(waiting.take())
+            other_tasks.append(asyncio.create_task(waiting.take()))
             await asyncio.sleep(0.2)
             await waiting.finish(held_by_waiting, Outcome.PROCESSED)
-            assert await asyncio.wait_for(other_task, 1) is None
 
         waiting.on_waiting = on_waiting
 
         assert await asyncio.wait_for(waiting.take(), 1) is None
+        assert await asyncio.wait_for(other_tasks[0], 1) is None
+
+    async def test_one_task_of_a_worker_polls_while_no_page_is_ready(self, open_frontier, monkeypatch):
+        await make_job(state="seeding")
+        frontier = await open_frontier("worker", poll_interval=0.05)
+        urls = [f"http://site/{i}" for i in range(10)]
+        await frontier.seed(urls)
+        polls = 0
+        delay = frontier._delay
+
+        def count_polls(state: asyncpg.Record) -> float | None:
+            nonlocal polls
+            polls += 1
+            return delay(state)
+
+        monkeypatch.setattr(frontier, "_delay", count_polls)
+        takers = [asyncio.create_task(frontier.take()) for _ in range(10)]
+        await asyncio.sleep(0.5)
+
+        assert polls <= 20  # about 100 if each of the ten tasks polled
+        await fetch("UPDATE crawl_jobs SET state = 'running'")
+        pages = await asyncio.wait_for(asyncio.gather(*takers), 5)
+        assert sorted(page.url for page in pages) == sorted(urls)
+
+    async def test_task_cancelled_while_it_polls_leaves_the_polling_to_the_others(self, open_frontier):
+        await make_job(state="seeding")
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+        polling = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0.1)
+        waiting = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0.1)
+
+        polling.cancel()
+        await fetch("UPDATE crawl_jobs SET state = 'running'")
+
+        assert await asyncio.wait_for(waiting, 5) == FrontierPage("http://site/", 0)
 
 
 class TestSeeding:

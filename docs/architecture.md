@@ -397,11 +397,14 @@ run against it; what it adds is what sharing needs.
 - **Waiting is polling.** A worker with nothing to take asks the
   database what it waits for: a page put off, a host's turn, a lease of
   another worker that may expire, and sleeps until the nearest of them,
-  at most `poll_interval`. Operations of its own frontier wake it at
-  once: each sets the event the waiting tasks saw before they looked and
-  starts a new one, so a task that looks meanwhile clears no wakeup of
-  another. `LISTEN/NOTIFY` could wake it on the operations of others; it
-  is worth it only if the measurements show the polls cost too much.
+  at most `poll_interval`. One task of the worker polls; its other tasks
+  with nothing to take wait behind it in the process and look once it
+  has a page, so an idle worker asks as often as one task does, whatever
+  `max_concurrent`. Operations of its own frontier wake it at once:
+  each sets the event the waiting task saw before it looked and starts
+  a new one, so a wakeup meanwhile is not lost. `LISTEN/NOTIFY` could
+  wake it on the operations of others; it is worth it only if the
+  measurements show the polls cost too much.
 - **Times are those of the database**: one clock for all workers, so a
   host interval holds whatever the clocks of the machines say. The
   interval is held as pages are taken: a request starts a little after

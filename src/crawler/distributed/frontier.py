@@ -262,11 +262,12 @@ class PostgresFrontier(Frontier):
 
     Times are those of the database clock. `take` waits by polling, at
     least every `poll_interval` seconds, and at once after an operation of
-    this frontier. `stats` is a snapshot of the job, refreshed every
-    `stats_seconds` apart from the heartbeat, so that counting the pages
-    of a large job never holds up the leases, once more as `take` finds
-    nothing left for this worker, and by `refresh_stats`; `requested` is
-    also brought up to date by `admit`. Taking a page, admitting, putting
+    this frontier; while no page is ready, one task of the worker polls,
+    and the others wait behind it in the process. `stats` is a snapshot
+    of the job, refreshed every `stats_seconds` apart from the heartbeat,
+    so that counting the pages of a large job never holds up the leases,
+    once more as `take` finds nothing left for this worker, and by
+    `refresh_stats`; `requested` is also brought up to date by `admit`. Taking a page, admitting, putting
     back and finishing it, and adding links are one call each, of a function in the database
     (see `procedures.py`): the rows of the job and the host are locked for
     as long as the function runs, not across round trips. Workers never
@@ -347,6 +348,8 @@ class PostgresFrontier(Frontier):
         # Set by an operation of this frontier, then replaced: each `take`
         # waits for the one it saw before it looked, which no other clears.
         self._wakeup = asyncio.Event()
+        # Held by the one task of this worker that polls for a page, see `take`.
+        self._polling = asyncio.Lock()
         # The heartbeat, saved and close each change many rows of this
         # worker: one at a time, or two of them may deadlock.
         self._rows_lock = asyncio.Lock()
@@ -463,50 +466,67 @@ class PostgresFrontier(Frontier):
 
     @_database_operation
     async def take(self) -> FrontierPage | None:
+        async with self._pool.acquire() as connection:
+            if not self._joined:
+                # Not on open: the process that seeds the job opens a frontier, but takes no page.
+                await connection.execute(_JOIN, self.job_id, self.worker, self.lease_seconds)
+                self._joined = True
+            page = await self._take_ready(connection)
+        if page is not None:
+            return page
+        # None is ready: one task of this worker polls for pages, the others
+        # wait behind it and look themselves once it has taken one.
+        async with self._polling:
+            page = await self._poll()
+        if page is None:
+            # The counts the summary of the crawl reports; on a connection of
+            # its own, and with the polling let go, so the other tasks end meanwhile.
+            await self.refresh_stats()
+        return page
+
+    async def _take_ready(self, connection: Connection) -> FrontierPage | None:
+        """Take a page whose turn has come; None if there is none."""
+        while True:
+            row = await connection.fetchrow(
+                "SELECT * FROM frontier_take($1, $2, $3, $4, $5)",
+                self.job_id,
+                self.worker,
+                self.lease_seconds,
+                self.host_interval,
+                self.max_attempts,
+            )
+            self._log_reclaimed(row)
+            if row["url"] in self._held:
+                # Its lease expired while another task of this worker
+                # crawls it, and was given back to this worker: that task
+                # finishes it. Taken back, it was uncounted.
+                logger.info("Lease of %s expired and came back to this worker: the page is crawled once", row["url"])
+                self._counted.discard(row["url"])
+                continue
+            if row["url"] is None:
+                return None
+            self._held[row["url"]] = row["waits"]
+            if row["given_up_outcome"] is not None:
+                self._given_up[row["url"]] = GivenUp(
+                    Outcome(row["given_up_outcome"]), row["given_up_reason"], row["given_up_error"]
+                )
+            if row["scope_version"] != self._scope_version:
+                await self._read_scope(connection)
+            return FrontierPage(row["url"], row["depth"])
+
+    async def _poll(self) -> FrontierPage | None:
+        """Take a page once one is ready; None once nothing is left for this worker to wait for."""
         while True:
             # Seen before looking: an operation of this frontier meanwhile wakes the wait below.
             wakeup = self._wakeup
             async with self._pool.acquire() as connection:
-                if not self._joined:
-                    # Not on open: the process that seeds the job opens a frontier, but takes no page.
-                    await connection.execute(_JOIN, self.job_id, self.worker, self.lease_seconds)
-                    self._joined = True
-                row = await connection.fetchrow(
-                    "SELECT * FROM frontier_take($1, $2, $3, $4, $5)",
-                    self.job_id,
-                    self.worker,
-                    self.lease_seconds,
-                    self.host_interval,
-                    self.max_attempts,
-                )
-                self._log_reclaimed(row)
-                if row["url"] in self._held:
-                    # Its lease expired while another task of this worker
-                    # crawls it, and was given back to this worker: that task
-                    # finishes it. Taken back, it was uncounted.
-                    logger.info(
-                        "Lease of %s expired and came back to this worker: the page is crawled once", row["url"]
-                    )
-                    self._counted.discard(row["url"])
-                    continue
-                if row["url"] is not None:
-                    self._held[row["url"]] = row["waits"]
-                    if row["given_up_outcome"] is not None:
-                        self._given_up[row["url"]] = GivenUp(
-                            Outcome(row["given_up_outcome"]), row["given_up_reason"], row["given_up_error"]
-                        )
-                    if row["scope_version"] != self._scope_version:
-                        await self._read_scope(connection)
-                    return FrontierPage(row["url"], row["depth"])
+                if (page := await self._take_ready(connection)) is not None:
+                    return page
                 state = self._job_row(await connection.fetchrow(_WAIT_STATE, self.job_id, self.worker))
                 delay = self._delay(state)
                 if delay is None:
                     await self._finish_job(connection)
-            if delay is None:
-                # The counts the summary of the crawl reports; on a connection
-                # of its own, once this one is back in the pool.
-                await self.refresh_stats()
-                return None
+                    return None
             if self.on_waiting is not None and _waits_for_others(state):
                 # Two workers, each with pages pending their save, would
                 # otherwise wait for each other for good: the heartbeat
