@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
-from helpers import UNTHROTTLED, FakeClock, MemoryStorage
+from helpers import UNTHROTTLED, FakeClock, MemoryStorage, index, urlset
 from multidict import CIMultiDict
 
 from crawler import (
@@ -43,6 +43,7 @@ from crawler import (
     RetryStrategy,
     RobotsDisallowedError,
     RobotsUnreachableError,
+    SitemapParser,
     StorageError,
     TooManyRedirectsError,
     TransientError,
@@ -2292,6 +2293,38 @@ class TestUserAgents:
     def test_single_string_is_rejected(self):
         with pytest.raises(TypeError, match="got a string"):
             AsyncCrawler(user_agents="TestBot/1.0")
+
+
+class TestSitemaps:
+    async def test_sitemap_has_longer_in_all_than_a_page(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+            connect_timeout=1,
+            read_timeout=2,
+            total_timeout=4,
+            timeout_growth=2,
+        )
+        fake_session.routes["http://a/sitemap.xml"] = [
+            aiohttp.SocketTimeoutError(),
+            FakeResponse(urlset("http://a/page"), content_type="application/xml"),
+        ]
+        assert await crawler.sitemaps.fetch_sitemap("http://a/sitemap.xml") == ["http://a/page"]
+        await crawler.fetch_url("http://a/page")
+
+        timeouts = [(t.connect, t.sock_read, t.total) for t in fake_session.timeouts]
+        factor = SitemapParser.TIMEOUT_FACTOR
+        assert timeouts == [(1, 2, 4 * factor), (2, 4, 8 * factor), (1, 2, 4)]
+
+    async def test_index_lists_the_sitemaps_of_the_host_it_redirected_to(self, make_crawler, fake_session):
+        fake_session.routes["http://a/sitemap.xml"] = FakeResponse(status=301, location="http://www.a/sitemap.xml")
+        fake_session.routes["http://www.a/sitemap.xml"] = FakeResponse(
+            index("http://www.a/pages.xml", "http://a/old.xml"), content_type="application/xml"
+        )
+        fake_session.routes["http://www.a/pages.xml"] = FakeResponse(urlset("http://www.a/page"))
+        crawler = make_crawler()
+
+        assert await crawler.sitemaps.fetch_sitemap("http://a/sitemap.xml") == ["http://www.a/page"]
+        assert fake_session.requested == ["http://a/sitemap.xml", "http://www.a/sitemap.xml", "http://www.a/pages.xml"]
 
 
 class TestRobots:

@@ -140,8 +140,9 @@ class Fetcher:
         in a row fail with `TooManyRedirectsError`.
 
         With `raw`, which is how a sitemap is downloaded, the result has the
-        `body` as it was sent instead of the decoded `content`, and a body
-        over `sitemaps.MAX_SIZE` fails with `SitemapError`. With
+        `body` as it was sent instead of the decoded `content`, a body over
+        `sitemaps.MAX_SIZE` fails with `SitemapError` and the request has
+        `sitemaps.TIMEOUT_FACTOR` times as long in all. With
         `truncate_at`, which is how robots.txt is downloaded, the body is
         cut to that many bytes instead of failing over `max_page_size`. With
         `track_errors`, the attempts count in `errors`. Without
@@ -241,7 +242,7 @@ class Fetcher:
 
         async def attempt() -> FetchResult:
             nonlocal last, attempts, failed_at
-            timeout = self._timeout_for(retries=attempts)
+            timeout = self._timeout_for(retries=attempts, sitemap=raw)
             result = await self._fetch_once(
                 url,
                 html_only=html_only,
@@ -357,8 +358,14 @@ class Fetcher:
         except Exception:
             logger.warning("Could not tell the other workers the Crawl-delay of %s", host, exc_info=True)
 
-    def _timeout_for(self, retries: int) -> aiohttp.ClientTimeout:
-        """Timeouts of a request after `retries` failed attempts."""
+    def _timeout_for(self, retries: int, *, sitemap: bool = False) -> aiohttp.ClientTimeout:
+        """Timeouts of a request after `retries` failed attempts.
+
+        A sitemap may take minutes to download: it has
+        `SitemapParser.TIMEOUT_FACTOR` times as long in all, while a server
+        that does not connect or stops sending is given up on as soon as
+        for a page.
+        """
         try:
             growth = min(self.timeout_growth**retries, self.MAX_TIMEOUT_GROWTH)
         except OverflowError:
@@ -366,7 +373,7 @@ class Fetcher:
         base = self._timeout
         assert base.total is not None and base.connect is not None and base.sock_read is not None
         return aiohttp.ClientTimeout(
-            total=base.total * growth,
+            total=base.total * growth * (self.sitemaps.TIMEOUT_FACTOR if sitemap else 1),
             connect=base.connect * growth,
             sock_read=base.sock_read * growth,
         )
@@ -440,14 +447,14 @@ class Fetcher:
         assert result.status is not None and result.content is not None
         return result.status, result.content
 
-    async def _download_sitemap(self, url: str) -> bytes:
+    async def _download_sitemap(self, url: str) -> tuple[bytes, str]:
         """Fetcher for SitemapParser: a sitemap goes through robots.txt, the limits and retries as a page does."""
         # Not decoded: a sitemap may be gzipped. Whoever asked for the sitemap logs the failure.
         result = await self.fetch(url, raw=True, failure_level=logging.INFO, track_errors=False)
         if result.error is not None:
             raise result.error
-        assert result.body is not None
-        return result.body
+        assert result.body is not None and result.final_url is not None
+        return result.body, result.final_url
 
     async def _fetch_once(
         self,

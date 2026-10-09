@@ -371,8 +371,12 @@ async def test_page_whose_host_asked_to_wait_goes_back_without_a_time_of_its_own
     job = make_config(urls=[url("/busy/60")], retry={"max_retries": 1, "max_delay": 0.5})
     await create_job(job, "test", dsn=POSTGRES_DSN)
     worker = asyncio.create_task(run_worker(worker_config(), "test", worker="w", configure_logging=False))
+    # now() is when the transaction of the query began, which may be before
+    # the host was held back and the page put back: the time of reading is
+    # clock_timestamp().
     query = (
-        "SELECT f.state, f.not_before <= now() AS at_once, h.hold_reason, extract(epoch FROM h.next_allowed_at - now()) AS left"
+        "SELECT f.state, f.not_before <= clock_timestamp() AS at_once, h.hold_reason,"
+        " extract(epoch FROM h.next_allowed_at - clock_timestamp()) AS left"
         " FROM frontier AS f JOIN hosts AS h USING (job, host)"
     )
     try:

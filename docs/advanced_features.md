@@ -23,11 +23,15 @@ that can be run, configured and watched.
     while reading, so read the body in chunks up to the limit rather than
     whole.
   - indexes: cap the depth or the number of files, remember what was
-    fetched (an index may list itself), cap the URLs taken.
+    fetched (an index may list itself), cap the URLs taken, and follow only
+    the sitemaps on the index's own host, as the protocol says, so an index
+    cannot send the crawler to download from other sites.
 - Real files are sloppy: different namespace versions or none, blank lines
   before the XML declaration. Match elements by local name.
 - Download sitemaps **through the crawler's own request path**, so the rate
-  limit, retries and the circuit breaker apply to them as to pages.
+  limit, retries and the circuit breaker apply to them as to pages, but
+  with a longer overall timeout: 50 MB over a slow link takes minutes, and
+  a timeout counts against the host in the circuit breaker.
 - A broken nested sitemap is logged and skipped; only the failure of the
   one that was asked for is an error.
 

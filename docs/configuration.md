@@ -87,7 +87,7 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `respect_robots` | true or false | `true` | check robots.txt before every request, and follow `nofollow` and `noindex` of pages and links |
 | `user_agent` | string, one line | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name; spaces and line breaks around it are dropped |
 | `user_agents` | list of strings | `[]` | variants to rotate; each must have the same name as `user_agent` |
-| `total_timeout` | number, > 0 | `30.0` | the whole request, body included |
+| `total_timeout` | number, > 0 | `30.0` | the whole request, body included; a sitemap has 10 times as long |
 | `connect_timeout` | number, > 0 | `10.0` | DNS, TCP and TLS |
 | `read_timeout` | number, > 0 | `20.0` | the longest pause between two chunks of the response |
 | `timeout_growth` | number, >= 1 | `1.5` | the timeouts grow by this factor on every retry |

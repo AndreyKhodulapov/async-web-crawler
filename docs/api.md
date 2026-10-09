@@ -347,7 +347,7 @@ are not counted.
 |--------|---------|--------|
 | `connect_timeout` | `10.0` | DNS, TCP and TLS, including the wait for a pooled connection |
 | `read_timeout` | `20.0` | the longest pause between two chunks of the response |
-| `total_timeout` | `30.0` | the whole request, body included |
+| `total_timeout` | `30.0` | the whole request, body included; a sitemap has `SitemapParser.TIMEOUT_FACTOR` (10) times as long |
 | `timeout_growth` | `1.5` | each retry multiplies all three by this, up to 4 times the initial values; `1` keeps them fixed |
 | `max_page_size` | `3145728` | bytes of a page body (3 MiB); a larger one fails with `PageTooLargeError` (a permanent error) and the rest is not downloaded; `None` lifts the limit |
 | `max_parsing` | `2` | pages parsed at once, whatever `max_concurrent` says |
@@ -690,9 +690,11 @@ only until the queue is full (see below): the rest of a sitemap and the
 sitemaps after it are not downloaded, so a crawl of 10 pages reads an index
 and its first few files, not the hundreds of files it may list. Indexes are
 followed, gzipped files unpacked (see `SitemapParser` for the limits; a
-sitemap over 50 MB is not downloaded to the end). A sitemap is
-downloaded like a page: robots.txt, the rate limit, retries and the circuit
-breaker apply, and its requests count in `crawl_stats().requests`, but not
+sitemap over 50 MB is not downloaded to the end). An index lists the
+sitemaps of its own host only, the one it redirected to if it did: those
+of other hosts are left out with a warning. A sitemap is downloaded like
+a page, with 10 times its `total_timeout`: robots.txt, the rate limit,
+retries and the circuit breaker apply, and its requests count in `crawl_stats().requests`, but not
 in `max_pages` or `error_stats()`. A page a sitemap lists has depth 0, like
 a start URL, so its links are followed up to `max_depth`; unlike a start
 URL, it must pass the filters, and a redirect does not bring another host
