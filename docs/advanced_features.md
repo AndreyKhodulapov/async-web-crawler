@@ -26,6 +26,9 @@ that can be run, configured and watched.
     fetched (an index may list itself), cap the URLs taken, and follow only
     the sitemaps on the index's own host, as the protocol says, so an index
     cannot send the crawler to download from other sites.
+  - a crawl of a few pages: stop reading once the queue is full, and once
+    enough pages were listed, those the filters turn away included, or a
+    narrow filter on a large site reads every file of the index.
 - Real files are sloppy: different namespace versions or none, blank lines
   before the XML declaration. Match elements by local name.
 - Download sitemaps **through the crawler's own request path**, so the rate

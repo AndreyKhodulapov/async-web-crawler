@@ -686,9 +686,12 @@ async with AsyncCrawler(max_depth=1) as crawler:
 ```
 
 Sitemaps are read before the first page is fetched, one after another and
-only until the queue is full (see below): the rest of a sitemap and the
-sitemaps after it are not downloaded, so a crawl of 10 pages reads an index
-and its first few files, not the hundreds of files it may list. Indexes are
+only until the queue is full (see below), or until they listed
+`AsyncCrawler.SITEMAP_PAGES_FACTOR` (10) times as many pages as the queue
+holds, those the filters turn away included (3,000 for `max_pages=100`):
+the rest of a sitemap and the sitemaps after it are not downloaded, so a
+crawl of 10 pages reads an index and its first few files, not the hundreds
+of files it may list, even when its filters let few of them through. Indexes are
 followed, gzipped files unpacked (see `SitemapParser` for the limits; a
 sitemap over 50 MB is not downloaded to the end). An index lists the
 sitemaps of its own host only, the one it redirected to if it did: those

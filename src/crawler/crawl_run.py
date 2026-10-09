@@ -68,6 +68,10 @@ class CrawlRun:
     # In a crawl of several processes, a storage that cannot write is tried
     # again after its cooldown, then after twice as long each time, up to this.
     MAX_STORAGE_PAUSE = 60.0
+    # In crawl() with max_pages, the sitemaps are read only until they listed
+    # this many times as many pages as the queue holds, those the filters
+    # turn away included: they do not fill the queue.
+    SITEMAP_PAGES_FACTOR = 10
     # The constants above that AsyncCrawler hands over from itself to every run.
     SETTINGS = (
         "MAX_CIRCUIT_OPENINGS",
@@ -76,6 +80,7 @@ class CrawlRun:
         "MAX_ROBOTS_RETRIES",
         "ROBOTS_POLL",
         "MAX_STORAGE_PAUSE",
+        "SITEMAP_PAGES_FACTOR",
     )
 
     def __init__(
@@ -268,10 +273,16 @@ class CrawlRun:
         """Queue the pages listed in `sitemap_urls` and in the sitemaps robots.txt of the sites of `robots_of` names.
 
         The sitemaps are read one by one, in order, and only until the
-        queue is full: the rest of a sitemap and the sitemaps after it are
-        not downloaded, so a crawl of a few pages does not read an index
-        of hundreds of files for them.
+        queue is full, or until they listed `SITEMAP_PAGES_FACTOR` times as
+        many pages as it holds, those the filters turned away included: the
+        rest of a sitemap and the sitemaps after it are not downloaded, so
+        a crawl of a few pages does not read an index of hundreds of files
+        for them, even when its filters let few of them through.
         """
+        frontier = self._frontier
+        max_listed = None
+        if frontier.max_pages is not None:
+            max_listed = self.SITEMAP_PAGES_FACTOR * frontier.frontier_factor * frontier.max_pages
         async with asyncio.TaskGroup() as group:
             named = [group.create_task(self._sitemaps_in_robots(url)) for url in robots_of]
         # Normalized, so a sitemap given twice, or given and named in robots.txt, is read once.
@@ -280,15 +291,23 @@ class CrawlRun:
             sitemaps.update(dict.fromkeys(task.result()))
         opened = listed = queued = 0
         for sitemap in sitemaps:
-            if await self._frontier.full():
+            if await frontier.full() or (max_listed is not None and listed >= max_listed):
                 break
             opened += 1
             async with aclosing(self._read_sitemap(sitemap)) as batches:
                 async for pages in batches:
                     listed += len(pages)
                     queued += await self._queue_sitemap_batch(pages, url_filter)
-                    if await self._frontier.full():
+                    if await frontier.full():
                         logger.info("Stopped reading sitemaps at %s: the queue is full", sitemap)
+                        break
+                    if max_listed is not None and listed >= max_listed:
+                        logger.info(
+                            "Stopped reading sitemaps at %s: they listed %d pages, %d times as many as the queue holds",
+                            sitemap,
+                            listed,
+                            self.SITEMAP_PAGES_FACTOR,
+                        )
                         break
         logger.info(
             "Sitemaps: %d read, %d failed, %d not read, %d pages listed, %d new queued",

@@ -66,7 +66,7 @@ Sitemaps whose pages are crawled along with the start URLs; see
 |-----|------|---------|---------|
 | `urls` | list of URLs | `[]` | sitemaps or sitemap indexes, plain or gzipped |
 | `from_robots` | true or false | `false` | also read the sitemaps that robots.txt of the start URLs' sites names; needs `crawler.respect_robots` |
-| `max_urls` | whole number, >= 1 | `50000` | pages taken from one sitemap, its index included; a crawl stops reading sitemaps sooner once its queue is full |
+| `max_urls` | whole number, >= 1 | `50000` | pages taken from one sitemap, its index included; a crawl stops reading sitemaps sooner once its queue is full, or once they listed 10 times as many pages as the queue holds (3 × `max_pages`), filtered ones included |
 
 ### `crawler`
 

@@ -228,6 +228,7 @@ class AsyncCrawler:
     MAX_ROBOTS_RETRIES = CrawlRun.MAX_ROBOTS_RETRIES
     ROBOTS_POLL = CrawlRun.ROBOTS_POLL
     MAX_STORAGE_PAUSE = CrawlRun.MAX_STORAGE_PAUSE
+    SITEMAP_PAGES_FACTOR = CrawlRun.SITEMAP_PAGES_FACTOR
     FRONTIER_FACTOR = Frontier.FRONTIER_FACTOR
     # In crawl(), longer links are not followed: they are mostly generated ones.
     MAX_URL_LENGTH = 2048
@@ -659,8 +660,10 @@ class AsyncCrawler:
         with `robots_sitemaps` so are those of the sitemaps that robots.txt
         of the start URLs' sites names. The sitemaps are read before the
         first page is fetched, one after another and only until the queue
-        is full: the rest of a sitemap and the sitemaps after it are not
-        downloaded (see `SitemapParser`). A page a sitemap lists
+        is full, or until they listed `SITEMAP_PAGES_FACTOR` times as many
+        pages as the queue holds, those the filters turn away included: the
+        rest of a sitemap and the sitemaps after it are not downloaded (see
+        `SitemapParser`). A page a sitemap lists
         has depth 0, like a start URL, but must pass the filters, like a
         link; it comes after the start URLs and before the links.
         `same_domain_only` keeps the hosts of `sitemap_urls` as well as
