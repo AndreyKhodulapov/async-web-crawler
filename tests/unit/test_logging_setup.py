@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import pytest
@@ -158,11 +159,14 @@ def test_file_is_rotated_by_size(tmp_path):
 def test_file_is_not_rotated_without_a_size_or_backups(tmp_path, max_bytes, backup_count):
     path = tmp_path / "crawler.log"
     configure_logging(file=path, max_bytes=max_bytes, backup_count=backup_count)
+    (handler,) = [handler for handler in own_handlers() if isinstance(handler, RotatingFileHandler)]
+    stream = handler.stream
     for number in range(30):
         logger.info("record %d", number)
 
     assert [file.name for file in tmp_path.iterdir()] == ["crawler.log"]
     assert len(read_entries(path)) == 30
+    assert handler.stream is stream  # not closed and reopened on every record past the size
 
 
 def test_file_of_an_earlier_run_is_appended_to(tmp_path):

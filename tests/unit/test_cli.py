@@ -802,6 +802,19 @@ def test_report_lists_the_pages_of_the_job_not_saved_besides_its_statistics(tmp_
     assert capsys.readouterr().out.endswith(f"Reports: {pages}\n")
 
 
+def test_report_by_the_configuration_of_a_worker_is_named_after_the_job(tmp_path, monkeypatch, capsys):
+    async def job_stats(dsn, job, **options):
+        return job_stats_of()
+
+    monkeypatch.setattr(main, "job_stats", job_stats)
+    report = {"stats_json": str(tmp_path / "stats-{worker}.json"), "html": str(tmp_path / "report-{worker}.html")}
+    path = write_config(tmp_path, {"distributed": {"database_url": DSN}, "report": report})
+
+    assert main.main(["report", "--job", "books", "--config", path]) == 0
+
+    assert sorted(file.name for file in tmp_path.iterdir()) == ["config.yaml", "report-books.html", "stats-books.json"]
+
+
 def test_report_with_no_file_to_write_exits_with_2(monkeypatch, capsys):
     monkeypatch.setattr(main, "job_stats", None)  # would fail if called
     monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)

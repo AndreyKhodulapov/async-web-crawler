@@ -252,9 +252,9 @@ Reports: out/stats.json, out/report.html
 Log: out/crawler.log
 ```
 
-At the default level `INFO` the log has a line per request; `--log-level
-WARNING` leaves the progress line and the failures. While a host is down
-or holds its pages back, a page of it put off is logged at `INFO` once per
+At the default level `INFO` the log has three lines per page (the request,
+the response and the links found); `--log-level WARNING` leaves the
+progress line and the failures. While a host is down or holds its pages back, a page of it put off is logged at `INFO` once per
 30 seconds per host, the others at `DEBUG` (in a crawl of one process).
 A password in a database or a proxy URL is shown as `***`. With proxies, the summary has a line of
 them: `Proxies: http://user:***@proxy-1:3128 (41 sent, 0 failed), ...`;
@@ -265,7 +265,7 @@ downloaded).
 
 | Exit code | Meaning |
 |-----------|---------|
-| 0 | the crawl ran, fetched at least one page and saved every page it should |
+| 0 | the crawl ran, fetched at least one page (saved or left out as skipped) and saved every page it should |
 | 1 | no page was fetched, some could not be saved, or a directory, the log file, an output file or the database could not be opened; an output that cannot be opened is reported before anything is requested |
 | 2 | wrong options or configuration; nothing was requested or written |
 | 130 | interrupted with Ctrl-C |
@@ -307,7 +307,7 @@ python src/main.py report --job books --stats-json out/stats.json --report out/r
 | `--name WORKER` | name of the worker in the database and for `{worker}`; by default the host name, the process id and a random part |
 | `report --job NAME` | the job to report on, finished or still running |
 | `report --stats-json PATH`, `--report PATH`, `--pages-report PATH` | the statistics of the job as JSON, an HTML report with charts and a table of the workers, the CSV list of the pages of the job not saved; without them, `report.stats_json`, `report.html` and `report.pages` of the configuration |
-| `report --config PATH` | configuration with the database and the `report` section (`title`, `top_domains`, the files) |
+| `report --config PATH` | configuration with the database and the `report` section (`title`, `top_domains`, the files); `{worker}` in a file name becomes the name of the job, so the configuration of a worker will do |
 | `status --job NAME` | print a line of the progress of the job: percent of `max_pages`, speed, time left, workers |
 | `status --watch` | update the line until the job is finished; `--interval SECONDS` between the updates (default 2) |
 | `status --config PATH` | configuration with the database |

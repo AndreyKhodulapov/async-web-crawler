@@ -441,8 +441,12 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
                     print_summary(crawler, interrupted=True)
                 raise
             print_summary(crawler)
+            progress_stats = crawler.crawler.crawl_stats()
+            # A page left out of the results (not HTML, noindex, a duplicate) was
+            # fetched all the same; one over max_pages_per_host was not requested.
+            fetched = crawler.get_stats()["successful"] or progress_stats.skipped > progress_stats.over_host_limit
             # A page that could not be saved is a failure of the run too.
-            return 0 if crawler.get_stats()["successful"] and not crawler.crawler.crawl_stats().save_failed else 1
+            return 0 if fetched and not progress_stats.save_failed else 1
 
 
 async def run_job_create(config: CrawlerConfig, name: str, mode: JobMode, *, dsn: str) -> int:
@@ -592,6 +596,9 @@ def run_command(args: argparse.Namespace) -> int:
 def _report_config(args: argparse.Namespace) -> CrawlerConfig:
     """The configuration of the `report` command: the file, if one is given, with the files of the options over it.
 
+    "{worker}" in the names of the files is replaced by the name of the job,
+    so the configuration of a worker gives the reports of the job.
+
     Raises:
         ConfigError: the file is invalid, or no report is to be written.
     """
@@ -608,7 +615,7 @@ def _report_config(args: argparse.Namespace) -> CrawlerConfig:
             "or report.stats_json, report.html or report.pages"
         )
         raise ConfigError([problem])
-    return config
+    return config.for_worker(args.job)
 
 
 def _exit_code(command: Coroutine[Any, Any, int]) -> int:

@@ -153,6 +153,21 @@ async def test_no_page_fetched_is_exit_code_1(url, config_file, capsys):
     assert "Pages: 1 (0 successful, 1 failed, 0 skipped)" in capsys.readouterr().out
 
 
+async def test_pages_fetched_and_left_out_are_exit_code_0(url, config_file, capsys):
+    argv = ["--config", config_file(), "--urls", url("/data.json"), "--max-depth", "0"]
+
+    assert await run(build_config(parse_args(argv)), progress=False) == 0
+    assert "Pages: 1 (0 successful, 0 failed, 1 skipped)" in capsys.readouterr().out
+
+
+async def test_pages_over_the_limit_of_their_host_are_not_fetched_pages(url, config_file, capsys):
+    crawler = {**FAST_CONFIG["crawler"], "max_pages_per_host": 1}
+    argv = ["--config", config_file(crawler=crawler), "--urls", url("/status/500"), url("/status/500?again")]
+
+    assert await run(build_config(parse_args(argv)), progress=False) == 1
+    assert "Pages: 2 (0 successful, 1 failed, 1 skipped)" in capsys.readouterr().out
+
+
 async def test_output_file_that_cannot_be_written_fails_the_run_before_anything_is_requested(
     url, site, config_file, tmp_path, capsys
 ):

@@ -102,9 +102,13 @@ def configure_logging(
     )
     if file is not None:
         # Opened before the old handlers are removed: a file that cannot be
-        # opened leaves the logging as it was.
+        # opened leaves the logging as it was. Without backups the handler would
+        # close and reopen the file on every record past the limit, rotating nothing.
         file_handler = RotatingFileHandler(
-            Path(file).expanduser(), maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+            Path(file).expanduser(),
+            maxBytes=max_bytes if backup_count else 0,
+            backupCount=backup_count,
+            encoding="utf-8",
         )
         file_handler.setFormatter(JsonLinesFormatter())
         handlers.append(file_handler)
