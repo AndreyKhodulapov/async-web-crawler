@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from contextlib import aclosing
@@ -82,6 +83,10 @@ class CrawlRun:
         "MAX_STORAGE_PAUSE",
         "SITEMAP_PAGES_FACTOR",
     )
+    # In a crawl of one process, the pages put off for their host are logged
+    # at INFO once per this many seconds per host, the others at DEBUG: while
+    # a host is down, each of its pages comes back about once a second.
+    DEFERRED_LOG_INTERVAL = 30.0
 
     def __init__(
         self,
@@ -117,6 +122,7 @@ class CrawlRun:
         self._failed_sitemaps: dict[str, str] = {}
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
         self._proxies_back_at = 0.0  # time.monotonic() at which a proxy is back after all of them were out
+        self._deferred_logged: dict[str, float] = {}  # host -> time.monotonic() of its last "Deferred" line at INFO
         # In a shared frontier: the failures of a host this process told it of, and the counts of the crawl it answered.
         self._failures_told: dict[str, HostFailures] = {}
         self._crawl_failures: dict[str, HostFailures] = {}
@@ -972,7 +978,7 @@ class CrawlRun:
                 page, refusal.url, delay, refusal.message, uncount=requested, hold_reason=reason
             )
         else:
-            await self._put_off_page(page, delay, refusal.message, uncount=requested)
+            await self._put_off_page(page, delay, refusal.message, uncount=requested, host=get_host(refusal.url))
         return True
 
     def _unreachable_reason(self, refusal: RobotsUnreachableError) -> str:
@@ -990,15 +996,23 @@ class CrawlRun:
         return refusal.message if unreachable is None else f"robots.txt is unreachable ({unreachable})"
 
     async def _put_off_page(
-        self, page: FrontierPage, delay: float, reason: str, *, uncount: bool, waited: bool = False
+        self,
+        page: FrontierPage,
+        delay: float,
+        reason: str,
+        *,
+        uncount: bool,
+        waited: bool = False,
+        host: str | None = None,
     ) -> None:
         """Put a page of the crawl back into the queue for `delay` seconds.
 
         With `uncount`, the page is uncounted from the limits first: it
         is counted again when it is taken again. With `waited`, it counts
-        a wait for its host (see `Frontier.waits`).
+        a wait for its host (see `Frontier.waits`). `host` is the one the
+        page is put off for, if any: see `_log_deferred`.
         """
-        logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
+        self._log_deferred(page, delay, reason, host)
         await self._frontier.put_back(page, delay, uncount=uncount, waited=waited)
 
     async def _put_off_for_host(
@@ -1024,15 +1038,34 @@ class CrawlRun:
         waits out the delay itself, as its own host is not held back: it
         would be handed out at once and redirect to the held one again.
         """
-        if not self._frontier.shared:
-            await self._put_off_page(page, delay, reason, uncount=uncount, waited=waited)
-            return
         host = get_host(url)
         assert host is not None  # a URL without a host is not requested
+        if not self._frontier.shared:
+            await self._put_off_page(page, delay, reason, uncount=uncount, waited=waited, host=host)
+            return
         await self._fetcher.tell_host_held(host, delay, hold_reason)
         logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
         own_delay = 0.0 if host == get_host(page.url) else delay
         await self._frontier.put_back(page, own_delay, uncount=uncount, waited=waited)
+
+    def _log_deferred(self, page: FrontierPage, delay: float, reason: str, host: str | None) -> None:
+        """Log that a page is put off: at INFO, but for `host` once per `DEFERRED_LOG_INTERVAL` in a crawl of one process.
+
+        While a host is down, every page of it in the queue comes back about
+        once a second and is put off again: thousands of lines a second for
+        a large queue, which would push the useful ones out of a rotated log.
+        The first of them is logged at INFO, the rest at DEBUG. In a frontier
+        shared by several processes the host is held back for all of them,
+        and its pages are not handed out meanwhile: every line is at INFO.
+        """
+        level = logging.INFO
+        if host is not None and not self._frontier.shared:
+            now = time.monotonic()
+            if now - self._deferred_logged.get(host, -math.inf) < self.DEFERRED_LOG_INTERVAL:
+                level = logging.DEBUG
+            else:
+                self._deferred_logged[host] = now
+        logger.log(level, "Deferred %s for %.1fs: %s", page.url, delay, reason)
 
     async def _hold_open_circuit(self, url: str) -> None:
         """In a frontier shared by several processes, hold the host of `url` back for all of them while its circuit is open here.
@@ -1181,7 +1214,7 @@ class CrawlRun:
                 page, refusal.url, probe_in, refusal.message, uncount=counted, hold_reason=refusal.message
             )
         else:
-            await self._put_off_page(page, 1.0, refusal.message, uncount=counted)
+            await self._put_off_page(page, 1.0, refusal.message, uncount=counted, host=get_host(refusal.url))
         return True
 
 

@@ -253,8 +253,10 @@ Log: out/crawler.log
 ```
 
 At the default level `INFO` the log has a line per request; `--log-level
-WARNING` leaves the progress line and the failures. A password in a database
-or a proxy URL is shown as `***`. With proxies, the summary has a line of
+WARNING` leaves the progress line and the failures. While a host is down
+or holds its pages back, a page of it put off is logged at `INFO` once per
+30 seconds per host, the others at `DEBUG` (in a crawl of one process).
+A password in a database or a proxy URL is shown as `***`. With proxies, the summary has a line of
 them: `Proxies: http://user:***@proxy-1:3128 (41 sent, 0 failed), ...`;
 with rendering, a line of the pages rendered: `Rendering: 12 pages
 rendered, 1 failed, average 0.84s` (the average of the rendered ones;

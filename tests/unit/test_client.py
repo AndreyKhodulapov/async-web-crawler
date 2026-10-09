@@ -1098,6 +1098,7 @@ class TestCrawlBlockedHost:
         # first failure is retried once the others have opened the circuit,
         # however slow the machine, and well before the cooldown ends.
         caplog.set_level(logging.INFO, logger="crawler")
+        caplog.set_level(logging.DEBUG, logger="crawler.crawl_run")  # "Deferred" lines after the first of a host
         crawler = make_crawler(
             max_concurrent=4,
             max_depth=0,
@@ -1313,6 +1314,7 @@ class TestCrawlHeldBackHost:
         # request is not retried, its other pages are put off, which is said
         # once at WARNING.
         caplog.set_level(logging.INFO, logger="crawler")
+        caplog.set_level(logging.DEBUG, logger="crawler.crawl_run")  # "Deferred" lines after the first of a host
         crawler = make_crawler(
             max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=1, max_delay=0.5)
         )
@@ -1332,6 +1334,37 @@ class TestCrawlHeldBackHost:
         assert warnings.count("a asked to wait 1s (Retry-After); its pages are put off until then") == 1
         deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/")]
         assert len(deferred) == 3
+
+    @pytest.mark.parametrize(("interval", "at_info"), [(CrawlRun.DEFERRED_LOG_INTERVAL, 2), (0.0, 6)])
+    async def test_pages_put_off_for_their_host_are_logged_at_info_once_a_while(
+        self, make_crawler, fake_session, caplog, monkeypatch, interval, at_info
+    ):
+        # While a host is held back, each of its pages is put off: the
+        # first line of each host is at INFO, the rest of the interval at DEBUG.
+        monkeypatch.setattr(CrawlRun, "DEFERRED_LOG_INTERVAL", interval)
+        caplog.set_level(logging.DEBUG, logger="crawler.crawl_run")
+        crawler = make_crawler(
+            max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=1, max_delay=0.5)
+        )
+        crawler.MIN_PENALTY_TO_DEFER = 0.05
+        pages = [f"http://{host}/{page}" for host in "ab" for page in range(1, 4)]
+        for page in pages:
+            fake_session.routes[page] = FakeResponse(b"ok")
+        for page in ("http://a/1", "http://b/1"):
+            fake_session.routes[page] = [FakeResponse(status=429, retry_after="1"), FakeResponse(b"ok")]
+
+        await crawler.crawl(["http://a/1", "http://b/1", "http://a/2", "http://a/3", "http://b/2", "http://b/3"])
+
+        assert set(crawler.processed_urls) == set(pages)
+        deferred = [record for record in caplog.records if record.getMessage().startswith("Deferred ")]
+        assert sorted(record.getMessage().split()[1] for record in deferred) == pages
+        at_info_by_host = Counter(get_host(r.getMessage().split()[1]) for r in deferred if r.levelno == logging.INFO)
+        assert sum(at_info_by_host.values()) == at_info
+        assert set(at_info_by_host) == {"a", "b"}
+        # The first line of a host is the one at INFO.
+        for host in "ab":
+            first = next(r for r in deferred if get_host(r.getMessage().split()[1]) == host)
+            assert first.levelno == logging.INFO
 
     async def test_page_forbidden_with_a_long_retry_after_fails_at_once(self, make_crawler, fake_session, caplog):
         # HTTP 403 with a Retry-After: the host is held back as it asked,
@@ -1373,6 +1406,7 @@ class TestCrawlHeldBackHost:
         self, make_crawler, fake_session, caplog, brief_slowdown
     ):
         caplog.set_level(logging.INFO, logger="crawler")
+        caplog.set_level(logging.DEBUG, logger="crawler.crawl_run")  # "Deferred" lines after the first of a host
         crawler = make_crawler(
             max_concurrent=1,
             max_depth=0,
