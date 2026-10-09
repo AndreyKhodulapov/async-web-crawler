@@ -130,8 +130,12 @@ sites it visits and follows their rules.
   disallowed ones, so the report does not blame robots.txt for a network
   failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
-  origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB,
+  origin. The RFC allows caching for up to 24 hours (here 24 hours, then
+  downloaded again in the background; the old rules answer meanwhile, and
+  stay if the site does not answer). Parse at least 500 KiB,
   and stop downloading there: a huge or endless file must not fill the memory.
+  Parsing 500 KiB of rules takes about half a second: do it in a thread
+  (here for files over 32 KiB), or every request stands still meanwhile.
 - **Single flight**: when many workers reach a new site at once, they must
   share one robots.txt download. Cache the `Task` rather than its result, and
   `await asyncio.shield(task)` so that one cancelled caller does not cancel

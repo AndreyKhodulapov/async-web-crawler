@@ -1,6 +1,7 @@
 """Unit tests for robots.txt parsing (RobotsRules) and fetching with a cache (RobotsParser)."""
 
 import asyncio
+import logging
 import time
 
 import pytest
@@ -273,6 +274,16 @@ class FakeFetcher:
         return self.answer
 
 
+async def _answer(text: str) -> tuple[int, str]:
+    return 200, text
+
+
+async def run_background() -> None:
+    """Lets the downloads started in the background finish: the fake fetchers answer within a few iterations of the event loop."""
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
 class TestRobotsParser:
     async def test_fetches_robots_txt_of_the_origin_once(self):
         fetch = FakeFetcher((200, "User-agent: *\nDisallow: /private/\nCrawl-delay: 2"))
@@ -422,6 +433,130 @@ class TestRobotsParser:
         clock.now += 10 * RobotsParser.UNREACHABLE_TTL
         assert await robots.is_allowed("https://site/page", BOT)
         assert len(fetch.requested) == 1
+
+    async def test_rules_read_are_downloaded_again_after_a_day_without_waiting(self):
+        answered = asyncio.Event()
+        requested: list[str] = []
+
+        async def fetch(url: str) -> tuple[int, str]:
+            requested.append(url)
+            if len(requested) == 1:
+                return 200, "User-agent: *\nDisallow: /x"
+            await answered.wait()
+            return 200, "User-agent: *\nDisallow: /y"
+
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        await robots.fetch_robots("https://site/")
+        clock.now += RobotsParser.RULES_TTL - 1
+        assert await robots.is_allowed("https://site/y", BOT) is True
+        assert len(requested) == 1
+
+        # The download starts in the background: the old rules answer
+        # every caller at once meanwhile, and one download serves them all.
+        clock.now += 1
+        async with asyncio.timeout(1):
+            assert await robots.is_allowed("https://site/x", BOT) is False
+            assert await robots.is_allowed("https://site/y", BOT) is True
+            assert await robots.is_allowed("https://site/y", BOT, wait=0.01) is True
+        await run_background()
+        assert len(requested) == 2
+
+        answered.set()
+        await run_background()
+        assert robots.can_fetch("https://site/x", BOT) is True
+        assert robots.can_fetch("https://site/y", BOT) is False
+        # The new rules are kept for a day from their download.
+        clock.now += RobotsParser.RULES_TTL - 1
+        assert await robots.is_allowed("https://site/y", BOT) is False
+        assert len(requested) == 2
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            (404, ""),  # no robots.txt any more: no rules
+            TooManyRedirectsError("https://site/robots.txt", "too many redirects (10)"),
+        ],
+    )
+    async def test_rules_read_are_replaced_by_a_missing_robots_txt(self, answer):
+        fetch = FakeFetcher((200, "User-agent: *\nDisallow: /x"))
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        await robots.fetch_robots("https://site/")
+        clock.now += RobotsParser.RULES_TTL
+        fetch.answer = answer
+
+        assert await robots.is_allowed("https://site/x", BOT) is False
+        await run_background()
+        assert await robots.is_allowed("https://site/x", BOT) is True
+        assert len(fetch.requested) == 2
+
+    @pytest.mark.parametrize(
+        "answer",
+        [
+            (503, ""),
+            (429, ""),
+            NetworkError("https://site/robots.txt", "connection refused"),
+            DNSError("https://site/robots.txt", "ClientConnectorDNSError: Cannot connect to host site:443"),
+            CircuitOpenError("https://site/robots.txt", "circuit open"),
+            ProxyNetworkError("https://site/robots.txt", "proxy refused the connection"),
+            NoProxyError("https://site/robots.txt", "every proxy is out", seconds=5.0),
+            CrawlerClosedError("https://site/robots.txt", "the crawler is closed"),
+        ],
+    )
+    async def test_rules_read_stay_when_robots_txt_cannot_be_downloaded_again(self, answer, caplog):
+        caplog.set_level(logging.INFO, logger="crawler.robots")
+        fetch = FakeFetcher((200, "User-agent: *\nDisallow: /x"))
+        clock = FakeClock()
+        robots = RobotsParser(fetch, clock=clock)
+        await robots.fetch_robots("https://site/")
+        clock.now += RobotsParser.RULES_TTL
+        fetch.answer = answer
+
+        assert await robots.is_allowed("https://site/x", BOT) is False
+        await run_background()
+        assert "could not be downloaded again" in caplog.text
+        # The site is not taken for unreachable: its old rules answer.
+        assert await robots.is_allowed("https://site/x", BOT) is False
+        assert await robots.is_allowed("https://site/y", BOT) is True
+        assert robots.unreachable_reason("https://site/y") is None
+        assert robots.unreachable_for("https://site/y") == 0
+        assert robots.failed_downloads("https://site/y") == 0
+        assert robots.may_recover("https://site/y")
+        assert len(fetch.requested) == 2
+
+        # Tried again after UNREACHABLE_TTL, not after another day.
+        clock.now += RobotsParser.UNREACHABLE_TTL - 1
+        await robots.is_allowed("https://site/y", BOT)
+        await run_background()
+        assert len(fetch.requested) == 2
+        clock.now += 1
+        fetch.answer = (200, "User-agent: *\nDisallow: /y")
+        assert await robots.is_allowed("https://site/x", BOT) is False
+        await run_background()
+        assert len(fetch.requested) == 3
+        assert robots.can_fetch("https://site/x", BOT) is True
+        assert robots.can_fetch("https://site/y", BOT) is False
+
+    async def test_large_robots_txt_is_parsed_in_a_thread(self, monkeypatch):
+        parsed_in_thread: list[int] = []
+        to_thread = asyncio.to_thread
+
+        async def record(function, text):
+            parsed_in_thread.append(len(text))
+            return await to_thread(function, text)
+
+        monkeypatch.setattr(asyncio, "to_thread", record)
+        lines = "".join(f"Disallow: /private-{n:05}/\n" for n in range(2000))
+        large = f"User-agent: *\n{lines}"
+        assert len(large) > RobotsParser.PARSE_IN_THREAD
+        small = "User-agent: *\nDisallow: /x"
+        robots = RobotsParser(lambda url: _answer(large if "large" in url else small))
+
+        assert await robots.is_allowed("https://large/private-01999/page", BOT) is False
+        assert await robots.is_allowed("https://large/private-02000/page", BOT) is True
+        assert await robots.is_allowed("https://small/x", BOT) is False
+        assert parsed_in_thread == [len(large)]
 
     async def test_old_rules_answer_while_robots_txt_is_fetched_again(self):
         fetch = FakeFetcher((503, ""))

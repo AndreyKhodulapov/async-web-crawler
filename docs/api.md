@@ -102,7 +102,9 @@ headless browser before it is returned (see [Rendering](#rendering)).
 Requests to one host start at least `max(1 / requests_per_second, min_delay,
 Crawl-delay)` seconds apart; with several sites (ports) on one host, the
 longest Crawl-delay counts. robots.txt is fetched once per site (scheme,
-host and port) and cached for the crawler's lifetime. A missing robots.txt
+host and port) and cached for 24 hours (`RobotsParser.RULES_TTL`); then
+it is fetched again in the background while the old rules keep
+answering, and they stay if the site does not answer. A missing robots.txt
 (HTTP 4xx, or a redirect loop) allows everything; an unreachable one (HTTP 5xx, 429, network
 errors, after the retries) disallows the whole site for 60 seconds, then it
 is fetched again. Such pages are counted as unreachable, not as blocked:
