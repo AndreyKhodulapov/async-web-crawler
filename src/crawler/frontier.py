@@ -203,10 +203,10 @@ class Frontier(ABC):
 
     @abstractmethod
     async def dropped(self, urls: Iterable[str]) -> None:
-        """The records of these pages, finished with `pending_save`, are dropped as ones no write can take.
+        """The records of these pages, finished with `pending_save`, are dropped by the storage.
 
         A frontier shared by several processes fails the pages, so that
-        none of them crawls them again for a record no write takes. One of
+        none of them crawls them again for a record that is not stored. One of
         a single process does not need it: the crawl counts the pages not
         saved itself.
         """

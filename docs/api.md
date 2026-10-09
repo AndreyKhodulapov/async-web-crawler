@@ -1273,7 +1273,12 @@ All of them share the behavior of `DataStorage`:
   `save()` only buffers, so a storage that is down does not slow the crawl
   down; `flush()` and `close()` write at once all the same. `write_failed`
   tells that the buffer holds records a write could not take, until one
-  does: a worker of a crawl job takes no pages meanwhile. Any other error
+  does: a worker of a crawl job takes no pages meanwhile. The buffer keeps
+  no more than `MAX_PENDING_BATCHES` (10) batches meanwhile: a record saved
+  over them is dropped and reported to `on_dropped`, without an error; the
+  first one is logged as an error with the size of the buffer, each with
+  its URL at DEBUG, and their number once a write takes the buffer again,
+  or on `close()`. Any other error
   (e.g. a value the database refuses, text that is not valid UTF-8) is one
   no retry cures: the batch is written again a record at a time, and only
   the records that fail on their own are dropped, each logged with its URL,
@@ -1284,8 +1289,9 @@ All of them share the behavior of `DataStorage`:
   written out.
 - `on_settled`, if set, is awaited with the URLs of the records written
   out after every write, and `on_dropped` with those of the records
-  dropped. Records still in the buffer are reported once a later write
-  takes them; those lost when `close()` cannot write them are not.
+  dropped, those saved over a full buffer included. Records still in the
+  buffer are reported once a later write takes them; those lost when
+  `close()` cannot write them are not.
   `crawl()` sets both for its run, so that a page is done in its frontier
   only once its record is stored, and failed once it is dropped (see
   `Frontier.saved` and `Frontier.dropped`), and clears them at the end.
@@ -1313,7 +1319,9 @@ returns, and what could not be written by then is `save_failed`. Only
 processed pages are saved, not the failed or skipped ones. A storage that
 stays down does not slow the crawl: after a write runs out of retries, saves
 only buffer for `cooldown` seconds before the storage tries again; the pages
-are written at the end of the crawl, or counted as `save_failed`.
+are written at the end of the crawl, or counted as `save_failed`. Nor does it
+fill the memory: the pages saved over a full buffer are dropped and counted as
+`save_failed` at once.
 
 `storage_from_output(output)` chooses the storage by the name of a file:
 `.jsonl` (or `.ndjson`) is JSON Lines, `.json` an indented array, `.csv` CSV,

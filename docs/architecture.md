@@ -82,8 +82,8 @@ listed in the [API reference](api.md#internals).
     stops then leaves it done in a shared queue with no record, and the
     next run never fetches it again. The crawl finishes such a page with
     `pending_save`; the storage reports the records it has written
-    through `on_settled`, and those it dropped as ones no write can take
-    through `on_dropped`; the crawl passes them on to `Frontier.saved`
+    through `on_settled`, and those it dropped (ones no write can take,
+    or saved over a full buffer) through `on_dropped`; the crawl passes them on to `Frontier.saved`
     and `Frontier.dropped`. Until then the database frontier keeps the
     page leased, and hands it out again if the lease runs out. A page
     whose record is dropped fails: counted processed, it would stand for
@@ -190,9 +190,12 @@ run against it; what it adds is what sharing needs.
   worker only waits for the turn of a host: the batches of the storage
   would shrink to a page.
 - **A worker whose storage cannot write takes no pages.** A local crawl
-  goes on and keeps the pages in the buffer; a worker doing so would
-  hold more and more pages `saving` that it may never store, while the
-  other workers could crawl them. So once a write fails after its
+  goes on and keeps the pages in the buffer, up to
+  `DataStorage.MAX_PENDING_BATCHES` batches, dropping the pages saved
+  over them, so that a storage that stays down does not fill the memory;
+  the crawl ends all the same, its pages counted `save_failed`. A worker
+  doing so would hold more and more pages `saving` that it may never
+  store, and fail the rest, while the other workers could crawl them. So once a write fails after its
   retries (`DataStorage.write_failed`), the worker stops taking pages:
   one of its tasks writes the buffer again after the storage's
   `cooldown`, then after twice as long each time, up to

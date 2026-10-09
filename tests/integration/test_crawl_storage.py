@@ -196,6 +196,29 @@ class TestSaveErrors:
         assert "Failed to close MemoryStorage" in caplog.text
         assert storage.released == 1
 
+    async def test_storage_that_always_fails_buffers_no_more_than_its_limit(self, url, caplog):
+        class SmallBuffer(MemoryStorage):
+            MAX_PENDING_BATCHES = 1
+
+            async def save(self, record):
+                try:
+                    await super().save(record)
+                finally:
+                    buffered.append(self.pending)
+
+        buffered: list[int] = []
+        storage = SmallBuffer(batch_size=2, failures=[DISK_FULL] * ALWAYS)
+
+        with caplog.at_level(logging.ERROR, logger="crawler"):
+            crawler = await crawl(storage, url("/site/"))
+
+        assert len(crawler.processed_urls) == 5
+        assert max(buffered) == 2
+        stats = crawler.crawl_stats()
+        assert (stats.processed, stats.saved, stats.save_failed) == (5, 0, 5)
+        assert "SmallBuffer cannot write and buffers 2 records, as many as it keeps" in caplog.text
+        assert "SmallBuffer dropped 3 records" in caplog.text
+
     async def test_pages_of_a_failed_write_are_saved_by_the_next_one(self, url):
         # The first batch fails with its retries; the storage works after that.
         storage = MemoryStorage(batch_size=2, failures=[DISK_FULL] * 4)

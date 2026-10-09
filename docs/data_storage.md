@@ -107,7 +107,10 @@ blocking the event loop, losing pages or writing them twice.
     the same page again replaces the row. Upsert turns at-least-once
     delivery into exactly-once results.
 - When the retries run out, **keep the records** and raise: the next write
-  takes them along, and a short outage loses nothing. The cost is memory.
+  takes them along, and a short outage loses nothing. The cost is memory,
+  so **bound the buffer** (`MAX_PENDING_BATCHES` batches): a long outage
+  drops the records saved over it, logged, rather than the whole process
+  running out of memory.
 - Do not retry on every save while the outage lasts: the retries run under
   the lock, and every worker would wait for them. After a failed write
   **back off for a cooldown** and only buffer; an explicit flush still

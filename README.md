@@ -433,11 +433,12 @@ storages. All of it is described in the [API reference](docs/api.md).
   start URLs again, adding to the output files or starting them anew with
   `--overwrite`. A crawl job keeps its queue in PostgreSQL and goes on
   where it stopped.
-- **A storage that keeps failing fills memory**, in a crawl of its own.
-  Pages that could not be written stay buffered and are retried; a
-  database that is down for long holds every page since the outage in
-  memory. A worker of a crawl job takes no pages until its storage writes
-  again, and leaves the rest to the others.
+- **A storage that stays down loses pages**, in a crawl of its own.
+  Pages that could not be written stay buffered and are retried, up to
+  10 batches (`batch_size` pages each); the pages saved over them are
+  dropped and counted `save_failed`, so that a database down for long
+  does not fill the memory. A worker of a crawl job takes no pages until
+  its storage writes again, and leaves the rest to the others.
 - **One host at a time under a rate limit**, in a crawl of its own. The
   workers take pages from one queue in the order of depth and wait for the
   turn of their host in the rate limiter; while the pages of the first host
