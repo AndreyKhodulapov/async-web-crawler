@@ -958,19 +958,26 @@ class TestCrawlBlockedHost:
         await crawler.crawl([*pages, "http://b/"])
 
         # Opened by a/0, which lost its retries to that and is put off like
-        # the others, then by the failed probes a/0 and a/1: a page whose
-        # probe failed is not put off again, so a/2 and a/3 are never requested.
-        assert fake_session.requested == ["http://a/0", "http://b/", "http://a/0", "http://a/1"]
+        # the others, then by the two failed probes. The pages put off come
+        # back at the same moment, in no set order: any two of them may be
+        # the probes. A page whose probe failed is not put off again, so the
+        # other two are never requested again.
+        requested = [page for page in fake_session.requested if page != "http://b/"]
+        probes = requested[1:]
+        assert fake_session.requested.count("http://b/") == 1
+        assert requested[0] == "http://a/0"
+        assert len(probes) == len(set(probes)) == 2 and set(probes) < set(pages)
+        given_up = [page for page in pages if page not in probes]
         assert list(crawler.processed_urls) == ["http://b/"]
-        assert [crawler.failed_urls[page].split(":")[0] for page in pages] == ["NetworkError"] * 2 + [
-            "CircuitOpenError"
-        ] * 2
+        assert {page: crawler.failed_urls[page].split(":")[0] for page in pages} == {
+            page: "NetworkError" if page in probes else "CircuitOpenError" for page in pages
+        }
         assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
         messages = [record.getMessage() for record in caplog.records]
         assert any(message.startswith("Deferred http://a/0 for 0.") for message in messages)
-        assert any(message.startswith("Deferred http://a/1 for 0.") for message in messages)
-        assert "Gave up on http://a/3: circuit breaker of a opened 3 times" in messages
-        # Deferred pages are counted once, when they are done; a/2 and a/3 were never requested.
+        for page in given_up:
+            assert f"Gave up on {page}: circuit breaker of a opened 3 times" in messages
+        # Deferred pages are counted once, when they are done; two were never requested again.
         stats = crawler.stats.get_stats()
         assert (stats["total_pages"], stats["successful"], stats["failed"]) == (5, 1, 4)
         assert stats["errors"] == {"NetworkError": 2, "CircuitOpenError": 2}
@@ -1087,13 +1094,15 @@ class TestCrawlBlockedHost:
         # The review's probe: a host answers 503 for a moment. Every page
         # in flight fails, the first ones open the circuit, and none is
         # retried, as the breaker refuses the retries; without the crawl
-        # putting them off, they would be the pages lost to the outage.
+        # putting them off, they would be the pages lost to the outage. The
+        # first failure is retried once the others have opened the circuit,
+        # however slow the machine, and well before the cooldown ends.
         caplog.set_level(logging.INFO, logger="crawler")
         crawler = make_crawler(
             max_concurrent=4,
             max_depth=0,
-            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
-            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=0.05),
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.1),
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=1.0),
         )
         pages = [f"http://a/{page}" for page in range(8)]
         for page in pages[:4]:
