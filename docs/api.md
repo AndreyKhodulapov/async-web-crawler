@@ -290,7 +290,10 @@ The same goes for a host held back longer than
 pause before the retry of a request that found it overloaded (HTTP 429, a
 timeout): its pages are put off until the host may be asked
 again, instead of holding workers in the rate limiter, and count toward
-`max_pages` only when they are taken again. A Retry-After longer than
+`max_pages` only when they are taken again. So is a page taken before the
+hold came: its request waits for the turn of the host at most
+`MIN_PENALTY_TO_DEFER`, then the page goes back unsent and the worker takes
+a page of another host. A Retry-After longer than
 `max_delay` of the retry strategy is logged as a warning once per host
 (`example.com asked to wait 300s (Retry-After); its pages are put off until
 then`): with one host in the crawl, nothing is requested until it ends.
@@ -1028,15 +1031,15 @@ may still send one request for it. If the hold cannot be written, a warning
 is logged and the host is held back by the worker that was answered only.
 
 A page whose host is held back by its own worker while the page waits for
-its turn goes back to the queue rather than keep the worker waiting: the
-crawl passes `max_wait=MIN_PENALTY_TO_DEFER` to `Fetcher.fetch`, whose
-request then fails with `HostHeldBackError` without being sent (not retried,
-not counted in the errors), and the page is put back uncounted. A retry
-waits out its own pause as before. The waits of a page
-(`Frontier.waits`, counted by `put_back(..., waited=True)`) are kept in the
-database, so `MAX_WAITS_PER_PAGE` counts them for the whole job; a page held
-back after it was taken that has waited its last waits in the rate limiter,
-as in a local crawl.
+its turn goes back to the queue rather than keep the worker waiting, as in a
+local crawl: the crawl passes `max_wait=MIN_PENALTY_TO_DEFER` to
+`Fetcher.fetch`, whose request then fails with `HostHeldBackError` without
+being sent (not retried, not counted in the errors), and the page is put
+back uncounted. A retry waits out its own pause as before. The waits of a
+page (`Frontier.waits`, counted by `put_back(..., waited=True)`) are kept in
+the database, so `MAX_WAITS_PER_PAGE` counts them for the whole job; a page
+held back after it was taken that has waited its last waits in the rate
+limiter.
 
 A host is given up for the whole job, not for each worker: the openings of
 the circuits of all workers count toward `MAX_CIRCUIT_OPENINGS`, and their

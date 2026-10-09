@@ -604,7 +604,8 @@ class AsyncCrawler:
         for longer than `MIN_PENALTY_TO_DEFER` seconds, by a Retry-After or
         the pause before the retry of a request that found the host
         overloaded (HTTP 429, a timeout), is put off until the host may be
-        asked again, without counting toward `max_pages` before then. A
+        asked again, without counting toward `max_pages` before then, even
+        when the hold comes while it waits for the turn of its host. A
         Retry-After longer than `max_delay` of the retry strategy is
         logged as a warning once per host, as the crawl may be quiet for
         that long; the page that got it, which the request did not retry,

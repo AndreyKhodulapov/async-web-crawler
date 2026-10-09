@@ -50,8 +50,8 @@ class CrawlRun:
     """
 
     MAX_CIRCUIT_OPENINGS = 3
-    # In crawl(), a page whose host is held back longer than this is put off;
-    # in a crawl of several processes, even once it waits for its turn.
+    # In crawl(), a page whose host is held back longer than this is put off,
+    # even once it waits for its turn.
     MIN_PENALTY_TO_DEFER = 1.0
     # In crawl(), a page waits at most this many times for a Retry-After
     # too long to retry it, before it is given up; in a crawl of several
@@ -874,12 +874,11 @@ class CrawlRun:
     def _max_wait(self, page: FrontierPage) -> float | None:
         """How long a request of the page waits for a host held back; None for as long as it is held.
 
-        In a crawl of several processes, a page whose host is held back
-        after it was taken goes back to the queue rather than keep the worker
-        waiting (see `_put_back_held`); once it has waited `MAX_WAITS_PER_PAGE`
-        times it waits in the rate limiter, as in a crawl of one process.
+        A page whose host is held back after it was taken goes back to the
+        queue rather than keep the worker waiting (see `_put_back_held`);
+        once it has waited `MAX_WAITS_PER_PAGE` times it waits in the rate limiter.
         """
-        if not self._frontier.shared or self._frontier.waits(page) >= self.MAX_WAITS_PER_PAGE:
+        if self._frontier.waits(page) >= self.MAX_WAITS_PER_PAGE:
             return None
         return self.MIN_PENALTY_TO_DEFER
 

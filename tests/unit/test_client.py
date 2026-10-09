@@ -1379,6 +1379,25 @@ class TestCrawlHeldBackHost:
         deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/1 for 0.1s")]
         assert len(deferred) == AsyncCrawler.MAX_WAITS_PER_PAGE
 
+    async def test_page_whose_host_is_held_back_while_it_waits_for_its_turn_goes_back_uncounted(
+        self, make_crawler, fake_session, caplog
+    ):
+        # a/1 and a/2 are taken at once; a/2 waits for the turn of host a
+        # when a/1 is answered with a Retry-After of 1 s. a/2 goes back to
+        # the queue, uncounted, and its worker crawls b/1 meanwhile. Were it
+        # counted twice, max_pages would leave it out.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(max_concurrent=2, max_depth=0, requests_per_second=3.0)  # 0.33 s apart
+        crawler.MIN_PENALTY_TO_DEFER = 0.1
+        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
+
+        await crawler.crawl(["http://a/1", "http://a/2", "http://b/1"], max_pages=3)
+
+        assert fake_session.requested == ["http://a/1", "http://b/1", "http://a/2"]
+        assert set(crawler.processed_urls) == {"http://a/2", "http://b/1"}
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/2")]
+        assert len(deferred) == 1 and deferred[0].endswith(": its host is held back")
+
     async def test_pause_before_a_retry_is_not_a_warning(self, make_crawler, fake_session, caplog):
         # A 429 without Retry-After holds the host back for the retry pause,
         # which is logged as the retry itself is; the other page is just put off.
@@ -1743,18 +1762,6 @@ class TestCrawlSharedFrontier:
         assert set(crawler.processed_urls) == {"http://a/1", "http://a/2"}
         assert crawler.rate_limiter.interval_for("a") == 0.01
         assert told == []
-
-    async def test_crawl_of_one_process_waits_in_the_rate_limiter(self, make_crawler, fake_session, caplog):
-        # Its frontier is not shared: the page waits for the host as before.
-        caplog.set_level(logging.INFO, logger="crawler")
-        crawler = make_crawler(max_concurrent=2, max_depth=0, requests_per_second=3.0)
-        crawler.MIN_PENALTY_TO_DEFER = 0.1
-        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
-
-        await crawler.crawl(["http://a/1", "http://a/2"])
-
-        assert set(crawler.processed_urls) == {"http://a/2"}
-        assert not [r for r in caplog.records if r.getMessage().startswith("Deferred http://a/2")]
 
 
 class Unreachable(Exception):
