@@ -7,6 +7,9 @@ import asyncpg
 from crawler.retry import RetryStrategy
 from crawler.storage.database import DatabaseDriver, DatabaseStorage
 
+# Key of the advisory lock under which the table of pages is created.
+_SCHEMA_LOCK = 0x70616765
+
 
 class PostgresDriver(DatabaseDriver):
     """A small asyncpg connection pool: a reader gets a connection of its own, apart from the writes."""
@@ -25,6 +28,13 @@ class PostgresDriver(DatabaseDriver):
 
     async def execute(self, statement: str) -> None:
         await self._pool.execute(statement)
+
+    async def create_schema(self, statements: Sequence[str]) -> None:
+        async with self._pool.acquire() as connection, connection.transaction():
+            # CREATE ... IF NOT EXISTS of two sessions at once may still fail on a duplicate.
+            await connection.execute("SELECT pg_advisory_xact_lock($1)", _SCHEMA_LOCK)
+            for statement in statements:
+                await connection.execute(statement)
 
     async def execute_many(self, statement: str, rows: Sequence[Sequence[object]]) -> None:
         # asyncpg runs it in a transaction of its own: all rows or none.

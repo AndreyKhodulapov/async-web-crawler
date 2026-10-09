@@ -20,13 +20,21 @@ class SQLiteDriver(DatabaseDriver):
     # which sorts in the order of time.
     JSON_TYPE = "TEXT"
     TIMESTAMP_TYPE = "TEXT"
+    # Seconds a statement waits for the lock of another connection before "database is locked".
+    BUSY_TIMEOUT = 30.0
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._connection: aiosqlite.Connection | None = None
 
     async def connect(self) -> None:
-        self._connection = await aiosqlite.connect(self.path)
+        self._connection = await aiosqlite.connect(self.path, timeout=self.BUSY_TIMEOUT)
+        try:
+            # Readers of the file do not hold the writes up (nor these the readers).
+            await self._connection.execute("PRAGMA journal_mode=WAL")
+        except BaseException:
+            await self._connection.close()
+            raise
 
     async def execute(self, statement: str) -> None:
         await self._connection.execute(statement)

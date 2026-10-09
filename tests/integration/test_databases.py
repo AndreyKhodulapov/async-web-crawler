@@ -246,6 +246,31 @@ class TestSQLite:
 
         assert stored == ("2025-03-14T15:09:26+00:00",)
 
+    async def test_file_is_in_wal_mode_and_a_lock_is_waited_for(self, tmp_path):
+        path = tmp_path / "crawler.db"
+        async with SQLiteStorage(path) as storage:
+            await storage.init_db()
+            async with storage._driver._connection.execute("PRAGMA busy_timeout") as cursor:
+                assert await cursor.fetchone() == (30000,)
+
+        with sqlite3.connect(path) as connection:
+            assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
+        connection.close()
+
+    async def test_reader_does_not_hold_the_writes_up(self, tmp_path):
+        path = tmp_path / "crawler.db"
+        async with SQLiteStorage(path, batch_size=1) as storage:
+            await storage.save(make_record("https://site/first"))
+            # A reader in the middle of its query, as one looking at the file while the crawl goes on.
+            reader = sqlite3.connect(path)
+            reader.execute("BEGIN")
+            assert reader.execute("SELECT COUNT(*) FROM pages").fetchone() == (1,)
+
+            await storage.save(make_record("https://site/second"))
+
+            assert await storage.count() == 2
+            reader.close()
+
     async def test_write_is_retried_when_the_database_is_locked(self, tmp_path):
         path = tmp_path / "crawler.db"
         locker = sqlite3.connect(path)
@@ -293,6 +318,20 @@ class TestPostgres:
         types = dict(columns)
         assert (types["links"], types["metadata"]) == ("jsonb", "jsonb")
         assert types["crawled_at"] == "timestamp with time zone"
+
+    @pytest.mark.postgres
+    async def test_storages_starting_at_once_create_the_table_once(self):
+        """As the workers of a crawl job that save to one database do."""
+        await run_in_postgres("DROP TABLE IF EXISTS pages")
+        storages = [PostgresStorage(POSTGRES_DSN) for _ in range(8)]
+        try:
+            await asyncio.gather(*(storage.init_db() for storage in storages))
+        finally:
+            for storage in storages:
+                await storage.close()
+
+        indexes = await run_in_postgres("SELECT indexname FROM pg_indexes WHERE tablename = 'pages'")
+        assert {"idx_pages_crawled_at", "idx_pages_status_code"} <= {name for (name,) in indexes}
 
     @pytest.mark.postgres
     async def test_writes_wait_for_the_disk(self):

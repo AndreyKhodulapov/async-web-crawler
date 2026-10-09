@@ -1261,7 +1261,7 @@ the same types:
 |---------|--------------------|-------|
 | `JSONStorage(path, indent=None, overwrite=False)` | a JSON Lines file whatever its extension (`results.json` too), or one indented array with `indent` | records are added without reading the file, and read back in pieces; the array is valid JSON after every write |
 | `CSVStorage(path, encoding="utf-8", overwrite=False, escape_formulas=True)` | a CSV file with a header row | the header comes from the first record, or from the file if it exists; `links` and `metadata` are JSON in a cell; quoting per RFC 4180; a character the encoding lacks is written as `?`; with `escape_formulas`, a value a spreadsheet would run as a formula (`=`, `+`, `-`, `@`, a tab or a carriage return at the start), or one starting with an apostrophe, is written after an apostrophe, which `read` drops |
-| `SQLiteStorage(path)` | the `pages` table of an SQLite file | `links` and `metadata` as JSON text, `crawled_at` as ISO 8601 in UTC |
+| `SQLiteStorage(path)` | the `pages` table of an SQLite file | `links` and `metadata` as JSON text, `crawled_at` as ISO 8601 in UTC; in WAL mode (the `-wal` and `-shm` files beside it while it is open), so a reader of the file does not hold the writes up; a lock of another connection is waited for up to 30 s |
 | `PostgresStorage(dsn)` | the `pages` table of a PostgreSQL database | `links` and `metadata` as `JSONB`, `crawled_at` as `TIMESTAMPTZ`; a connection pool |
 | `CompositeStorage(*storages)` | each of the storages | a page counts as written once all of them have it; one failing does not stop the others |
 
