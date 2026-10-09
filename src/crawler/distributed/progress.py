@@ -8,9 +8,8 @@ from typing import TextIO
 import asyncpg
 
 from crawler.distributed.job import database_errors
-from crawler.distributed.schema import Connection, create_schema
-from crawler.distributed.stats import FINISHED
-from crawler.exceptions import JobError
+from crawler.distributed.schema import Connection
+from crawler.distributed.stats import FINISHED, fetch_job
 from crawler.progress import format_duration, print_progress_line, progress_bar
 
 # The time of a job ends with the job, so the speed of a job finished is that of its last seconds.
@@ -91,7 +90,6 @@ async def job_progress(dsn: str, job: str, *, window: float = 30.0) -> JobProgre
     with database_errors(job):
         connection = await asyncpg.connect(dsn)
         try:
-            await create_schema(connection)
             return await _read_progress(connection, job, window)
         finally:
             await connection.close()
@@ -120,7 +118,6 @@ async def watch_job(
     with database_errors(job):
         connection = await asyncpg.connect(dsn)
         try:
-            await create_schema(connection)
             while True:
                 progress = await _read_progress(connection, job, window)
                 print_progress_line(format_job_progress(progress), stream, live=live)
@@ -158,9 +155,7 @@ def format_job_progress(progress: JobProgress) -> str:
 async def _read_progress(connection: Connection, job: str, window: float) -> JobProgress:
     # One snapshot: the workers go on meanwhile.
     async with connection.transaction(isolation="repeatable_read", readonly=True):
-        row = await connection.fetchrow(_JOB, job)
-        if row is None:
-            raise JobError(f'There is no crawl job named "{job}"')
+        row = await fetch_job(connection, _JOB, job)
         pages = await connection.fetchrow(_PAGES, row["id"], FINISHED, row["moment"], window)
     total, done, elapsed = row["max_pages"], pages["done"], float(row["elapsed"])
     # A job younger than the window has run for less time than that.

@@ -23,8 +23,9 @@ class CompositeStorage(DataStorage):
 
     A page counts as `written` once every storage has written it, and as
     `pending` while any of them still buffers it; `write_failed` is that
-    of any of them. A page is reported to `on_settled` once every storage
-    has written or dropped it. `read` gives the records of the first storage.
+    of any of them. A page is reported once every storage has written or
+    dropped it: to `on_dropped` if any of them dropped it, to `on_settled`
+    otherwise. `read` gives the records of the first storage.
     """
 
     def __init__(self, *storages: DataStorage) -> None:
@@ -32,9 +33,11 @@ class CompositeStorage(DataStorage):
             raise ValueError("CompositeStorage needs at least one storage")
         super().__init__()
         self.storages = storages
-        self._settled: Counter[str] = Counter()  # by URL, the storages that have settled its record
+        self._settled: Counter[str] = Counter()  # by URL, the storages that have written or dropped its record
+        self._dropped: set[str] = set()  # the URLs of those settled so far whose record one of them dropped
         for storage in storages:
             storage.on_settled = self._settle_in_one
+            storage.on_dropped = self._drop_in_one
 
     @property
     def pending(self) -> int:
@@ -60,14 +63,27 @@ class CompositeStorage(DataStorage):
     async def close(self) -> None:
         await self._for_each(lambda storage: storage.close(), "close")
 
+    async def _drop_in_one(self, urls: list[str]) -> None:
+        self._dropped.update(urls)
+        await self._settle_in_one(urls)
+
     async def _settle_in_one(self, urls: list[str]) -> None:
-        """A storage has settled these records: those settled by all of them are reported."""
+        """A storage has written or dropped these records: those settled by all of them are reported."""
         self._settled.update(urls)
-        settled = [url for url in urls if self._settled[url] == len(self.storages)]
-        for url in settled:
+        written, dropped = [], []
+        for url in urls:
+            if self._settled[url] < len(self.storages):
+                continue
             del self._settled[url]
-        if settled and self.on_settled is not None:
-            await self.on_settled(settled)
+            if url in self._dropped:
+                self._dropped.discard(url)
+                dropped.append(url)
+            else:
+                written.append(url)
+        if written and self.on_settled is not None:
+            await self.on_settled(written)
+        if dropped and self.on_dropped is not None:
+            await self.on_dropped(dropped)
 
     async def _for_each(self, call: Callable[[DataStorage], Awaitable[None]], action: str) -> None:
         outcomes = await asyncio.gather(*(call(storage) for storage in self.storages), return_exceptions=True)

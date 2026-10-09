@@ -50,6 +50,9 @@ blocking the event loop, losing pages or writing them twice.
 | SQLite | queries, indexes, transactions, zero setup: one file | one writer at a time |
 | PostgreSQL | concurrent writers, `JSONB` queries, real types, scale | a server to run |
 
+- **JSON Lines or an array**: `JSONStorage(path)` writes JSON Lines whatever
+  the extension, so `json.load` fails on its `results.json` ("Extra data");
+  with `indent` it writes one array (and `--output x.json` of the CLI too).
 - **Append without reading**: a JSON array can still be appended in O(1):
   write `\n]\n` after the records, remember where it starts, and overwrite it
   with `,\n<record>\n]\n` next time. The file is valid JSON after every write.
@@ -66,6 +69,15 @@ blocking the event loop, losing pages or writing them twice.
   cell; the header comes from the first record and must not be written twice
   on append; `utf-8-sig` adds the BOM Excel needs; decide what happens to a
   character the encoding lacks.
+- **Formulas in CSV**: a spreadsheet runs a cell that starts with `=`, `+`,
+  `-`, `@`, a tab or a carriage return as a formula, and the titles and
+  texts come from the sites (`=HYPERLINK(...)`). `CSVStorage` writes such a
+  value after an apostrophe (`escape_formulas`, on by default; the key
+  `storage.csv_escape_formulas`), and a value that starts with an
+  apostrophe too, so that `read` can drop it and return the value as it
+  was; an apostrophe followed by anything else is left alone, so files
+  written without escaping read as before. The list of the pages not saved
+  is escaped the same way.
 - **Empty vs missing**: CSV cannot tell `None` from `""`. If all backends
   must return the same record, normalize before saving (here: empty strings).
 - **Time**: store UTC, as ISO 8601 text or a `TIMESTAMPTZ`; ISO 8601 in one
@@ -107,7 +119,10 @@ blocking the event loop, losing pages or writing them twice.
     the same page again replaces the row. Upsert turns at-least-once
     delivery into exactly-once results.
 - When the retries run out, **keep the records** and raise: the next write
-  takes them along, and a short outage loses nothing. The cost is memory.
+  takes them along, and a short outage loses nothing. The cost is memory,
+  so **bound the buffer** (`MAX_PENDING_BATCHES` batches): a long outage
+  drops the records saved over it, logged, rather than the whole process
+  running out of memory.
 - Do not retry on every save while the outage lasts: the retries run under
   the lock, and every worker would wait for them. After a failed write
   **back off for a cooldown** and only buffer; an explicit flush still
@@ -144,11 +159,13 @@ blocking the event loop, losing pages or writing them twice.
 - **Tell the caller what is stored.** A crawl whose queue outlives the
   process (a shared queue, a resumed crawl) must not count a page done
   while its record is in the buffer. The storage reports the URLs of
-  every batch written, and of the records dropped, to a callback
-  (`on_settled`); the records still in the buffer, and those lost when a
-  failed close gives up on them, are not reported, so their pages are
-  crawled again. `CompositeStorage` reports a record once every one of its
-  storages has settled it. A failure of the callback is logged, not
+  every batch written to one callback (`on_settled`), and those of the
+  records dropped to another (`on_dropped`): a page whose record is
+  dropped is failed, not done. The records still in the buffer, and those
+  lost when a failed close gives up on them, are not reported, so their
+  pages are crawled again. `CompositeStorage` reports a record once every
+  one of its storages has written or dropped it, as dropped if any of
+  them dropped it. A failure of the callback is logged, not
   raised: the records are written all the same.
 - **Close in `finally`**: flush, then release the file or the connection
   even if the flush failed. Make `close` idempotent. An async generator that
@@ -161,10 +178,11 @@ blocking the event loop, losing pages or writing them twice.
   is `UNIQUE`, which both forbids duplicates and gives the index that makes
   the upsert and lookups by URL fast.
 - Index what is queried: `crawled_at` (what changed since), `status_code`
-  (which pages failed). Every index slows inserts, so not "all columns".
+  (pages by status). Every index slows inserts, so not "all columns".
 - Check that an index is used: `EXPLAIN QUERY PLAN` (SQLite), `EXPLAIN
   ANALYZE` (PostgreSQL).
-- Semi-structured fields (links, meta tags) fit a JSON column: `JSONB` in
+- Semi-structured fields (links, meta tags, headings, tables) fit a JSON
+  column, and a new kind of them needs no migration. `JSONB` in
   PostgreSQL is binary, queryable (`metadata ->> 'language'`) and indexable
   with GIN; in SQLite it is text with JSON functions.
 - **Always bind parameters**; never format values into SQL. Page text is

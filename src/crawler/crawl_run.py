@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
 from contextlib import aclosing
@@ -16,6 +17,7 @@ from crawler.exceptions import (
     FrontierError,
     HostHeldBackError,
     HTTPStatusError,
+    NoProxyError,
     ParseError,
     PermanentError,
     ProxyError,
@@ -49,8 +51,8 @@ class CrawlRun:
     """
 
     MAX_CIRCUIT_OPENINGS = 3
-    # In crawl(), a page whose host is held back longer than this is put off;
-    # in a crawl of several processes, even once it waits for its turn.
+    # In crawl(), a page whose host is held back longer than this is put off,
+    # even once it waits for its turn.
     MIN_PENALTY_TO_DEFER = 1.0
     # In crawl(), a page waits at most this many times for a Retry-After
     # too long to retry it, before it is given up; in a crawl of several
@@ -67,6 +69,10 @@ class CrawlRun:
     # In a crawl of several processes, a storage that cannot write is tried
     # again after its cooldown, then after twice as long each time, up to this.
     MAX_STORAGE_PAUSE = 60.0
+    # In crawl() with max_pages, the sitemaps are read only until they listed
+    # this many times as many pages as the queue holds, those the filters
+    # turn away included: they do not fill the queue.
+    SITEMAP_PAGES_FACTOR = 10
     # The constants above that AsyncCrawler hands over from itself to every run.
     SETTINGS = (
         "MAX_CIRCUIT_OPENINGS",
@@ -75,7 +81,12 @@ class CrawlRun:
         "MAX_ROBOTS_RETRIES",
         "ROBOTS_POLL",
         "MAX_STORAGE_PAUSE",
+        "SITEMAP_PAGES_FACTOR",
     )
+    # In a crawl of one process, the pages put off for their host are logged
+    # at INFO once per this many seconds per host, the others at DEBUG: while
+    # a host is down, each of its pages comes back about once a second.
+    DEFERRED_LOG_INTERVAL = 30.0
 
     def __init__(
         self,
@@ -110,6 +121,8 @@ class CrawlRun:
         self._scope_synced = 0  # hosts of Frontier.scope_hosts() the filter has
         self._failed_sitemaps: dict[str, str] = {}
         self._hosts_warned_held_back: set[str] = set()  # hosts whose long Retry-After was logged by the crawl
+        self._proxies_back_at = 0.0  # time.monotonic() at which a proxy is back after all of them were out
+        self._deferred_logged: dict[str, float] = {}  # host -> time.monotonic() of its last "Deferred" line at INFO
         # In a shared frontier: the failures of a host this process told it of, and the counts of the crawl it answered.
         self._failures_told: dict[str, HostFailures] = {}
         self._crawl_failures: dict[str, HostFailures] = {}
@@ -161,9 +174,11 @@ class CrawlRun:
         self._crawl_started, self._crawl_finished = time.perf_counter(), None
         self.stats.start()
         if self.storage is not None:
-            # A page saved is done in the frontier once its record is written;
-            # other processes that wait for it are not kept waiting by the buffer.
+            # A page saved is done in the frontier once its record is written,
+            # and failed once it is dropped; other processes that wait for it
+            # are not kept waiting by the buffer.
             self.storage.on_settled = self._frontier.saved
+            self.storage.on_dropped = self._frontier.dropped
             self._frontier.on_waiting = self._flush_storage
         if self._frontier.shared:
             # A host held back by this process is held back by the others
@@ -199,6 +214,7 @@ class CrawlRun:
         finally:
             if self.storage is not None:
                 self.storage.on_settled = None
+                self.storage.on_dropped = None
                 self._frontier.on_waiting = None
             if self._frontier.shared:
                 self._fetcher.on_host_held = None
@@ -263,10 +279,16 @@ class CrawlRun:
         """Queue the pages listed in `sitemap_urls` and in the sitemaps robots.txt of the sites of `robots_of` names.
 
         The sitemaps are read one by one, in order, and only until the
-        queue is full: the rest of a sitemap and the sitemaps after it are
-        not downloaded, so a crawl of a few pages does not read an index
-        of hundreds of files for them.
+        queue is full, or until they listed `SITEMAP_PAGES_FACTOR` times as
+        many pages as it holds, those the filters turned away included: the
+        rest of a sitemap and the sitemaps after it are not downloaded, so
+        a crawl of a few pages does not read an index of hundreds of files
+        for them, even when its filters let few of them through.
         """
+        frontier = self._frontier
+        max_listed = None
+        if frontier.max_pages is not None:
+            max_listed = self.SITEMAP_PAGES_FACTOR * frontier.frontier_factor * frontier.max_pages
         async with asyncio.TaskGroup() as group:
             named = [group.create_task(self._sitemaps_in_robots(url)) for url in robots_of]
         # Normalized, so a sitemap given twice, or given and named in robots.txt, is read once.
@@ -275,15 +297,23 @@ class CrawlRun:
             sitemaps.update(dict.fromkeys(task.result()))
         opened = listed = queued = 0
         for sitemap in sitemaps:
-            if await self._frontier.full():
+            if await frontier.full() or (max_listed is not None and listed >= max_listed):
                 break
             opened += 1
             async with aclosing(self._read_sitemap(sitemap)) as batches:
                 async for pages in batches:
                     listed += len(pages)
                     queued += await self._queue_sitemap_batch(pages, url_filter)
-                    if await self._frontier.full():
+                    if await frontier.full():
                         logger.info("Stopped reading sitemaps at %s: the queue is full", sitemap)
+                        break
+                    if max_listed is not None and listed >= max_listed:
+                        logger.info(
+                            "Stopped reading sitemaps at %s: they listed %d pages, %d times as many as the queue holds",
+                            sitemap,
+                            listed,
+                            self.SITEMAP_PAGES_FACTOR,
+                        )
                         break
         logger.info(
             "Sitemaps: %d read, %d failed, %d not read, %d pages listed, %d new queued",
@@ -464,6 +494,9 @@ class CrawlRun:
                             await frontier.finish(page, Outcome.UNREACHABLE, reason)
                     elif isinstance(refusal, CircuitOpenError):
                         await self._defer_or_fail(page, refusal)
+                    elif isinstance(refusal, NoProxyError):
+                        if not await self._wait_for_proxy(page, refusal, uncount=False):
+                            await self._fail_page(page, refusal)
                     else:
                         await self._fail_page(page, refusal)
                     continue
@@ -523,6 +556,8 @@ class CrawlRun:
             requested = sent or refusal is not result.error
             if not await self._defer_or_fail(page, refusal, result, counted=True, requested=requested):
                 await self._forget_redirects(url, targets)
+            return
+        if isinstance(result.error, NoProxyError) and await self._wait_for_proxy(page, result.error, uncount=True):
             return
         if self._outwaits_retries(result.error) and await self._wait_for_host(page, result.error):
             return
@@ -796,6 +831,15 @@ class CrawlRun:
         counts them from zero. With nothing new to tell, the counts are those
         the frontier answered last: the process whose failure brings a
         count to a limit is the one that gives the host up (see `_give_up_host`).
+
+        A circuit opens at most once per cooldown, and an unreachable
+        robots.txt is downloaded at most once per `UNREACHABLE_TTL`: in a
+        crawl of one process, the limits are a time the host keeps failing.
+        In a shared frontier, failures told within half of that of the last
+        ones counted are the same failure, seen by several processes at
+        once: a wave of them would otherwise give the host up in seconds.
+        Half, as the failures of one process, a full cooldown apart, reach
+        the frontier a little more or less than that apart.
         """
         host = get_host(url)
         assert host is not None  # the frontier holds valid URLs only
@@ -817,6 +861,8 @@ class CrawlRun:
             circuit_openings=here.circuit_openings - told.circuit_openings,
             robots_failures=here.robots_failures - (0 if read else told.robots_failures),
             robots_read=read,
+            circuit_apart=self.circuit_breaker.cooldown / 2,
+            robots_apart=0.0 if self.robots is None else self.robots.UNREACHABLE_TTL / 2,
         )
         self._crawl_failures[host] = failures
         return failures
@@ -853,12 +899,11 @@ class CrawlRun:
     def _max_wait(self, page: FrontierPage) -> float | None:
         """How long a request of the page waits for a host held back; None for as long as it is held.
 
-        In a crawl of several processes, a page whose host is held back
-        after it was taken goes back to the queue rather than keep the worker
-        waiting (see `_put_back_held`); once it has waited `MAX_WAITS_PER_PAGE`
-        times it waits in the rate limiter, as in a crawl of one process.
+        A page whose host is held back after it was taken goes back to the
+        queue rather than keep the worker waiting (see `_put_back_held`);
+        once it has waited `MAX_WAITS_PER_PAGE` times it waits in the rate limiter.
         """
-        if not self._frontier.shared or self._frontier.waits(page) >= self.MAX_WAITS_PER_PAGE:
+        if self._frontier.waits(page) >= self.MAX_WAITS_PER_PAGE:
             return None
         return self.MIN_PENALTY_TO_DEFER
 
@@ -933,7 +978,7 @@ class CrawlRun:
                 page, refusal.url, delay, refusal.message, uncount=requested, hold_reason=reason
             )
         else:
-            await self._put_off_page(page, delay, refusal.message, uncount=requested)
+            await self._put_off_page(page, delay, refusal.message, uncount=requested, host=get_host(refusal.url))
         return True
 
     def _unreachable_reason(self, refusal: RobotsUnreachableError) -> str:
@@ -951,15 +996,23 @@ class CrawlRun:
         return refusal.message if unreachable is None else f"robots.txt is unreachable ({unreachable})"
 
     async def _put_off_page(
-        self, page: FrontierPage, delay: float, reason: str, *, uncount: bool, waited: bool = False
+        self,
+        page: FrontierPage,
+        delay: float,
+        reason: str,
+        *,
+        uncount: bool,
+        waited: bool = False,
+        host: str | None = None,
     ) -> None:
         """Put a page of the crawl back into the queue for `delay` seconds.
 
         With `uncount`, the page is uncounted from the limits first: it
         is counted again when it is taken again. With `waited`, it counts
-        a wait for its host (see `Frontier.waits`).
+        a wait for its host (see `Frontier.waits`). `host` is the one the
+        page is put off for, if any: see `_log_deferred`.
         """
-        logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
+        self._log_deferred(page, delay, reason, host)
         await self._frontier.put_back(page, delay, uncount=uncount, waited=waited)
 
     async def _put_off_for_host(
@@ -985,15 +1038,34 @@ class CrawlRun:
         waits out the delay itself, as its own host is not held back: it
         would be handed out at once and redirect to the held one again.
         """
-        if not self._frontier.shared:
-            await self._put_off_page(page, delay, reason, uncount=uncount, waited=waited)
-            return
         host = get_host(url)
         assert host is not None  # a URL without a host is not requested
+        if not self._frontier.shared:
+            await self._put_off_page(page, delay, reason, uncount=uncount, waited=waited, host=host)
+            return
         await self._fetcher.tell_host_held(host, delay, hold_reason)
         logger.info("Deferred %s for %.1fs: %s", page.url, delay, reason)
         own_delay = 0.0 if host == get_host(page.url) else delay
         await self._frontier.put_back(page, own_delay, uncount=uncount, waited=waited)
+
+    def _log_deferred(self, page: FrontierPage, delay: float, reason: str, host: str | None) -> None:
+        """Log that a page is put off: at INFO, but for `host` once per `DEFERRED_LOG_INTERVAL` in a crawl of one process.
+
+        While a host is down, every page of it in the queue comes back about
+        once a second and is put off again: thousands of lines a second for
+        a large queue, which would push the useful ones out of a rotated log.
+        The first of them is logged at INFO, the rest at DEBUG. In a frontier
+        shared by several processes the host is held back for all of them,
+        and its pages are not handed out meanwhile: every line is at INFO.
+        """
+        level = logging.INFO
+        if host is not None and not self._frontier.shared:
+            now = time.monotonic()
+            if now - self._deferred_logged.get(host, -math.inf) < self.DEFERRED_LOG_INTERVAL:
+                level = logging.DEBUG
+            else:
+                self._deferred_logged[host] = now
+        logger.log(level, "Deferred %s for %.1fs: %s", page.url, delay, reason)
 
     async def _hold_open_circuit(self, url: str) -> None:
         """In a frontier shared by several processes, hold the host of `url` back for all of them while its circuit is open here.
@@ -1048,6 +1120,25 @@ class CrawlRun:
         self._warn_once_held_back(error.url, delay)
         return True
 
+    async def _wait_for_proxy(self, page: FrontierPage, error: NoProxyError, *, uncount: bool) -> bool:
+        """Put off a page that no proxy was left for, until the first one is back.
+
+        The request was not sent: with `uncount`, the page is uncounted
+        from the limits. The proxies are those of this process: in a
+        frontier shared by several processes the page goes back to the
+        queue for any of them, and its host is not held back. Proxies that
+        never come back end the crawl: once a page has waited
+        `MAX_WAITS_PER_PAGE` times, False is returned and the caller fails it.
+        """
+        if self._frontier.waits(page) >= self.MAX_WAITS_PER_PAGE:
+            return False
+        now = time.monotonic()
+        if now >= self._proxies_back_at:
+            logger.warning("Pages are put off until a proxy is back: %s", error.message)
+        self._proxies_back_at = now + error.seconds
+        await self._put_off_page(page, error.seconds, error.message, uncount=uncount, waited=True)
+        return True
+
     def _circuit_refusal(self, result: FetchResult) -> CircuitOpenError | None:
         """The refusal of the circuit breaker that a page of the crawl waits out; None if the breaker has no say in its outcome.
 
@@ -1058,16 +1149,18 @@ class CrawlRun:
         about the host. The probe of the host, though, is the retry the
         breaker gave the page: a page whose probe failed fails with its error.
         So does a page with a `PermanentError`, such as HTTP 501: it would
-        have had no retries.
+        have had no retries. HTTP 429 is not a failure to the breaker, but
+        it speaks for the host as much and would have been retried.
         """
         error = result.error
         if isinstance(error, CircuitOpenError):
             return error
         breaker = self.circuit_breaker
+        too_many_requests = isinstance(error, HTTPStatusError) and error.status == 429
         if (
             error is None
             or isinstance(error, PermanentError)
-            or not breaker.is_failure(error)
+            or not (breaker.is_failure(error) or too_many_requests)
             or breaker.opened_by_probe(error.url)
         ):
             return None
@@ -1121,7 +1214,7 @@ class CrawlRun:
                 page, refusal.url, probe_in, refusal.message, uncount=counted, hold_reason=refusal.message
             )
         else:
-            await self._put_off_page(page, 1.0, refusal.message, uncount=counted)
+            await self._put_off_page(page, 1.0, refusal.message, uncount=counted, host=get_host(refusal.url))
         return True
 
 
@@ -1144,7 +1237,12 @@ def _first_of(errors: BaseExceptionGroup, kinds: tuple[type[Exception], ...]) ->
 
 
 def _page_record(result: FetchResult, page: ParsedPage, depth: int) -> PageRecord:
-    """A crawled page as a storage keeps it: the parsed page with the facts of its response."""
+    """A crawled page as a storage keeps it: the parsed page with the facts of its response.
+
+    The structured elements of the page and the problems met parsing it go
+    into `metadata`, which a storage keeps as JSON, rather than into columns
+    of their own.
+    """
     assert result.status is not None
     # The title has a field of its own.
     metadata = {name: value for name, value in page["metadata"].items() if name != "title"}
@@ -1153,7 +1251,16 @@ def _page_record(result: FetchResult, page: ParsedPage, depth: int) -> PageRecor
         title=page["title"] or "",
         text=page["text"],
         links=page["links"],
-        metadata={**metadata, "final_url": page["final_url"], "depth": depth},
+        metadata={
+            **metadata,
+            "final_url": page["final_url"],
+            "depth": depth,
+            "headings": page["headings"],
+            "images": page["images"],
+            "tables": page["tables"],
+            "lists": page["lists"],
+            "parse_errors": page["errors"],
+        },
         crawled_at=datetime.now(UTC),
         status_code=result.status,
         content_type=result.content_type or "",

@@ -53,12 +53,18 @@ def storage_from_url(url: str, **options: Any) -> DatabaseStorage:
 
 
 def storage_from_output(
-    output: str | Path, *, csv_encoding: str = "utf-8", overwrite: bool = False, **options: Any
+    output: str | Path,
+    *,
+    csv_encoding: str = "utf-8",
+    csv_escape_formulas: bool = True,
+    overwrite: bool = False,
+    **options: Any,
 ) -> DataStorage:
     """The storage for an output: a file, chosen by its extension, or a database URL.
 
     "pages.jsonl" (or ".ndjson") is JSON Lines, "pages.json" an indented
-    JSON array, "pages.csv" CSV in `csv_encoding`, "pages.db" (or ".sqlite",
+    JSON array, "pages.csv" CSV in `csv_encoding` (with `csv_escape_formulas`,
+    see `CSVStorage`), "pages.db" (or ".sqlite",
     ".sqlite3") an SQLite database; "~" at the start of a path is the home
     directory. A string with "://" is a database URL, see
     `storage_from_url`. `overwrite` starts a file anew instead of adding
@@ -74,7 +80,9 @@ def storage_from_output(
     path = Path(output).expanduser()
     extension = path.suffix.lower()
     if extension == ".csv":
-        return CSVStorage(path, encoding=csv_encoding, overwrite=overwrite, **options)
+        return CSVStorage(
+            path, encoding=csv_encoding, escape_formulas=csv_escape_formulas, overwrite=overwrite, **options
+        )
     if extension == ".json":
         return JSONStorage(path, indent=2, overwrite=overwrite, **options)
     if extension in (".jsonl", ".ndjson"):

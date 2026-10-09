@@ -119,9 +119,11 @@ def make_cookie(
 def load_cookies_file(path: str | Path) -> list[Cookie]:
     """The cookies of a Netscape cookies.txt file, session ones included, expired ones left out.
 
-    Such a file is exported by browser extensions and `curl -c`. Cookies
-    the crawler cannot send are left out and logged by their host and
-    name: those of IP addresses and those with an invalid name.
+    Such a file is exported by browser extensions and `curl -c`. An expiry
+    date past the year 9999 is read as milliseconds, which some exporters
+    write. Cookies the crawler cannot send are left out and logged by their
+    host and name: those of IP addresses, those with an invalid name and
+    those whose expiry date is still out of range.
 
     Raises:
         OSError: the file cannot be read.
@@ -140,9 +142,15 @@ def load_cookies_file(path: str | Path) -> list[Cookie]:
             raise ValueError("not a Netscape cookies.txt file, or a line of it is malformed") from None
     now = time.time()
     cookies = []
+    in_milliseconds = 0
     for cookie in jar:
         if cookie.expires == 0:
             cookie.expires, cookie.discard = None, True
+        elif cookie.expires is not None and cookie.expires > CookieJar.MAX_TIME:
+            # No date in seconds is that far, and a date after 1978 in
+            # milliseconds always is: some exporters write milliseconds.
+            cookie.expires //= 1000
+            in_milliseconds += 1
         if cookie.is_expired(now):
             continue
         if cookie.value is None:
@@ -150,10 +158,14 @@ def load_cookies_file(path: str | Path) -> list[Cookie]:
             logger.warning("Left out a cookie without a name of %s from %s", cookie.domain, path)
             continue
         problem = cookie_name_problem(cookie.name) or cookie_domain_problem(cookie.domain)
+        if problem is None and cookie.expires is not None and cookie.expires > CookieJar.MAX_TIME:
+            problem = "its expiry date is neither in seconds nor in milliseconds"
         if problem is not None:
             logger.warning("Left out the cookie %r of %s from %s: %s", cookie.name, cookie.domain, path, problem)
             continue
         cookies.append(cookie)
+    if in_milliseconds:
+        logger.info("Read the expiry dates of %d cookies from %s as milliseconds", in_milliseconds, path)
     return cookies
 
 
@@ -222,7 +234,8 @@ class CookieJar(aiohttp.CookieJar):
             if cookie.has_nonstandard_attr(HTTPONLY_ATTR):
                 morsel["httponly"] = True
             if cookie.expires is not None:
-                morsel["expires"] = formatdate(cookie.expires, usegmt=True)
+                # formatdate() fails on a date past MAX_TIME, as make_cookie() may be given.
+                morsel["expires"] = formatdate(min(cookie.expires, self.MAX_TIME), usegmt=True)
             self.update_cookies(
                 [(cookie.name, morsel)], URL.build(scheme="https", host=cookie.domain.removeprefix("."))
             )

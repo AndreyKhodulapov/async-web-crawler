@@ -35,6 +35,11 @@ class DatabaseDriver(ABC):
     async def execute(self, statement: str) -> None:
         """Run a statement that takes no parameters and returns no rows."""
 
+    async def create_schema(self, statements: Sequence[str]) -> None:
+        """Run the statements that create the table and its indexes; several storages may do it at once."""
+        for statement in statements:
+            await self.execute(statement)
+
     @abstractmethod
     async def execute_many(self, statement: str, rows: Sequence[Sequence[object]]) -> None:
         """Run the statement for every row of parameters, all in one transaction."""
@@ -99,7 +104,7 @@ class DatabaseStorage(DataStorage):
                 await self._driver.connect()
                 self._connected = True
             driver = self._driver
-            await driver.execute(
+            table = (
                 f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
                 f"id {driver.ID_COLUMN}, "
                 "url TEXT NOT NULL UNIQUE, "
@@ -111,8 +116,11 @@ class DatabaseStorage(DataStorage):
                 "status_code INTEGER NOT NULL, "
                 "content_type TEXT NOT NULL)"
             )
-            for column in ("crawled_at", "status_code"):
-                await driver.execute(f"CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_{column} ON {self.TABLE} ({column})")
+            indexes = [
+                f"CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_{column} ON {self.TABLE} ({column})"
+                for column in ("crawled_at", "status_code")
+            ]
+            await driver.create_schema([table, *indexes])
             self._initialized = True
 
     async def count(self) -> int:

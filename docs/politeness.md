@@ -130,8 +130,12 @@ sites it visits and follows their rules.
   disallowed ones, so the report does not blame robots.txt for a network
   failure.
 - Rules apply to one **origin** (scheme, host, port) and are cached per
-  origin. The RFC allows caching for up to 24 hours. Parse at least 500 KiB,
+  origin. The RFC allows caching for up to 24 hours (here 24 hours, then
+  downloaded again in the background; the old rules answer meanwhile, and
+  stay if the site does not answer). Parse at least 500 KiB,
   and stop downloading there: a huge or endless file must not fill the memory.
+  Parsing 500 KiB of rules takes about half a second: do it in a thread
+  (here for files over 32 KiB), or every request stands still meanwhile.
 - **Single flight**: when many workers reach a new site at once, they must
   share one robots.txt download. Cache the `Task` rather than its result, and
   `await asyncio.shield(task)` so that one cancelled caller does not cancel
@@ -176,6 +180,16 @@ sites it visits and follows their rules.
   `max_retry_after`): a misconfigured server must not stop the crawl for a
   day. And say so in the log: a crawl that makes no requests for minutes
   looks stuck to the user.
+- A 429 without Retry-After says "fewer requests", not "come back in a
+  while": a pause before the retry alone is not enough, as the crawl
+  returns to the old pace right after it and earns the next 429. Here the
+  interval of the host doubles on every 429 (to at least 1 and at most
+  60 seconds) and halves again every minute without one, the way Scrapy's
+  AutoThrottle or TCP's congestion control (AIMD) find the rate a server
+  takes. The requests in flight when the first 429 comes were sent at the
+  old pace: their 429s double the interval once, not once each. A 429 is
+  not a failure to the circuit breaker either: the site is up and asks to
+  slow down, and giving it up would be the opposite of what it asked.
 - A 500 or 502 on one URL, or a reset connection, more often means **one
   page** or one backend is broken. Let only that request wait for its
   retry: holding the host for every retry lets a few broken pages stall

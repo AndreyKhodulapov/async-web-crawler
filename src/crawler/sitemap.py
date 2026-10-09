@@ -11,12 +11,13 @@ from typing import NamedTuple
 from lxml import etree
 
 from crawler.exceptions import FetchError, SitemapError
-from crawler.urls import normalize_url
+from crawler.urls import drop_userinfo, get_host, normalize_url
 
 logger = logging.getLogger(__name__)
 
 
 class _Sitemap(NamedTuple):
+    url: str  # where it was downloaded from, after redirects
     is_index: bool
     locations: list[str]  # normalized URLs: of pages, or of other sitemaps in an index
 
@@ -26,17 +27,22 @@ class SitemapParser:
 
     Usage::
 
-        sitemaps = SitemapParser(fetch)               # fetch(url) -> body
+        sitemaps = SitemapParser(fetch)               # fetch(url) -> (body, final URL)
         urls = await sitemaps.fetch_sitemap("https://example.com/sitemap.xml")
 
-    `fetch` downloads a URL and returns the body as bytes; it raises
-    `FetchError` when there is no successful response.
+    `fetch` downloads a URL and returns the body as bytes with the URL it
+    came from after redirects; it raises `FetchError` when there is no
+    successful response. A sitemap may be tens of megabytes: a fetcher
+    gives it `TIMEOUT_FACTOR` times as long as a page.
 
     A sitemap index lists other sitemaps, which are downloaded too, at most
-    `CONCURRENCY` at a time, and may be indexes themselves. Every sitemap is
-    downloaded once, so indexes that list each other do not loop, and at
-    most `MAX_FILES` of them are downloaded for one call. A sitemap listed
-    in an index that cannot be downloaded or read is logged and left out.
+    `CONCURRENCY` at a time, and may be indexes themselves. The protocol
+    lets an index list only the sitemaps of its own host, the one it was
+    downloaded from: those of other hosts are logged and left out. Every
+    sitemap is downloaded once, so indexes that list each other do not
+    loop, and at most `MAX_FILES` of them are downloaded for one call. A
+    sitemap listed in an index that cannot be downloaded or read is logged
+    and left out.
 
     Gzipped sitemaps (.xml.gz) are unpacked, those made of several gzip
     members too. A sitemap over `MAX_SIZE` bytes, the limit of the
@@ -53,8 +59,9 @@ class SitemapParser:
     MAX_SIZE = 50 * 1024 * 1024
     MAX_FILES = 500
     CONCURRENCY = 5
+    TIMEOUT_FACTOR = 10
 
-    def __init__(self, fetch: Callable[[str], Awaitable[bytes]], *, max_urls: int = 50_000) -> None:
+    def __init__(self, fetch: Callable[[str], Awaitable[tuple[bytes, str]]], *, max_urls: int = 50_000) -> None:
         if max_urls < 1:
             raise ValueError(f"max_urls must be >= 1, got {max_urls}")
         self._fetch = fetch
@@ -103,7 +110,7 @@ class SitemapParser:
                         raise sitemap
                     logger.warning("Skipped sitemap %s: %s: %s", url, type(sitemap).__name__, sitemap.message)
                 elif sitemap.is_index:
-                    pending.extend(self._new_sitemaps(url, sitemap.locations, known))
+                    pending.extend(self._new_sitemaps(sitemap, known))
                 else:
                     new.update(dict.fromkeys(location for location in sitemap.locations if location not in pages))
             taken = list(new)[: self.max_urls - len(pages)]
@@ -116,14 +123,23 @@ class SitemapParser:
             logger.warning("Sitemap %s lists more than %d URLs, the rest are left out", root, self.max_urls)
         logger.info("Sitemap %s: %d URLs in %d files", root, len(pages), len(known))
 
-    def _new_sitemaps(self, index_url: str, locations: list[str], known: set[str]) -> list[str]:
-        """The sitemaps of an index that are not known yet, as many as `MAX_FILES` allows; adds them to `known`."""
-        new = list(dict.fromkeys(location for location in locations if location not in known))
+    def _new_sitemaps(self, index: _Sitemap, known: set[str]) -> list[str]:
+        """The sitemaps of an index on its host not known yet, as many as `MAX_FILES` allows; adds them to `known`."""
+        host = get_host(index.url)
+        own = [location for location in index.locations if get_host(location) == host]
+        if len(own) < len(index.locations):
+            logger.warning(
+                "Sitemap index %s: %d sitemaps on other hosts left out, such as %s",
+                index.url,
+                len(index.locations) - len(own),
+                next(location for location in index.locations if get_host(location) != host),
+            )
+        new = list(dict.fromkeys(location for location in own if location not in known))
         allowed = new[: self.MAX_FILES - len(known)]
         if len(allowed) < len(new):
             logger.warning(
                 "Sitemap index %s: %d sitemaps left out, over the limit of %d files",
-                index_url,
+                index.url,
                 len(new) - len(allowed),
                 self.MAX_FILES,
             )
@@ -133,11 +149,12 @@ class SitemapParser:
     async def _load(self, url: str) -> _Sitemap | FetchError:
         """Download and parse one sitemap; a failure is returned, so it does not cancel the others."""
         try:
-            body = await self._fetch(url)
+            body, final_url = await self._fetch(url)
             # A sitemap may hold 50,000 URLs: parsed off the event loop.
-            return await asyncio.to_thread(_parse, url, body, self.MAX_SIZE)
+            sitemap = await asyncio.to_thread(_parse, url, body, self.MAX_SIZE)
         except FetchError as error:
             return error
+        return sitemap._replace(url=final_url)
 
 
 def _parse(url: str, body: bytes, max_size: int) -> _Sitemap:
@@ -161,8 +178,8 @@ def _parse(url: str, body: bytes, max_size: int) -> _Sitemap:
         if location is None:
             logger.debug("Sitemap %s: skipped an invalid URL %r", url, entry.text)
         else:
-            locations.append(location)
-    return _Sitemap(is_index, locations)
+            locations.append(drop_userinfo(location))  # credentials of the site's choosing are not sent
+    return _Sitemap(url, is_index, locations)
 
 
 def _unpack(url: str, body: bytes, max_size: int) -> bytes:

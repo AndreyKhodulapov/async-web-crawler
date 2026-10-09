@@ -37,7 +37,11 @@ class DataStorage(ABC):
     `cooldown` seconds after that `save` only buffers the records, so that
     a storage that is down does not make every save wait for the retries;
     `flush` and `close` write at once all the same. `write_failed` tells
-    that the buffer holds records a write could not take. Any
+    that the buffer holds records a write could not take. The buffer keeps
+    no more than `MAX_PENDING_BATCHES` batches meanwhile: a record saved
+    over them is dropped, so that a storage that stays down does not fill
+    the memory; the first one dropped is logged as an error, and the number
+    of them once a write takes the buffer again, or on `close`. Any
     other error is one no retry cures, and kept in the buffer the batch
     would fail every later write: the batch is written again a record at
     a time, and only the records that fail on their own are dropped, each
@@ -54,15 +58,17 @@ class DataStorage(ABC):
     `WRITE_ERRORS` the exceptions its writes fail with; `_open_storage`
     does what the first write would otherwise do to open the storage.
 
-    `on_settled`, if set, is called with the URLs of the records settled:
-    written, or dropped as ones no write can take. A crawl uses it to mark
-    its pages done once they are stored. Records that stay in the buffer
-    after a failed write are reported once a later write takes them, and
-    those lost when `close` cannot write them are not reported. An error
-    of `on_settled` is logged and does not fail the write.
+    `on_settled`, if set, is called with the URLs of the records written,
+    and `on_dropped` with those dropped: ones no write can take, or saved
+    over a full buffer. A crawl uses them to mark its pages done once they
+    are stored, and failed once they cannot be. Records that stay in the
+    buffer after a failed write are reported once a later write takes
+    them, and those lost when `close` cannot write them are not reported.
+    An error of either callback is logged and does not fail the write.
     """
 
     WRITE_ERRORS: ClassVar[tuple[type[Exception], ...]] = (OSError,)
+    MAX_PENDING_BATCHES: ClassVar[int] = 10
 
     def __init__(
         self,
@@ -87,7 +93,9 @@ class DataStorage(ABC):
         self._lock = asyncio.Lock()
         self._closed = False
         self._written = 0
+        self._overflow = 0  # records dropped since the buffer filled up
         self.on_settled: Callable[[list[str]], Awaitable[None]] | None = None
+        self.on_dropped: Callable[[list[str]], Awaitable[None]] | None = None
 
     @property
     def pending(self) -> int:
@@ -143,8 +151,10 @@ class DataStorage(ABC):
         Raises:
             StorageError: the storage is closed, or the batch this record
                 completed could not be written. The record is kept either
-                way, unless the storage is closed. During the `cooldown`
-                after a failed write nothing is written and nothing raised.
+                way, unless the storage is closed or the buffer is full.
+                During the `cooldown` after a failed write nothing is written
+                and nothing raised; a record saved over a full buffer is
+                dropped without an error.
             Exception: a record of the batch failed with an error outside
                 `WRITE_ERRORS` and is dropped, this one or another; the
                 other records of the batch are written.
@@ -154,7 +164,12 @@ class DataStorage(ABC):
                 raise StorageError(f"{type(self).__name__} is closed")
             self._buffer.append(record)
             if len(self._buffer) >= self.batch_size and self._clock() >= self._paused_until:
-                await self._flush_buffer()
+                try:
+                    await self._flush_buffer()
+                except StorageError:
+                    await self._drop_overflow()
+                    raise
+            await self._drop_overflow()
 
     async def flush(self) -> None:
         """Write out the buffered records.
@@ -188,6 +203,12 @@ class DataStorage(ABC):
             try:
                 await self._flush_buffer()
             finally:
+                if self._overflow:
+                    logger.error(
+                        "%s dropped %d records: its buffer was full while it could not write",
+                        type(self).__name__,
+                        self._overflow,
+                    )
                 # Whatever is still here is lost: a later flush must not
                 # reopen what `_close` releases.
                 self._buffer = []
@@ -207,13 +228,12 @@ class DataStorage(ABC):
             if len(batch) == 1:
                 self._buffer = []
                 self._log_dropped(batch[0], error)
-                await self._settle(batch)
+                await self._settle(batch, dropped=True)
                 raise
             await self._write_one_by_one(error)
             return
         self._buffer = []
-        self._paused_until = 0.0
-        self._failing = False
+        self._writes_again()
         self._written += len(batch)
         logger.debug("Wrote %d records to %s", len(batch), type(self).__name__)
         await self._settle(batch)
@@ -229,6 +249,36 @@ class DataStorage(ABC):
         self._paused_until = self._clock() + self.cooldown
         self._failing = True
         return StorageError(f"failed to write {records} records: {error}")
+
+    def _writes_again(self) -> None:
+        """End the cooldown once a write took the buffer."""
+        self._paused_until = 0.0
+        self._failing = False
+        if self._overflow:
+            logger.warning(
+                "%s writes again: %d records were dropped while its buffer was full",
+                type(self).__name__,
+                self._overflow,
+            )
+            self._overflow = 0
+
+    async def _drop_overflow(self) -> None:
+        """Drop the newest records over `MAX_PENDING_BATCHES` batches, which only writes that fail leave."""
+        over = len(self._buffer) - self.MAX_PENDING_BATCHES * self.batch_size
+        if over <= 0:
+            return
+        self._buffer, dropped = self._buffer[:-over], self._buffer[-over:]
+        if not self._overflow:
+            logger.error(
+                "%s cannot write and buffers %d records, as many as it keeps: "
+                "the records saved until it writes again are dropped",
+                type(self).__name__,
+                len(self._buffer),
+            )
+        for record in dropped:
+            logger.debug("Dropped the record of %s: the buffer of %s is full", record["url"], type(self).__name__)
+        self._overflow += over
+        await self._settle(dropped, dropped=True)
 
     async def _write_one_by_one(self, batch_error: Exception) -> None:
         """Write the buffer a record at a time after its batch failed with an error no retry cures.
@@ -248,6 +298,7 @@ class DataStorage(ABC):
         first_error: Exception | None = None
         while self._buffer:
             record = self._buffer[0]
+            dropped = False
             try:
                 await self._write_with_retries([record])
             except self.WRITE_ERRORS as error:
@@ -255,26 +306,32 @@ class DataStorage(ABC):
             except Exception as error:  # noqa: BLE001 - raised once the other records are written
                 self._log_dropped(record, error)
                 first_error = first_error or error
+                dropped = True
             else:
                 self._written += 1
             # Gone from the buffer as soon as it is written or dropped, so
             # that a cancelled flush does not write it twice.
             self._buffer = self._buffer[1:]
-            await self._settle([record])
-        self._paused_until = 0.0
-        self._failing = False
+            await self._settle([record], dropped=dropped)
+        self._writes_again()
         if first_error is not None:
             raise first_error
         logger.warning("%s wrote its records one by one: none of them failed on its own", type(self).__name__)
 
-    async def _settle(self, records: Sequence[PageRecord]) -> None:
-        """Report the records written or dropped to `on_settled`; its error is logged, not raised."""
-        if self.on_settled is None:
+    async def _settle(self, records: Sequence[PageRecord], *, dropped: bool = False) -> None:
+        """Report the records written to `on_settled`, or those dropped to `on_dropped`; an error is logged, not raised."""
+        report = self.on_dropped if dropped else self.on_settled
+        if report is None:
             return
         try:
-            await self.on_settled([record["url"] for record in records])
+            await report([record["url"] for record in records])
         except Exception:
-            logger.exception("Failed to report %d records settled by %s", len(records), type(self).__name__)
+            logger.exception(
+                "Failed to report %d records %s by %s",
+                len(records),
+                "dropped" if dropped else "settled",
+                type(self).__name__,
+            )
 
     def _log_dropped(self, record: PageRecord, error: Exception) -> None:
         logger.error("Dropped the record of %s: %s cannot write it: %s", record["url"], type(self).__name__, error)

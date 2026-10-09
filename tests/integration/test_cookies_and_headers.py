@@ -2,6 +2,7 @@
 
 import asyncio
 import stat
+import time
 
 import pytest
 import yaml
@@ -50,6 +51,16 @@ async def test_starting_cookie_goes_to_its_domain_only(url):
     assert "cookie:sid=abc" in own
     assert "https_only" not in own  # not over http
     assert "cookie:" not in other
+
+
+async def test_cookie_of_a_file_dated_in_milliseconds_reaches_the_site(url, tmp_path):
+    later = (int(time.time()) + 3600) * 1000
+    path = cookies_file(tmp_path / "cookies.txt", f"{HOST}\tFALSE\t/\tFALSE\t{later}\tsid\tabc")
+
+    async with AsyncCrawler(**UNTHROTTLED, cookies=load_cookies_file(path)) as crawler:
+        page = await crawler.fetch_url(url("/cookies/echo", HOST))
+
+    assert "cookie:sid=abc" in page
 
 
 async def test_headers_reach_the_pages_and_robots_txt(url, site):

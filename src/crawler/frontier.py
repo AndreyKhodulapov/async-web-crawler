@@ -31,6 +31,21 @@ class Outcome(enum.Enum):
     UNREACHABLE = "unreachable"
 
 
+class UnsavedPage(NamedTuple):
+    """A page a crawl finished without a record in the storage, see `MemoryFrontier.unsaved`.
+
+    `outcome` is a value of `Outcome`: that of the page, or "failed" for a
+    page processed whose record the storage dropped. `status` is that of
+    the response and `error` the class of the error, if the page had them.
+    """
+
+    url: str
+    outcome: str
+    reason: str
+    status: int | None = None
+    error: str | None = None
+
+
 class Admission(enum.Enum):
     """Whether a page taken from the frontier may be requested, see `Frontier.admit`."""
 
@@ -102,6 +117,8 @@ class Frontier(ABC):
 
     # Room for the pages that do not count toward max_pages, such as those robots.txt disallows.
     FRONTIER_FACTOR = 3
+    # How a page whose record the storage dropped ends up, see `dropped`.
+    DROPPED: ClassVar[GivenUp] = GivenUp(Outcome.FAILED, "its record could not be stored", "RecordDropped")
     # Whether other processes take pages of this frontier too: what holds a
     # host back in one of them is then told to the frontier, see `hold_host`.
     shared = False
@@ -193,13 +210,23 @@ class Frontier(ABC):
         `status` and `elapsed` are those of the response, if there was one,
         and `error` the class of the error a failed page failed with. A
         frontier shared by several processes keeps them for the statistics
-        of the whole crawl; one of a single process does not need them, as
-        the process counts its pages itself.
+        of the whole crawl; one of a single process keeps the status and the
+        error of a page not processed, to list it as unsaved, as the process
+        counts its pages itself.
         """
 
     @abstractmethod
     async def saved(self, urls: Iterable[str]) -> None:
-        """The records of these pages, finished with `pending_save`, are written, or dropped as ones no write can take."""
+        """The records of these pages, finished with `pending_save`, are written."""
+
+    @abstractmethod
+    async def dropped(self, urls: Iterable[str]) -> None:
+        """The records of these pages, finished with `pending_save`, are dropped by the storage.
+
+        A frontier shared by several processes fails the pages, so that
+        none of them crawls them again for a record that is not stored, as
+        `DROPPED` says. One of a single process lists them as unsaved.
+        """
 
     @abstractmethod
     async def mark_seen(self, url: str, source: str) -> bool:
@@ -275,14 +302,24 @@ class Frontier(ABC):
         """
 
     async def count_host_failures(
-        self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
+        self,
+        host: str,
+        *,
+        circuit_openings: int = 0,
+        robots_failures: int = 0,
+        robots_read: bool = False,
+        circuit_apart: float = 0.0,
+        robots_apart: float = 0.0,
     ) -> HostFailures:
         """Add the failures of `host` a process saw to those of the crawl; the counts of the crawl after it.
 
         `circuit_openings` counts the times its circuit opened anew,
         `robots_failures` the downloads of its robots.txt that failed anew;
         with `robots_read`, robots.txt was read since the failures told
-        before, and they are counted from zero. The counts are added in one
+        before, and they are counted from zero. Failures told less than
+        `circuit_apart` or `robots_apart` seconds after the last ones the
+        crawl counted are not counted: they are the same failure of the
+        host, seen by several processes at once. The counts are added in one
         step: of the processes that count failures of a host at once, one
         sees the count reach a limit, and gives the host up (see
         `give_up_host`). A frontier of one process
@@ -313,7 +350,9 @@ class MemoryFrontier(Frontier):
 
     `queue` keeps the outcomes and depths of the pages. Once `max_pages`
     pages are admitted the queue is closed, so that the workers stop
-    taking pages; a page uncounted reopens it.
+    taking pages; a page uncounted reopens it. `unsaved` lists, by URL in
+    the order they were finished, the pages that end up without a record:
+    those not processed, and those whose record the storage dropped.
     """
 
     def __init__(
@@ -337,6 +376,7 @@ class MemoryFrontier(Frontier):
         self._scope_hosts: list[str] = []
         self._waits: Counter[str] = Counter()
         self._seen_from: dict[str, str] = {}  # URL remembered with mark_seen -> the page whose redirect led to it
+        self.unsaved: dict[str, UnsavedPage] = {}
 
     async def seed(self, urls: Iterable[str]) -> list[str]:
         seeded: dict[str, None] = {}
@@ -414,6 +454,7 @@ class MemoryFrontier(Frontier):
                 self.queue.mark_blocked(page.url, reason)
             case Outcome.UNREACHABLE:
                 self.queue.mark_unreachable(page.url, reason)
+        self.unsaved[page.url] = UnsavedPage(page.url, outcome.value, reason, status, error)
 
     def in_progress(self, page: FrontierPage) -> bool:
         return self.queue.is_in_progress(page.url)
@@ -423,6 +464,11 @@ class MemoryFrontier(Frontier):
 
     async def saved(self, urls: Iterable[str]) -> None:
         pass
+
+    async def dropped(self, urls: Iterable[str]) -> None:
+        outcome, reason, error = self.DROPPED
+        for url in urls:
+            self.unsaved[url] = UnsavedPage(url, outcome.value, reason, error=error)
 
     async def mark_seen(self, url: str, source: str) -> bool:
         form = queue_form(url)

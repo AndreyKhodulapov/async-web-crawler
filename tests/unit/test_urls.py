@@ -3,6 +3,7 @@
 import pytest
 
 from crawler.urls import (
+    drop_userinfo,
     get_host,
     hide_password,
     is_same_host,
@@ -52,6 +53,36 @@ def test_resolve_relative_links(href, expected):
 )
 def test_resolve_skips_non_crawlable_links(href):
     assert resolve_url(href, BASE) is None
+
+
+@pytest.mark.parametrize(
+    ("href", "base", "expected"),
+    [
+        # Credentials written in the link are not the crawler's to send.
+        ("http://user:pass@other.org/page", BASE, "http://other.org/page"),
+        ("//user:pass@cdn.example.org/lib.js", BASE, "https://cdn.example.org/lib.js"),
+        ("https://user@example.com/a", BASE, "https://example.com/a"),
+        ("http://user:pass@site/b", "http://user:pass@site/a", "http://site/b"),
+        # A link without a host of its own keeps those of the page it is on.
+        ("/b", "http://user:pass@site/a", "http://user:pass@site/b"),
+        ("b?x=1", "http://user:pass@site/d/a", "http://user:pass@site/d/b?x=1"),
+    ],
+)
+def test_resolve_drops_the_credentials_written_in_the_link(href, base, expected):
+    assert resolve_url(href, base) == expected
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("http://user:pass@site:8080/a?b", "http://site:8080/a?b"),
+        ("http://user@site/", "http://site/"),
+        ("http://@site/", "http://site/"),
+        ("http://site/a@b", "http://site/a@b"),
+    ],
+)
+def test_drop_userinfo(url, expected):
+    assert drop_userinfo(url) == expected
 
 
 def test_resolve_with_invalid_base_keeps_only_absolute_links():

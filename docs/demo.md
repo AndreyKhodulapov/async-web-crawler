@@ -26,7 +26,7 @@ politeness options:
 | `--no-robots` | off | do not check robots.txt; `errors` and `save` do not check it unless given `--robots` |
 | `--retries` | 2 (0 for `benchmark`, 3 for `errors` and `save`) | retries of timeouts, network errors, 408, 429, 500, 502-504 and 520-524 |
 | `--retry-delay` | 1 (0.2 for `errors` and `save`) | seconds before the first retry, doubled for every next one up to 30 s, see [Retries](api.md#retries) |
-| `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 408, 429 or 5xx |
+| `--breaker-threshold` | 0.5 | block a host once this share of its requests in the last minute (5 at least) failed with a timeout, a network error, 408 or 5xx |
 | `--breaker-cooldown` | 30 (1 for `errors` and `save`) | seconds a blocked host is left alone before a probe request |
 | `--no-breaker` | off | never block a host |
 | `--user-agent` | `AsyncWebCrawler/0.1 (+repo URL)` | repeat to rotate several; all must share the bot name |
@@ -51,7 +51,8 @@ The default start pages are sandboxes made for crawling practice, and their
 robots.txt shows the rules at work. webscraper.io disallows its pagination
 and product pages, one of them with a wildcard rule (`/test-sites/pagination*?page=`),
 and web-scraping.dev sets `Crawl-delay: 2`.
-While it runs, a progress line is updated every second:
+While it runs, a progress line is updated every second (when stderr is a
+file or a pipe, a line is printed every 30 seconds):
 
 ```
 [######--------------]  30% | 9/30 pages, 1 failed | 1.6 pages/s | ETA 14s | active 6 (2 in flight) | queued 15 | 7s
@@ -168,7 +169,6 @@ WARNING | crawler.retry | Failed http://127.0.0.1:50864/server-error on attempt 
 WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:50864/rate-limited failed: TransientHTTPError: HTTP 429 Too Many Requests; retrying in 1.0s
 WARNING | crawler.retry | Attempt 1/4 for http://127.0.0.1:50864/slow failed: FetchTimeoutError: read timeout (1.0s); retrying in 0.2s
 INFO    | crawler.circuit_breaker | Circuit breaker of localhost is half-open: probing it with http://localhost:50865/page/6
-INFO    | crawler.crawl_run | Deferred http://localhost:50865/page/7 for 1.0s: circuit breaker of localhost is half-open, waiting for the probe request
 INFO    | crawler.retry | Succeeded http://127.0.0.1:50864/flaky on attempt 3/4 after 1.63s
 INFO    | crawler.retry | Succeeded http://127.0.0.1:50864/slow on attempt 2/4 after 2.82s
 INFO    | crawler.crawl_run | Gave up on http://localhost:50865/page/8: circuit breaker of localhost opened 3 times

@@ -81,11 +81,14 @@ listed in the [API reference](api.md#internals).
     batches, so a page processed may wait in its buffer: a process that
     stops then leaves it done in a shared queue with no record, and the
     next run never fetches it again. The crawl finishes such a page with
-    `pending_save`; the storage reports the records it has written (or
-    dropped as ones no write can take) through `on_settled`, and the
-    crawl passes them on to `Frontier.saved`. Until then the database
-    frontier keeps the page leased, and hands it out again if the lease
-    runs out. The storage knows nothing of the frontier: a callback of
+    `pending_save`; the storage reports the records it has written
+    through `on_settled`, and those it dropped (ones no write can take,
+    or saved over a full buffer) through `on_dropped`; the crawl passes them on to `Frontier.saved`
+    and `Frontier.dropped`. Until then the database frontier keeps the
+    page leased, and hands it out again if the lease runs out. A page
+    whose record is dropped fails: counted processed, it would stand for
+    a record the job does not have, and left `saving`, the heartbeat
+    would renew its lease and keep the job from finishing. The storage knows nothing of the frontier: a callback of
     URLs is all it offers, so any storage works, not only a table in the
     same database as the queue.
 
@@ -146,6 +149,10 @@ run against it; what it adds is what sharing needs.
   row per URL does. A lease that expired while the worker was slow, not
   gone, may come back to that worker through another of its tasks: the
   page is left to the task that crawls it, not crawled a second time.
+  So a task lets go of a page it puts back before the database queues
+  it: another task of the worker may take it before the answer comes,
+  and would otherwise leave it to the first one, done with it, while
+  the heartbeat kept it leased for good.
 - **The target of a redirect is seen from its page.** A redirect marks
   its target seen, so that a link to it is not crawled a second time,
   and the row keeps the page it was seen from (`frontier.seen_from`). A
@@ -183,9 +190,12 @@ run against it; what it adds is what sharing needs.
   worker only waits for the turn of a host: the batches of the storage
   would shrink to a page.
 - **A worker whose storage cannot write takes no pages.** A local crawl
-  goes on and keeps the pages in the buffer; a worker doing so would
-  hold more and more pages `saving` that it may never store, while the
-  other workers could crawl them. So once a write fails after its
+  goes on and keeps the pages in the buffer, up to
+  `DataStorage.MAX_PENDING_BATCHES` batches, dropping the pages saved
+  over them, so that a storage that stays down does not fill the memory;
+  the crawl ends all the same, its pages counted `save_failed`. A worker
+  doing so would hold more and more pages `saving` that it may never
+  store, and fail the rest, while the other workers could crawl them. So once a write fails after its
   retries (`DataStorage.write_failed`), the worker stops taking pages:
   one of its tasks writes the buffer again after the storage's
   `cooldown`, then after twice as long each time, up to
@@ -285,8 +295,15 @@ run against it; what it adds is what sharing needs.
     one statement that adds them and returns the counts of the job; of
     the workers that fail at once, one sees a count reach
     `MAX_CIRCUIT_OPENINGS` or pass `MAX_ROBOTS_RETRIES`, and gives the
-    host up (`give_up_host`). A host name that does not resolve is given
-    up at its first failure. The queued pages of the host are finished
+    host up (`give_up_host`). Failures told within half a cooldown of the
+    circuit breaker, or half of `UNREACHABLE_TTL` for robots.txt, of the
+    last ones counted are not counted (`hosts.circuit_counted_at`,
+    `robots_counted_at`): a wave of workers that fail at once is one
+    failure. A circuit opens at most once per cooldown and robots.txt is
+    downloaded again at most once per `UNREACHABLE_TTL`, so the limits
+    keep the time a host fails in a local crawl; half, as the failures of
+    one worker reach the database a little more or less than that apart.
+    A host name that does not resolve is given up at its first failure. The queued pages of the host are finished
     in one statement, failed or unreachable with the reason; a page of it
     handed out later (put back, its lease expired, a link found since)
     comes with that outcome, whatever the hold, and is finished without a
@@ -387,11 +404,14 @@ run against it; what it adds is what sharing needs.
 - **Waiting is polling.** A worker with nothing to take asks the
   database what it waits for: a page put off, a host's turn, a lease of
   another worker that may expire, and sleeps until the nearest of them,
-  at most `poll_interval`. Operations of its own frontier wake it at
-  once: each sets the event the waiting tasks saw before they looked and
-  starts a new one, so a task that looks meanwhile clears no wakeup of
-  another. `LISTEN/NOTIFY` could wake it on the operations of others; it
-  is worth it only if the measurements show the polls cost too much.
+  at most `poll_interval`. One task of the worker polls; its other tasks
+  with nothing to take wait behind it in the process and look once it
+  has a page, so an idle worker asks as often as one task does, whatever
+  `max_concurrent`. Operations of its own frontier wake it at once:
+  each sets the event the waiting task saw before it looked and starts
+  a new one, so a wakeup meanwhile is not lost. `LISTEN/NOTIFY` could
+  wake it on the operations of others; it is worth it only if the
+  measurements show the polls cost too much.
 - **Times are those of the database**: one clock for all workers, so a
   host interval holds whatever the clocks of the machines say. The
   interval is held as pages are taken: a request starts a little after

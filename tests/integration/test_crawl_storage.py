@@ -7,7 +7,17 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from helpers import UNTHROTTLED, MemoryStorage
 
-from crawler import AsyncCrawler, CSVStorage, DataStorage, JSONStorage, PageRecord, SQLiteStorage, StorageError
+from crawler import (
+    AsyncCrawler,
+    CSVStorage,
+    DataStorage,
+    JSONStorage,
+    PageRecord,
+    SQLiteStorage,
+    StorageError,
+    UnsavedPage,
+)
+from crawler.parser import HTMLParser
 
 DISK_FULL = OSError("disk full")
 # More failures than any test has writes: the storage never recovers.
@@ -47,6 +57,13 @@ class TestSavedPages:
         for page_url, record in saved.items():
             page = crawler.processed_urls[page_url]
             assert (record["title"], record["text"], record["links"]) == (page["title"], page["text"], page["links"])
+            metadata = record["metadata"]
+            assert (metadata["headings"], metadata["images"], metadata["tables"], metadata["lists"]) == (
+                page["headings"],
+                page["images"],
+                page["tables"],
+                page["lists"],
+            )
             assert (record["status_code"], record["content_type"]) == (200, "text/html")
         stats = crawler.crawl_stats()
         assert (stats.saved, stats.save_failed) == (5, 0)
@@ -55,7 +72,7 @@ class TestSavedPages:
         storage = MemoryStorage()
         started = datetime.now(UTC)
 
-        await crawl(storage, url("/catalog/tools/"), max_depth=0)
+        crawler = await crawl(storage, url("/catalog/tools/"), max_depth=0)
 
         (record,) = saved_records(storage).values()
         assert list(record) == [
@@ -77,10 +94,18 @@ class TestSavedPages:
         assert timedelta(0) <= record["crawled_at"] - started < timedelta(seconds=10)
         assert record["crawled_at"].utcoffset() == timedelta(0)
         assert set(record["metadata"]) == {
-            "description", "keywords", "language", "canonical", "robots", "final_url", "depth"
+            "description", "keywords", "language", "canonical", "robots", "final_url", "depth",
+            "headings", "images", "tables", "lists", "parse_errors",
         }  # fmt: skip
         assert record["metadata"]["final_url"] == url("/catalog/tools/")
         assert record["metadata"]["depth"] == 0
+        page = crawler.processed_urls[url("/catalog/tools/")]
+        assert page["headings"] and page["images"] and page["tables"] and page["lists"]
+        assert record["metadata"]["headings"] == page["headings"]
+        assert record["metadata"]["images"] == page["images"]
+        assert record["metadata"]["tables"] == page["tables"]
+        assert record["metadata"]["lists"] == page["lists"]
+        assert record["metadata"]["parse_errors"] == []
 
     async def test_redirected_page_keeps_the_requested_url(self, url):
         storage = MemoryStorage()
@@ -100,6 +125,20 @@ class TestSavedPages:
         (record,) = saved_records(storage).values()
         assert record["title"] == ""
         assert record["text"] == "hello"
+
+    async def test_problems_met_parsing_a_page_are_saved_with_it(self, url, monkeypatch):
+        def broken(*args):
+            raise ValueError("broken table")
+
+        monkeypatch.setattr(HTMLParser, "extract_tables", broken)
+        storage = MemoryStorage()
+
+        await crawl(storage, url("/catalog/tools/"), max_depth=0)
+
+        (record,) = saved_records(storage).values()
+        assert record["metadata"]["tables"] == []
+        assert record["metadata"]["parse_errors"] == ["tables: ValueError: broken table"]
+        assert record["metadata"]["headings"]
 
     async def test_failed_and_skipped_pages_are_not_saved(self, url):
         storage = MemoryStorage()
@@ -196,6 +235,29 @@ class TestSaveErrors:
         assert "Failed to close MemoryStorage" in caplog.text
         assert storage.released == 1
 
+    async def test_storage_that_always_fails_buffers_no_more_than_its_limit(self, url, caplog):
+        class SmallBuffer(MemoryStorage):
+            MAX_PENDING_BATCHES = 1
+
+            async def save(self, record):
+                try:
+                    await super().save(record)
+                finally:
+                    buffered.append(self.pending)
+
+        buffered: list[int] = []
+        storage = SmallBuffer(batch_size=2, failures=[DISK_FULL] * ALWAYS)
+
+        with caplog.at_level(logging.ERROR, logger="crawler"):
+            crawler = await crawl(storage, url("/site/"))
+
+        assert len(crawler.processed_urls) == 5
+        assert max(buffered) == 2
+        stats = crawler.crawl_stats()
+        assert (stats.processed, stats.saved, stats.save_failed) == (5, 0, 5)
+        assert "SmallBuffer cannot write and buffers 2 records, as many as it keeps" in caplog.text
+        assert "SmallBuffer dropped 3 records" in caplog.text
+
     async def test_pages_of_a_failed_write_are_saved_by_the_next_one(self, url):
         # The first batch fails with its retries; the storage works after that.
         storage = MemoryStorage(batch_size=2, failures=[DISK_FULL] * 4)
@@ -235,6 +297,8 @@ class TestSaveErrors:
         stats = crawler.crawl_stats()
         assert (stats.processed, stats.saved, stats.save_failed) == (5, 4, 1)
         assert f"Dropped the record of {url('/site/b.html')}" in caplog.text
+        dropped = UnsavedPage(url("/site/b.html"), "failed", "its record could not be stored", error="RecordDropped")
+        assert dropped in crawler.unsaved_pages
 
     async def test_closed_storage_fails_the_crawl_before_it_requests_anything(self, url, site):
         storage = MemoryStorage()

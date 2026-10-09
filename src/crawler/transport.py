@@ -179,16 +179,17 @@ class HttpTransport:
         return self._session
 
     def _create_session(self) -> aiohttp.ClientSession:
+        # Filled before the connector is made, so that a cookie it fails on leaves no connector open.
+        cookie_jar: aiohttp.abc.AbstractCookieJar = aiohttp.DummyCookieJar()
+        if self._keep_cookies:
+            cookie_jar = self._cookie_jar = CookieJar()
+            cookie_jar.add(self._initial_cookies)
         # certifi's CA bundle is added on top of the system store: TLS then
         # works on Python builds without system certificates, and locally
         # installed CAs (corporate proxies) stay trusted.
         ssl_context = ssl.create_default_context()
         ssl_context.load_verify_locations(cafile=certifi.where())
         connector = aiohttp.TCPConnector(limit=self._max_concurrent, ttl_dns_cache=300, ssl=ssl_context)
-        cookie_jar: aiohttp.abc.AbstractCookieJar = aiohttp.DummyCookieJar()
-        if self._keep_cookies:
-            cookie_jar = self._cookie_jar = CookieJar()
-            cookie_jar.add(self._initial_cookies)
         return aiohttp.ClientSession(
             connector=connector,
             timeout=self._timeout,
@@ -347,6 +348,12 @@ class HttpTransport:
             retry_after = parse_retry_after(exc.headers.get(aiohttp.hdrs.RETRY_AFTER) if exc.headers else None)
             raise HTTPStatusError(url, exc.status, exc.message, retry_after=retry_after) from exc
         except TimeoutError as exc:
+            # Through a proxy the connect phase is the connection to the proxy
+            # and, for an https URL, its answer to CONNECT: a silent proxy, not
+            # a slow site. Past it a slow proxy and a slow site look the same,
+            # and the timeout stays the site's.
+            if proxy is not None and isinstance(exc, aiohttp.ConnectionTimeoutError):
+                raise ProxyNetworkError(url, f"proxy {proxy.label}: {_describe_timeout(exc, timeout)}") from exc
             raise FetchTimeoutError(url, _describe_timeout(exc, timeout)) from exc
         # UnicodeError comes from IDNA encoding of the host, e.g. a domain
         # label longer than 63 characters; aiohttp does not wrap it.

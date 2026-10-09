@@ -44,6 +44,15 @@ class CSVStorage(DataStorage):
 
     `encoding` is that of the file, e.g. "utf-8-sig" for Excel. A character
     the encoding lacks is written as "?".
+
+    With `escape_formulas`, the default, a value that a spreadsheet would
+    take for a formula (it starts with "=", "+", "-", "@", a tab or a
+    carriage return) is written after an apostrophe, and so is one that
+    starts with an apostrophe itself; `read` drops it and returns the
+    value as it was. The pages are written by the sites, and a title such
+    as "=HYPERLINK(...)" would otherwise run in Excel. An apostrophe that
+    is not followed by one of these characters is left as it is, so a file
+    written without escaping is read as before.
     """
 
     PARSERS: ClassVar[Mapping[str, Callable[[str], object]]] = {
@@ -62,12 +71,14 @@ class CSVStorage(DataStorage):
         batch_size: int = 100,
         retry_strategy: RetryStrategy | None = None,
         cooldown: float = 5.0,
+        escape_formulas: bool = True,
     ) -> None:
         "".encode(encoding)  # an unknown encoding fails here, not on the first write
         super().__init__(batch_size, retry_strategy=retry_strategy, cooldown=cooldown)
         self.path = Path(path)
         self.encoding = encoding
         self.overwrite = overwrite
+        self.escape_formulas = escape_formulas
         self._file: AsyncBufferedReader | None = None
         self._header: list[str] | None = None
         self._end = 0  # where the next row goes
@@ -83,7 +94,7 @@ class CSVStorage(DataStorage):
         writer = csv.DictWriter(rows, self._header or list(records[0]))
         if self._header is None:
             writer.writeheader()
-        writer.writerows({field: _to_cell(value) for field, value in record.items()} for record in records)
+        writer.writerows({field: self._to_cell(value) for field, value in record.items()} for record in records)
         encoded = rows.getvalue().encode(self.encoding, errors="replace")
         if self._end:
             # Encodings such as utf-8-sig and utf-16 start every encoded
@@ -156,6 +167,8 @@ class CSVStorage(DataStorage):
                         header = row
                         continue
                     try:
+                        if self.escape_formulas:
+                            row = [unescape_formula(cell) for cell in row]
                         record = dict(zip(header, row, strict=True))
                         for field, parse in self.PARSERS.items():
                             if field in record:
@@ -174,10 +187,25 @@ class CSVStorage(DataStorage):
             await self._file.close()
             self._file = None
 
+    def _to_cell(self, value: object) -> object:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, list | dict):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, str) and self.escape_formulas:
+            return escape_formula(value)
+        return value
 
-def _to_cell(value: object) -> object:
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, list | dict):
-        return json.dumps(value, ensure_ascii=False)
-    return value
+
+# What a spreadsheet takes for the start of a formula.
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def escape_formula(value: str) -> str:
+    """`value` after an apostrophe if a spreadsheet would take it for a formula or it starts with one; else as it is."""
+    return f"'{value}" if value.startswith((*FORMULA_START, "'")) else value
+
+
+def unescape_formula(cell: str) -> str:
+    """The value `escape_formula` turned into `cell`."""
+    return cell[1:] if cell.startswith("'") and cell[1:].startswith((*FORMULA_START, "'")) else cell

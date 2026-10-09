@@ -191,7 +191,7 @@ def add_common_options(
         default=0.5,
         metavar="SHARE",
         help="block a host once this share of its requests in the last minute (5 at least) "
-        "failed with a timeout, a network error, HTTP 408, 429 or 5xx (default: %(default)g)",
+        "failed with a timeout, a network error, HTTP 408 or 5xx (default: %(default)g)",
     )
     breaker.add_argument(
         "--breaker-cooldown",

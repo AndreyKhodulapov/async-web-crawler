@@ -80,14 +80,16 @@ class CircuitBreaker:
       circuit with an empty window, its failure opens it for another cooldown.
 
     Failures are the errors that say the host is in trouble: a
-    `TransientError` (a timeout, HTTP 408, 429), a `NetworkError` or any
+    `TransientError` (a timeout, HTTP 408), a `NetworkError` or any
     HTTP 5xx, even one not worth a retry, such as 501. Any other response
     of the server, HTTP 404 included, is a success: the host is up, and a
     site with broken links must not be blocked for them. Other errors, such
     as a bad certificate, count neither way, and so does a `ProxyError`
     (a `ProxyNetworkError` included): a dead proxy says nothing of the host.
     Neither does a `RenderTimeoutError`: the host answered, the browser
-    took too long for the page.
+    took too long for the page. Nor does HTTP 429: the host is up and asks
+    for fewer requests, which is for the rate limiter to give; blocking it
+    would give it none for a cooldown and then a burst again.
 
     A call counts once, however many attempts it takes: the retries of a
     request reuse its `BreakerCall`, and each `record` replaces the outcome
@@ -182,7 +184,7 @@ class CircuitBreaker:
     def is_failure(error: FetchError | None) -> bool:
         """Whether an outcome counts as a failure of the host: a transient or network error, or an HTTP 5xx.
 
-        An error of a proxy is not one, nor is a timeout of rendering.
+        An error of a proxy is not one, nor is a timeout of rendering or HTTP 429.
         """
         return _is_failure(error) is True
 
@@ -370,6 +372,8 @@ def _is_failure(error: FetchError | None) -> bool | None:
         return None  # a dead proxy must not block the sites behind it
     if isinstance(error, RenderTimeoutError):
         return None  # the host answered: a page slow in the browser must not block the others
+    if isinstance(error, HTTPStatusError) and error.status == 429:
+        return None  # the host answered: it is slowed down, not blocked
     if isinstance(error, TransientError | NetworkError):
         return True
     if isinstance(error, HTTPStatusError):

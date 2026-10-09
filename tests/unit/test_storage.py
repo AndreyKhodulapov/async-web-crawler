@@ -411,16 +411,100 @@ class TestCooldown:
             MemoryStorage(cooldown=-1)
 
 
+class TestBufferLimit:
+    """While writes fail, the buffer keeps no more than `MAX_PENDING_BATCHES` batches."""
+
+    @staticmethod
+    async def full_storage(clock: FakeClock, failures: int = 4) -> tuple[MemoryStorage, list[str]]:
+        """A storage of batches of one whose write failed and whose buffer is full, and the URLs it drops."""
+        storage = MemoryStorage(batch_size=1, failures=[OSError("disk full")] * failures, cooldown=5, clock=clock)
+        dropped: list[str] = []
+
+        async def on_dropped(urls: list[str]) -> None:
+            dropped.extend(urls)
+
+        storage.on_dropped = on_dropped
+        with pytest.raises(StorageError):
+            await storage.save(make_record("page-0"))
+        await save_pages(storage, *(f"page-{number}" for number in range(1, 10)))
+        return storage, dropped
+
+    async def test_records_saved_over_a_full_buffer_are_dropped(self):
+        storage, dropped = await self.full_storage(FakeClock())
+        assert (storage.pending, dropped) == (10, [])
+
+        await save_pages(storage, "late-1", "late-2")
+
+        assert storage.pending == 10
+        assert dropped == ["late-1", "late-2"]
+        assert [record["url"] for record in storage._buffer] == [f"page-{number}" for number in range(10)]
+
+    async def test_first_record_dropped_is_logged_as_an_error_the_others_with_their_url(self, caplog):
+        storage, _ = await self.full_storage(FakeClock())
+
+        with caplog.at_level(logging.DEBUG, logger="crawler"):
+            await save_pages(storage, "late-1", "late-2")
+
+        errors = [record.getMessage() for record in caplog.records if record.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert errors[0].startswith("MemoryStorage cannot write and buffers 10 records, as many as it keeps")
+        assert "Dropped the record of late-2: the buffer of MemoryStorage is full" in caplog.text
+
+    async def test_write_that_fails_over_a_full_buffer_drops_the_record_saved(self):
+        clock = FakeClock()
+        storage, dropped = await self.full_storage(clock, failures=8)
+        clock.now += 5
+
+        with pytest.raises(StorageError):
+            await save_pages(storage, "late")
+
+        assert storage.pending == 10
+        assert dropped == ["late"]
+
+    async def test_storage_that_writes_again_buffers_again_and_logs_the_records_dropped(self, caplog):
+        storage, dropped = await self.full_storage(FakeClock())
+        await save_pages(storage, "late")
+
+        with caplog.at_level(logging.WARNING, logger="crawler"):
+            await storage.flush()
+        await save_pages(storage, "after")
+
+        assert "MemoryStorage writes again: 1 records were dropped while its buffer was full" in caplog.text
+        assert storage.written == 11
+        assert dropped == ["late"]
+
+    async def test_close_logs_the_records_dropped(self, caplog):
+        storage, _ = await self.full_storage(FakeClock(), failures=8)
+        await save_pages(storage, "late-1", "late-2")
+
+        with caplog.at_level(logging.ERROR, logger="crawler"), pytest.raises(StorageError):
+            await storage.close()
+
+        assert "MemoryStorage dropped 2 records: its buffer was full while it could not write" in caplog.text
+
+    async def test_limit_counts_in_batches(self):
+        storage = MemoryStorage(batch_size=3, failures=[OSError("disk full")] * 4, cooldown=5, clock=FakeClock())
+        with pytest.raises(StorageError):
+            await save_pages(storage, "a", "b", "c")
+
+        await save_pages(storage, *(f"page-{number}" for number in range(30)))
+
+        assert storage.pending == 30
+
+
 class TestSettled:
     @staticmethod
     def listened(storage: DataStorage) -> list[list[str]]:
-        """The URLs `on_settled` is called with, a list per call."""
+        """The URLs `on_settled` is called with, a list per call, and those of `on_dropped` marked "dropped"."""
         calls: list[list[str]] = []
 
         async def on_settled(urls: list[str]) -> None:
             calls.append(urls)
 
-        storage.on_settled = on_settled
+        async def on_dropped(urls: list[str]) -> None:
+            calls.append(["dropped", *urls])
+
+        storage.on_settled, storage.on_dropped = on_settled, on_dropped
         return calls
 
     async def test_urls_of_a_written_batch_are_reported(self):
@@ -444,7 +528,7 @@ class TestSettled:
 
         assert calls == [["a", "b"]]
 
-    async def test_records_dropped_are_reported_with_those_written(self):
+    async def test_records_dropped_are_reported_apart_from_those_written(self):
         names = [f"page-{number}" for number in range(4)]
         storage = MemoryStorage(batch_size=4, refused={"page-1"})
         calls = self.listened(storage)
@@ -452,8 +536,8 @@ class TestSettled:
         with pytest.raises(ValueError):
             await save_pages(storage, *names)
 
-        # Written one by one: each is settled once written or dropped.
-        assert calls == [[name] for name in names]
+        # Written one by one: each is reported once written or dropped.
+        assert calls == [["page-0"], ["dropped", "page-1"], ["page-2"], ["page-3"]]
 
     async def test_batch_of_one_record_dropped_is_reported(self):
         storage = MemoryStorage(batch_size=1, refused={"a"})
@@ -462,7 +546,7 @@ class TestSettled:
         with pytest.raises(ValueError):
             await save_pages(storage, "a")
 
-        assert calls == [["a"]]
+        assert calls == [["dropped", "a"]]
 
     async def test_records_lost_at_close_are_not_reported(self):
         storage = MemoryStorage(batch_size=2, failures=[OSError("disk full")] * 4)
@@ -486,3 +570,16 @@ class TestSettled:
 
         assert storage.urls == [["a"], ["b"]]
         assert "Failed to report 1 records settled by MemoryStorage" in caplog.text
+
+    async def test_error_of_the_listener_of_drops_is_logged(self, caplog):
+        storage = MemoryStorage(batch_size=1, refused={"a"})
+
+        async def on_dropped(urls: list[str]) -> None:
+            raise RuntimeError("frontier is down")
+
+        storage.on_dropped = on_dropped
+        with caplog.at_level(logging.ERROR, logger="crawler.storage"), pytest.raises(ValueError):
+            await save_pages(storage, "a")
+
+        assert storage.pending == 0
+        assert "Failed to report 1 records dropped by MemoryStorage" in caplog.text

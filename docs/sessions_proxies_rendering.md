@@ -32,12 +32,18 @@ requests through other addresses and sees the pages JavaScript builds.
   browser, export its cookies** to a Netscape `cookies.txt` (browser
   extensions and `curl -c` write it) and give the file to the crawler.
   Save the cookies after the crawl: the site may have renewed the session.
+- Some exporters write the expiry dates in milliseconds. Read as seconds,
+  such a date is tens of thousands of years away: an expired cookie would
+  look alive, and neither aiohttp nor Chromium takes the date. No date in
+  seconds is past the year 9999 and a date after 1978 in milliseconds
+  always is, so the file is read by that.
 - Do not follow the logout link: the crawl would end its own session.
 - A session tied to the browser (its User-Agent, its address) may end
   when the crawler rotates User-Agents or proxies.
 - An API token goes in a header (`Authorization`). Extra headers go to
   every request, so with links to other sites the token leaks: keep the
-  crawl on its own domain.
+  crawl on its own domain. A rendered page calls CDNs and analytics: the
+  browser gives the headers to the page's own origin only.
 
 ## Cookies are secrets
 
@@ -78,12 +84,14 @@ requests through other addresses and sees the pages JavaScript builds.
     a site sees all of them.
 - **A proxy has its own health**, like a circuit breaker per proxy: after
   N failures in a row it is out for a cooldown, and the request is
-  retried through another one at once. All out: fail the pages at once
-  and end the crawl instead of waiting.
+  retried through another one at once. All out: put the pages off until
+  the first proxy is back, a few times at most, so that proxies that
+  never come back still end the crawl.
 - **Blame the right party.** A dead proxy must not open the circuits of
   the sites behind it, so a proxy error is not the site's. Only what is
   surely the proxy's counts against it: cannot connect, its name does not
-  resolve, HTTP 407. A timeout, an error page of the proxy, a refused
+  resolve, HTTP 407, no connection or no answer to CONNECT within the
+  connect timeout. A read timeout, an error page of the proxy, a refused
   CONNECT may be the site's: they count against the site.
 - **Politeness goes by the site, not by the proxy**: rate limits,
   robots.txt and the circuit breaker are per host of the URL, whatever
@@ -132,7 +140,11 @@ requests through other addresses and sees the pages JavaScript builds.
   the pages that need it. The site serves the scripts and data too, and
   no browser asks robots.txt for them.
 - **The pitfalls**:
-  - a browser that crashes: restart it, but not forever;
+  - a browser that crashes: restart it, but not forever, then take the
+    pages as downloaded rather than fail them all;
+  - a script that never yields: the page's HTML cannot be read, so the
+    deadline covers the whole page, not only the waits;
+  - web sockets go past the routing of requests (`route_web_socket`);
   - Chromium's Local Network Access: a page the browser got from the
     crawler looks public, so its requests to another origin on a
     loopback or private address are refused;

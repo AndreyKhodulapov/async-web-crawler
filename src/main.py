@@ -20,7 +20,8 @@ A crawl job is a crawl that workers share through PostgreSQL. `job create`
 creates it by a configuration file, reads its sitemaps and queues its start
 URLs; `worker`, started in as many processes or containers as wanted, crawls
 its pages until none is left. `report` writes the statistics of the job, of
-all its workers together, to a JSON file and an HTML report, at any time;
+all its workers together, to a JSON file and an HTML report, and lists its
+pages not saved in a CSV file, at any time;
 `status` prints a line of its progress, updated until it is finished with
 `--watch`.
 The database is `distributed.database_url` of the configuration, or the
@@ -61,6 +62,7 @@ from crawler.config import LOG_LEVELS
 from crawler.distributed import (
     JobMode,
     create_job,
+    export_job_pages,
     export_job_stats,
     format_job_progress,
     job_progress,
@@ -154,6 +156,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     reports = parser.add_argument_group("reports and log")
     reports.add_argument("--stats-json", metavar="PATH", help="write the statistics of the crawl to a JSON file")
     reports.add_argument("--report", metavar="PATH", help="write an HTML report with charts")
+    reports.add_argument(
+        "--pages-report", metavar="PATH", help="list the pages not saved, with the reasons, in a CSV file"
+    )
     reports.add_argument("--log-level", type=str.upper, choices=LOG_LEVELS, help="level of the log")
     reports.add_argument("--log-file", metavar="PATH", help="also write the log to a file, as JSON Lines")
     reports.add_argument("--no-progress", action="store_true", help="do not show the progress line")
@@ -198,8 +203,9 @@ def parse_command_args(argv: list[str]) -> argparse.Namespace:
         "worker",
         help="crawl the pages of a crawl job until none is left; start as many as wanted",
         epilog="The configuration of the job says what and how to crawl; that of the worker gives the rest: "
-        "distributed, session, proxy, storage, logging, report and crawler.max_concurrent. Every file of the "
-        "storage must have {worker} in its name, such as pages-{worker}.jsonl. The database is "
+        "distributed, session, proxy, storage, logging, report and crawler.max_concurrent. Every file it "
+        "writes, of the storage, the log, the reports and session.save_cookies, must have {worker} in its name, "
+        "such as pages-{worker}.jsonl. The database is "
         "distributed.database_url of the configuration, or the CRAWLER_DATABASE_URL variable.",
     )
     worker.add_argument("--job", required=True, metavar="NAME", help="name of the crawl job")
@@ -219,10 +225,11 @@ def parse_command_args(argv: list[str]) -> argparse.Namespace:
     )
     report = commands.add_parser(
         "report",
-        help="write the statistics of a crawl job, of all its workers, to a JSON file and an HTML report",
-        epilog="Without --stats-json and --report, the files are report.stats_json and report.html of the "
-        "configuration. The job may still be running: the reports show it as it is. The database is "
-        "distributed.database_url of the configuration, or the CRAWLER_DATABASE_URL variable.",
+        help="write the statistics of a crawl job, of all its workers, to a JSON file and an HTML report, "
+        "and list its pages not saved in a CSV file",
+        epilog="Without --stats-json, --report and --pages-report, the files are report.stats_json, report.html "
+        "and report.pages of the configuration. The job may still be running: the reports show it as it is. "
+        "The database is distributed.database_url of the configuration, or the CRAWLER_DATABASE_URL variable.",
     )
     report.add_argument("--job", required=True, metavar="NAME", help="name of the crawl job")
     report.add_argument(
@@ -232,6 +239,9 @@ def parse_command_args(argv: list[str]) -> argparse.Namespace:
     )
     report.add_argument("--stats-json", metavar="PATH", help="write the statistics of the job to a JSON file")
     report.add_argument("--report", metavar="PATH", help="write an HTML report with charts and the workers")
+    report.add_argument(
+        "--pages-report", metavar="PATH", help="list the pages of the job not saved, with the reasons, in a CSV file"
+    )
     status = commands.add_parser(
         "status",
         help="show the progress of a crawl job: percent, speed, time left, workers",
@@ -286,6 +296,7 @@ def config_overrides(args: argparse.Namespace) -> dict[str, Any]:
         ("session", "save_cookies", args.save_cookies),
         ("report", "stats_json", args.stats_json),
         ("report", "html", args.report),
+        ("report", "pages", args.pages_report),
         ("logging", "level", args.log_level),
         ("logging", "file", args.log_file),
     ]
@@ -372,8 +383,9 @@ def print_stats(stats: dict[str, Any]) -> None:
         print(f"Proxies: {', '.join(proxies)}")
     if "rendering" in stats:
         rendering = stats["rendering"]
+        unrendered = f", {rendering['unrendered']} not rendered" if rendering["unrendered"] else ""
         print(
-            f"Rendering: {rendering['rendered']} pages rendered, {rendering['failed']} failed, "
+            f"Rendering: {rendering['rendered']} pages rendered, {rendering['failed']} failed{unrendered}, "
             f"average {rendering['avg_render_time']:.2f}s"
         )
     if stats.get("workers"):
@@ -429,8 +441,12 @@ async def run(config: CrawlerConfig, *, progress: bool = True) -> int:
                     print_summary(crawler, interrupted=True)
                 raise
             print_summary(crawler)
+            progress_stats = crawler.crawler.crawl_stats()
+            # A page left out of the results (not HTML, noindex, a duplicate) was
+            # fetched all the same; one over max_pages_per_host was not requested.
+            fetched = crawler.get_stats()["successful"] or progress_stats.skipped > progress_stats.over_host_limit
             # A page that could not be saved is a failure of the run too.
-            return 0 if crawler.get_stats()["successful"] and not crawler.crawler.crawl_stats().save_failed else 1
+            return 0 if fetched and not progress_stats.save_failed else 1
 
 
 async def run_job_create(config: CrawlerConfig, name: str, mode: JobMode, *, dsn: str) -> int:
@@ -486,6 +502,8 @@ async def run_report_command(config: CrawlerConfig, job: str, *, dsn: str) -> in
     options = config.report
     stats = await job_stats(dsn, job, top_domains=options.top_domains)
     written = export_job_stats(stats, stats_json=options.stats_json, html=options.html, title=f"{options.title}: {job}")
+    if options.pages is not None:
+        written.append(await export_job_pages(dsn, job, options.pages))
     print(f"=== Crawl job {job}: {stats['state']} ({stats['elapsed_seconds']:.2f}s) ===")
     print_stats(stats)
     if stats["state"] != "finished":
@@ -578,20 +596,26 @@ def run_command(args: argparse.Namespace) -> int:
 def _report_config(args: argparse.Namespace) -> CrawlerConfig:
     """The configuration of the `report` command: the file, if one is given, with the files of the options over it.
 
+    "{worker}" in the names of the files is replaced by the name of the job,
+    so the configuration of a worker gives the reports of the job.
+
     Raises:
         ConfigError: the file is invalid, or no report is to be written.
     """
-    files = {key: value for key, value in (("stats_json", args.stats_json), ("html", args.report)) if value}
+    options = (("stats_json", args.stats_json), ("html", args.report), ("pages", args.pages_report))
+    files = {key: value for key, value in options if value}
     config = (
         CrawlerConfig.from_dict({"report": files})
         if args.config is None
         else load_config(args.config, {"report": files})
     )
-    if config.report.stats_json is None and config.report.html is None:
-        raise ConfigError(
-            ["report: nothing to write, give --stats-json or --report, or report.stats_json or report.html"]
+    if config.report.stats_json is None and config.report.html is None and config.report.pages is None:
+        problem = (
+            "report: nothing to write, give --stats-json, --report or --pages-report, "
+            "or report.stats_json, report.html or report.pages"
         )
-    return config
+        raise ConfigError([problem])
+    return config.for_worker(args.job)
 
 
 def _exit_code(command: Coroutine[Any, Any, int]) -> int:

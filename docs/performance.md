@@ -272,6 +272,9 @@ another, one page per host and no interval:
 - A job just seeded is slower still until PostgreSQL has statistics of
   its new rows: 130 ms a take at 1 000 hosts, 1.8 s at 20 000, before
   autovacuum analyzes the tables (or `ANALYZE` is run).
+- A worker with nothing to take polls with one task, the others wait
+  behind it: a take and a look at the job each time it polls, not one
+  of each for every one of its `max_concurrent` tasks.
 - A crawl of a few sites (`same_domain_only: true`, the default) keeps
   to the hosts of its start URLs and never comes near it. A wide crawl with
   `same_domain_only: false` meets a new host on almost every page.

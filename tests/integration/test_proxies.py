@@ -18,9 +18,11 @@ from crawler import (
     AsyncCrawler,
     CircuitBreaker,
     CircuitState,
+    FetchTimeoutError,
     NetworkError,
     NoProxyError,
     Proxy,
+    ProxyError,
     ProxyNetworkError,
     ProxyPool,
     ProxyStats,
@@ -179,27 +181,32 @@ async def test_a_proxy_out_of_rotation_waits_for_its_cooldown(url, make_proxy):
     assert len(proxy.requests) == 3
 
 
-async def test_the_crawl_ends_when_every_proxy_is_out(url, site):
+async def test_the_crawl_ends_when_the_proxies_never_come_back(url, site, caplog):
+    # Each page waits for the proxies to come back as many times as for a host held back, then fails.
+    # The cooldown is far longer than the retries of robots.txt: no proxy comes back while they go,
+    # so each download ends with no proxy available, even on a slow machine.
     site.robots = "User-agent: *\nAllow: /\n"
-    pool = ProxyPool([dead_proxy(), dead_proxy()], max_failures=1)
+    pool = ProxyPool([dead_proxy(), dead_proxy()], max_failures=1, cooldown=1.0)
     retries = {"retry_strategy": RetryStrategy(max_retries=3, base_delay=0.01)}
+    caplog.set_level(logging.INFO, logger="crawler.crawl_run")
     async with AsyncCrawler(**UNTHROTTLED | BREAKER | retries | {"respect_robots": True}, proxies=pool) as crawler:
         await crawler.crawl([url("/site/"), url("/site/a.html")], max_pages=10)
         failed = dict(crawler.failed_urls)
         circuit = crawler.circuit_breaker.state("127.0.0.1")
-        with pytest.raises(NoProxyError):
+        with pytest.raises(ProxyError):
             await crawler.robots.fetch_robots(url("/"))
         with pytest.raises(LookupError):  # no answer of the site: nothing is cached
             crawler.robots.unreachable_reason(url("/"))
 
     assert set(failed) == {url("/site/"), url("/site/a.html")}
     assert {reason.split(":")[0] for reason in failed.values()} <= {"ProxyNetworkError", "NoProxyError"}
+    assert caplog.text.count(f"Deferred {url('/site/')} for ") == AsyncCrawler.MAX_WAITS_PER_PAGE
     assert circuit is CircuitState.CLOSED
 
 
 async def test_sitemaps_of_robots_txt_are_given_up_when_every_proxy_is_out(url, site):
     site.robots = f"Sitemap: {url('/sitemaps/pages.xml')}\nUser-agent: *\nAllow: /\n"
-    pool = ProxyPool([dead_proxy()], max_failures=1)
+    pool = ProxyPool([dead_proxy()], max_failures=1, cooldown=0.01)
     async with AsyncCrawler(**UNTHROTTLED | {"respect_robots": True}, proxies=pool) as crawler:
         pages = await crawler.crawl([url("/site/")], max_pages=5, robots_sitemaps=True)
         failed = dict(crawler.failed_urls)
@@ -217,6 +224,46 @@ async def test_a_proxy_that_cannot_reach_the_site_stays_in_rotation(https_server
     assert type(result.error) is NetworkError
     assert "answered CONNECT with HTTP 502" in result.error.message
     assert stats[proxy.url] == ProxyStats(state="active", requests=1)
+
+
+@pytest.mark.parametrize(
+    ("scheme", "error", "timeout", "failures"),
+    [("https", ProxyNetworkError, "connect timeout", 1), ("http", FetchTimeoutError, "read timeout", 0)],
+)
+async def test_a_silent_proxy_is_blamed_for_the_connect_timeout_alone(
+    url, https_server, make_proxy, scheme, error, timeout, failures
+):
+    # Over https the silence falls on CONNECT, over http on the request the proxy passes on to the site.
+    proxy = await make_proxy(silent="localhost")
+    page_url = url("/ok", "localhost") if scheme == "http" else f"https://localhost:{https_server.port}/ok"
+    timeouts = {"connect_timeout": 0.2, "read_timeout": 0.2}
+    async with AsyncCrawler(**UNTHROTTLED | timeouts, proxies=ProxyPool([proxy.url], max_failures=5)) as crawler:
+        result = await crawler.fetch_result(page_url)
+        stats = crawler.proxy_stats()
+
+    assert type(result.error) is error
+    assert result.error.message.endswith(f"{timeout} (0.2s)")
+    assert stats[proxy.url] == ProxyStats(state="active", requests=1, failures=failures)
+
+
+async def test_a_host_moves_off_a_proxy_silent_to_connect(https_server, make_proxy):
+    proxy, silent = await make_proxy(), await make_proxy(silent="localhost")
+    page_url = f"https://localhost:{https_server.port}/ok"
+    retries = {"retry_strategy": RetryStrategy(max_retries=1, base_delay=0.01)}
+    pool = ProxyPool([proxy.url, silent.url], max_failures=5)
+    async with AsyncCrawler(**UNTHROTTLED | BREAKER | retries, connect_timeout=0.2, proxies=pool) as crawler:
+        results = [await crawler.fetch_result(page_url) for _ in range(3)]
+        stats = crawler.proxy_stats()
+        circuit = crawler.circuit_breaker.state("localhost")
+
+    # The hash of localhost gives the silent proxy; one timeout moves the host to the other for good.
+    assert [result.error for result in results] == [None, None, None]
+    assert silent.requests == proxy.requests == [f"CONNECT localhost:{https_server.port}"]  # one tunnel, kept
+    assert stats == {
+        proxy.url: ProxyStats(state="active", requests=3),
+        silent.url: ProxyStats(state="active", requests=1, failures=1),
+    }
+    assert circuit is CircuitState.CLOSED
 
 
 @pytest.mark.usefixtures("clean_proxy_environment")

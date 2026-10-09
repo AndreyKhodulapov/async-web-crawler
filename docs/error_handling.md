@@ -44,11 +44,13 @@ leaves a failing site alone.
   (`ProxyNetworkError`). A 407 or a bad certificate inside the tunnel of
   an https URL is the site's. Any other response through a proxy is the
   site's too, whatever its status, and so is a
-  refused CONNECT (the proxy cannot reach the site). A timeout cannot be
-  told apart: over https the connect step includes the CONNECT, so a slow
-  proxy and a slow site look alike. It is put on the site, as without a
-  proxy; put on the proxy, one dead site would take every proxy out in
-  turn. A proxy that loses packets then looks like slow sites.
+  refused CONNECT (the proxy cannot reach the site). A connect timeout is
+  the proxy's: the connection to it, and over https its answer to CONNECT,
+  did not come in time; a proxy that stays silent is the most common way
+  a pool degrades. A read or total timeout cannot be told apart, since a
+  slow proxy and a slow site look alike: it is put on the site, as without
+  a proxy; put on the proxy, one dead site would take every proxy out in
+  turn. A proxy that stalls mid-response then looks like slow sites.
   A browser that cannot start or crashes is a failure of the crawler, not
   of the site (`RenderError`): it is not retried, since another attempt meets the
   same browser, and the circuit breaker does not count it. A page the
@@ -70,6 +72,10 @@ leaves a failing site alone.
 - **Retry at one layer**. If the HTTP client, the crawler and the job
   scheduler each make 3 retries, one failing page costs 4 x 4 x 4 = 64
   requests. Here only `RetryStrategy` retries; aiohttp does not.
+  `retry_strategy.execute_with_retry(crawler.fetch_url, url)` adds a second
+  layer: `fetch_url` already retries inside, so with 3 retries in each one
+  503 page costs 4 x 4 = 16 requests. Wrap a function of your own, or give
+  the crawler `RetryStrategy(max_retries=0)`.
 - **Cap the retries**: in total per request (`max_retries`) and per kind of
   error (`RetryRule`). Large systems add a **retry budget**: retries may be at
   most a share of all requests (Finagle, Envoy), so when a whole service
@@ -142,9 +148,12 @@ leaves a failing site alone.
   one failed request out of one is not a broken site. Hystrix used a rolling
   percentage; resilience4j offers count-based and time-based windows.
 - **What counts as a failure**: only what says the host is in trouble, i.e.
-  timeouts, network errors, 429 and any 5xx, even a 501 that is not
+  timeouts, network errors and any 5xx, even a 501 that is not
   retried. A 404 is a healthy server answering; counting it would block a
-  site for its broken links.
+  site for its broken links. So is a 429: the site is up and asks for fewer
+  requests. Blocking it would give it none for a cooldown and then the
+  same burst again, and the third time the host would be given up; slowing
+  down is for the rate limiter.
 - **Per host**: one dead site must not stop the crawl of the others, and a
   host that is down fails all of its pages, so a circuit per URL learns too late.
 - **Keep the errors of proxies out of it.** A dead proxy would otherwise
@@ -155,8 +164,8 @@ leaves a failing site alone.
   failed request is retried through another proxy at once. There is no
   half-open probe: the next request after the cooldown is the probe, and
   one failure takes the proxy out again. When every proxy is out, a
-  request fails at once without being sent, rather than waiting for one
-  to come back.
+  request fails at once without being sent, and a page of a crawl waits
+  for the first proxy to come back, a few times at most.
 - **Retries under a breaker**: a request counts once, however many attempts
   it takes. Its first failure counts at once, so a dead host opens its
   circuit after a few pages, not after their retries; a failed retry adds
@@ -197,6 +206,7 @@ leaves a failing site alone.
   - backoff and jitter spread retries out in time;
   - retries at one layer, capped per request or by a budget;
   - a timeout or a 429 holds back the whole host, not only the failed request;
+  - a 429 slows the host down until it stops answering it;
   - Retry-After is honored;
   - a circuit breaker stops the traffic while the host is down, and a single
     probe tests its recovery.

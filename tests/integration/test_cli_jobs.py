@@ -101,13 +101,12 @@ async def test_job_created_by_a_command_is_crawled_by_two_worker_processes_page_
     assert Counter(saved_urls(tmp_path)) == Counter(await urls_in("processed"))  # each page once
     assert await job_state() == "finished"
 
-    code, output, errors = await finish(
-        await start(
-            tmp_path, "report", "--job", "test", "--stats-json", "out/stats.json", "--report", "out/report.html"
-        )
-    )
+    report = ("--stats-json", "out/stats.json", "--report", "out/report.html", "--pages-report", "out/pages.csv")
+    code, output, errors = await finish(await start(tmp_path, "report", "--job", "test", *report))
     assert code == 0, errors
     assert output.startswith("=== Crawl job test: finished (")
+    # Every page was saved.
+    assert (tmp_path / "out" / "pages.csv").read_text(encoding="utf-8") == "url,outcome,reason,status,error\n"
     stats = json.loads((tmp_path / "out" / "stats.json").read_text(encoding="utf-8"))
     assert (stats["total_pages"], stats["successful"], sorted(stats["workers"])) == (
         WIDE_PAGES,

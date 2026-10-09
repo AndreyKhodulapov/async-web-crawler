@@ -18,13 +18,23 @@ class ProxyServer:
     headers, None when there was none. With `authorization` set, a request
     without that header gets HTTP 407. `connect_status` answers CONNECT with
     that status instead of opening the tunnel. A request whose target holds
-    `drop` gets no answer: its connection is closed.
+    `drop` gets no answer: its connection is closed. One whose target holds
+    `silent` gets no answer either, and its connection stays open until the
+    client closes it.
     """
 
-    def __init__(self, *, authorization: str | None = None, connect_status: int = 200, drop: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        authorization: str | None = None,
+        connect_status: int = 200,
+        drop: str | None = None,
+        silent: str | None = None,
+    ) -> None:
         self.authorization = authorization
         self.connect_status = connect_status
         self.drop = drop
+        self.silent = silent
         self.requests: list[str] = []
         self.authorizations: list[str | None] = []
         self._server: asyncio.Server | None = None
@@ -82,6 +92,9 @@ class ProxyServer:
             await _answer(writer, 407, "Proxy Authentication Required", 'Proxy-Authenticate: Basic realm="test"\r\n')
             return
         if self.drop is not None and self.drop in target:
+            return
+        if self.silent is not None and self.silent in target:
+            await reader.read()
             return
         if method == "CONNECT":
             await self._tunnel(target, reader, writer)

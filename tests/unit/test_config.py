@@ -101,6 +101,7 @@ FULL = {
         "outputs": ["pages.jsonl", "pages.csv"],
         "batch_size": 50,
         "csv_encoding": "utf-8-sig",
+        "csv_escape_formulas": False,
         "overwrite": True,
     },
     "logging": {
@@ -110,7 +111,13 @@ FULL = {
         "backup_count": 2,
         "console_format": "json",
     },
-    "report": {"stats_json": "stats.json", "html": "report.html", "title": "Blog crawl", "top_domains": 5},
+    "report": {
+        "stats_json": "stats.json",
+        "html": "report.html",
+        "pages": "not-saved.csv",
+        "title": "Blog crawl",
+        "top_domains": 5,
+    },
     "distributed": {
         "database_url": "postgresql://crawler:dbp4ss@db.example:5432/crawler",
         "lease_seconds": 120.0,
@@ -159,7 +166,9 @@ class TestDefaults:
             same_domain_only=True, include=(), exclude=(), exclude_extensions=EXCLUDED_EXTENSIONS
         )
         assert {"pdf", "jpg", "zip", "mp4"} <= set(EXCLUDED_EXTENSIONS)
-        assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8", overwrite=False)
+        assert config.storage == StorageOptions(
+            outputs=(), batch_size=100, csv_encoding="utf-8", csv_escape_formulas=True, overwrite=False
+        )
         assert config.logging == LoggingOptions(
             level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5, console_format="text"
         )
@@ -318,6 +327,10 @@ class TestStorage:
         assert isinstance(first, JSONStorage) and isinstance(second, CSVStorage)
         assert (second.encoding, first.batch_size, second.batch_size) == ("utf-8-sig", 7, 7)
 
+    def test_escaping_of_formulas_reaches_the_csv_files(self):
+        assert StorageOptions(outputs=("pages.csv",)).build().escape_formulas is True
+        assert StorageOptions(outputs=("pages.csv",), csv_escape_formulas=False).build().escape_formulas is False
+
     def test_overwrite_reaches_the_files(self):
         storage = StorageOptions(outputs=("pages.jsonl", "pages.csv", "pages.db"), overwrite=True).build()
 
@@ -396,6 +409,7 @@ class TestInvalid:
             ({"logging": {"console_format": "xml"}}, 'logging.console_format: expected one of text, json, got "xml"'),
             ({"report": {"top_domains": 0}}, "report.top_domains: must be >= 1, got 0"),
             ({"report": {"html": ""}}, 'report.html: must not be empty, got ""'),
+            ({"report": {"pages": ""}}, 'report.pages: must not be empty, got ""'),
         ],
     )
     def test_value_out_of_limits(self, data, problem):
@@ -1079,13 +1093,77 @@ class TestDistributed:
         assert "sqlite" not in problem
 
 
+class TestSecretsFromTheEnvironment:
+    @pytest.fixture(autouse=True)
+    def variables(self, monkeypatch):
+        monkeypatch.setenv("CRAWLER_TEST_TOKEN", "t0ken")
+        monkeypatch.setenv("CRAWLER_TEST_PASSWORD", "s3cr3t")
+        monkeypatch.delenv("CRAWLER_TEST_MISSING", raising=False)
+
+    def test_variables_fill_the_secrets(self):
+        config = CrawlerConfig.from_dict(
+            {
+                "session": {
+                    "headers": {"Authorization": "Bearer ${CRAWLER_TEST_TOKEN}"},
+                    "cookies": [{"name": "sid", "value": "${CRAWLER_TEST_TOKEN}", "domain": "example.com"}],
+                },
+                "proxy": {"urls": ["http://user:${CRAWLER_TEST_PASSWORD}@proxy:3128"]},
+                "distributed": {
+                    "database_url": "postgresql://${CRAWLER_TEST_TOKEN}:${CRAWLER_TEST_PASSWORD}@db/crawler"
+                },
+            }
+        )
+
+        assert config.session.headers == {"Authorization": "Bearer t0ken"}
+        assert config.session.cookies[0].value == "t0ken"
+        assert config.proxy.urls == ("http://user:s3cr3t@proxy:3128",)
+        assert config.distributed.database_url == "postgresql://t0ken:s3cr3t@db/crawler"
+
+    def test_variables_fill_the_secrets_of_a_file(self, tmp_path):
+        path = write(tmp_path, 'session:\n  headers:\n    Authorization: "Bearer ${CRAWLER_TEST_TOKEN}"\n')
+        assert load_config(path).session.headers == {"Authorization": "Bearer t0ken"}
+
+    def test_a_dollar_before_the_variable_keeps_the_text(self):
+        config = CrawlerConfig.from_dict({"session": {"headers": {"X-Template": "$${CRAWLER_TEST_TOKEN} $5 ${x"}}})
+        assert config.session.headers == {"X-Template": "${CRAWLER_TEST_TOKEN} $5 ${x"}
+
+    def test_a_variable_not_set_is_an_error(self):
+        found = problems(
+            {
+                "session": {"headers": {"Authorization": "${CRAWLER_TEST_MISSING} ${CRAWLER_TEST_MISSING}"}},
+                "proxy": {"urls": ["http://user:${CRAWLER_TEST_MISSING}@proxy:3128"]},
+            }
+        )
+        assert found == [
+            'session.headers.Authorization: the environment variable "CRAWLER_TEST_MISSING" is not set',
+            'proxy.urls[0]: the environment variable "CRAWLER_TEST_MISSING" is not set',
+        ]
+
+    def test_the_value_of_a_variable_is_checked_and_not_shown(self, monkeypatch):
+        monkeypatch.setenv("CRAWLER_TEST_PROXY", "socks5://user:s3cr3t@proxy:1080")
+        (found,) = problems({"proxy": {"urls": ["${CRAWLER_TEST_PROXY}"]}})
+        assert found.startswith("proxy.urls[0]: ")
+        assert "s3cr3t" not in found
+
+    def test_other_keys_are_taken_as_written(self):
+        config = CrawlerConfig.from_dict(
+            {"crawler": {"user_agent": "Bot/${CRAWLER_TEST_TOKEN}"}, "filters": {"exclude": ["/a${x}$"]}}
+        )
+        assert config.crawler.user_agent == "Bot/${CRAWLER_TEST_TOKEN}"
+        assert config.filters.exclude == ("/a${x}$",)
+
+
 class TestForWorker:
     def test_name_of_the_worker_goes_into_the_paths_of_the_files_written(self):
         config = CrawlerConfig.from_dict(
             {
                 "storage": {"outputs": ["out/pages-{worker}.jsonl", "sqlite:///pages-{worker}.db"]},
                 "logging": {"file": "{worker}.log"},
-                "report": {"stats_json": "stats-{worker}.json", "html": "report-{worker}.html"},
+                "report": {
+                    "stats_json": "stats-{worker}.json",
+                    "html": "report-{worker}.html",
+                    "pages": "pages-{worker}.csv",
+                },
                 "session": {"cookies_file": "cookies-{worker}.txt", "save_cookies": "saved-{worker}.txt"},
             }
         ).for_worker("w1")
@@ -1096,6 +1174,7 @@ class TestForWorker:
             "stats-w1.json",
             "report-w1.html",
         )
+        assert config.report.pages == "pages-w1.csv"
         assert config.session.save_cookies == "saved-w1.txt"
         # A file that is read is the same for every worker.
         assert config.session.cookies_file == "cookies-{worker}.txt"

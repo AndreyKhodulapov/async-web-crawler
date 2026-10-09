@@ -348,6 +348,7 @@ class StorageOptions:
     outputs: tuple[str, ...] = _option((), check=_file_path)  # files by extension, or database URLs
     batch_size: int = _option(100, minimum=1)
     csv_encoding: str = "utf-8"
+    csv_escape_formulas: bool = True  # values a spreadsheet would run as formulas get an apostrophe, see CSVStorage
     overwrite: bool = False  # files are started anew instead of added to; databases keep a row per URL anyway
 
     def build(self) -> DataStorage | None:
@@ -359,7 +360,11 @@ class StorageOptions:
         """
         storages = [
             storage_from_output(
-                output, csv_encoding=self.csv_encoding, overwrite=self.overwrite, batch_size=self.batch_size
+                output,
+                csv_encoding=self.csv_encoding,
+                csv_escape_formulas=self.csv_escape_formulas,
+                overwrite=self.overwrite,
+                batch_size=self.batch_size,
             )
             for output in self.outputs
         ]
@@ -385,6 +390,7 @@ class ReportOptions:
 
     stats_json: str | None = _option(None, check=_file_path)
     html: str | None = _option(None, check=_file_path)
+    pages: str | None = _option(None, check=_file_path)  # CSV of the pages not saved, with the reasons
     title: str = "Crawl report"
     top_domains: int = _option(10, minimum=1)
 
@@ -497,7 +503,10 @@ class CrawlerConfig:
             storage=dataclasses.replace(self.storage, outputs=tuple(map(named, self.storage.outputs))),
             logging=dataclasses.replace(self.logging, file=named(self.logging.file)),
             report=dataclasses.replace(
-                self.report, stats_json=named(self.report.stats_json), html=named(self.report.html)
+                self.report,
+                stats_json=named(self.report.stats_json),
+                html=named(self.report.html),
+                pages=named(self.report.pages),
             ),
             session=dataclasses.replace(self.session, save_cookies=named(self.session.save_cookies)),
         )
@@ -684,6 +693,10 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
         )
         problems.append(f"{path}: expected {expected}{_got(value, limits)}{quote}")
         return _INVALID
+    if "secret" in limits:
+        value = _from_environment(value, path, problems)
+        if value is None:
+            return _INVALID
     if "normalize" in limits:
         value = limits["normalize"](value)
     problem = _out_of_limits(value, limits)
@@ -691,6 +704,28 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
         problems.append(f"{path}: {problem}{_got(value, limits)}")
         return _INVALID
     return value
+
+
+def _from_environment(value: str, path: str, problems: list[str]) -> str | None:
+    """A secret with "${NAME}" replaced by the variable NAME of the environment; None if one is not set.
+
+    The secret then stays out of the file. "$${NAME}" is the text "${NAME}".
+    """
+    missing: dict[str, None] = {}
+
+    def substitute(match: re.Match[str]) -> str:
+        escaped, name = match.groups()
+        if escaped:
+            return match.group()[1:]
+        if name not in os.environ:
+            missing[name] = None
+            return ""
+        return os.environ[name]
+
+    expanded = re.sub(r"\$(\$?)\{([A-Za-z_][A-Za-z0-9_]*)\}", substitute, value)
+    for name in missing:
+        problems.append(f'{path}: the environment variable "{name}" is not set')
+    return None if missing else expanded
 
 
 def _got(value: Any, limits: Mapping[str, Any], section: type | None = None) -> str:

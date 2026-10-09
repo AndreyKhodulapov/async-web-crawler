@@ -58,7 +58,10 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
   short one brings the pages of a dead worker back sooner, but a worker
   paused longer than the lease (a long garbage collection, a stalled
   disk) loses its pages to another one and they are crawled twice. The
-  heartbeat must come several times within a lease (here 20 s and 60 s).
+  heartbeat must come several times within a lease (here 20 s and 60 s),
+  and does nothing else: the counts of the job, a scan of all its pages,
+  are refreshed by a task of their own every minute, so a slow scan of a
+  large job never makes a lease late.
 - **A page that kills its workers** (a parser crash, a page too big for
   memory) would come back forever. Expiries are counted, and a page fails
   after a few (`max_attempts`).
@@ -76,12 +79,16 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
   move the host's next allowed time in the database; the pages of the
   host stay in the queue instead of being taken and put back. A host
   that keeps failing is given up for the job, by counts all workers add
-  to.
+  to. Failures several workers meet at once count as one: a host down for
+  a few seconds is not given up because many workers saw it.
 - **What is cheap to repeat stays in each worker**: robots.txt is
-  downloaded and cached by every worker once per host, and each worker
-  has its own circuit breaker. A host gets a few more requests than from
+  downloaded and cached by every worker once per host, each worker
+  has its own circuit breaker, and each slows a host down after the 429
+  it gets. A host gets a few more requests than from
   one process; sharing them would cost a database round trip at every
-  request.
+  request. The proxies are each worker's too: a page none of them was
+  left for goes back to the queue for any worker, without holding its
+  host back.
 
 ## Failures
 
@@ -94,7 +101,16 @@ they are, in [performance.md](performance.md#crawl-jobs-of-several-workers).
 - **The database fails**: the worker stops with exit code 1 rather than
   trying to ride out the outage (crash-only design). Its leases bring
   its pages back, and starting it again is the job of whatever runs it: a
-  restart policy, a Kubernetes Job.
+  restart policy, a Kubernetes Job. The compose file restarts it on any
+  failure with no limit: Docker doubles the pause between the starts up
+  to a minute, so an outage of minutes is ridden out, and a worker that
+  starts on a finished job takes nothing and exits with 0. The price: a
+  wrong configuration (exit code 2) is retried every minute too, seen in
+  `docker compose ps` and the logs.
+- **The job is restarted under its workers** (`job create --restart`):
+  each worker of the old job stops the same way, exit code 1, once the
+  database tells it the job is gone. It writes what its storage buffers
+  first, and touches nothing of the new job; started again, it joins it.
 - **The database crashes itself**: the frontier commits without waiting
   for the disk, so up to 0.6 s of its changes may be lost; those pages
   are handed out or finished once more, which "at least once" allows.
@@ -153,9 +169,11 @@ operations a second on one job exceed what one row allows (below).
   A file in the container dies with it.
 - **Metrics**: pages per second, pages queued and in progress, leases
   expired, hosts held back and given up, storage failures. Here `status`
-  and `report` read the first of them from the database; a production
-  setup exports them to Prometheus and alerts on a queue that stops
-  shrinking or leases that keep expiring.
+  and `report` read the first of them from the database, and only read:
+  a role that may not write is enough for them, and they never change
+  the tables or functions the workers run on. A production setup exports
+  them to Prometheus and alerts on a queue that stops shrinking or
+  leases that keep expiring.
 - **Secrets in the environment**, not in files baked into the image:
   `CRAWLER_DATABASE_URL` here.
 - **One image, many roles**: the same image creates the job, runs the

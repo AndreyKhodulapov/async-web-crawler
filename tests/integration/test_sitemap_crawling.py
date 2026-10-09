@@ -360,6 +360,21 @@ async def test_pages_that_only_the_last_sitemap_lets_through_the_filters_are_cra
     assert list(pages) == [url(f"/wide/{number}") for number in range(110, 115)]
 
 
+async def test_sitemaps_are_read_until_they_listed_enough_pages_the_filters_turned_away(url, site, caplog):
+    caplog.set_level(logging.INFO, logger="crawler")
+    names = [f"{number}.xml" for number in range(50)]
+    site.sitemaps = {"sitemap.xml": index(*(url(f"/sitemaps/{name}") for name in names))} | {
+        name: urlset(*(url(f"/wide/{number * 10 + page}") for page in range(10))) for number, name in enumerate(names)
+    }
+    async with make_crawler() as crawler:
+        # At most 10 x 3 x 2 = 60 pages listed: two batches of 5 files with 10 pages each.
+        pages = await crawler.crawl([], 2, sitemap_urls=[url(SITEMAP)], include_patterns=[r"/site/"])
+
+    assert pages == {}
+    assert sum(site.hits[f"/sitemaps/{name}"] for name in names) == 2 * SitemapParser.CONCURRENCY
+    assert f"Stopped reading sitemaps at {url(SITEMAP)}: they listed 100 pages" in caplog.text
+
+
 async def test_invalid_sitemap_arguments_are_rejected(url, site):
     async with make_crawler() as crawler:
         with pytest.raises(ValueError, match="invalid sitemap URLs: 'sitemap.xml'"):

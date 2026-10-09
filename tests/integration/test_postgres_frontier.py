@@ -12,6 +12,7 @@ import itertools
 import logging
 import random
 import time
+import types
 from collections.abc import AsyncGenerator, Awaitable, Callable
 
 import asyncpg
@@ -553,6 +554,63 @@ class TestLease:
         (host,) = await fetch("SELECT requested FROM hosts")
         assert (job["requested"], host["requested"]) == (0, 0)
 
+    @staticmethod
+    def answer_put_back_late(
+        frontier: PostgresFrontier,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        before: Callable[[], Awaitable[None]] | None = None,
+        after: Callable[[], Awaitable[None]] | None = None,
+    ) -> None:
+        """Make `put_back` of `frontier` await `before` ahead of the database and `after` once it queued the page, unanswered."""
+        pool = frontier._pool
+
+        async def fetchrow(query: str, *parameters: object) -> asyncpg.Record:
+            put_back = "frontier_put_back" in query
+            if put_back and before is not None:
+                await before()
+            row = await pool.fetchrow(query, *parameters)
+            if put_back and after is not None:
+                await after()
+            return row
+
+        monkeypatch.setattr(frontier, "_pool", types.SimpleNamespace(acquire=pool.acquire, fetchrow=fetchrow))
+
+    async def test_page_put_back_is_taken_by_another_task_before_the_answer_comes(self, open_frontier, monkeypatch):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+        page = await take(frontier)
+        taken = []
+
+        async def take_meanwhile() -> None:
+            taken.append(await asyncio.wait_for(frontier.take(), 2))
+
+        self.answer_put_back_late(frontier, monkeypatch, after=take_meanwhile)
+        await frontier.put_back(page, uncount=True)
+
+        assert taken == [page]
+        assert frontier.in_progress(page)
+        await frontier.finish(page, Outcome.PROCESSED)
+        assert await asyncio.wait_for(frontier.take(), 2) is None
+        assert (await row_of(page.url))["state"] == "processed"
+
+    async def test_task_waiting_while_a_page_is_put_back_keeps_waiting_for_it(self, open_frontier, monkeypatch):
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+        page = await take(frontier)
+        other_task = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0.1)
+
+        async def look_meanwhile() -> None:
+            # Let go, not yet queued: the other task looks a few times.
+            await asyncio.sleep(0.1)
+            assert not other_task.done()
+
+        self.answer_put_back_late(frontier, monkeypatch, before=look_meanwhile)
+        await frontier.put_back(page, uncount=True)
+
+        assert await asyncio.wait_for(other_task, 2) == page
+
 
 class TestWaits:
     async def test_waits_of_a_page_are_known_to_the_next_worker_and_outlast_its_lease(self, open_frontier):
@@ -639,6 +697,29 @@ class TestPendingSave:
         await other.saved([page.url])
 
         assert (await row_of(page.url))[:2] == ("saving", "saving")
+
+    async def test_page_whose_record_is_dropped_fails_and_lets_the_job_finish(self, open_frontier):
+        saving, other = await open_frontier("saving"), await open_frontier("other")
+        await saving.seed(["http://site/"])
+        page = await take(saving)
+        await saving.finish(page, Outcome.PROCESSED, pending_save=True, status=200)
+
+        await saving.dropped([page.url])
+
+        (row,) = await fetch("SELECT state, error, status, lease_until FROM frontier WHERE url = $1", page.url)
+        assert tuple(row) == ("failed", "RecordDropped", 200, None)
+        assert await other.take() is None
+        assert await job_state() == "finished"
+
+    async def test_dropped_fails_only_the_pages_of_its_worker(self, open_frontier):
+        saving, other = await open_frontier("saving"), await open_frontier("other")
+        await saving.seed(["http://site/"])
+        page = await take(saving)
+        await saving.finish(page, Outcome.PROCESSED, pending_save=True)
+
+        await other.dropped([page.url])
+
+        assert (await row_of(page.url))["state"] == "saving"
 
 
 class TestHosts:
@@ -794,6 +875,51 @@ class TestHostFailures:
 
         # The circuit openings stay.
         assert failures == HostFailures(1, 1)
+
+    async def test_failures_workers_tell_at_once_count_as_one(self, open_frontier):
+        workers = [await open_frontier(f"w{number}") for number in range(4)]
+        apart = {"circuit_apart": 60.0, "robots_apart": 60.0}
+
+        await asyncio.gather(
+            *(worker.count_host_failures("a", circuit_openings=1, robots_failures=1, **apart) for worker in workers)
+        )
+
+        assert await workers[0].count_host_failures("a", **apart) == HostFailures(1, 1)
+
+    async def test_failure_told_after_the_last_one_counted_is_counted_once_far_enough_apart(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.count_host_failures("a", circuit_openings=1, circuit_apart=0.3)
+
+        await asyncio.sleep(0.2)
+        # Within the time of the first: not counted, and the time stays.
+        assert await second.count_host_failures("a", circuit_openings=1, circuit_apart=0.3) == HostFailures(1, 0)
+        await asyncio.sleep(0.15)
+        assert await second.count_host_failures("a", circuit_openings=1, circuit_apart=0.3) == HostFailures(2, 0)
+
+    async def test_failures_of_each_kind_are_apart_on_their_own(self, open_frontier):
+        frontier = await open_frontier("first")
+        apart = {"circuit_apart": 60.0, "robots_apart": 60.0}
+        await frontier.count_host_failures("a", circuit_openings=1, **apart)
+
+        assert await frontier.count_host_failures("a", robots_failures=1, **apart) == HostFailures(1, 1)
+
+    async def test_robots_txt_read_counts_its_next_failure_whenever_it_comes(self, open_frontier):
+        first, second = await open_frontier("first"), await open_frontier("second")
+        await first.count_host_failures("a", robots_failures=1, robots_apart=60.0)
+
+        failures = await second.count_host_failures("a", robots_failures=1, robots_read=True, robots_apart=60.0)
+        assert failures == HostFailures(0, 1)
+        assert await first.count_host_failures("a", robots_failures=1, robots_apart=60.0) == HostFailures(0, 1)
+
+    async def test_table_of_hosts_made_before_the_moments_of_failures_gets_them(self, open_frontier):
+        first = await open_frontier("first")
+        await first.count_host_failures("a", circuit_openings=1)
+        await fetch("ALTER TABLE hosts DROP COLUMN circuit_counted_at, DROP COLUMN robots_counted_at")
+
+        second = await open_frontier("second")
+
+        assert await second.count_host_failures("a", circuit_openings=1, circuit_apart=60.0) == HostFailures(2, 0)
+        assert await second.count_host_failures("a", circuit_openings=1, circuit_apart=60.0) == HostFailures(2, 0)
 
     async def test_host_given_up_has_its_pages_queued_finished_and_the_job_may_end(self, open_frontier):
         first, second = await open_frontier("first"), await open_frontier("second")
@@ -952,17 +1078,55 @@ class TestWaiting:
         await busy.seed(["http://site/a", "http://site/b"])
         held_by_busy, held_by_waiting = await take(busy), await take(waiting)
 
+        other_tasks = []
+
         async def on_waiting() -> None:
             waiting.on_waiting = None
             await busy.finish(held_by_busy, Outcome.PROCESSED)
-            other_task = asyncio.create_task(waiting.take())
+            other_tasks.append(asyncio.create_task(waiting.take()))
             await asyncio.sleep(0.2)
             await waiting.finish(held_by_waiting, Outcome.PROCESSED)
-            assert await asyncio.wait_for(other_task, 1) is None
 
         waiting.on_waiting = on_waiting
 
         assert await asyncio.wait_for(waiting.take(), 1) is None
+        assert await asyncio.wait_for(other_tasks[0], 1) is None
+
+    async def test_one_task_of_a_worker_polls_while_no_page_is_ready(self, open_frontier, monkeypatch):
+        await make_job(state="seeding")
+        frontier = await open_frontier("worker", poll_interval=0.05)
+        urls = [f"http://site/{i}" for i in range(10)]
+        await frontier.seed(urls)
+        polls = 0
+        delay = frontier._delay
+
+        def count_polls(state: asyncpg.Record) -> float | None:
+            nonlocal polls
+            polls += 1
+            return delay(state)
+
+        monkeypatch.setattr(frontier, "_delay", count_polls)
+        takers = [asyncio.create_task(frontier.take()) for _ in range(10)]
+        await asyncio.sleep(0.5)
+
+        assert polls <= 20  # about 100 if each of the ten tasks polled
+        await fetch("UPDATE crawl_jobs SET state = 'running'")
+        pages = await asyncio.wait_for(asyncio.gather(*takers), 5)
+        assert sorted(page.url for page in pages) == sorted(urls)
+
+    async def test_task_cancelled_while_it_polls_leaves_the_polling_to_the_others(self, open_frontier):
+        await make_job(state="seeding")
+        frontier = await open_frontier("worker")
+        await frontier.seed(["http://site/"])
+        polling = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0.1)
+        waiting = asyncio.create_task(frontier.take())
+        await asyncio.sleep(0.1)
+
+        polling.cancel()
+        await fetch("UPDATE crawl_jobs SET state = 'running'")
+
+        assert await asyncio.wait_for(waiting, 5) == FrontierPage("http://site/", 0)
 
 
 class TestSeeding:
@@ -1111,14 +1275,36 @@ class TestStats:
         stats = first.stats()
         assert (stats.queued, stats.in_progress, stats.processed) == (1, 1, 1)
 
-    async def test_heartbeat_refreshes_the_stats(self, open_frontier):
-        watching = await open_frontier("watching", heartbeat_seconds=0.05)
+    async def test_stats_are_refreshed_every_stats_seconds(self, open_frontier):
+        watching = await open_frontier("watching", heartbeat_seconds=60, stats_seconds=0.05)
         other = await open_frontier("other")
 
         await other.seed(["http://site/a", "http://site/b"])
         await asyncio.sleep(0.3)
 
         assert watching.stats().queued == 2
+
+    async def test_stats_are_those_of_the_end_once_nothing_is_left_to_take(self, open_frontier):
+        worker = await open_frontier("worker")
+        await worker.seed(["http://site/a", "http://site/b"])
+        while (page := await worker.take()) is not None:
+            await worker.finish(page, Outcome.PROCESSED)
+
+        assert (worker.stats().queued, worker.stats().processed) == (0, 2)
+
+    async def test_slow_count_of_the_pages_does_not_hold_up_the_leases(self, open_frontier, monkeypatch):
+        busy = await open_frontier("busy", lease_seconds=0.3, heartbeat_seconds=0.05, stats_seconds=0.05)
+        other = await open_frontier("other")
+        await busy.seed(["http://site/"])
+        page = await take(busy)
+
+        async def slow_refresh() -> None:
+            await asyncio.sleep(10)
+
+        monkeypatch.setattr(busy, "refresh_stats", slow_refresh)
+
+        assert await still_waiting(other.take(), 0.8)
+        assert (await row_of(page.url))["worker"] == "busy"
 
 
 class TestDatabaseGone:

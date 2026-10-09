@@ -15,6 +15,7 @@ from helpers import long_url
 from pages import ENCODING_PAGES, JS_PAGES, JS_SCRIPT, SITE_HEADERS, SITE_PAGES, fixture_html
 from proxy_server import ProxyServer
 
+from crawler import RateLimiter
 from crawler.logging_setup import reset_logging
 from demo_site import free_port
 
@@ -23,11 +24,12 @@ class SiteState:
     """What the crawl-test site has served, and its robots.txt.
 
     `log` lists (path, time) of every request to /site/ pages, /flaky/,
-    /busy/, /shop/, /js/, sitemaps and robots.txt, in the order they arrived. `robots` is the
+    /busy/, /throttled/, /shop/, /js/, sitemaps and robots.txt, in the order they arrived. `robots` is the
     body of /robots.txt, served with `robots_status`; None means 404; the
     first `robots_failures` requests for it answer 503 whatever it is, or
     the first `robots_failures_by_host[host]` requests from the hosts named
-    there; `robots_hits` counts its requests by host.
+    there; `robots_hits` counts its requests by host. It answers after
+    `robots_latency` seconds.
     With `robots_endless`, comment lines follow the body for as long as
     the client reads them. `robots_by_host` gives other hosts of the server
     a robots.txt of their own.
@@ -35,7 +37,9 @@ class SiteState:
     bodies; the first `sitemap_failures` requests for them answer 503.
     `sitemap_headers` are added to the responses with them.
     `headers` keeps the request headers of the latest request for each
-    path recorded, /cookies/ pages included.
+    path recorded, /cookies/ pages included. /throttled/ pages answer 429
+    to a request that comes within `throttle_gap` seconds of the last one
+    they served.
     """
 
     def __init__(self) -> None:
@@ -49,12 +53,15 @@ class SiteState:
         self.robots_failures = 0
         self.robots_failures_by_host: dict[str, int] = {}
         self.robots_hits: Counter[str] = Counter()
+        self.robots_latency = 0.0
         self.robots_endless = False
         self.robots_by_host: dict[str, str] = {}
         self.sitemaps: dict[str, bytes] = {}
         self.sitemap_failures = 0
         self.sitemap_headers: dict[str, str] = {}
         self.headers: dict[str, dict[str, str]] = {}
+        self.throttle_gap = 0.0
+        self.throttled_at: float | None = None
 
     def record(self, request: web.Request) -> None:
         self.hits[request.path] += 1
@@ -131,6 +138,7 @@ async def robots_txt(request: web.Request) -> web.StreamResponse:
     state.record(request)
     host = request.url.host or ""
     state.robots_hits[host] += 1
+    await asyncio.sleep(state.robots_latency)
     if state.robots_hits[host] <= state.robots_failures_by_host.get(host, state.robots_failures):
         raise web.HTTPServiceUnavailable()
     if request.url.host in state.robots_by_host:
@@ -210,6 +218,17 @@ async def overloaded(request: web.Request) -> web.Response:
 
 SHOP_PAGES = 20
 SHOP_SORTS = ("price", "name", "date")
+
+
+async def throttled(request: web.Request) -> web.Response:
+    """Answers 429 without Retry-After within `throttle_gap` seconds of the last page it served, else a page."""
+    state = request.app[SITE_STATE]
+    state.record(request)
+    now = time.monotonic()
+    if state.throttled_at is not None and now - state.throttled_at < state.throttle_gap:
+        raise web.HTTPTooManyRequests()
+    state.throttled_at = now
+    return web.Response(text="<title>Served</title>", content_type="text/html")
 
 
 async def shop_list(request: web.Request) -> web.Response:
@@ -294,7 +313,8 @@ async def site_page(request: web.Request) -> web.Response:
 async def js_page(request: web.Request) -> web.Response:
     """The pages of JS_PAGES, their script and image; any other path under /js/ is a plain page.
 
-    /js/cookie-read sets a cookie for every parameter of its query, as /cookies/set does.
+    /js/cookie-read sets a cookie for every parameter of its query, as /cookies/set does. In a page,
+    {other_host} is the same site under the name localhost.
     """
     request.app[SITE_STATE].record(request)
     if request.path == "/js/app.js":
@@ -304,11 +324,22 @@ async def js_page(request: web.Request) -> web.Response:
     if request.path == "/js/to-private":
         raise web.HTTPFound("/js/private/page")
     html = JS_PAGES.get(request.path, f"<html><body><p>{request.path}</p></body></html>")
+    html = html.replace("{other_host}", f"http://localhost:{request.url.port}")
     response = web.Response(text=html, content_type="text/html")
     if request.path == "/js/cookie-read":
         for name, value in request.query.items():
             response.headers.add("Set-Cookie", f"{name}={value}")
     return response
+
+
+async def web_socket(request: web.Request) -> web.WebSocketResponse:
+    """A web socket, open until the client closes it."""
+    request.app[SITE_STATE].record(request)
+    socket = web.WebSocketResponse()
+    await socket.prepare(request)
+    async for _ in socket:
+        pass
+    return socket
 
 
 @pytest.fixture(scope="session")
@@ -330,6 +361,13 @@ def clean_proxy_environment(monkeypatch) -> None:
     for name in ["http_proxy", "https_proxy", "no_proxy", "all_proxy", "REQUEST_METHOD"]:
         monkeypatch.delenv(name, raising=False)
         monkeypatch.delenv(name.upper(), raising=False)
+
+
+@pytest.fixture
+def brief_slowdown(monkeypatch) -> None:
+    """Slows a host that answers HTTP 429 down by milliseconds, for the tests of what else a 429 does."""
+    monkeypatch.setattr(RateLimiter, "MIN_SLOWDOWN", 0.01)
+    monkeypatch.setattr(RateLimiter, "MAX_SLOWDOWN", 0.05)
 
 
 @pytest.fixture
@@ -362,12 +400,14 @@ def make_app() -> web.Application:
     app.router.add_get("/flaky/{fails}", flaky)
     app.router.add_get("/busy/{seconds}", busy)
     app.router.add_get("/overloaded/{fails}/{seconds}", overloaded)
+    app.router.add_get("/throttled/{n}", throttled)
     app.router.add_get("/shop/list", shop_list)
     app.router.add_get("/shop/item/{n}", shop_item)
     app.router.add_get("/wide/{n}", wide_page)
     app.router.add_get("/cookies/set", set_cookies)
     app.router.add_get("/cookies/echo", echo_cookies)
     app.router.add_get("/js/{path:.*}", js_page)
+    app.router.add_get("/socket", web_socket)
     return app
 
 

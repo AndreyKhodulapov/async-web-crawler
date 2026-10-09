@@ -49,6 +49,20 @@ Times are in seconds. Paths are relative to the working directory, not to
 the configuration file; `~` is expanded. Directories of the outputs, the
 log and the reports are created if they are missing.
 
+Secrets can stay out of the file. In the values of `session.headers`,
+`session.cookies`, `proxy.urls` and `distributed.database_url`, `${NAME}`
+is replaced by the environment variable `NAME` when the configuration is
+read; a variable that is not set is an error, and `$${NAME}` is the text
+`${NAME}`. The other keys are taken as written.
+
+```yaml
+session:
+  headers:
+    Authorization: "Bearer ${API_TOKEN}"
+proxy:
+  urls: ["http://user:${PROXY_PASSWORD}@proxy-1.example:3128"]
+```
+
 ## Keys
 
 ### `urls`
@@ -66,7 +80,7 @@ Sitemaps whose pages are crawled along with the start URLs; see
 |-----|------|---------|---------|
 | `urls` | list of URLs | `[]` | sitemaps or sitemap indexes, plain or gzipped |
 | `from_robots` | true or false | `false` | also read the sitemaps that robots.txt of the start URLs' sites names; needs `crawler.respect_robots` |
-| `max_urls` | whole number, >= 1 | `50000` | pages taken from one sitemap, its index included; a crawl stops reading sitemaps sooner once its queue is full |
+| `max_urls` | whole number, >= 1 | `50000` | pages taken from one sitemap, its index included; a crawl stops reading sitemaps sooner once its queue is full, or once they listed 10 times as many pages as the queue holds (3 × `max_pages`), filtered ones included |
 
 ### `crawler`
 
@@ -87,7 +101,7 @@ How much to crawl and how fast; see [Politeness](api.md#politeness) and
 | `respect_robots` | true or false | `true` | check robots.txt before every request, and follow `nofollow` and `noindex` of pages and links |
 | `user_agent` | string, one line | `AsyncWebCrawler/0.1 (+repo URL)` | the User-Agent; robots.txt rules are looked up by its name; spaces and line breaks around it are dropped |
 | `user_agents` | list of strings | `[]` | variants to rotate; each must have the same name as `user_agent` |
-| `total_timeout` | number, > 0 | `30.0` | the whole request, body included |
+| `total_timeout` | number, > 0 | `30.0` | the whole request, body included; a sitemap has 10 times as long. The first of the three timeouts to run out ends a request: `connect_timeout` or `read_timeout` above this one only applies to sitemaps |
 | `connect_timeout` | number, > 0 | `10.0` | DNS, TCP and TLS |
 | `read_timeout` | number, > 0 | `20.0` | the longest pause between two chunks of the response |
 | `timeout_growth` | number, >= 1 | `1.5` | the timeouts grow by this factor on every retry |
@@ -179,9 +193,11 @@ required so that a cookie never goes to a host it is not for:
 `example.com` is that host only, `.example.com` the host and its subdomains,
 as in a `cookies.txt` file. The cookies of `cookies_file` come first, those
 of `cookies` win over them. A cookie of an expired date in the file is left
-out; one without a date lasts for the crawl. aiohttp keeps no cookies of IP
-addresses, so a cookie for `127.0.0.1` is an error here and is left out of
-the file with a warning: reach such a site by its name, e.g. `localhost`.
+out; one without a date lasts for the crawl. A date past the year 9999 is
+read as milliseconds, as some exporters write it. aiohttp keeps no cookies
+of IP addresses, so a cookie for `127.0.0.1` is an error here and is left
+out of the file with a warning: reach such a site by its name, e.g.
+`localhost`.
 
 ```yaml
 session:
@@ -209,7 +225,9 @@ The values of the cookies and the headers are secrets: they are not
 written to the log, the summary, the reports or the messages of the
 validation, and `repr()` of the configuration leaves them out.
 `CrawlerConfig.to_dict()` keeps them, so that `from_dict()` can read it
-back. Keep a file with them private, or keep them in `cookies_file`.
+back. Keep a file with them private, keep them in `cookies_file`, or take
+them from the environment with `${NAME}` (see
+[Where a value comes from](#where-a-value-comes-from)).
 
 ### `proxy`
 
@@ -247,11 +265,12 @@ failures in a row it is out of rotation for `cooldown` seconds, and the
 requests go through the other proxies; any response through it clears
 the count. Once back, one more failure takes it out again. The request
 that failed is retried through the next proxy at once, and with
-`per_host` its host stays on that proxy. When every proxy is out, a page
-fails at once with "no proxy available" and is not retried, and the crawl
-ends instead of waiting. A proxy that answers, whatever the site says
+`per_host` its host stays on that proxy. When every proxy is out, a
+request is not sent ("no proxy available") and not retried; its page is
+put off until the first proxy is back, at most three times, then fails,
+so proxies that never come back still end the crawl. A proxy that answers, whatever the site says
 through it, is up: a 404, a 503 or a refused CONNECT (the proxy cannot or
-may not reach the site) count against the site, and so does a timeout,
+may not reach the site) count against the site, and so does a read timeout,
 since the proxy and the site cannot be told apart then.
 
 `from_env` reads the variables once, when the crawler is made, in either
@@ -293,9 +312,9 @@ it, [the note on the headless browser](sessions_proxies_rendering.md#headless-br
 | `include` | list of regular expressions | `[]` | with `mode: patterns`, the URLs to render, searched anywhere in the URL as in `filters`; required there, an error with another `mode` |
 | `wait_until` | `load`, `domcontentloaded` or `networkidle` | `load` | the event of the page to wait for; `networkidle` is no request for half a second |
 | `wait_for` | CSS selector or `null` | `null` | an element to wait for after that, e.g. `"#content"` |
-| `timeout` | number, > 0 | `30.0` | seconds the browser has for a page, the waits included |
+| `timeout` | number, > 0 | `30.0` | seconds the browser has for a page, the waits and the reading of its HTML included |
 | `max_open_pages` | whole number, >= 1 | `2` | pages rendered at once; a browser tab takes 50 to 100 MB |
-| `block_resources` | list of resource types | `[image, font, media]` | requests the browser does not make: `image`, `font`, `media`, `stylesheet`, `script`, `xhr`, `fetch`, `websocket`, `eventsource`, `manifest`, `texttrack`, `other` |
+| `block_resources` | list of resource types | `[image, font, media]` | requests the browser does not make: `image`, `font`, `media`, `stylesheet`, `script`, `xhr`, `fetch`, `websocket`, `eventsource`, `manifest`, `texttrack`, `other`; a web socket is closed before it connects |
 
 ```yaml
 rendering:
@@ -334,7 +353,8 @@ the page set, by JavaScript or in the responses to its requests: they go
 with the next download and to `save_cookies`. Only the changes go each
 way, so two pages rendered at once do not undo each other's cookies; when
 both change the same cookie, the browser wins. The requests of the
-browser carry `crawler.user_agent` and `session.headers`, and go through
+browser carry `crawler.user_agent`, those to the origin of their page
+`session.headers` too, and go through
 the proxy the document of the page came through: every proxy has a
 browser context of its own (cookies, cache), so with `per_host` a site
 and its scripts stay on one address. The hosts of `NO_PROXY` are reached
@@ -357,10 +377,11 @@ over `max_page_size` once rendered fails with `PageTooLargeError`, one
 the browser takes longer than `timeout` to render fails with a timeout
 (`RenderTimeoutError`) and is retried as one, with the same `timeout`
 (it does not grow with the retries); the site is not held to blame for
-it, since the document came in time. A browser that cannot start or
-crashes fails the pages
-with `RenderError`, which is not retried and not held against the site;
-a crashed browser is started again for the next page, once.
+it, since the document came in time. A browser that crashes fails the
+pages it was rendering with `RenderError`, which is not retried and not
+held against the site, and is started again for the next page, once.
+After that, or if it cannot start, the browser is given up with an error
+in the log, and the pages are taken as downloaded, without rendering.
 
 `wait_until: load` is enough for a page that builds itself from its own
 scripts; a page that loads its data afterwards needs `networkidle` or,
@@ -370,7 +391,8 @@ the site serves its scripts and data too. Use `patterns` when only some
 pages need it.
 
 The summary, the JSON statistics and the HTML report count the pages
-rendered and failed (a timeout, a browser that failed) and the average
+rendered and failed (a timeout, a browser that failed), those taken as
+downloaded once the browser was given up, and the average
 time the browser took for a rendered page, without the wait for a free
 tab.
 
@@ -383,6 +405,7 @@ Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
 | `outputs` | list of strings | `[]` | files or database URLs; the pages go to each of them; empty saves nothing |
 | `batch_size` | whole number, >= 1 | `100` | pages written at once |
 | `csv_encoding` | string | `utf-8` | encoding of CSV files, e.g. `utf-8-sig` for Excel |
+| `csv_escape_formulas` | true or false | `true` | a value of a CSV file that a spreadsheet would run as a formula (it starts with `=`, `+`, `-`, `@`, a tab or a carriage return) is written after an apostrophe, and so is one that starts with an apostrophe; reading the file back drops it. See [Formats](data_storage.md#formats) |
 | `overwrite` | true or false | `false` | true starts the files anew on the first write; false adds to them and logs a warning if a file is not empty. A database keeps a row per URL either way |
 
 | Output | Storage |
@@ -394,10 +417,12 @@ Where the crawled pages are saved; see [Saving pages](api.md#saving-pages).
 | `sqlite:///pages.db`, `postgresql://user:password@host:5432/database` | the database of the URL |
 
 `{worker}` in a file name, such as `pages-{worker}.jsonl`, is the name of
-the worker of a crawl job, and `local` in a crawl of its own; so it is in
+the worker of a crawl job, `local` in a crawl of its own and the name of
+the job in the `report` command; so it is in
 `logging.file`, the files of `report` and `session.save_cookies`. A worker
-refuses a file of the storage, SQLite included, without it: workers write
-side by side, and one page may be saved by two of them (see
+refuses any of those files without it, a file of the storage, SQLite
+included, as well: workers write side by side, and one page may be saved
+by two of them (see
 [Crawl jobs](api.md#crawl-jobs)).
 
 ### `logging`
@@ -424,6 +449,7 @@ job (see [Crawl jobs](api.md#crawl-jobs)).
 |-----|------|---------|---------|
 | `stats_json` | string or `null` | `null` | the statistics as JSON |
 | `html` | string or `null` | `null` | an HTML report with tables and charts |
+| `pages` | string or `null` | `null` | a CSV list of the pages not saved, `url, outcome, reason, status, error`: those failed, skipped, blocked and unreachable, in the order they were finished, and as failed (`RecordDropped`) those whose record the storage dropped. A worker does not write it: the command `report` lists the pages of the whole job |
 | `title` | string | `Crawl report` | the title of the HTML report |
 | `top_domains` | whole number, >= 1 | `10` | hosts listed in the statistics |
 

@@ -36,14 +36,16 @@ async def run_worker(
     What and how to crawl is the job's: the sections of `JOB_SECTIONS`,
     which `create_job` kept. `config` gives the rest: the database and the
     leases in `distributed`, the session, the proxies, the storage, the
-    log, the reports and `crawler.max_concurrent`. The keys of the job that
+    log, the reports (but `report.pages`, which the `report` command
+    writes for the whole job) and `crawler.max_concurrent`. The keys of the job that
     `config` sets otherwise are ignored, which is logged as a warning. The
     pages are not kept in memory, whatever `crawler.keep_pages` says: they
     go to the storage, if the worker has one.
 
     `worker` names the worker in the database and stands for "{worker}" in
     the paths of the files it writes; by default it is made of the host
-    name, the process id and a random part. Every file of the storage must
+    name, the process id and a random part. Every file the worker writes,
+    of the storage, the log, the reports and `session.save_cookies`, must
     have "{worker}" in its name: workers write side by side, and a page of
     a worker that stopped is crawled again by another one, so a page may
     be in the files of two workers. A database keeps a row per URL.
@@ -67,12 +69,13 @@ async def run_worker(
     frontier and raises `CancelledError`.
 
     Raises:
-        ConfigError: there is no database, a file of the storage is
+        ConfigError: there is no database, a file the worker writes is
             without "{worker}", or the part of the job cannot be used here,
             such as rendering without Playwright or its Chromium; nothing
             is taken.
         JobError: there is no crawl job of that name.
-        FrontierError: the database cannot be reached or failed an operation.
+        FrontierError: the database cannot be reached or failed an operation,
+            or the job was deleted or restarted under the worker.
         ValueError: `worker` cannot be a part of a file name.
         StorageError: the storage cannot be opened; nothing is requested.
     """
@@ -133,12 +136,23 @@ def host_interval(options: CrawlOptions) -> float:
 
 
 def _check_files(config: CrawlerConfig) -> None:
-    """Raises ConfigError if a file of the storage is not one of the worker's own."""
-    problems = [
-        f"storage.outputs[{index}]: workers of a crawl job write files of their own, "
-        "put {worker} in the name, such as pages-{worker}.jsonl"
+    """Raises ConfigError if a file the worker writes is not one of its own."""
+    files = {
+        f"storage.outputs[{index}]": output
         for index, output in enumerate(config.storage.outputs)
-        if "{worker}" not in output and getattr(storage_from_output(output), "path", None) is not None
+        if getattr(storage_from_output(output), "path", None) is not None
+    }
+    files |= {
+        "logging.file": config.logging.file,
+        "report.stats_json": config.report.stats_json,
+        "report.html": config.report.html,
+        "session.save_cookies": config.session.save_cookies,
+    }
+    problems = [
+        f"{key}: workers of a crawl job write files of their own, put {{worker}} in the name, such as "
+        "pages-{worker}.jsonl"
+        for key, path in files.items()
+        if path is not None and "{worker}" not in path
     ]
     if problems:
         raise ConfigError(problems)
@@ -160,7 +174,11 @@ async def _job_settings(dsn: str, job: str) -> dict[str, Any]:
 
 
 def _worker_config(config: CrawlerConfig, job: str, settings: dict[str, Any]) -> CrawlerConfig:
-    """`config` with the sections of the job taken from `settings`, but `crawler.max_concurrent`; pages not kept."""
+    """`config` with the sections of the job taken from `settings`, but `crawler.max_concurrent`; pages not kept.
+
+    `report.pages` is dropped: the outcomes of the pages are in the
+    database, not in the worker, and the `report` command lists them.
+    """
     given = job_config(config)
     # Those the worker sets, as opposed to defaults it was left with.
     set_here = set(config_differences(job_config(CrawlerConfig()), given))
@@ -172,6 +190,12 @@ def _worker_config(config: CrawlerConfig, job: str, settings: dict[str, Any]) ->
             job,
         )
     part = CrawlerConfig.from_dict(settings, source=f'crawl job "{job}"')
+    if config.report.pages is not None:
+        logger.warning(
+            "report.pages is not written by a worker: the report command lists the pages not saved of crawl job %s",
+            job,
+        )
     crawler = dataclasses.replace(part.crawler, max_concurrent=config.crawler.max_concurrent, keep_pages=False)
+    report = dataclasses.replace(config.report, pages=None)
     sections = {name: getattr(part, name) for name in JOB_SECTIONS}
-    return dataclasses.replace(config, **{**sections, "crawler": crawler})
+    return dataclasses.replace(config, **{**sections, "crawler": crawler, "report": report})

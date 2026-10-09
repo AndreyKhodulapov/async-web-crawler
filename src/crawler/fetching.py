@@ -20,6 +20,7 @@ from crawler.exceptions import (
     HostHeldBackError,
     HTTPStatusError,
     InvalidURLError,
+    NoProxyError,
     ProxyError,
     ProxyNetworkError,
     RenderTimeoutError,
@@ -139,8 +140,9 @@ class Fetcher:
         in a row fail with `TooManyRedirectsError`.
 
         With `raw`, which is how a sitemap is downloaded, the result has the
-        `body` as it was sent instead of the decoded `content`, and a body
-        over `sitemaps.MAX_SIZE` fails with `SitemapError`. With
+        `body` as it was sent instead of the decoded `content`, a body over
+        `sitemaps.MAX_SIZE` fails with `SitemapError` and the request has
+        `sitemaps.TIMEOUT_FACTOR` times as long in all. With
         `truncate_at`, which is how robots.txt is downloaded, the body is
         cut to that many bytes instead of failing over `max_page_size`. With
         `track_errors`, the attempts count in `errors`. Without
@@ -240,7 +242,7 @@ class Fetcher:
 
         async def attempt() -> FetchResult:
             nonlocal last, attempts, failed_at
-            timeout = self._timeout_for(retries=attempts)
+            timeout = self._timeout_for(retries=attempts, sitemap=raw)
             result = await self._fetch_once(
                 url,
                 html_only=html_only,
@@ -356,8 +358,14 @@ class Fetcher:
         except Exception:
             logger.warning("Could not tell the other workers the Crawl-delay of %s", host, exc_info=True)
 
-    def _timeout_for(self, retries: int) -> aiohttp.ClientTimeout:
-        """Timeouts of a request after `retries` failed attempts."""
+    def _timeout_for(self, retries: int, *, sitemap: bool = False) -> aiohttp.ClientTimeout:
+        """Timeouts of a request after `retries` failed attempts.
+
+        A sitemap may take minutes to download: it has
+        `SitemapParser.TIMEOUT_FACTOR` times as long in all, while a server
+        that does not connect or stops sending is given up on as soon as
+        for a page.
+        """
         try:
             growth = min(self.timeout_growth**retries, self.MAX_TIMEOUT_GROWTH)
         except OverflowError:
@@ -365,7 +373,7 @@ class Fetcher:
         base = self._timeout
         assert base.total is not None and base.connect is not None and base.sock_read is not None
         return aiohttp.ClientTimeout(
-            total=base.total * growth,
+            total=base.total * growth * (self.sitemaps.TIMEOUT_FACTOR if sitemap else 1),
             connect=base.connect * growth,
             sock_read=base.sock_read * growth,
         )
@@ -382,8 +390,10 @@ class Fetcher:
             return None  # an invalid URL fails in the transport with InvalidURLError
         try:
             allowed = await self.robots.is_allowed(url, self._user_agent, wait=wait)
+        # Raised for the robots.txt URL; the page is refused for the same reason under its own.
+        except NoProxyError as error:
+            return NoProxyError(url, error.message, seconds=error.seconds)
         except (CrawlerClosedError, CircuitOpenError, ProxyError) as error:
-            # Raised for the robots.txt URL; the page fails for the same reason under its own.
             return type(error)(url, error.message)
         except TimeoutError:
             return RobotsUnreachableError(url, "robots.txt is being downloaded")
@@ -437,14 +447,14 @@ class Fetcher:
         assert result.status is not None and result.content is not None
         return result.status, result.content
 
-    async def _download_sitemap(self, url: str) -> bytes:
+    async def _download_sitemap(self, url: str) -> tuple[bytes, str]:
         """Fetcher for SitemapParser: a sitemap goes through robots.txt, the limits and retries as a page does."""
         # Not decoded: a sitemap may be gzipped. Whoever asked for the sitemap logs the failure.
         result = await self.fetch(url, raw=True, failure_level=logging.INFO, track_errors=False)
         if result.error is not None:
             raise result.error
-        assert result.body is not None
-        return result.body
+        assert result.body is not None and result.final_url is not None
+        return result.body, result.final_url
 
     async def _fetch_once(
         self,
@@ -460,7 +470,8 @@ class Fetcher:
         """Make one request under the breaker `call` of `url`, unless the circuit breaker of the host refuses it.
 
         Nor is it made when its host is held back longer than `max_wait`.
-        A probe of a half-open circuit it took is let go then.
+        A probe of a half-open circuit it took is let go then. HTTP 429
+        slows the requests to the host down (see `RateLimiter.slow_down`).
         """
         host = get_host(url)
 
@@ -483,11 +494,24 @@ class Fetcher:
                 # The rate limit is waited for before taking a concurrency slot,
                 # so a request waiting for its host does not hold a slot another
                 # host could use; inside the slot the interval is checked once more.
-                async with gate() if host is None else self.rate_limiter.slot(host, gate, max_wait=max_wait):
+                async with gate() if host is None else self.rate_limiter.slot(host, gate, max_wait=max_wait) as started:
                     result = await self._send(
                         url, html_only=html_only, raw=raw, truncate_at=truncate_at, timeout=timeout
                     )
                     call.record(result.error)
+                    error = result.error
+                    if (
+                        isinstance(error, HTTPStatusError)
+                        and error.status == 429
+                        and host is not None
+                        and started is not None
+                        and self.rate_limiter.slow_down(host, started)
+                    ):
+                        logger.info(
+                            "%s answered HTTP 429: requests to it are now %.1fs apart",
+                            host,
+                            self.rate_limiter.interval_for(host),
+                        )
                     return result
         except CircuitOpenError as error:
             return FetchResult.failure(url, error, 0.0)

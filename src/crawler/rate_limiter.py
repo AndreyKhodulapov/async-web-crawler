@@ -51,6 +51,13 @@ class RateLimiter:
     request waits for its turn there first, then books the shared schedule.
     Booking both at once would let a domain waiting out a long delay hold
     the shared schedule, and every other domain with it.
+    A request without a domain (`acquire()`) books the shared schedule
+    alone, under either kind of limits: with `per_domain=True` the requests
+    without a domain are spaced out among themselves, as one more domain.
+
+    A domain that answers HTTP 429 asks for fewer requests: `slow_down`
+    doubles its interval, and the slowdown wears off by itself over time
+    (see `slow_down`). It is kept apart from the domain's Crawl-delay.
 
     The algorithm is GCRA (generic cell rate algorithm): each schedule keeps
     only the time its next request may start. `acquire` books that time,
@@ -70,6 +77,11 @@ class RateLimiter:
 
     # Seconds over which `current_rps` is measured.
     WINDOW = 5.0
+    # Bounds of the interval of a domain slowed down by `slow_down`, and the
+    # seconds over which the slowdown halves.
+    MIN_SLOWDOWN = 1.0
+    MAX_SLOWDOWN = 60.0
+    SLOWDOWN_HALF_LIFE = 60.0
 
     def __init__(
         self,
@@ -95,13 +107,15 @@ class RateLimiter:
         self._last_start: dict[str | None, float] = {}
         self._delays: dict[str, float] = {}
         self._penalized_until: dict[str, float] = {}
+        # The interval of a slowed down domain and when it was set.
+        self._slowdowns: dict[str, tuple[float, float]] = {}
         self.reset_stats()
 
     def interval_for(self, domain: str | None) -> float:
         """The minimum gap enforced now between requests to `domain`, jitter aside."""
         if domain is None:
             return self.interval
-        return max(self.interval, self._delays.get(domain, 0.0))
+        return max(self.interval, self._own_delay(domain))
 
     def set_delay(self, domain: str, delay: float) -> bool:
         """Keep requests to `domain` at least `delay` seconds apart, e.g. its Crawl-delay; whether its delay grew.
@@ -117,6 +131,30 @@ class RateLimiter:
         # start with the old interval: move it.
         if domain in self._last_start:
             self._next_start[domain] = max(self._next_start[domain], self._last_start[domain] + delay)
+        return True
+
+    def slow_down(self, domain: str, sent_at: float) -> bool:
+        """Double the interval of `domain` after it answered HTTP 429 to a request started at `sent_at`; whether it grew.
+
+        `sent_at` is the start time `slot` gave the request. The interval
+        becomes at least MIN_SLOWDOWN and at most MAX_SLOWDOWN seconds, then
+        halves every SLOWDOWN_HALF_LIFE seconds, down to the interval the
+        domain has without the slowdown. A request started before the last
+        slowdown does not slow the domain down again: the requests already
+        on their way at the old pace double the interval once, not once
+        each. The Crawl-delay of `set_delay` is not changed.
+        """
+        slowed = self._slowdowns.get(domain)
+        if slowed is not None and sent_at < slowed[1]:
+            return False
+        current = self.interval_for(domain)
+        interval = min(self.MAX_SLOWDOWN, max(2 * current, self.MIN_SLOWDOWN))
+        if interval <= current:
+            return False
+        self._slowdowns[domain] = (interval, self._clock())
+        # The next start may have been booked with the old interval.
+        if domain in self._last_start:
+            self._next_start[domain] = max(self._next_start[domain], self._last_start[domain] + interval)
         return True
 
     def penalize(self, domain: str, seconds: float) -> None:
@@ -139,8 +177,9 @@ class RateLimiter:
         For callers that sleep on their own. Unlike `acquire`, it books all
         schedules at once: under a global limit a domain's own delay then
         holds back the shared schedule too, and the booking does not move
-        if the domain is penalized after it. `domain` may be None only when
-        `per_domain` is False.
+        if the domain is penalized after it. With `domain` None, the request
+        books the shared schedule: under per-domain limits it is spaced out
+        only from the other requests without a domain.
         """
         now = self._clock()
         start = self._book(self._schedules(domain), now)
@@ -160,8 +199,10 @@ class RateLimiter:
         gate: Callable[[], AbstractAsyncContextManager[object]] = contextlib.nullcontext,
         *,
         max_wait: float | None = None,
-    ) -> AsyncGenerator[None, None]:
+    ) -> AsyncGenerator[float, None]:
         """Wait for the turn of `domain`, then hold `gate()`, e.g. a concurrency slot, for the request.
+
+        Gives the time the request started, by the clock of the limiter.
 
         Nothing is waited for inside the gate, so a request waiting for its
         domain does not hold a gate that other domains could use. When the
@@ -184,8 +225,9 @@ class RateLimiter:
             async with gate():
                 if not self._start(domain, start):
                     continue
-                self._record(domain, self._clock(), waited)
-                yield
+                started = self._clock()
+                self._record(domain, started, waited)
+                yield started
                 return
 
     def get_stats(self) -> RateStats:
@@ -225,12 +267,20 @@ class RateLimiter:
 
     def _schedules(self, domain: str | None) -> list[tuple[str | None, float]]:
         """The schedules a request to `domain` waits for, with the interval of each, in order."""
-        if self.per_domain:
-            if domain is None:
-                raise ValueError("a domain is required when limits are per domain")
-            return [(domain, self.interval_for(domain))]
         shared: list[tuple[str | None, float]] = [(None, self.interval)]
-        return shared if domain is None else [(domain, self._delays.get(domain, 0.0)), *shared]
+        if domain is None:
+            return shared
+        if self.per_domain:
+            return [(domain, self.interval_for(domain))]
+        return [(domain, self._own_delay(domain)), *shared]
+
+    def _own_delay(self, domain: str) -> float:
+        """The interval of `domain` alone: its Crawl-delay or what is left of its slowdown, whichever is longer."""
+        delay = self._delays.get(domain, 0.0)
+        if (slowed := self._slowdowns.get(domain)) is None:
+            return delay
+        interval, since = slowed
+        return max(delay, interval * 0.5 ** ((self._clock() - since) / self.SLOWDOWN_HALF_LIFE))
 
     def _book(self, schedules: list[tuple[str | None, float]], now: float) -> float:
         """Take the next start time common to `schedules`; return it."""

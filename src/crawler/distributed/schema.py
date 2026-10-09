@@ -74,8 +74,9 @@ CREATE TABLE IF NOT EXISTS frontier (
 # limit of the job says. A host held back, e.g. after a Retry-After, keeps
 # the reason of the hold that ends last; it says why the host waits while
 # `next_allowed_at` is ahead. The failures of all the workers count toward
-# giving the host up; a host given up has the outcome, reason and error its
-# pages are finished with, unrequested.
+# giving the host up, each kind with the moment it was last counted; a host
+# given up has the outcome, reason and error its pages are finished with,
+# unrequested.
 _HOSTS = """
 CREATE TABLE IF NOT EXISTS hosts (
     job BIGINT NOT NULL REFERENCES crawl_jobs (id) ON DELETE CASCADE,
@@ -87,6 +88,8 @@ CREATE TABLE IF NOT EXISTS hosts (
     requested INTEGER NOT NULL DEFAULT 0,
     circuit_openings INTEGER NOT NULL DEFAULT 0,
     robots_failures INTEGER NOT NULL DEFAULT 0,
+    circuit_counted_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
+    robots_counted_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
     given_up_outcome TEXT CHECK (given_up_outcome IN ('failed', 'unreachable')),
     given_up_reason TEXT,
     given_up_error TEXT,
@@ -145,6 +148,23 @@ _STATEMENTS = (
     # The redirect targets of a page that failed.
     "CREATE INDEX IF NOT EXISTS frontier_seen_from ON frontier (job, seen_from) WHERE state = 'seen'",
     _HOSTS,
+    # A table of hosts made before the columns of the moments gets them.
+    # Checked first: ALTER TABLE locks the table out even when they are
+    # there, and the workers of a running job wait on it.
+    """
+    DO $$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT FROM pg_attribute
+            WHERE attrelid = 'hosts'::regclass AND attname = 'robots_counted_at' AND NOT attisdropped
+        ) THEN
+            ALTER TABLE hosts
+                ADD COLUMN IF NOT EXISTS circuit_counted_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity',
+                ADD COLUMN IF NOT EXISTS robots_counted_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity';
+        END IF;
+    END
+    $$
+    """,
     _WORKERS,
     _SCOPE,
     _OUT_OF_SCOPE,

@@ -13,6 +13,7 @@ from helpers import (
     UNTHROTTLED,
     DatabaseLink,
     MemoryStorage,
+    dead_proxy,
     drop_frontier_tables,
     make_config,
     urlset,
@@ -30,7 +31,7 @@ from crawler import (
     RobotsParser,
 )
 from crawler.config import StorageOptions
-from crawler.distributed import create_job, job_stats, run_worker
+from crawler.distributed import JobMode, create_job, job_stats, run_worker
 from crawler.distributed import worker as worker_module
 from crawler.distributed.frontier import DATABASE_ERRORS
 
@@ -370,8 +371,12 @@ async def test_page_whose_host_asked_to_wait_goes_back_without_a_time_of_its_own
     job = make_config(urls=[url("/busy/60")], retry={"max_retries": 1, "max_delay": 0.5})
     await create_job(job, "test", dsn=POSTGRES_DSN)
     worker = asyncio.create_task(run_worker(worker_config(), "test", worker="w", configure_logging=False))
+    # now() is when the transaction of the query began, which may be before
+    # the host was held back and the page put back: the time of reading is
+    # clock_timestamp().
     query = (
-        "SELECT f.state, f.not_before <= now() AS at_once, h.hold_reason, extract(epoch FROM h.next_allowed_at - now()) AS left"
+        "SELECT f.state, f.not_before <= clock_timestamp() AS at_once, h.hold_reason,"
+        " extract(epoch FROM h.next_allowed_at - clock_timestamp()) AS left"
         " FROM frontier AS f JOIN hosts AS h USING (job, host)"
     )
     try:
@@ -543,6 +548,26 @@ async def test_failed_downloads_of_robots_txt_by_all_workers_give_its_host_up(ur
     assert await urls_in("processed") == set(other)
 
 
+async def test_robots_txt_that_fails_for_all_workers_at_once_counts_as_one_failure(url, site, monkeypatch):
+    # Four workers take the pages of 127.0.0.1 at once and each downloads
+    # its robots.txt, which answers 503 to all four: one failure of the
+    # site, not the four that would pass MAX_ROBOTS_RETRIES. The next
+    # downloads, 2 s later, read it.
+    monkeypatch.setattr(RobotsParser, "UNREACHABLE_TTL", 2.0)
+    site.robots, site.robots_failures_by_host, site.robots_latency = "", {"127.0.0.1": 4}, 1.0
+    pages = [url(f"/wide/{n}") for n in range(1, 9)]
+    job = make_config(urls=pages, crawler={"max_depth": 0, "respect_robots": True})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    await run_workers(worker_config(crawler={"max_concurrent": 2}), 4)
+
+    downloads = [moment for path, moment in site.log if path == "/robots.txt"]
+    assert downloads[3] - downloads[0] < 1.0
+    assert await given_up("127.0.0.1") == (None, None)
+    assert await urls_in("processed") == set(pages)
+    assert await job_state() == "finished"
+
+
 async def test_page_of_a_host_given_up_found_later_is_finished_without_a_request(url, site):
     await create_job(
         make_config(urls=[url("/wide/1", "localhost")], crawler={"max_depth": 0}), "test", dsn=POSTGRES_DSN
@@ -667,6 +692,25 @@ async def test_page_put_back_after_its_redirect_follows_it_again_with_the_next_w
     assert await job_state() == "finished"
 
 
+async def test_page_no_proxy_is_left_for_goes_back_to_the_queue_for_any_worker(url, site):
+    # The proxies of a worker are its own: the next one, without them, crawls the page.
+    page = url("/site/")
+    job = make_config(urls=[page], crawler={"max_depth": 0}, retry={"max_retries": 1, "base_delay": 0.01})
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+
+    async def put_off() -> bool:
+        (row,) = await fetch("SELECT state, waits FROM frontier WHERE url = $1", page)
+        return (row["state"], row["waits"]) == ("queued", 1)
+
+    proxy = {"urls": [dead_proxy()], "max_failures": 1, "cooldown": 0.5}
+    await run_worker_until(worker_config(proxy=proxy), put_off)
+    await run_worker(worker_config(), "test", worker="next", configure_logging=False)
+
+    assert site.hits["/site/"] == 1
+    assert await state_of(page) == "processed"
+    assert await job_state() == "finished"
+
+
 async def test_page_that_keeps_asking_to_wait_fails_after_the_waits_of_all_workers(url, site):
     # Retry-After of 2 s is too long to retry and capped to 0.2 s of
     # holding the host back. The first worker stops after the first wait:
@@ -732,6 +776,23 @@ async def test_worker_whose_storage_cannot_write_takes_no_pages_until_it_can(url
     assert await job_state() == "finished"
 
 
+async def test_page_whose_record_no_write_takes_fails_in_the_job_and_the_job_finishes(url, site, monkeypatch):
+    await create_job(make_config(urls=[url("/wide/0")]), "test", dsn=POSTGRES_DSN)
+    refused = url("/wide/7")
+    storage = MemoryStorage(batch_size=5, refused={refused})
+    monkeypatch.setattr(StorageOptions, "build", lambda self: storage)
+
+    async with asyncio.timeout(10):
+        await run_workers(worker_config(), 1)
+
+    saved = {page for batch in storage.urls for page in batch}
+    assert len(saved) == WIDE_PAGES - 1
+    assert saved == await urls_in("processed")
+    assert await urls_in("failed") == {refused}
+    assert (await job_stats(POSTGRES_DSN, "test"))["errors"] == {"RecordDropped": 1}
+    assert await job_state() == "finished"
+
+
 async def test_worker_whose_database_is_gone_stops_and_the_others_crawl_its_pages(url, site, tmp_path, caplog):
     # The first worker reaches the database through a link cut once it has crawled a few pages.
     caplog.set_level(logging.WARNING, logger="crawler")
@@ -764,6 +825,31 @@ async def test_worker_whose_database_is_gone_stops_and_the_others_crawl_its_page
     assert len(processed) == WIDE_PAGES
     assert set(saved_urls(tmp_path)) == processed
     assert await job_state() == "finished"
+
+
+async def test_worker_whose_job_is_restarted_under_it_stops_and_writes_its_pages(url, site, tmp_path, caplog):
+    # Two pages a second, and no links past the start page: the worker mostly waits for the turn of the host.
+    config = make_config(urls=[url("/wide/0")], crawler={"rate_limit": 2, "max_depth": 1})
+    await create_job(config, "test", dsn=POSTGRES_DSN)
+    storage = {"outputs": [str(tmp_path / "pages-{worker}.jsonl")]}
+    worker = asyncio.create_task(
+        run_worker(worker_config(storage=storage), "test", worker="old", configure_logging=False)
+    )
+    async with asyncio.timeout(5):
+        while len(await urls_in("saving")) < 3:
+            await asyncio.sleep(0.02)
+
+    await create_job(config, "test", dsn=POSTGRES_DSN, mode=JobMode.RESTART)
+
+    async with asyncio.timeout(5):
+        with pytest.raises(FrontierError, match='JobError: Crawl job "test" no longer exists') as raised:
+            await worker
+    assert isinstance(raised.value.__cause__, JobError)
+    assert len(saved_urls(tmp_path)) >= 3
+    assert "Unexpected error" not in caplog.text
+    # The new job is left to the workers that join it.
+    assert await urls_in("queued") == {url("/wide/0")}
+    assert await fetch("SELECT url FROM frontier WHERE state <> 'queued'") == []
 
 
 async def test_os_error_of_a_worker_outside_the_database_fails_its_page_alone(url, site, monkeypatch, caplog):
@@ -842,6 +928,29 @@ async def test_file_of_the_storage_without_the_name_of_the_worker_is_refused(url
     with pytest.raises(ConfigError, match=r"storage.outputs\[1\]: .*\{worker\}"):
         await run_worker(config, "test", configure_logging=False)
 
+    assert site.hits.total() == 0
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("section", "option"),
+    [("logging", "file"), ("report", "stats_json"), ("report", "html"), ("session", "save_cookies")],
+)
+async def test_log_report_or_cookies_file_without_the_name_of_the_worker_is_refused(
+    url, site, tmp_path, section, option
+):
+    await create_job(make_config(urls=[url("/site/b.html")]), "test", dsn=POSTGRES_DSN)
+    files = {
+        "logging": {"file": str(tmp_path / "crawler-{worker}.log")},
+        "report": {"stats_json": str(tmp_path / "stats-{worker}.json"), "html": str(tmp_path / "report-{worker}.html")},
+        "session": {"save_cookies": str(tmp_path / "cookies-{worker}.txt")},
+    }
+    files[section][option] = str(tmp_path / "shared")
+
+    with pytest.raises(ConfigError) as refused:
+        await run_worker(worker_config(**files), "test", configure_logging=False)
+
+    assert [problem.split(":")[0] for problem in refused.value.problems] == [f"{section}.{option}"]
     assert site.hits.total() == 0
     assert list(tmp_path.iterdir()) == []
 

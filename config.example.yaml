@@ -64,7 +64,8 @@ filters:
                        css, js]
 
 # Cookies and headers of the requests. Their values are secrets: they stay
-# out of the log, the summary and the reports, so keep this file private too.
+# out of the log, the summary and the reports, so keep this file private too,
+# or take them from the environment: "Bearer ${API_TOKEN}".
 session:
   keep_cookies: true    # send back the cookies sites set; false keeps none, so no site can keep a session
   # Cookies sent from the first request, each to its own domain only:
@@ -74,12 +75,12 @@ session:
   save_cookies: null    # e.g. cookies.txt; written after the crawl, readable by its owner only
   # Sent with every request to every host, robots.txt and redirects to other
   # sites included; User-Agent, Cookie and Host have keys of their own.
-  headers: {}           # e.g. {Accept-Language: en, Authorization: "Bearer ..."}
+  headers: {}           # e.g. {Accept-Language: en, Authorization: "Bearer ${API_TOKEN}"}
 
 # Proxies the requests go through; without any, requests go directly.
 # robots.txt, rate limits and max_per_domain still go by the host of the site.
 proxy:
-  urls: []              # e.g. ["http://user:password@proxy-1.example:3128", "http://proxy-2.example:3128"]
+  urls: []              # e.g. ["http://user:${PROXY_PASSWORD}@proxy-1.example:3128", "http://proxy-2.example:3128"]
   rotation: per_host    # per_host: a host always goes through one proxy; per_request: the proxies take turns
   from_env: false       # true takes HTTP_PROXY, HTTPS_PROXY and NO_PROXY instead of urls
   max_failures: 3       # failures in a row that take a proxy out of rotation
@@ -106,6 +107,7 @@ storage:
   outputs: []           # e.g. [pages.jsonl, pages.csv]
   batch_size: 100       # pages written at once
   csv_encoding: utf-8   # utf-8-sig for Excel
+  csv_escape_formulas: true  # an apostrophe before a value that Excel would run as a formula (=, +, -, @)
   overwrite: false      # true starts the files anew; false adds to them (databases keep a row per URL)
 
 logging:
@@ -119,6 +121,7 @@ logging:
 report:
   stats_json: null      # e.g. stats.json
   html: null            # e.g. report.html
+  pages: null           # e.g. pages-not-saved.csv: url, outcome, reason, status, error; a worker leaves it to the report command
   title: Crawl report
   top_domains: 10       # hosts listed in the statistics
 

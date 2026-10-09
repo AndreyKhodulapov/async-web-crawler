@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 
 import aiohttp
 import pytest
-from helpers import UNTHROTTLED, FakeClock, MemoryStorage
+from helpers import UNTHROTTLED, FakeClock, MemoryStorage, index, urlset
 from multidict import CIMultiDict
 
 from crawler import (
@@ -43,6 +43,7 @@ from crawler import (
     RetryStrategy,
     RobotsDisallowedError,
     RobotsUnreachableError,
+    SitemapParser,
     StorageError,
     TooManyRedirectsError,
     TransientError,
@@ -501,6 +502,18 @@ class TestFetchMany:
         [result] = await crawler.fetch_many(["http://a"])
         assert result.robots_tag == ("noindex", "noarchive")
 
+    async def test_credentials_in_a_redirect_are_dropped(self, crawler, fake_session):
+        # Those written in the Location are dropped; a relative one keeps the request's.
+        fake_session.routes["http://a/"] = FakeResponse(status=302, location="http://user:pass@b/x")
+        fake_session.routes["http://u:p@a/"] = FakeResponse(status=302, location="/y")
+        await crawler.fetch_many(["http://a/", "http://u:p@a/"])
+        assert sorted(fake_session.requested) == ["http://a/", "http://b/x", "http://u:p@a/", "http://u:p@a/y"]
+
+    async def test_credentials_in_the_links_of_a_page_are_dropped(self, crawler, fake_session):
+        fake_session.routes["http://a/"] = FakeResponse(b"<a href='http://user:pass@a/x'>x</a><a href='/y'>y</a>")
+        page = await crawler.fetch_and_parse("http://a/")
+        assert page["links"] == ["http://a/x", "http://a/y"]
+
     async def test_redirect_and_missing_content_type(self, crawler, fake_session):
         fake_session.routes["http://a"] = FakeResponse(status=302, location="https://a/home")
         fake_session.routes["https://a/home"] = FakeResponse(content_type=None)
@@ -957,19 +970,26 @@ class TestCrawlBlockedHost:
         await crawler.crawl([*pages, "http://b/"])
 
         # Opened by a/0, which lost its retries to that and is put off like
-        # the others, then by the failed probes a/0 and a/1: a page whose
-        # probe failed is not put off again, so a/2 and a/3 are never requested.
-        assert fake_session.requested == ["http://a/0", "http://b/", "http://a/0", "http://a/1"]
+        # the others, then by the two failed probes. The pages put off come
+        # back at the same moment, in no set order: any two of them may be
+        # the probes. A page whose probe failed is not put off again, so the
+        # other two are never requested again.
+        requested = [page for page in fake_session.requested if page != "http://b/"]
+        probes = requested[1:]
+        assert fake_session.requested.count("http://b/") == 1
+        assert requested[0] == "http://a/0"
+        assert len(probes) == len(set(probes)) == 2 and set(probes) < set(pages)
+        given_up = [page for page in pages if page not in probes]
         assert list(crawler.processed_urls) == ["http://b/"]
-        assert [crawler.failed_urls[page].split(":")[0] for page in pages] == ["NetworkError"] * 2 + [
-            "CircuitOpenError"
-        ] * 2
+        assert {page: crawler.failed_urls[page].split(":")[0] for page in pages} == {
+            page: "NetworkError" if page in probes else "CircuitOpenError" for page in pages
+        }
         assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
         messages = [record.getMessage() for record in caplog.records]
         assert any(message.startswith("Deferred http://a/0 for 0.") for message in messages)
-        assert any(message.startswith("Deferred http://a/1 for 0.") for message in messages)
-        assert "Gave up on http://a/3: circuit breaker of a opened 3 times" in messages
-        # Deferred pages are counted once, when they are done; a/2 and a/3 were never requested.
+        for page in given_up:
+            assert f"Gave up on {page}: circuit breaker of a opened 3 times" in messages
+        # Deferred pages are counted once, when they are done; two were never requested again.
         stats = crawler.stats.get_stats()
         assert (stats["total_pages"], stats["successful"], stats["failed"]) == (5, 1, 4)
         assert stats["errors"] == {"NetworkError": 2, "CircuitOpenError": 2}
@@ -1086,13 +1106,16 @@ class TestCrawlBlockedHost:
         # The review's probe: a host answers 503 for a moment. Every page
         # in flight fails, the first ones open the circuit, and none is
         # retried, as the breaker refuses the retries; without the crawl
-        # putting them off, they would be the pages lost to the outage.
+        # putting them off, they would be the pages lost to the outage. The
+        # first failure is retried once the others have opened the circuit,
+        # however slow the machine, and well before the cooldown ends.
         caplog.set_level(logging.INFO, logger="crawler")
+        caplog.set_level(logging.DEBUG, logger="crawler.crawl_run")  # "Deferred" lines after the first of a host
         crawler = make_crawler(
             max_concurrent=4,
             max_depth=0,
-            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
-            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=0.05),
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.1),
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=1.0),
         )
         pages = [f"http://a/{page}" for page in range(8)]
         for page in pages[:4]:
@@ -1135,6 +1158,52 @@ class TestCrawlBlockedHost:
         assert crawler.processed_urls == {}
         assert len(fake_session.requested) == 6
         assert crawler.circuit_breaker.times_opened("a") == AsyncCrawler.MAX_CIRCUIT_OPENINGS
+
+    async def test_host_that_answers_too_many_requests_is_not_given_up(
+        self, make_crawler, fake_session, brief_slowdown
+    ):
+        # The host asks for fewer requests: its 429s pause it, but do not
+        # block it, and every page comes through on a retry.
+        crawler = make_crawler(
+            max_concurrent=4,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(failure_threshold=0.5, min_requests=2, cooldown=0.05),
+        )
+        pages = [f"http://a/{page}" for page in range(8)]
+        for page in pages:
+            fake_session.routes[page] = [FakeResponse(status=429), FakeResponse(status=429), FakeResponse()]
+        fake_session.latency = 0.01
+
+        await crawler.crawl(pages)
+
+        assert crawler.failed_urls == {}
+        assert set(crawler.processed_urls) == set(pages)
+        assert crawler.circuit_breaker.times_opened("a") == 0
+
+    async def test_page_answered_with_too_many_requests_while_the_circuit_opens_is_put_off(
+        self, make_crawler, fake_session
+    ):
+        # The 503s of a/0 and a/1 open the circuit, and the breaker refuses
+        # the retry a/2 would have had for its 429: the page is put off
+        # with the others, not lost to the outage.
+        crawler = make_crawler(
+            max_concurrent=3,
+            max_depth=0,
+            retry_strategy=RetryStrategy(max_retries=3, base_delay=0.001),
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=2, cooldown=0.05),
+        )
+        pages = ["http://a/0", "http://a/1", "http://a/2"]
+        fake_session.routes["http://a/0"] = [FakeResponse(status=503), FakeResponse()]
+        fake_session.routes["http://a/1"] = [FakeResponse(status=503), FakeResponse()]
+        fake_session.routes["http://a/2"] = [FakeResponse(status=429), FakeResponse()]
+        fake_session.latency = 0.01
+
+        await crawler.crawl(pages)
+
+        assert crawler.failed_urls == {}
+        assert set(crawler.processed_urls) == set(pages)
+        assert crawler.circuit_breaker.times_opened("a") == 1
 
     async def test_page_whose_probe_fails_is_not_put_off_again(self, make_crawler, fake_session):
         # One page of a healthy host answers 500 every time, and opens the
@@ -1257,6 +1326,7 @@ class TestCrawlHeldBackHost:
         # request is not retried, its other pages are put off, which is said
         # once at WARNING.
         caplog.set_level(logging.INFO, logger="crawler")
+        caplog.set_level(logging.DEBUG, logger="crawler.crawl_run")  # "Deferred" lines after the first of a host
         crawler = make_crawler(
             max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=1, max_delay=0.5)
         )
@@ -1276,6 +1346,37 @@ class TestCrawlHeldBackHost:
         assert warnings.count("a asked to wait 1s (Retry-After); its pages are put off until then") == 1
         deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/")]
         assert len(deferred) == 3
+
+    @pytest.mark.parametrize(("interval", "at_info"), [(CrawlRun.DEFERRED_LOG_INTERVAL, 2), (0.0, 6)])
+    async def test_pages_put_off_for_their_host_are_logged_at_info_once_a_while(
+        self, make_crawler, fake_session, caplog, monkeypatch, interval, at_info
+    ):
+        # While a host is held back, each of its pages is put off: the
+        # first line of each host is at INFO, the rest of the interval at DEBUG.
+        monkeypatch.setattr(CrawlRun, "DEFERRED_LOG_INTERVAL", interval)
+        caplog.set_level(logging.DEBUG, logger="crawler.crawl_run")
+        crawler = make_crawler(
+            max_concurrent=1, max_depth=0, retry_strategy=RetryStrategy(max_retries=1, max_delay=0.5)
+        )
+        crawler.MIN_PENALTY_TO_DEFER = 0.05
+        pages = [f"http://{host}/{page}" for host in "ab" for page in range(1, 4)]
+        for page in pages:
+            fake_session.routes[page] = FakeResponse(b"ok")
+        for page in ("http://a/1", "http://b/1"):
+            fake_session.routes[page] = [FakeResponse(status=429, retry_after="1"), FakeResponse(b"ok")]
+
+        await crawler.crawl(["http://a/1", "http://b/1", "http://a/2", "http://a/3", "http://b/2", "http://b/3"])
+
+        assert set(crawler.processed_urls) == set(pages)
+        deferred = [record for record in caplog.records if record.getMessage().startswith("Deferred ")]
+        assert sorted(record.getMessage().split()[1] for record in deferred) == pages
+        at_info_by_host = Counter(get_host(r.getMessage().split()[1]) for r in deferred if r.levelno == logging.INFO)
+        assert sum(at_info_by_host.values()) == at_info
+        assert set(at_info_by_host) == {"a", "b"}
+        # The first line of a host is the one at INFO.
+        for host in "ab":
+            first = next(r for r in deferred if get_host(r.getMessage().split()[1]) == host)
+            assert first.levelno == logging.INFO
 
     async def test_page_forbidden_with_a_long_retry_after_fails_at_once(self, make_crawler, fake_session, caplog):
         # HTTP 403 with a Retry-After: the host is held back as it asked,
@@ -1313,8 +1414,11 @@ class TestCrawlHeldBackHost:
         assert set(crawler.processed_urls) == {"http://a/1"}
         assert crawler.crawl_stats().queued == 0
 
-    async def test_page_that_keeps_asking_to_wait_fails_in_the_end(self, make_crawler, fake_session, caplog):
+    async def test_page_that_keeps_asking_to_wait_fails_in_the_end(
+        self, make_crawler, fake_session, caplog, brief_slowdown
+    ):
         caplog.set_level(logging.INFO, logger="crawler")
+        caplog.set_level(logging.DEBUG, logger="crawler.crawl_run")  # "Deferred" lines after the first of a host
         crawler = make_crawler(
             max_concurrent=1,
             max_depth=0,
@@ -1330,6 +1434,25 @@ class TestCrawlHeldBackHost:
         assert crawler.stats.get_stats()["total_pages"] == 1
         deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/1 for 0.1s")]
         assert len(deferred) == AsyncCrawler.MAX_WAITS_PER_PAGE
+
+    async def test_page_whose_host_is_held_back_while_it_waits_for_its_turn_goes_back_uncounted(
+        self, make_crawler, fake_session, caplog
+    ):
+        # a/1 and a/2 are taken at once; a/2 waits for the turn of host a
+        # when a/1 is answered with a Retry-After of 1 s. a/2 goes back to
+        # the queue, uncounted, and its worker crawls b/1 meanwhile. Were it
+        # counted twice, max_pages would leave it out.
+        caplog.set_level(logging.INFO, logger="crawler")
+        crawler = make_crawler(max_concurrent=2, max_depth=0, requests_per_second=3.0)  # 0.33 s apart
+        crawler.MIN_PENALTY_TO_DEFER = 0.1
+        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
+
+        await crawler.crawl(["http://a/1", "http://a/2", "http://b/1"], max_pages=3)
+
+        assert fake_session.requested == ["http://a/1", "http://b/1", "http://a/2"]
+        assert set(crawler.processed_urls) == {"http://a/2", "http://b/1"}
+        deferred = [r.getMessage() for r in caplog.records if r.getMessage().startswith("Deferred http://a/2")]
+        assert len(deferred) == 1 and deferred[0].endswith(": its host is held back")
 
     async def test_pause_before_a_retry_is_not_a_warning(self, make_crawler, fake_session, caplog):
         # A 429 without Retry-After holds the host back for the retry pause,
@@ -1356,7 +1479,8 @@ class SharedMemoryFrontier(MemoryFrontier):
     is held comes back when the hold ends, as a frontier in a database
     hands it out. It counts the failures of hosts in `failures`, as other
     processes would have too, keeps what it was told in `told` (host,
-    circuit openings, robots.txt failures, robots.txt read), the hosts
+    circuit openings, robots.txt failures, robots.txt read) and how far
+    apart failures are to count in `apart` (circuit, robots.txt), the hosts
     given up in `given_up_hosts` (host, outcome, reason, error) and the
     intervals of hosts in `intervals`.
     """
@@ -1369,6 +1493,7 @@ class SharedMemoryFrontier(MemoryFrontier):
         self.put_backs: list[tuple[str, bool, bool]] = []
         self.failures: dict[str, HostFailures] = {}
         self.told: list[tuple[str, int, int, bool]] = []
+        self.apart: list[tuple[float, float]] = []
         self.given_up_hosts: list[tuple[str, PageOutcome, str, str | None]] = []
         self.intervals: list[tuple[str, float]] = []
         self._held_until: dict[str, float] = {}
@@ -1377,9 +1502,17 @@ class SharedMemoryFrontier(MemoryFrontier):
         self.intervals.append((host, seconds))
 
     async def count_host_failures(
-        self, host: str, *, circuit_openings: int = 0, robots_failures: int = 0, robots_read: bool = False
+        self,
+        host: str,
+        *,
+        circuit_openings: int = 0,
+        robots_failures: int = 0,
+        robots_read: bool = False,
+        circuit_apart: float = 0.0,
+        robots_apart: float = 0.0,
     ) -> HostFailures:
         self.told.append((host, circuit_openings, robots_failures, robots_read))
+        self.apart.append((circuit_apart, robots_apart))
         known = self.failures.get(host, HostFailures())
         self.failures[host] = HostFailures(
             known.circuit_openings + circuit_openings, (0 if robots_read else known.robots_failures) + robots_failures
@@ -1590,6 +1723,27 @@ class TestCrawlSharedFrontier:
         assert frontier.told == [("a", 1, 0, False)]
         assert set(crawler.failed_urls) == {"http://a/1", "http://a/2"}
 
+    async def test_failures_of_a_host_count_in_the_crawl_half_a_cooldown_or_a_robots_txt_retry_apart(
+        self, make_crawler, fake_session
+    ):
+        # Failures of other processes told sooner are the same failure.
+        crawler = make_crawler(
+            respect_robots=True,
+            max_depth=0,
+            circuit_breaker=CircuitBreaker(failure_threshold=1.0, min_requests=1, cooldown=0.2),
+        )
+        crawler.robots.UNREACHABLE_TTL = 0.05
+        fake_session.routes["http://a/robots.txt"] = [
+            FakeResponse(status=503),
+            FakeResponse(b"", content_type="text/plain"),
+        ]
+        frontier = SharedMemoryFrontier()
+
+        await crawler.crawl_frontier(frontier, ["http://a/1"])
+
+        assert frontier.told
+        assert set(frontier.apart) == {(0.1, 0.025)}
+
     async def test_crawl_of_one_process_tells_its_frontier_of_no_failure_of_a_host(
         self, make_crawler, fake_session, monkeypatch
     ):
@@ -1664,18 +1818,6 @@ class TestCrawlSharedFrontier:
         assert set(crawler.processed_urls) == {"http://a/1", "http://a/2"}
         assert crawler.rate_limiter.interval_for("a") == 0.01
         assert told == []
-
-    async def test_crawl_of_one_process_waits_in_the_rate_limiter(self, make_crawler, fake_session, caplog):
-        # Its frontier is not shared: the page waits for the host as before.
-        caplog.set_level(logging.INFO, logger="crawler")
-        crawler = make_crawler(max_concurrent=2, max_depth=0, requests_per_second=3.0)
-        crawler.MIN_PENALTY_TO_DEFER = 0.1
-        fake_session.routes["http://a/1"] = FakeResponse(status=429, retry_after="1")
-
-        await crawler.crawl(["http://a/1", "http://a/2"])
-
-        assert set(crawler.processed_urls) == {"http://a/2"}
-        assert not [r for r in caplog.records if r.getMessage().startswith("Deferred http://a/2")]
 
 
 class Unreachable(Exception):
@@ -1992,7 +2134,7 @@ class TestCrawlStorage:
 
     @staticmethod
     def recording_frontier(monkeypatch) -> list[tuple[str, ...]]:
-        """The pages the crawl finishes as processed, and those it reports saved, in order."""
+        """The pages the crawl finishes as processed, and those it reports saved or dropped, in order."""
         events: list[tuple[str, ...]] = []
 
         class Recording(MemoryFrontier):
@@ -2003,6 +2145,9 @@ class TestCrawlStorage:
 
             async def saved(self, urls):
                 events.append(("saved", *urls))
+
+            async def dropped(self, urls):
+                events.append(("dropped", *urls))
 
         monkeypatch.setattr("crawler.client.MemoryFrontier", Recording)
         return events
@@ -2024,6 +2169,22 @@ class TestCrawlStorage:
         ]
         # The storage reports to the frontier of its crawl only.
         assert storage.on_settled is None
+
+    async def test_page_whose_record_is_dropped_is_reported_dropped(self, make_crawler, fake_session, monkeypatch):
+        events = self.recording_frontier(monkeypatch)
+        storage = MemoryStorage(batch_size=2, refused={"http://a/2"})
+        crawler = make_crawler(storage=storage, max_concurrent=1, max_depth=1)
+        fake_session.routes["http://a/1"] = FakeResponse(b'<a href="http://a/2">2</a>')
+
+        await crawler.crawl(["http://a/1"])
+
+        assert events == [
+            ("pending save", "http://a/1"),
+            ("pending save", "http://a/2"),
+            ("saved", "http://a/1"),
+            ("dropped", "http://a/2"),
+        ]
+        assert storage.on_dropped is None
 
     async def test_without_a_storage_pages_are_processed_at_once(self, make_crawler, fake_session, monkeypatch):
         events = self.recording_frontier(monkeypatch)
@@ -2187,6 +2348,38 @@ class TestUserAgents:
     def test_single_string_is_rejected(self):
         with pytest.raises(TypeError, match="got a string"):
             AsyncCrawler(user_agents="TestBot/1.0")
+
+
+class TestSitemaps:
+    async def test_sitemap_has_longer_in_all_than_a_page(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+            connect_timeout=1,
+            read_timeout=2,
+            total_timeout=4,
+            timeout_growth=2,
+        )
+        fake_session.routes["http://a/sitemap.xml"] = [
+            aiohttp.SocketTimeoutError(),
+            FakeResponse(urlset("http://a/page"), content_type="application/xml"),
+        ]
+        assert await crawler.sitemaps.fetch_sitemap("http://a/sitemap.xml") == ["http://a/page"]
+        await crawler.fetch_url("http://a/page")
+
+        timeouts = [(t.connect, t.sock_read, t.total) for t in fake_session.timeouts]
+        factor = SitemapParser.TIMEOUT_FACTOR
+        assert timeouts == [(1, 2, 4 * factor), (2, 4, 8 * factor), (1, 2, 4)]
+
+    async def test_index_lists_the_sitemaps_of_the_host_it_redirected_to(self, make_crawler, fake_session):
+        fake_session.routes["http://a/sitemap.xml"] = FakeResponse(status=301, location="http://www.a/sitemap.xml")
+        fake_session.routes["http://www.a/sitemap.xml"] = FakeResponse(
+            index("http://www.a/pages.xml", "http://a/old.xml"), content_type="application/xml"
+        )
+        fake_session.routes["http://www.a/pages.xml"] = FakeResponse(urlset("http://www.a/page"))
+        crawler = make_crawler()
+
+        assert await crawler.sitemaps.fetch_sitemap("http://a/sitemap.xml") == ["http://www.a/page"]
+        assert fake_session.requested == ["http://a/sitemap.xml", "http://www.a/sitemap.xml", "http://www.a/pages.xml"]
 
 
 class TestRobots:
@@ -2649,6 +2842,41 @@ class TestProxies:
         assert isinstance(result.error, NoProxyError)  # the retry found no proxy, and it is not retried
         assert fake_session.requested == ["http://a/"]
         assert crawler.error_stats().retries == 1
+
+    async def test_pages_no_proxy_is_left_for_wait_until_one_is_back(self, make_crawler, fake_session, caplog):
+        crawler = make_crawler(
+            proxies=ProxyPool(["http://proxy:3128"], max_failures=1, cooldown=0.05),
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+            max_concurrent=1,
+        )
+        fake_session.routes["http://a/1"] = [
+            aiohttp.ClientProxyConnectionError(MagicMock(), ConnectionRefusedError("connection refused")),
+            FakeResponse(),
+        ]
+        with caplog.at_level(logging.WARNING):
+            pages = await crawler.crawl(["http://a/1", "http://a/2"])
+
+        # /2 is taken while the proxy is out, and is put off too, sent once it is back.
+        assert set(pages) == {"http://a/1", "http://a/2"}
+        assert Counter(fake_session.requested) == {"http://a/1": 2, "http://a/2": 1}
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        prefix = "Pages are put off until a proxy is back: no proxy available: http://proxy:3128 is out of rotation"
+        assert len([message for message in warnings if message.startswith(prefix)]) == 1
+
+    async def test_page_fails_once_it_has_waited_for_proxies_that_never_come_back(self, make_crawler, fake_session):
+        crawler = make_crawler(
+            proxies=ProxyPool(["http://proxy:3128"], max_failures=1, cooldown=0.01),
+            retry_strategy=RetryStrategy(max_retries=1, base_delay=0.001),
+        )
+        fake_session.routes["http://a/"] = aiohttp.ClientProxyConnectionError(
+            MagicMock(), ConnectionRefusedError("connection refused")
+        )
+        pages = await crawler.crawl(["http://a/"])
+
+        assert pages == {}
+        # Each time it is taken, the proxy back from its cooldown fails once more and is out again.
+        assert fake_session.requested == ["http://a/"] * (1 + AsyncCrawler.MAX_WAITS_PER_PAGE)
+        assert crawler.failed_urls["http://a/"].startswith("NoProxyError: no proxy available")
 
     async def test_a_crawl_counts_the_proxies_anew(self, make_proxied, fake_session):
         crawler = make_proxied("http://proxy-1:3128", "http://proxy-2:3128")

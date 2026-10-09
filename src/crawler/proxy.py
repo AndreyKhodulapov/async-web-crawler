@@ -235,14 +235,14 @@ class ProxyPool:
                 f"no proxy available: all {len(candidates)} proxies are out of rotation,"
                 f" the first is back in {back_in:.1f}s"
             )
-        raise NoProxyError(url, message)
+        raise NoProxyError(url, message, seconds=back_in)
 
     def record(self, proxy: Proxy, url: str, error: FetchError | None) -> None:
         """How a request to `url` through `proxy` went.
 
         None: a response came through, whatever its status; a
         `ProxyNetworkError`: the proxy failed. Any other error, such as a
-        timeout, counts the request, but neither way: it may be the site's.
+        read timeout, counts the request, but neither way: it may be the site's.
         """
         state = self._states[proxy.label]
         state.requests += 1

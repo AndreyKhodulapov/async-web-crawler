@@ -27,6 +27,8 @@ POSTGRES_DSN = os.environ.get(
     "CRAWLER_TEST_DATABASE_URL",
     f"postgresql://crawler:crawler@localhost:{os.environ.get('CRAWLER_POSTGRES_PORT') or 5432}/crawler",
 )
+# The same database, every transaction of which may only read, as for a role that monitors the jobs.
+READ_ONLY_DSN = f"{POSTGRES_DSN}{'&' if '?' in POSTGRES_DSN else '?'}default_transaction_read_only=on"
 SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
 COOKIES_FILE_HEADER = "# Netscape HTTP Cookie File\n"
 EXAMPLES = Path(__file__).parents[1] / "examples"
@@ -61,6 +63,14 @@ async def drop_frontier_tables() -> None:
             "DROP TABLE IF EXISTS out_of_scope, job_scope, workers, hosts, frontier, crawl_jobs;"
             " DROP SEQUENCE IF EXISTS frontier_seq"
         )
+    finally:
+        await connection.close()
+
+
+async def frontier_tables_exist() -> bool:
+    connection = await asyncpg.connect(POSTGRES_DSN)
+    try:
+        return await connection.fetchval("SELECT to_regclass('crawl_jobs') IS NOT NULL")
     finally:
         await connection.close()
 

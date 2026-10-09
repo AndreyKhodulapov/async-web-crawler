@@ -13,24 +13,26 @@ from crawler import HTTPStatusError, NetworkError, SitemapError, SitemapParser
 
 
 class FakeSite:
-    """Serves sitemaps by URL and records what was requested."""
+    """Serves sitemaps by URL, following the redirects it is given, and records what was requested."""
 
-    def __init__(self, files: dict[str, bytes | Exception]) -> None:
+    def __init__(self, files: dict[str, bytes | Exception], redirects: dict[str, str] | None = None) -> None:
         self.files = files
+        self.redirects = redirects or {}
         self.requested: list[str] = []
         self.in_flight = 0
         self.max_in_flight = 0
 
-    async def __call__(self, url: str) -> bytes:
+    async def __call__(self, url: str) -> tuple[bytes, str]:
         self.requested.append(url)
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
         await asyncio.sleep(0)
         self.in_flight -= 1
-        answer = self.files.get(url, HTTPStatusError(url, 404, "Not Found"))
+        final_url = self.redirects.get(url, url)
+        answer = self.files.get(final_url, HTTPStatusError(url, 404, "Not Found"))
         if isinstance(answer, Exception):
             raise answer
-        return answer
+        return answer, final_url
 
 
 async def fetch(files: dict[str, bytes | Exception], url: str = "https://site/sitemap.xml", **options) -> list[str]:
@@ -104,6 +106,13 @@ class TestIndex:
         }
         assert await fetch(files) == ["https://site/post/1", "https://site/post/2", "https://site/about"]
 
+    async def test_credentials_in_the_locations_are_dropped(self):
+        files = {
+            "https://site/sitemap.xml": index("https://user:pass@site/pages.xml"),
+            "https://site/pages.xml": urlset("https://user:pass@site/page"),
+        }
+        assert await fetch(files) == ["https://site/page"]
+
     async def test_follows_nested_indexes(self):
         files = {
             "https://site/sitemap.xml": index("https://site/2026.xml"),
@@ -147,6 +156,40 @@ class TestIndex:
         assert "https://site/missing.xml" in skipped[0] and "HTTP 404" in skipped[0]
         assert "NetworkError" in skipped[1]
         assert "SitemapError" in skipped[2]
+
+    async def test_sitemaps_of_other_hosts_in_an_index_are_left_out(self, caplog):
+        site = FakeSite(
+            {
+                "https://site/sitemap.xml": index(
+                    "https://other/a.xml", "https://site/pages.xml", "https://cdn.site/b.xml", "http://site:8080/c.xml"
+                ),
+                "https://site/pages.xml": urlset("https://site/page"),
+                "http://site:8080/c.xml": urlset("https://site/more"),
+            }
+        )
+        with caplog.at_level(logging.WARNING, logger="crawler.sitemap"):
+            urls = await SitemapParser(site).fetch_sitemap("https://site/sitemap.xml")
+        assert urls == ["https://site/page", "https://site/more"]
+        assert sorted(site.requested) == [
+            "http://site:8080/c.xml",
+            "https://site/pages.xml",
+            "https://site/sitemap.xml",
+        ]
+        assert (
+            "Sitemap index https://site/sitemap.xml: 2 sitemaps on other hosts left out, such as https://other/a.xml"
+            in (caplog.text)
+        )
+
+    async def test_host_of_an_index_is_the_one_it_redirected_to(self):
+        site = FakeSite(
+            {
+                "https://www.site/sitemap.xml": index("https://www.site/pages.xml", "https://site/old.xml"),
+                "https://www.site/pages.xml": urlset("https://www.site/page"),
+            },
+            redirects={"https://site/sitemap.xml": "https://www.site/sitemap.xml"},
+        )
+        assert await SitemapParser(site).fetch_sitemap("https://site/sitemap.xml") == ["https://www.site/page"]
+        assert site.requested == ["https://site/sitemap.xml", "https://www.site/pages.xml"]
 
     async def test_downloads_at_most_concurrency_sitemaps_at_once(self):
         children = [f"https://site/{number}.xml" for number in range(12)]

@@ -199,7 +199,10 @@ class TestSettled:
         async def on_settled(urls: list[str]) -> None:
             calls.append(urls)
 
-        storage.on_settled = on_settled
+        async def on_dropped(urls: list[str]) -> None:
+            calls.append(["dropped", *urls])
+
+        storage.on_settled, storage.on_dropped = on_settled, on_dropped
         await save_pages(storage, "a", "b")
         assert calls == []
 
@@ -207,4 +210,22 @@ class TestSettled:
         with pytest.raises(StorageError):
             await storage.flush()
 
-        assert calls == [["a"], ["b"]]
+        assert calls == [["a"], ["dropped", "b"]]
+
+    async def test_record_dropped_before_the_others_write_it_is_reported_dropped(self):
+        first, second = MemoryStorage(batch_size=1, refused={"a"}), MemoryStorage(batch_size=3)
+        storage = CompositeStorage(first, second)
+        calls: list[list[str]] = []
+
+        async def on_dropped(urls: list[str]) -> None:
+            calls.append(urls)
+
+        storage.on_dropped = on_dropped
+        with pytest.raises(StorageError):
+            await save_pages(storage, "a")
+        assert calls == []
+
+        await storage.flush()
+
+        assert calls == [["a"]]
+        assert second.urls == [["a"]]

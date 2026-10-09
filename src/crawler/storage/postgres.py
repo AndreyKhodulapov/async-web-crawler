@@ -7,6 +7,9 @@ import asyncpg
 from crawler.retry import RetryStrategy
 from crawler.storage.database import DatabaseDriver, DatabaseStorage
 
+# Key of the advisory lock under which the table of pages is created.
+_SCHEMA_LOCK = 0x70616765
+
 
 class PostgresDriver(DatabaseDriver):
     """A small asyncpg connection pool: a reader gets a connection of its own, apart from the writes."""
@@ -25,6 +28,13 @@ class PostgresDriver(DatabaseDriver):
 
     async def execute(self, statement: str) -> None:
         await self._pool.execute(statement)
+
+    async def create_schema(self, statements: Sequence[str]) -> None:
+        async with self._pool.acquire() as connection, connection.transaction():
+            # CREATE ... IF NOT EXISTS of two sessions at once may still fail on a duplicate.
+            await connection.execute("SELECT pg_advisory_xact_lock($1)", _SCHEMA_LOCK)
+            for statement in statements:
+                await connection.execute(statement)
 
     async def execute_many(self, statement: str, rows: Sequence[Sequence[object]]) -> None:
         # asyncpg runs it in a transaction of its own: all rows or none.
@@ -48,16 +58,20 @@ class PostgresStorage(DatabaseStorage):
 
     `dsn` is a connection URL: "postgresql://user:password@host:5432/database".
     See `DatabaseStorage`. A write is retried when the server cannot be
-    reached, drops the connection, has no free connections or picks the
-    transaction as the victim of a deadlock.
+    reached or drops the connection; runs out of disk, memory or free
+    connections; cancels the query (`statement_timeout`) or shuts down;
+    rolls the transaction back over a deadlock or a serialization failure;
+    or accepts only reads, as a standby after a failover does. Such a
+    batch stays in the buffer instead of being dropped.
     """
 
     WRITE_ERRORS = (
         OSError,
         asyncpg.PostgresConnectionError,
-        asyncpg.CannotConnectNowError,
-        asyncpg.TooManyConnectionsError,
-        asyncpg.DeadlockDetectedError,
+        asyncpg.InsufficientResourcesError,
+        asyncpg.OperatorInterventionError,
+        asyncpg.TransactionRollbackError,
+        asyncpg.ReadOnlySQLTransactionError,
     )
 
     def __init__(

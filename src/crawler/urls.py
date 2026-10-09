@@ -62,6 +62,11 @@ def resolve_url(href: str, base_url: str) -> str | None:
     Returns None for values that do not point to another crawlable page:
     empty or fragment-only hrefs ("#top") and non-http schemes such as
     "mailto:", "tel:", "javascript:" or "data:".
+
+    A user name and password written in the href itself
+    ("http://user:pass@host/") are dropped: the crawler would send them in
+    an Authorization header and keep them in its records and log. A link
+    without a host of its own keeps those of `base_url`.
     """
     href = href.strip()
     if not href or href.startswith("#"):
@@ -69,13 +74,23 @@ def resolve_url(href: str, base_url: str) -> str | None:
     try:
         absolute = urljoin(base_url, href)
         scheme = urlsplit(absolute).scheme
+        own_host = bool(urlsplit(href).netloc)
     except ValueError:
         return None
     # Turned away before `normalize_url`, which would remember the whole of
     # an inline image ("data:" with tens of kilobytes) as a key of its cache.
     if scheme not in ("http", "https"):
         return None
-    return normalize_url(absolute)
+    normalized = normalize_url(absolute)
+    return drop_userinfo(normalized) if own_host and normalized else normalized
+
+
+def drop_userinfo(url: str) -> str:
+    """`url` without the user name and password in it, if it has them."""
+    parts = urlsplit(url)
+    if parts.username is None:
+        return url
+    return urlunsplit(parts._replace(netloc=parts.netloc.rpartition("@")[2]))
 
 
 # Click IDs of ad networks; parameters starting with "utm_" go too.

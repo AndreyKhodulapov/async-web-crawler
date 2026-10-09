@@ -1,16 +1,21 @@
-"""Renders the statistics of a crawl as JSON and as an HTML report with tables and charts."""
+"""Renders the statistics of a crawl as JSON and as an HTML report with tables and charts, and the pages not saved as CSV."""
 
 import base64
+import contextlib
+import csv
 import json
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from html import escape
 from http import HTTPStatus
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
+from crawler.frontier import UnsavedPage
 from crawler.progress import format_duration
+from crawler.storage.csv_file import escape_formula
 
 # Colors of the charts and of the page around them.
 _SURFACE = "#fcfcfb"
@@ -25,6 +30,37 @@ def render_json(stats: Mapping[str, Any]) -> str:
     which has no other keys.
     """
     return json.dumps(stats, indent=2, ensure_ascii=False) + "\n"
+
+
+@contextlib.contextmanager
+def unsaved_pages_csv(path: Path) -> Iterator[Any]:
+    """Open `path` for the list of the pages not saved; yield a writer that has written the header row.
+
+    The writer takes the rows with `writerows`. The rows are
+    `UnsavedPage`s, a status or an error that is None an empty cell. A
+    value a spreadsheet would take for a formula (a URL, a reason, an
+    error, all of them from the sites) is escaped as `CSVStorage` does it.
+    The file is replaced if it exists.
+
+    Raises:
+        OSError: the file cannot be written.
+    """
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(UnsavedPage._fields)
+        yield _FormulaEscapingWriter(writer)
+
+
+class _FormulaEscapingWriter:
+    """A `csv.writer` that escapes the values a spreadsheet would take for formulas."""
+
+    def __init__(self, writer: Any) -> None:
+        self._writer = writer
+
+    def writerows(self, rows: Iterable[Iterable[object]]) -> None:
+        self._writer.writerows(
+            [escape_formula(value) if isinstance(value, str) else value for value in row] for row in rows
+        )
 
 
 def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str:
@@ -146,6 +182,9 @@ def _rendering_section(rendering: Mapping[str, Any]) -> str:
         "Failed": _count(rendering["failed"]),
         "Average render time": _duration(rendering["avg_render_time"]),
     }
+    if rendering["unrendered"]:
+        # Pages taken as downloaded once the browser was given up.
+        numbers["Not rendered"] = _count(rendering["unrendered"])
     tiles = "".join(f"<div><dt>{name}</dt><dd>{value}</dd></div>" for name, value in numbers.items())
     return f'<section>\n<h2>Rendering</h2>\n<dl class="summary">{tiles}</dl>\n</section>\n'
 

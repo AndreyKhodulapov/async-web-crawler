@@ -15,7 +15,7 @@ from crawler.crawl_run import CrawlRun
 from crawler.exceptions import ParseError, StorageError
 from crawler.fetching import Fetcher
 from crawler.filters import UrlFilter
-from crawler.frontier import Frontier, MemoryFrontier
+from crawler.frontier import Frontier, MemoryFrontier, UnsavedPage
 from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage, ProxyStats, RenderStats
 from crawler.parser import HTMLParser
 from crawler.proxy import ProxyPool
@@ -90,9 +90,9 @@ class AsyncCrawler:
       was too long to retry comes back once the host may be asked again.
     - A host whose requests keep failing is left alone for a while, as
       `circuit_breaker` says: by default once half of at least 5 requests
-      in a minute have failed with a transient or network error, its
-      requests fail with `CircuitOpenError` for 30 seconds without being
-      sent (see `CircuitBreaker`). A request counts once in the window of
+      in a minute have failed with a transient or network error (HTTP 429
+      aside: the host is up), its requests fail with `CircuitOpenError`
+      for 30 seconds without being sent (see `CircuitBreaker`). A request counts once in the window of
       the breaker, however many attempts it took: a page made good by a
       retry is a success of the host. A retry the breaker would refuse is
       not made: the request fails with the error of its last attempt.
@@ -140,10 +140,12 @@ class AsyncCrawler:
     a request fails it with `ProxyNetworkError`, a network error that is
     retried, through another proxy at once; when every proxy is out of
     rotation, requests fail with `NoProxyError` without being sent, and
-    are not retried. The circuit breaker counts neither: a dead proxy
-    must not block the sites behind it. robots.txt that cannot be
-    downloaded for this reason is not cached as unreachable: the page
-    fails with the error of the proxy. `proxy_stats()` counts the
+    are not retried; a page of `crawl()` is put off until the first proxy
+    is back, at most `MAX_WAITS_PER_PAGE` times. The circuit breaker
+    counts neither: a dead proxy must not block the sites behind it.
+    robots.txt that cannot be downloaded for this reason is not cached as
+    unreachable: the page fails with the error of the proxy, or waits for
+    a proxy. `proxy_stats()` counts the
     requests and failures of every proxy; the proxies out of rotation
     stay out from one `crawl()` to the next.
 
@@ -162,12 +164,13 @@ class AsyncCrawler:
     the filters of `crawl()` and `MAX_REDIRECTS` apply to it. A page the
     browser takes longer than `rendering.timeout` to render fails with
     `RenderTimeoutError`, a timeout that is retried and not held against
-    the host; one it cannot render (not installed, crashed) with
-    `RenderError`, which is not retried. The circuit breaker counts
-    neither. robots.txt and sitemaps are never rendered.
-    The browser starts with the first page to render and is closed by
-    `close()`. `render_stats()` counts the pages rendered and failed, and
-    the time the browser took for them.
+    the host; one that crashes the browser with `RenderError`, which is
+    not retried. The circuit breaker counts neither. robots.txt and
+    sitemaps are never rendered. The browser starts with the first page
+    to render and is closed by `close()`; once it is given up (it crashed
+    again or is not installed), pages are taken as downloaded.
+    `render_stats()` counts the pages rendered, failed and taken as
+    downloaded, and the time the browser took for them.
 
     `error_stats()` counts the errors of page requests and their retries
     (see `ErrorStats`); robots.txt downloads and the URLs it blocks are not
@@ -225,6 +228,7 @@ class AsyncCrawler:
     MAX_ROBOTS_RETRIES = CrawlRun.MAX_ROBOTS_RETRIES
     ROBOTS_POLL = CrawlRun.ROBOTS_POLL
     MAX_STORAGE_PAUSE = CrawlRun.MAX_STORAGE_PAUSE
+    SITEMAP_PAGES_FACTOR = CrawlRun.SITEMAP_PAGES_FACTOR
     FRONTIER_FACTOR = Frontier.FRONTIER_FACTOR
     # In crawl(), longer links are not followed: they are mostly generated ones.
     MAX_URL_LENGTH = 2048
@@ -474,6 +478,17 @@ class AsyncCrawler:
         return self._queue().unreachable
 
     @property
+    def unsaved_pages(self) -> list[UnsavedPage]:
+        """Pages the latest crawl finished without a record in the storage, in the order they were finished.
+
+        Those failed, skipped, blocked and unreachable, with the reasons, and
+        those processed whose record the storage dropped, listed as failed.
+        Empty if the frontier keeps the pages elsewhere, as in a database.
+        """
+        frontier = self._frontier
+        return list(frontier.unsaved.values()) if isinstance(frontier, MemoryFrontier) else []
+
+    @property
     def failed_sitemaps(self) -> dict[str, str]:
         """Sitemap URL -> error description for sitemaps the latest crawl could not read. Do not modify."""
         return self._run.failed_sitemaps
@@ -601,7 +616,8 @@ class AsyncCrawler:
         for longer than `MIN_PENALTY_TO_DEFER` seconds, by a Retry-After or
         the pause before the retry of a request that found the host
         overloaded (HTTP 429, a timeout), is put off until the host may be
-        asked again, without counting toward `max_pages` before then. A
+        asked again, without counting toward `max_pages` before then, even
+        when the hold comes while it waits for the turn of its host. A
         Retry-After longer than `max_delay` of the retry strategy is
         logged as a warning once per host, as the crawl may be quiet for
         that long; the page that got it, which the request did not retry,
@@ -655,8 +671,10 @@ class AsyncCrawler:
         with `robots_sitemaps` so are those of the sitemaps that robots.txt
         of the start URLs' sites names. The sitemaps are read before the
         first page is fetched, one after another and only until the queue
-        is full: the rest of a sitemap and the sitemaps after it are not
-        downloaded (see `SitemapParser`). A page a sitemap lists
+        is full, or until they listed `SITEMAP_PAGES_FACTOR` times as many
+        pages as the queue holds, those the filters turn away included: the
+        rest of a sitemap and the sitemaps after it are not downloaded (see
+        `SitemapParser`). A page a sitemap lists
         has depth 0, like a start URL, but must pass the filters, like a
         link; it comes after the start URLs and before the links.
         `same_domain_only` keeps the hosts of `sitemap_urls` as well as

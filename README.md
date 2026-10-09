@@ -25,7 +25,8 @@ configuration file, by command-line options, or from Python.
 - **Concurrency**: one connection pool, a global limit of requests in
   flight and an optional limit per host
 - **Politeness**: requests per second per host or overall, minimum delay
-  and jitter, robots.txt per RFC 9309 with Crawl-delay, `nofollow` and
+  and jitter, a host that answers HTTP 429 slowed down until it stops,
+  robots.txt per RFC 9309 with Crawl-delay, `nofollow` and
   `noindex` of links, robots meta tags and `X-Robots-Tag` (also those
   that name the crawler), a
   configurable User-Agent with rotation
@@ -36,15 +37,18 @@ configuration file, by command-line options, or from Python.
 - **Proxies**: http and https proxies with a password, a site kept on one
   proxy or the proxies taking turns per request, `HTTP_PROXY` and
   `NO_PROXY` of the environment; a proxy that keeps failing is taken out
-  of rotation for a while without blocking the sites behind it; requests
+  of rotation for a while without blocking the sites behind it, and the
+  pages wait while every proxy is out; requests
   and failures per proxy in the summary and the reports, passwords hidden
 - **JavaScript rendering** in a headless Chromium (Playwright):
   every HTML page or those matching patterns, waiting for an event or a
   CSS selector; the page itself downloaded as without a browser, images
   and fonts not loaded, navigations of a page checked against robots.txt
   and the filters like redirects; the browser shares the cookies, the
-  headers and the proxy of the crawler, and the cookies its scripts set
-  are saved; pages rendered and the time they took in the summary and
+  headers (only with the page's own origin) and the proxy of the crawler,
+  and the cookies its scripts set are saved; one deadline a page; a
+  browser that keeps crashing is given up and the pages are taken as
+  downloaded; pages rendered and the time they took in the summary and
   the reports
 - **Retries** of timeouts, network errors, HTTP 408, 429 and 5xx with
   exponential backoff and jitter, honoring `Retry-After`; timeouts that
@@ -54,8 +58,8 @@ configuration file, by command-line options, or from Python.
 - **Clear error types** grouped by whether a retry can help; one failing
   URL never breaks a crawl; a size limit on every body, gzip bombs included
 - **HTML parsing** into title, metadata, text, links, images, headings,
-  tables and lists; broken HTML and any encoding are handled; runs in a
-  worker thread
+  tables and lists, all of them saved with the page; broken HTML and any
+  encoding are handled; runs in a worker thread
 - **Storage** behind one interface: JSON Lines or a JSON array, CSV,
   SQLite, PostgreSQL, or several at once; asynchronous writes in batches
   with retries; a file is added to by the next run, or started anew with
@@ -137,7 +141,7 @@ the [configuration guide](docs/configuration.md) explains them.
 ```bash
 docker build -t async-web-crawler .                   # the crawler, about 700 MB
 docker build --target js -t async-web-crawler:js .    # with Chromium for rendering, about 2.2 GB
-docker run --rm -v "$PWD/out:/app/out" async-web-crawler \
+docker run --rm --init -v "$PWD/out:/app/out" async-web-crawler \
     --urls https://books.toscrape.com/ --max-pages 20 --output out/pages.jsonl --report out/report.html
 ```
 
@@ -145,10 +149,14 @@ The image runs `python src/main.py`: its arguments are those of the
 [command line](#command-line), `--help` without any. It works in `/app`
 as a user that is not root (uid 10001) and writes to `/app/out`, a
 volume; on Linux, give it a directory it can write to, or run it as
-yourself with `--user $(id -u):$(id -g)`. The image `js` renders pages in
-Chromium; run it with `--init --shm-size=1g`. `docker stop` stops a crawl
-as Ctrl-C does: what the storage buffers is written, the reports too,
-and the exit code is 143.
+yourself with `--user $(id -u):$(id -g)`. Run it with `--init`: without
+it Python is process 1 of the container, which ignores a SIGTERM it has
+no handler for, so a SIGTERM before the crawl starts, or the second one
+that ends a crawl at once, does nothing and `docker stop` kills the
+crawler 10 seconds later, without its reports. The image `js` renders
+pages in Chromium; run it with `--init --shm-size=1g`. `docker stop`
+stops a crawl as Ctrl-C does: what the storage buffers is written, the
+reports too, and the exit code is 143.
 
 [docker-compose.yml](docker-compose.yml) runs the crawler next to its
 PostgreSQL, with the configuration files of
@@ -166,8 +174,8 @@ docker compose run --rm job report --job books --report out/report.html
 The crawler services are started by their names only: `docker compose
 up -d --wait` starts PostgreSQL alone, for the tests. The workers log
 JSON Lines; `docker compose stop worker` puts their pages back in the
-queue, and a worker the database failed is started again (up to 5
-times). The job is made once: to crawl it anew, `docker compose run --rm
+queue, and a worker the database failed is started again until the
+database is back (one with a wrong configuration too, every minute). The job is made once: to crawl it anew, `docker compose run --rm
 job job create --config /config/job.yaml --name books --restart`.
 `CRAWLER_JOB` names another job; `CRAWLER_TARGET=js` builds and runs the
 image with Chromium, which the workers of a job that renders its pages
@@ -213,13 +221,14 @@ when the configuration has sitemaps to crawl.
 | `--overwrite`, `--no-overwrite` | `storage.overwrite` | start output files anew, or add to them (the default; the log warns about a file that is not empty); a database keeps a row per URL either way |
 | `--cookies-file PATH` | `session.cookies_file` | send the cookies of a Netscape `cookies.txt` file, as a browser extension or `curl -c` exports it |
 | `--save-cookies PATH` | `session.save_cookies` | write the cookies to a `cookies.txt` file after the crawl, readable by its owner only |
-| `--proxy URL` | `proxy.urls` | send the requests through a proxy, `http://[user:password@]host:port`; repeat for several, in place of those of the file (`proxy.from_env` is turned off) |
+| `--proxy URL` | `proxy.urls` | send the requests through a proxy, `http://[user:password@]host:port`; repeat for several, in place of those of the file (`proxy.from_env` is turned off). A password here is seen by `ps` and kept in the shell history: put it in `proxy.urls` as `${PROXY_PASSWORD}` instead (see [secrets](docs/configuration.md#where-a-value-comes-from)), or use `proxy.from_env` |
 | `--render` | `rendering.mode` | render every HTML page in a headless Chromium, so that links and text JavaScript makes are found; sets `mode: always` and clears `rendering.include` of the file. Without Chromium, exit code 2 with the command to install it |
 | `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, `nofollow` and `noindex`, or do not |
 | `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
 | `--stats-json PATH` | `report.stats_json` | write the statistics of the crawl to a JSON file |
 | `--report PATH` | `report.html` | write an HTML report with charts |
+| `--pages-report PATH` | `report.pages` | list the pages not saved in a CSV file: `url, outcome, reason, status, error` for every page failed, skipped, blocked or unreachable, and failed for one whose record the storage dropped |
 | `--log-level LEVEL` | `logging.level` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 | `--log-file PATH` | `logging.file` | also write the log to a file, as JSON Lines |
 | `--no-progress` | | do not show the progress line |
@@ -227,7 +236,9 @@ when the configuration has sitemaps to crawl.
 Everything else (sitemaps, the other filters, retries, the circuit breaker, timeouts,
 the rotation of proxies, what and how to render) is set in the file. The command line never keeps the pages in memory
 (`crawler.keep_pages` is off whatever the file says): they go to `--output`.
-The log and the progress line go to stderr, the summary to stdout:
+The log and the progress line go to stderr, the summary to stdout. In a terminal
+the progress line is redrawn every second; when stderr is a file or a pipe, such as `docker logs`, a line
+is printed every 30 seconds and at the end:
 
 ```
 [####################] 100% | 8/8 pages, 0 failed | 1.1 pages/s | done | active 0 (0 in flight) | queued 0 | 8s
@@ -241,16 +252,20 @@ Reports: out/stats.json, out/report.html
 Log: out/crawler.log
 ```
 
-At the default level `INFO` the log has a line per request; `--log-level
-WARNING` leaves the progress line and the failures. A password in a database
-or a proxy URL is shown as `***`. With proxies, the summary has a line of
+At the default level `INFO` the log has three lines per page (the request,
+the response and the links found); `--log-level WARNING` leaves the
+progress line and the failures. While a host is down or holds its pages back, a page of it put off is logged at `INFO` once per
+30 seconds per host, the others at `DEBUG` (in a crawl of one process).
+A password in a database or a proxy URL is shown as `***`. With proxies, the summary has a line of
 them: `Proxies: http://user:***@proxy-1:3128 (41 sent, 0 failed), ...`;
 with rendering, a line of the pages rendered: `Rendering: 12 pages
-rendered, 1 failed, average 0.84s` (the average of the rendered ones).
+rendered, 1 failed, average 0.84s` (the average of the rendered ones;
+`, 30 not rendered` when the browser was given up and pages were taken as
+downloaded).
 
 | Exit code | Meaning |
 |-----------|---------|
-| 0 | the crawl ran, fetched at least one page and saved every page it should |
+| 0 | the crawl ran, fetched at least one page (saved or left out as skipped) and saved every page it should |
 | 1 | no page was fetched, some could not be saved, or a directory, the log file, an output file or the database could not be opened; an output that cannot be opened is reported before anything is requested |
 | 2 | wrong options or configuration; nothing was requested or written |
 | 130 | interrupted with Ctrl-C |
@@ -277,7 +292,7 @@ export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
 python src/main.py job create --config config.yaml --name books
 python src/main.py worker --job books --config worker.yaml --concurrency 20   # in each of several terminals
 python src/main.py status --job books --watch
-python src/main.py report --job books --stats-json out/stats.json --report out/report.html
+python src/main.py report --job books --stats-json out/stats.json --report out/report.html --pages-report out/pages.csv
 ```
 
 | Option | Effect |
@@ -287,12 +302,12 @@ python src/main.py report --job books --stats-json out/stats.json --report out/r
 | `--resume` | go on with the job of that name: queue the start URLs it never queued; the configuration must not differ |
 | `--restart` | delete the job of that name with its pages and create it anew |
 | `worker --job NAME` | the job to crawl |
-| `worker --config PATH` | configuration of the worker: `distributed`, `session`, `proxy`, `storage`, `logging`, `report`; the keys of the job in it are ignored with a warning. Every file of the storage needs `{worker}` in its name, such as `pages-{worker}.jsonl` |
+| `worker --config PATH` | configuration of the worker: `distributed`, `session`, `proxy`, `storage`, `logging`, `report` (but `report.pages`, which `report` writes for the job); the keys of the job in it are ignored with a warning. Every file it writes (storage, log, reports, `session.save_cookies`) needs `{worker}` in its name, such as `pages-{worker}.jsonl` |
 | `--concurrency N` | pages crawled at a time, in place of `crawler.max_concurrent` |
 | `--name WORKER` | name of the worker in the database and for `{worker}`; by default the host name, the process id and a random part |
 | `report --job NAME` | the job to report on, finished or still running |
-| `report --stats-json PATH`, `--report PATH` | the statistics of the job as JSON, an HTML report with charts and a table of the workers; without them, `report.stats_json` and `report.html` of the configuration |
-| `report --config PATH` | configuration with the database and the `report` section (`title`, `top_domains`, the files) |
+| `report --stats-json PATH`, `--report PATH`, `--pages-report PATH` | the statistics of the job as JSON, an HTML report with charts and a table of the workers, the CSV list of the pages of the job not saved; without them, `report.stats_json`, `report.html` and `report.pages` of the configuration |
+| `report --config PATH` | configuration with the database and the `report` section (`title`, `top_domains`, the files); `{worker}` in a file name becomes the name of the job, so the configuration of a worker will do |
 | `status --job NAME` | print a line of the progress of the job: percent of `max_pages`, speed, time left, workers |
 | `status --watch` | update the line until the job is finished; `--interval SECONDS` between the updates (default 2) |
 | `status --config PATH` | configuration with the database |
@@ -421,11 +436,12 @@ storages. All of it is described in the [API reference](docs/api.md).
   start URLs again, adding to the output files or starting them anew with
   `--overwrite`. A crawl job keeps its queue in PostgreSQL and goes on
   where it stopped.
-- **A storage that keeps failing fills memory**, in a crawl of its own.
-  Pages that could not be written stay buffered and are retried; a
-  database that is down for long holds every page since the outage in
-  memory. A worker of a crawl job takes no pages until its storage writes
-  again, and leaves the rest to the others.
+- **A storage that stays down loses pages**, in a crawl of its own.
+  Pages that could not be written stay buffered and are retried, up to
+  10 batches (`batch_size` pages each); the pages saved over them are
+  dropped and counted `save_failed`, so that a database down for long
+  does not fill the memory. A worker of a crawl job takes no pages until
+  its storage writes again, and leaves the rest to the others.
 - **One host at a time under a rate limit**, in a crawl of its own. The
   workers take pages from one queue in the order of depth and wait for the
   turn of their host in the rate limiter; while the pages of the first host
@@ -446,18 +462,31 @@ storages. All of it is described in the [API reference](docs/api.md).
 - **No cookies for IP addresses.** aiohttp keeps cookies of host names
   only, so a site reached as `http://127.0.0.1:8080/` cannot keep a session
   of the crawler; reach it as `http://localhost:8080/`.
-- **Extra headers go to every host.** The headers of `session.headers`
-  are sent to every request, robots.txt and other sites included: an
-  `Authorization` header reaches a third-party site that the crawl follows
-  a link or a redirect to. Use it with `same_domain_only`, the default.
+- **Extra headers go to every host the crawler requests.** The headers
+  of `session.headers` are sent to every request of the crawler,
+  robots.txt and other sites included: an `Authorization` header reaches
+  a third-party site that the crawl follows a link or a redirect to. Use
+  it with `same_domain_only`, the default. The browser sends them only to
+  the origin of the page it renders, not to the CDNs and the analytics its
+  scripts call.
+- **Credentials in URLs.** A user name and password written in a link,
+  a redirect or a sitemap of a site (`http://user:pass@host/`) are
+  dropped: the crawler does not send them. A start URL keeps those it was
+  given, and so do the relative links of its pages; they are then in the
+  records, the log and the CSV files. For HTTP basic auth, an
+  `Authorization` header in `session.headers` keeps them out.
 - **No SOCKS proxies.** Only http and https proxies; `socks5://` is a
   configuration error. A local bridge from HTTP to SOCKS (such as
   `gost` or `privoxy`) makes a SOCKS proxy usable.
-- **A timeout through a proxy is the site's.** The crawler cannot tell a
-  slow proxy from a slow site, so a timeout counts against the site, in
-  its circuit breaker, and never takes the proxy out of rotation. A proxy
-  that loses packets looks like slow sites; a proxy that cannot be reached
-  or refuses the password is taken out as it should be.
+- **A read timeout through a proxy is the site's.** A connect timeout
+  is the proxy's: it did not accept the connection or, for an https URL,
+  did not answer CONNECT in time. Past that the crawler cannot tell a slow
+  proxy from a slow site, so a read or total timeout counts against the
+  site, in its circuit breaker, and never takes the proxy out of rotation.
+  A proxy that stalls mid-response looks like slow sites. The other way
+  round, a proxy that waits for an unreachable https site longer than
+  `connect_timeout` is blamed for it; any response through the proxy
+  clears its count, so only a crawl of such sites alone takes it out.
 - **An error page of an http proxy is the site's.** An `http://` URL is
   asked of the proxy itself, which answers for the site: its own 502 or
   503, when it cannot reach the site or fails, cannot be told from the
@@ -717,7 +746,7 @@ src/
     │   ├── progress.py     # job_progress, watch_job: the progress line of a crawl job, of all its workers
     │   ├── procedures.py   # PL/pgSQL functions: a page taken, admitted, put back or finished, links added, in one call each
     │   ├── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, workers, job_scope, out_of_scope
-    │   ├── stats.py        # job_stats, export_job_stats: the statistics and reports of a crawl job, of all its workers
+    │   ├── stats.py        # job_stats, export_job_stats, export_job_pages: the statistics, reports and pages not saved of a crawl job
     │   └── worker.py       # run_worker: a worker of a crawl job, its configuration and its files
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes

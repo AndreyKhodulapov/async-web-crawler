@@ -6,7 +6,7 @@ import logging
 import math
 import re
 import time
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -20,7 +20,7 @@ from crawler.exceptions import (
     ProxyError,
     TooManyRedirectsError,
 )
-from crawler.urls import normalize_url, percent_encode
+from crawler.urls import drop_userinfo, normalize_url, percent_encode
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +159,7 @@ class RobotsRules:
                 elif rule := _Rule.parse(key == "allow", value):
                     group.rules.append(rule)
             elif key == "sitemap" and (sitemap := normalize_url(value)):
-                sitemaps[sitemap] = None
+                sitemaps[drop_userinfo(sitemap)] = None  # credentials of the site's choosing are not sent
         return cls(groups, sitemaps=list(sitemaps))
 
     @classmethod
@@ -238,8 +238,12 @@ class RobotsParser:
     unavailable file; 5xx, 429 and network errors mean the site is
     unreachable and everything is disallowed. 429 is treated as a server
     error, as major search engines do: the site is asking crawlers to back off.
-    Unlike the rules of a file that was read, which are kept for good, an
-    unreachable robots.txt is fetched again after `UNREACHABLE_TTL`
+    The rules of a file that was read are kept for `RULES_TTL` seconds
+    (24 hours, the longest RFC 9309 advises), then downloaded again in the
+    background: every caller gets the old rules at once meanwhile, and
+    keeps getting them if the site does not answer (they are tried again
+    after `UNREACHABLE_TTL`); such a failure does not count as an outage.
+    An unreachable robots.txt is fetched again after `UNREACHABLE_TTL`
     seconds, so one timeout does not close the site for the whole crawl.
     Only the caller that starts that download waits for it: the others
     get the stale rules, which still disallow everything, until it is
@@ -253,12 +257,15 @@ class RobotsParser:
     `CircuitOpenError`), and one that failed in a proxy (`ProxyError`), is
     no answer from the site: the error is passed on and nothing is cached.
     Files over 500 KiB are cut to that size, the minimum the RFC requires
-    crawlers to read.
+    crawlers to read; those over `PARSE_IN_THREAD` characters are parsed
+    in a thread, so that the other requests do not stand still meanwhile.
     """
 
     MAX_SIZE = 500 * 1024
     MAX_CRAWL_DELAY = 30.0
     UNREACHABLE_TTL = 60.0
+    RULES_TTL = 24 * 3600.0
+    PARSE_IN_THREAD = 32 * 1024
 
     def __init__(
         self,
@@ -270,6 +277,7 @@ class RobotsParser:
         self._clock = clock
         self._rules: dict[str, RobotsRules] = {}
         self._expires: dict[str, float] = {}  # origin -> when its unreachable robots.txt is fetched again
+        self._stale_at: dict[str, float] = {}  # origin -> when the rules of its robots.txt read are fetched again
         self._failed: dict[str, int] = {}  # origin -> downloads of its robots.txt failed in a row
         self._downloads: dict[str, asyncio.Task[RobotsRules]] = {}
         self._started: dict[str, float] = {}  # origin -> when its download under way started
@@ -381,13 +389,13 @@ class RobotsParser:
         # is downloaded again: the synchronous methods keep answering.
         cached = self._rules.get(origin)
         if cached is not None and self._clock() < self._expires.get(origin, math.inf):
+            if self._clock() >= self._stale_at.get(origin, math.inf) and origin not in self._downloads:
+                # Nobody waits for the rules read once to be downloaded again.
+                self._start_download(origin, self._refresh(origin, cached))
             return cached
         download = self._downloads.get(origin)
         if download is None:
-            download = asyncio.create_task(self._download(origin))
-            self._downloads[origin] = download
-            self._started[origin] = self._clock()
-            download.add_done_callback(functools.partial(self._forget_download, origin))
+            download = self._start_download(origin, self._download(origin))
         elif cached is not None:
             # The unreachable robots.txt is being downloaded again: the
             # stale rules answer at once, so that nobody waits for a site
@@ -415,6 +423,13 @@ class RobotsParser:
                 return rules
             raise
 
+    def _start_download(self, origin: str, coroutine: Coroutine[Any, Any, RobotsRules]) -> asyncio.Task[RobotsRules]:
+        download = asyncio.create_task(coroutine)
+        self._downloads[origin] = download
+        self._started[origin] = self._clock()
+        download.add_done_callback(functools.partial(self._forget_download, origin))
+        return download
+
     def _forget_download(self, origin: str, download: asyncio.Task[RobotsRules]) -> None:
         del self._downloads[origin]
         self._started.pop(origin, None)
@@ -424,6 +439,47 @@ class RobotsParser:
             download.exception()
 
     async def _download(self, origin: str) -> RobotsRules:
+        rules = await self._read(origin)
+        if rules.unreachable is None:
+            self._expires.pop(origin, None)
+            self._failed.pop(origin, None)
+            self._stale_at[origin] = self._clock() + self.RULES_TTL
+        else:
+            logger.warning(
+                "robots.txt of %s is unreachable, the site is disallowed for %gs: %s",
+                origin,
+                self.UNREACHABLE_TTL,
+                rules.unreachable,
+            )
+            self._expires[origin] = self._clock() + self.UNREACHABLE_TTL
+            self._failed[origin] = self._failed.get(origin, 0) + 1
+            self._stale_at.pop(origin, None)
+        self._rules[origin] = rules
+        return rules
+
+    async def _refresh(self, origin: str, rules: RobotsRules) -> RobotsRules:
+        """Download again robots.txt whose rules `RULES_TTL` has passed for; keep `rules` if it cannot be read."""
+        # Set at once: an error nobody expects must not start a download on every call.
+        self._stale_at[origin] = self._clock() + self.UNREACHABLE_TTL
+        try:
+            fresh = await self._read(origin)
+        except (CrawlerClosedError, CircuitOpenError, ProxyError) as error:
+            failure = f"{type(error).__name__}: {error.message}"
+        else:
+            failure = fresh.unreachable
+        if failure is not None:
+            logger.info(
+                "robots.txt of %s could not be downloaded again, its old rules stay for %gs: %s",
+                origin,
+                self.UNREACHABLE_TTL,
+                failure,
+            )
+            return rules
+        self._stale_at[origin] = self._clock() + self.RULES_TTL
+        self._rules[origin] = fresh
+        return fresh
+
+    async def _read(self, origin: str) -> RobotsRules:
         url = f"{origin}/robots.txt"
         try:
             status, text = await self._fetch(url)
@@ -438,25 +494,16 @@ class RobotsParser:
             rules = RobotsRules.forbid_all(f"{type(error).__name__}: {error.message}", recoverable=recoverable)
         else:
             if 200 <= status < 300:
-                rules = RobotsRules.parse(text[: self.MAX_SIZE])
+                text = text[: self.MAX_SIZE]
+                if len(text) > self.PARSE_IN_THREAD:
+                    rules = await asyncio.to_thread(RobotsRules.parse, text)
+                else:
+                    rules = RobotsRules.parse(text)
             elif status == 429 or status >= 500:
                 rules = RobotsRules.forbid_all(f"HTTP {status}")
             else:
                 logger.info("robots.txt of %s answered HTTP %d, everything is allowed", origin, status)
                 rules = RobotsRules.allow_all()
-        if rules.unreachable is None:
-            self._expires.pop(origin, None)
-            self._failed.pop(origin, None)
-        else:
-            logger.warning(
-                "robots.txt of %s is unreachable, the site is disallowed for %gs: %s",
-                origin,
-                self.UNREACHABLE_TTL,
-                rules.unreachable,
-            )
-            self._expires[origin] = self._clock() + self.UNREACHABLE_TTL
-            self._failed[origin] = self._failed.get(origin, 0) + 1
-        self._rules[origin] = rules
         return rules
 
 

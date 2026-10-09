@@ -238,7 +238,7 @@ class TestShowProgress:
         task = asyncio.create_task(release.wait())
         stream = io.StringIO()
 
-        shown = asyncio.create_task(show_progress(crawler, task, 4, interval=0.01, stream=stream))
+        shown = asyncio.create_task(show_progress(crawler, task, 4, interval=0.01, off_tty_interval=0.0, stream=stream))
         while stream.getvalue().count("\n") < 2:
             await asyncio.sleep(0.01)
         release.set()
@@ -250,6 +250,33 @@ class TestShowProgress:
         assert lines[-1].startswith("[####################] 100% | 4/4 pages")
         assert "| done |" in lines[-1]
         assert "\033" not in stream.getvalue()
+
+    async def test_prints_a_line_now_and_then_off_a_terminal(self):
+        crawler = FakeCrawler(*(snapshot(0.1 * number, number) for number in range(1, 5)))
+        task = asyncio.create_task(asyncio.sleep(0.2))
+        stream = io.StringIO()
+
+        await show_progress(crawler, task, 4, interval=0.01, stream=stream)
+
+        lines = stream.getvalue().splitlines()
+        assert len(lines) == 2
+        assert "1/4 pages" in lines[0]
+        assert lines[1].startswith("[####################] 100% | 4/4 pages")
+
+    async def test_redraws_the_line_in_a_terminal_at_every_update(self):
+        crawler = FakeCrawler(snapshot(0.1, 1), snapshot(0.2, 2), snapshot(0.3, 4))
+        release = asyncio.Event()
+        task = asyncio.create_task(release.wait())
+        stream = Terminal()
+
+        shown = asyncio.create_task(show_progress(crawler, task, 4, interval=0.01, stream=stream))
+        while stream.getvalue().count("\r") < 3:
+            await asyncio.sleep(0.01)
+        release.set()
+        await shown
+
+        assert "1/4 pages" in stream.getvalue()
+        assert "2/4 pages" in stream.getvalue()
 
     async def test_redraws_the_line_in_a_terminal(self):
         task = asyncio.create_task(asyncio.sleep(0))
