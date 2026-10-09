@@ -106,6 +106,13 @@ class TestIndex:
         }
         assert await fetch(files) == ["https://site/post/1", "https://site/post/2", "https://site/about"]
 
+    async def test_credentials_in_the_locations_are_dropped(self):
+        files = {
+            "https://site/sitemap.xml": index("https://user:pass@site/pages.xml"),
+            "https://site/pages.xml": urlset("https://user:pass@site/page"),
+        }
+        assert await fetch(files) == ["https://site/page"]
+
     async def test_follows_nested_indexes(self):
         files = {
             "https://site/sitemap.xml": index("https://site/2026.xml"),

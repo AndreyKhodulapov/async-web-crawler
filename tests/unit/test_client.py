@@ -502,6 +502,18 @@ class TestFetchMany:
         [result] = await crawler.fetch_many(["http://a"])
         assert result.robots_tag == ("noindex", "noarchive")
 
+    async def test_credentials_in_a_redirect_are_dropped(self, crawler, fake_session):
+        # Those written in the Location are dropped; a relative one keeps the request's.
+        fake_session.routes["http://a/"] = FakeResponse(status=302, location="http://user:pass@b/x")
+        fake_session.routes["http://u:p@a/"] = FakeResponse(status=302, location="/y")
+        await crawler.fetch_many(["http://a/", "http://u:p@a/"])
+        assert sorted(fake_session.requested) == ["http://a/", "http://b/x", "http://u:p@a/", "http://u:p@a/y"]
+
+    async def test_credentials_in_the_links_of_a_page_are_dropped(self, crawler, fake_session):
+        fake_session.routes["http://a/"] = FakeResponse(b"<a href='http://user:pass@a/x'>x</a><a href='/y'>y</a>")
+        page = await crawler.fetch_and_parse("http://a/")
+        assert page["links"] == ["http://a/x", "http://a/y"]
+
     async def test_redirect_and_missing_content_type(self, crawler, fake_session):
         fake_session.routes["http://a"] = FakeResponse(status=302, location="https://a/home")
         fake_session.routes["https://a/home"] = FakeResponse(content_type=None)

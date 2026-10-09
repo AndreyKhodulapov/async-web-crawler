@@ -469,6 +469,12 @@ storages. All of it is described in the [API reference](docs/api.md).
   it with `same_domain_only`, the default. The browser sends them only to
   the origin of the page it renders, not to the CDNs and the analytics its
   scripts call.
+- **Credentials in URLs.** A user name and password written in a link,
+  a redirect or a sitemap of a site (`http://user:pass@host/`) are
+  dropped: the crawler does not send them. A start URL keeps those it was
+  given, and so do the relative links of its pages; they are then in the
+  records, the log and the CSV files. For HTTP basic auth, an
+  `Authorization` header in `session.headers` keeps them out.
 - **No SOCKS proxies.** Only http and https proxies; `socks5://` is a
   configuration error. A local bridge from HTTP to SOCKS (such as
   `gost` or `privoxy`) makes a SOCKS proxy usable.

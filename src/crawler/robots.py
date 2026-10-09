@@ -20,7 +20,7 @@ from crawler.exceptions import (
     ProxyError,
     TooManyRedirectsError,
 )
-from crawler.urls import normalize_url, percent_encode
+from crawler.urls import drop_userinfo, normalize_url, percent_encode
 
 logger = logging.getLogger(__name__)
 
@@ -159,7 +159,7 @@ class RobotsRules:
                 elif rule := _Rule.parse(key == "allow", value):
                     group.rules.append(rule)
             elif key == "sitemap" and (sitemap := normalize_url(value)):
-                sitemaps[sitemap] = None
+                sitemaps[drop_userinfo(sitemap)] = None  # credentials of the site's choosing are not sent
         return cls(groups, sitemaps=list(sitemaps))
 
     @classmethod

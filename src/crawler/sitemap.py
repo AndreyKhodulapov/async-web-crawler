@@ -11,7 +11,7 @@ from typing import NamedTuple
 from lxml import etree
 
 from crawler.exceptions import FetchError, SitemapError
-from crawler.urls import get_host, normalize_url
+from crawler.urls import drop_userinfo, get_host, normalize_url
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ def _parse(url: str, body: bytes, max_size: int) -> _Sitemap:
         if location is None:
             logger.debug("Sitemap %s: skipped an invalid URL %r", url, entry.text)
         else:
-            locations.append(location)
+            locations.append(drop_userinfo(location))  # credentials of the site's choosing are not sent
     return _Sitemap(url, is_index, locations)
 
 

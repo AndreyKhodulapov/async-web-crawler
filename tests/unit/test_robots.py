@@ -253,6 +253,10 @@ class TestSitemaps:
         robots = "Sitemap: https://site/sitemap.xml\nSitemap: /sitemap.xml\nSitemap:\nSitemap: https://site/sitemap.xml"
         assert RobotsRules.parse(robots).sitemaps == ["https://site/sitemap.xml"]
 
+    def test_credentials_in_a_sitemap_line_are_dropped(self):
+        robots = "Sitemap: https://user:pass@site/sitemap.xml"
+        assert RobotsRules.parse(robots).sitemaps == ["https://site/sitemap.xml"]
+
     def test_no_sitemaps_without_a_file(self):
         assert RobotsRules.allow_all().sitemaps == []
         assert RobotsRules.forbid_all("HTTP 503").sitemaps == []
