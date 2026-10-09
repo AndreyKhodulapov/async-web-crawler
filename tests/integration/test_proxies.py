@@ -183,8 +183,10 @@ async def test_a_proxy_out_of_rotation_waits_for_its_cooldown(url, make_proxy):
 
 async def test_the_crawl_ends_when_the_proxies_never_come_back(url, site, caplog):
     # Each page waits for the proxies to come back as many times as for a host held back, then fails.
+    # The cooldown is far longer than the retries of robots.txt: no proxy comes back while they go,
+    # so each download ends with no proxy available, even on a slow machine.
     site.robots = "User-agent: *\nAllow: /\n"
-    pool = ProxyPool([dead_proxy(), dead_proxy()], max_failures=1, cooldown=0.05)
+    pool = ProxyPool([dead_proxy(), dead_proxy()], max_failures=1, cooldown=1.0)
     retries = {"retry_strategy": RetryStrategy(max_retries=3, base_delay=0.01)}
     caplog.set_level(logging.INFO, logger="crawler.crawl_run")
     async with AsyncCrawler(**UNTHROTTLED | BREAKER | retries | {"respect_robots": True}, proxies=pool) as crawler:
