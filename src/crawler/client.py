@@ -15,7 +15,7 @@ from crawler.crawl_run import CrawlRun
 from crawler.exceptions import ParseError, StorageError
 from crawler.fetching import Fetcher
 from crawler.filters import UrlFilter
-from crawler.frontier import Frontier, MemoryFrontier
+from crawler.frontier import Frontier, MemoryFrontier, UnsavedPage
 from crawler.models import CrawlStats, ErrorStats, FetchResult, ParsedPage, ProxyStats, RenderStats
 from crawler.parser import HTMLParser
 from crawler.proxy import ProxyPool
@@ -476,6 +476,17 @@ class AsyncCrawler:
     def unreachable_urls(self) -> dict[str, str]:
         """URL -> reason for pages the latest crawl skipped because robots.txt was unreachable. Do not modify."""
         return self._queue().unreachable
+
+    @property
+    def unsaved_pages(self) -> list[UnsavedPage]:
+        """Pages the latest crawl finished without a record in the storage, in the order they were finished.
+
+        Those failed, skipped, blocked and unreachable, with the reasons, and
+        those processed whose record the storage dropped, listed as failed.
+        Empty if the frontier keeps the pages elsewhere, as in a database.
+        """
+        frontier = self._frontier
+        return list(frontier.unsaved.values()) if isinstance(frontier, MemoryFrontier) else []
 
     @property
     def failed_sitemaps(self) -> dict[str, str]:

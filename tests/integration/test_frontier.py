@@ -15,6 +15,7 @@ from crawler import (
     MemoryFrontier,
     Outcome,
     PostgresFrontier,
+    UnsavedPage,
 )
 
 FrontierFactory = Callable[..., Awaitable[Frontier]]
@@ -292,6 +293,31 @@ class TestOutcomes:
         assert (stats.queued, stats.in_progress) == (1, 0)
         assert (stats.processed, stats.failed, stats.skipped, stats.blocked, stats.unreachable) == (1, 1, 1, 1, 1)
 
+    async def test_frontier_in_memory_lists_the_pages_without_a_record(self):
+        frontier = MemoryFrontier()
+        await frontier.seed([f"http://site/{name}" for name in "abcdef"])
+        a, b, c, d, e, f = [await take(frontier) for _ in range(6)]
+
+        await frontier.finish(a, Outcome.PROCESSED, pending_save=True)
+        await frontier.finish(c, Outcome.SKIPPED, "not HTML: application/pdf", status=200, elapsed=0.1)
+        await frontier.finish(
+            b, Outcome.FAILED, "HTTPStatusError: HTTP 404", status=404, elapsed=0.1, error="HTTPStatusError"
+        )
+        await frontier.finish(d, Outcome.BLOCKED, "disallowed by robots.txt")
+        await frontier.finish(e, Outcome.UNREACHABLE, "robots.txt is unreachable (HTTP 503)")
+        await frontier.finish(f, Outcome.PROCESSED, pending_save=True)
+        await frontier.saved([a.url])
+        await frontier.dropped([f.url])
+
+        assert list(frontier.unsaved.values()) == [
+            UnsavedPage(c.url, "skipped", "not HTML: application/pdf", 200),
+            UnsavedPage(b.url, "failed", "HTTPStatusError: HTTP 404", 404, "HTTPStatusError"),
+            UnsavedPage(d.url, "blocked", "disallowed by robots.txt"),
+            UnsavedPage(e.url, "unreachable", "robots.txt is unreachable (HTTP 503)"),
+            UnsavedPage(f.url, "failed", "its record could not be stored", error="RecordDropped"),
+        ]
+        assert (await current_stats(frontier)).processed == 2
+
     async def test_page_processed_pending_its_save_is_processed(self, frontier):
         await frontier.seed(["http://site/a"])
         page = await take(frontier)
@@ -342,6 +368,8 @@ class TestOutcomes:
         await frontier.seed(["http://site/a"])
         with pytest.raises(ValueError, match="not in progress"):
             await finish(frontier, FrontierPage("http://site/a", 0))
+        if isinstance(frontier, MemoryFrontier):
+            assert frontier.unsaved == {}
 
 
 class TestMaxPages:

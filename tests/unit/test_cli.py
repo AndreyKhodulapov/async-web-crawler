@@ -4,6 +4,7 @@ import asyncio
 import io
 import json
 import sys
+from pathlib import Path
 
 import pytest
 import yaml
@@ -52,6 +53,7 @@ def test_options_are_shaped_like_the_configuration():
             "--rate-limit", "2.5",
             "--stats-json", "stats.json",
             "--report", "report.html",
+            "--pages-report", "not-saved.csv",
             "--log-level", "debug",
             "--log-file", "crawler.log",
         ]
@@ -68,7 +70,7 @@ def test_options_are_shaped_like_the_configuration():
             "from_env": False,
         },
         "rendering": {"mode": "always", "include": []},
-        "report": {"stats_json": "stats.json", "html": "report.html"},
+        "report": {"stats_json": "stats.json", "html": "report.html", "pages": "not-saved.csv"},
         "logging": {"level": "DEBUG", "file": "crawler.log"},
     }
 
@@ -711,7 +713,10 @@ def test_report_takes_a_job_and_optionally_the_files():
     args = parse_command_args(
         ["report", "--job", "books", "--config", "c.yaml", "--stats-json", "s.json", "--report", "r.html"]
     )
-    assert (args.config, args.stats_json, args.report) == ("c.yaml", "s.json", "r.html")
+    assert (args.config, args.stats_json, args.report, args.pages_report) == ("c.yaml", "s.json", "r.html", None)
+
+    args = parse_command_args(["report", "--job", "books", "--pages-report", "p.csv"])
+    assert args.pages_report == "p.csv"
 
 
 @pytest.mark.parametrize(
@@ -776,13 +781,34 @@ def test_report_takes_its_files_title_and_domains_from_the_configuration(tmp_pat
     assert capsys.readouterr().out.endswith(f"Reports: {stats_json}, {html}\n")
 
 
+def test_report_lists_the_pages_of_the_job_not_saved_besides_its_statistics(tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    async def job_stats(dsn, job, **options):
+        return job_stats_of()
+
+    async def export_job_pages(dsn, job, path):
+        seen.update(dsn=dsn, job=job, path=path)
+        return Path(path)
+
+    monkeypatch.setattr(main, "job_stats", job_stats)
+    monkeypatch.setattr(main, "export_job_pages", export_job_pages)
+    monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)
+    pages = str(tmp_path / "pages.csv")
+
+    assert main.main(["report", "--job", "books", "--pages-report", pages]) == 0
+
+    assert seen == {"dsn": DSN, "job": "books", "path": pages}
+    assert capsys.readouterr().out.endswith(f"Reports: {pages}\n")
+
+
 def test_report_with_no_file_to_write_exits_with_2(monkeypatch, capsys):
     monkeypatch.setattr(main, "job_stats", None)  # would fail if called
     monkeypatch.setenv("CRAWLER_DATABASE_URL", DSN)
 
     assert main.main(["report", "--job", "books"]) == 2
 
-    assert "report: nothing to write, give --stats-json or --report" in capsys.readouterr().err
+    assert "report: nothing to write, give --stats-json, --report or --pages-report" in capsys.readouterr().err
 
 
 def test_summary_of_a_report_counts_the_pages_of_all_workers(tmp_path, monkeypatch, capsys):

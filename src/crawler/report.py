@@ -1,15 +1,19 @@
-"""Renders the statistics of a crawl as JSON and as an HTML report with tables and charts."""
+"""Renders the statistics of a crawl as JSON and as an HTML report with tables and charts, and the pages not saved as CSV."""
 
 import base64
+import contextlib
+import csv
 import json
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from html import escape
 from http import HTTPStatus
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
+from crawler.frontier import UnsavedPage
 from crawler.progress import format_duration
 
 # Colors of the charts and of the page around them.
@@ -25,6 +29,22 @@ def render_json(stats: Mapping[str, Any]) -> str:
     which has no other keys.
     """
     return json.dumps(stats, indent=2, ensure_ascii=False) + "\n"
+
+
+@contextlib.contextmanager
+def unsaved_pages_csv(path: Path) -> Iterator[Any]:
+    """Open `path` for the list of the pages not saved; yield a `csv.writer` that has written the header row.
+
+    The rows are `UnsavedPage`s, a status or an error that is None an
+    empty cell. The file is replaced if it exists.
+
+    Raises:
+        OSError: the file cannot be written.
+    """
+    with path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(UnsavedPage._fields)
+        yield writer
 
 
 def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str:

@@ -1,6 +1,7 @@
 """The statistics of a crawl job, read from the tables its workers share, and its reports."""
 
-from collections.abc import Mapping
+import contextlib
+from collections.abc import AsyncIterator, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,8 @@ from crawler.advanced import make_directory
 from crawler.distributed.job import database_errors
 from crawler.distributed.schema import Connection
 from crawler.exceptions import JobError
-from crawler.report import render_html, render_json
+from crawler.frontier import UnsavedPage
+from crawler.report import render_html, render_json, unsaved_pages_csv
 
 # The states of the pages finished, which the statistics count as
 # `CrawlerStats` does: a page pending its save is processed. Pages never requested, such as
@@ -196,6 +198,52 @@ def export_job_stats(
             file.write_text(render(stats), encoding="utf-8")
             written.append(file)
     return written
+
+
+async def export_job_pages(dsn: str, job: str, path: str | Path) -> Path:
+    """Write the pages of the crawl job `job` not saved to a CSV file, see `unsaved_pages_csv`; return the file.
+
+    Those failed, skipped, blocked and unreachable, in the order they were
+    finished; a page whose record a storage dropped is failed with the
+    error `RecordDropped`. The job may still be running: the list is then
+    of the pages finished so far. The directory of the file is created if
+    missing, and the file replaced if it exists.
+
+    Raises:
+        JobError: there is no crawl job of that name.
+        FrontierError: the database cannot be reached or failed.
+        OSError: the file cannot be written.
+    """
+    async with contextlib.aclosing(_unsaved_pages(dsn, job)) as chunks:
+        await anext(chunks)  # the job exists: the file may be written
+        file = make_directory(path)
+        with unsaved_pages_csv(file) as writer:
+            async for chunk in chunks:
+                writer.writerows(chunk)
+    return file
+
+
+async def _unsaved_pages(dsn: str, job: str) -> AsyncIterator[list[UnsavedPage]]:
+    """The pages of `job` not saved, a chunk at a time, after an empty one once the job is found.
+
+    Only the errors of the database become FrontierError, not those of whoever writes the chunks.
+    """
+    with database_errors(job):
+        connection = await asyncpg.connect(dsn)
+        try:
+            async with connection.transaction(isolation="repeatable_read", readonly=True):
+                job_id = (await fetch_job(connection, "SELECT id FROM crawl_jobs WHERE name = $1", job))["id"]
+                yield []
+                cursor = await connection.cursor(
+                    "SELECT url, state, reason, status, error FROM frontier"
+                    " WHERE job = $1 AND state IN ('failed', 'skipped', 'blocked', 'unreachable')"
+                    " ORDER BY finished_at, seq",
+                    job_id,
+                )
+                while rows := await cursor.fetch(1000):
+                    yield [UnsavedPage(*row) for row in rows]
+        finally:
+            await connection.close()
 
 
 def _iso(moment: datetime | None) -> str | None:

@@ -228,6 +228,7 @@ when the configuration has sitemaps to crawl.
 | `--rate-limit RPS` | `crawler.rate_limit` | max requests per second to one host; 0 lifts the limit |
 | `--stats-json PATH` | `report.stats_json` | write the statistics of the crawl to a JSON file |
 | `--report PATH` | `report.html` | write an HTML report with charts |
+| `--pages-report PATH` | `report.pages` | list the pages not saved in a CSV file: `url, outcome, reason, status, error` for every page failed, skipped, blocked or unreachable, and failed for one whose record the storage dropped |
 | `--log-level LEVEL` | `logging.level` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 | `--log-file PATH` | `logging.file` | also write the log to a file, as JSON Lines |
 | `--no-progress` | | do not show the progress line |
@@ -289,7 +290,7 @@ export CRAWLER_DATABASE_URL=postgresql://crawler:crawler@localhost:5432/crawler
 python src/main.py job create --config config.yaml --name books
 python src/main.py worker --job books --config worker.yaml --concurrency 20   # in each of several terminals
 python src/main.py status --job books --watch
-python src/main.py report --job books --stats-json out/stats.json --report out/report.html
+python src/main.py report --job books --stats-json out/stats.json --report out/report.html --pages-report out/pages.csv
 ```
 
 | Option | Effect |
@@ -299,11 +300,11 @@ python src/main.py report --job books --stats-json out/stats.json --report out/r
 | `--resume` | go on with the job of that name: queue the start URLs it never queued; the configuration must not differ |
 | `--restart` | delete the job of that name with its pages and create it anew |
 | `worker --job NAME` | the job to crawl |
-| `worker --config PATH` | configuration of the worker: `distributed`, `session`, `proxy`, `storage`, `logging`, `report`; the keys of the job in it are ignored with a warning. Every file it writes (storage, log, reports, `session.save_cookies`) needs `{worker}` in its name, such as `pages-{worker}.jsonl` |
+| `worker --config PATH` | configuration of the worker: `distributed`, `session`, `proxy`, `storage`, `logging`, `report` (but `report.pages`, which `report` writes for the job); the keys of the job in it are ignored with a warning. Every file it writes (storage, log, reports, `session.save_cookies`) needs `{worker}` in its name, such as `pages-{worker}.jsonl` |
 | `--concurrency N` | pages crawled at a time, in place of `crawler.max_concurrent` |
 | `--name WORKER` | name of the worker in the database and for `{worker}`; by default the host name, the process id and a random part |
 | `report --job NAME` | the job to report on, finished or still running |
-| `report --stats-json PATH`, `--report PATH` | the statistics of the job as JSON, an HTML report with charts and a table of the workers; without them, `report.stats_json` and `report.html` of the configuration |
+| `report --stats-json PATH`, `--report PATH`, `--pages-report PATH` | the statistics of the job as JSON, an HTML report with charts and a table of the workers, the CSV list of the pages of the job not saved; without them, `report.stats_json`, `report.html` and `report.pages` of the configuration |
 | `report --config PATH` | configuration with the database and the `report` section (`title`, `top_domains`, the files) |
 | `status --job NAME` | print a line of the progress of the job: percent of `max_pages`, speed, time left, workers |
 | `status --watch` | update the line until the job is finished; `--interval SECONDS` between the updates (default 2) |
@@ -737,7 +738,7 @@ src/
     │   ├── progress.py     # job_progress, watch_job: the progress line of a crawl job, of all its workers
     │   ├── procedures.py   # PL/pgSQL functions: a page taken, admitted, put back or finished, links added, in one call each
     │   ├── schema.py       # the tables of crawl jobs: crawl_jobs, frontier, hosts, workers, job_scope, out_of_scope
-    │   ├── stats.py        # job_stats, export_job_stats: the statistics and reports of a crawl job, of all its workers
+    │   ├── stats.py        # job_stats, export_job_stats, export_job_pages: the statistics, reports and pages not saved of a crawl job
     │   └── worker.py       # run_worker: a worker of a crawl job, its configuration and its files
     └── storage/
         ├── base.py         # DataStorage: buffer, batches, retries of failed writes

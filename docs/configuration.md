@@ -431,6 +431,7 @@ job (see [Crawl jobs](api.md#crawl-jobs)).
 |-----|------|---------|---------|
 | `stats_json` | string or `null` | `null` | the statistics as JSON |
 | `html` | string or `null` | `null` | an HTML report with tables and charts |
+| `pages` | string or `null` | `null` | a CSV list of the pages not saved, `url, outcome, reason, status, error`: those failed, skipped, blocked and unreachable, in the order they were finished, and as failed (`RecordDropped`) those whose record the storage dropped. A worker does not write it: the command `report` lists the pages of the whole job |
 | `title` | string | `Crawl report` | the title of the HTML report |
 | `top_domains` | whole number, >= 1 | `10` | hosts listed in the statistics |
 

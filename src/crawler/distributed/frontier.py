@@ -631,14 +631,17 @@ class PostgresFrontier(Frontier):
         urls = list(urls)
         if not urls:
             return
+        outcome, reason, error = self.DROPPED
         async with self._rows_lock:
             await self._pool.execute(
-                "UPDATE frontier SET state = 'failed', reason = 'its record could not be stored',"
-                " error = 'RecordDropped', lease_until = NULL"
+                "UPDATE frontier SET state = $4, reason = $5, error = $6, lease_until = NULL"
                 " WHERE job = $1 AND worker = $2 AND state = 'saving' AND url = ANY($3::text[])",
                 self.job_id,
                 self.worker,
                 urls,
+                outcome.value,
+                reason,
+                error,
             )
 
     def waits(self, page: FrontierPage) -> int:

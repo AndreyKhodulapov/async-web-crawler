@@ -48,6 +48,7 @@ from crawler.frontier import (
     HostFailures,
     MemoryFrontier,
     Outcome,
+    UnsavedPage,
 )
 from crawler.logging_setup import configure_logging
 from crawler.models import (
@@ -169,6 +170,7 @@ __all__ = [
     "TransientError",
     "TransientHTTPError",
     "UnexpectedError",
+    "UnsavedPage",
     "UrlFilter",
     "configure_logging",
     "error_kind",

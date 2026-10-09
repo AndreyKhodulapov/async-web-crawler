@@ -110,7 +110,13 @@ FULL = {
         "backup_count": 2,
         "console_format": "json",
     },
-    "report": {"stats_json": "stats.json", "html": "report.html", "title": "Blog crawl", "top_domains": 5},
+    "report": {
+        "stats_json": "stats.json",
+        "html": "report.html",
+        "pages": "not-saved.csv",
+        "title": "Blog crawl",
+        "top_domains": 5,
+    },
     "distributed": {
         "database_url": "postgresql://crawler:dbp4ss@db.example:5432/crawler",
         "lease_seconds": 120.0,
@@ -396,6 +402,7 @@ class TestInvalid:
             ({"logging": {"console_format": "xml"}}, 'logging.console_format: expected one of text, json, got "xml"'),
             ({"report": {"top_domains": 0}}, "report.top_domains: must be >= 1, got 0"),
             ({"report": {"html": ""}}, 'report.html: must not be empty, got ""'),
+            ({"report": {"pages": ""}}, 'report.pages: must not be empty, got ""'),
         ],
     )
     def test_value_out_of_limits(self, data, problem):
@@ -1085,7 +1092,11 @@ class TestForWorker:
             {
                 "storage": {"outputs": ["out/pages-{worker}.jsonl", "sqlite:///pages-{worker}.db"]},
                 "logging": {"file": "{worker}.log"},
-                "report": {"stats_json": "stats-{worker}.json", "html": "report-{worker}.html"},
+                "report": {
+                    "stats_json": "stats-{worker}.json",
+                    "html": "report-{worker}.html",
+                    "pages": "pages-{worker}.csv",
+                },
                 "session": {"cookies_file": "cookies-{worker}.txt", "save_cookies": "saved-{worker}.txt"},
             }
         ).for_worker("w1")
@@ -1096,6 +1107,7 @@ class TestForWorker:
             "stats-w1.json",
             "report-w1.html",
         )
+        assert config.report.pages == "pages-w1.csv"
         assert config.session.save_cookies == "saved-w1.txt"
         # A file that is read is the same for every worker.
         assert config.session.cookies_file == "cookies-{worker}.txt"

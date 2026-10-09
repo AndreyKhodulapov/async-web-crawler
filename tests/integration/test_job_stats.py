@@ -1,13 +1,15 @@
 """Integration tests for the statistics of a crawl job, read from the tables its workers share."""
 
 import asyncio
+import csv
 import json
+import logging
 
 import pytest
 from helpers import POSTGRES_DSN, READ_ONLY_DSN, drop_frontier_tables, frontier_tables_exist, make_config, make_job
 
-from crawler import AdvancedCrawler, FrontierError, JobError, Outcome, PostgresFrontier
-from crawler.distributed import create_job, export_job_stats, job_stats, run_worker
+from crawler import AdvancedCrawler, FrontierError, JobError, Outcome, PostgresFrontier, UnsavedPage
+from crawler.distributed import create_job, export_job_pages, export_job_stats, job_stats, run_worker
 from demo_site import free_port
 
 pytestmark = pytest.mark.postgres
@@ -185,3 +187,93 @@ async def test_reports_of_a_job_are_written_to_missing_directories(tmp_path):
     html = written[1].read_text(encoding="utf-8")
     assert "<title>Books</title>" in html
     assert "No worker has started." in html
+
+
+def read_csv(path) -> list[list[str]]:
+    with path.open(encoding="utf-8", newline="") as file:
+        return list(csv.reader(file))
+
+
+async def test_pages_of_a_job_not_saved_are_those_of_a_crawl_of_one_process(url, tmp_path, caplog):
+    job = make_config(
+        urls=[url("/site/"), url("/site/for-testbot.html")], crawler={"max_depth": 2, "respect_robots": True}
+    )
+    async with AdvancedCrawler(job, configure_logging=False) as crawler:
+        await crawler.crawl()
+        local = crawler.crawler.unsaved_pages
+    await create_job(job, "test", dsn=POSTGRES_DSN)
+    config = make_config(
+        distributed={"database_url": POSTGRES_DSN, "poll_interval": 0.1},
+        report={"pages": str(tmp_path / "pages-{worker}.csv")},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="crawler.distributed.worker"):
+        await asyncio.gather(*(run_worker(config, "test", worker=f"w{n}", configure_logging=False) for n in range(2)))
+    path = await export_job_pages(POSTGRES_DSN, "test", tmp_path / "out" / "pages.csv")
+
+    assert {page.outcome for page in local} == {"failed", "skipped"}
+    rows = read_csv(path)
+    assert rows[0] == list(UnsavedPage._fields)
+    as_written = [[page.url, page.outcome, page.reason, str(page.status or ""), page.error or ""] for page in local]
+    assert sorted(rows[1:]) == sorted(as_written)
+    # The list is the job's, not a worker's.
+    assert list(tmp_path.glob("pages-*.csv")) == []
+    assert "report.pages is not written by a worker" in caplog.text
+
+
+async def test_pages_of_a_job_not_saved_are_listed_in_the_order_they_were_finished(tmp_path):
+    await make_job("test")
+    worker = await open_worker("w")
+    try:
+        await worker.seed([f"http://a/{n}" for n in range(5)])
+        pages = [await worker.take() for _ in range(5)]
+        await worker.finish(pages[3], Outcome.BLOCKED, "disallowed by robots.txt")
+        await worker.finish(pages[1], Outcome.PROCESSED, pending_save=True, status=200, elapsed=0.1)
+        await worker.finish(pages[0], Outcome.FAILED, "HTTP 500", status=500, elapsed=0.1, error="TransientHTTPError")
+        await worker.finish(pages[2], Outcome.PROCESSED, pending_save=True, status=200, elapsed=0.1)
+        await worker.dropped([pages[1].url])
+        await worker.saved([pages[2].url])
+    finally:
+        await worker.close()
+
+    path = await export_job_pages(POSTGRES_DSN, "test", tmp_path / "pages.csv")
+
+    assert read_csv(path) == [
+        ["url", "outcome", "reason", "status", "error"],
+        ["http://a/3", "blocked", "disallowed by robots.txt", "", ""],
+        ["http://a/1", "failed", "its record could not be stored", "200", "RecordDropped"],
+        ["http://a/0", "failed", "HTTP 500", "500", "TransientHTTPError"],
+    ]
+
+
+async def test_pages_of_a_job_that_does_not_exist_fail_and_write_no_file(tmp_path):
+    with pytest.raises(JobError, match='There is no crawl job named "test"'):
+        await export_job_pages(POSTGRES_DSN, "test", tmp_path / "pages.csv")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_pages_of_a_job_without_the_database_fail_as_the_frontier_does(tmp_path):
+    dsn = f"postgresql://crawler:crawler@127.0.0.1:{free_port()}/crawler"
+
+    with pytest.raises(FrontierError, match="the database of crawl job test failed"):
+        await export_job_pages(dsn, "test", tmp_path / "pages.csv")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_pages_of_a_job_are_read_by_a_session_that_may_not_write(tmp_path):
+    await make_job("test")
+
+    path = await export_job_pages(READ_ONLY_DSN, "test", tmp_path / "pages.csv")
+
+    assert read_csv(path) == [["url", "outcome", "reason", "status", "error"]]
+
+
+async def test_list_of_pages_that_cannot_be_written_is_no_failure_of_the_database(tmp_path):
+    await make_job("test")
+
+    with pytest.raises(OSError) as raised:
+        await export_job_pages(POSTGRES_DSN, "test", tmp_path)  # a directory
+
+    assert not isinstance(raised.value, FrontierError)

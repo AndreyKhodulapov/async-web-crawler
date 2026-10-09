@@ -1,5 +1,6 @@
 """Integration tests: AdvancedCrawler set up by a configuration crawls a local site, saves, logs and reports."""
 
+import csv
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -87,6 +88,35 @@ async def test_local_crawl_writes_the_files_of_worker_local(url, tmp_path):
 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["pages-local.jsonl", "stats-local.json"]
     assert crawler.reports == [tmp_path / "stats-local.json"]
+
+
+async def test_crawl_lists_the_pages_it_did_not_save_with_their_outcomes(url, site, tmp_path):
+    site.robots = "User-agent: *\nDisallow: /site/b.html\n"
+    config = make_config(
+        urls=[url("/site/"), url("/site/noindex.html")],
+        crawler={"respect_robots": True, "max_depth": 1},
+        filters={"same_domain_only": True},
+        report={"pages": str(tmp_path / "out" / "pages-{worker}.csv")},
+    )
+    async with AdvancedCrawler(config, configure_logging=False) as crawler:
+        await crawler.crawl()
+
+    path = tmp_path / "out" / "pages-local.csv"
+    assert crawler.reports == [path]
+    with path.open(encoding="utf-8", newline="") as file:
+        rows = {row["url"]: row for row in csv.DictReader(file)}
+    assert list(next(iter(rows.values()))) == ["url", "outcome", "reason", "status", "error"]
+    assert {page_url: row["outcome"] for page_url, row in rows.items()} == {
+        url("/site/noindex.html"): "skipped",
+        url("/site/b.html"): "blocked",
+        url("/site/missing.html"): "failed",
+    }
+    assert rows[url("/site/missing.html")]["status"] == "404"
+    assert rows[url("/site/missing.html")]["error"] == "PermanentHTTPError"
+    assert rows[url("/site/noindex.html")]["status"] == "200"
+    assert "noindex" in rows[url("/site/noindex.html")]["reason"]
+    assert (rows[url("/site/b.html")]["status"], rows[url("/site/b.html")]["error"]) == ("", "")
+    assert rows[url("/site/b.html")]["reason"] == crawler.crawler.blocked_urls[url("/site/b.html")]
 
 
 async def test_overrides_win_over_the_file(url, tmp_path):

@@ -119,6 +119,7 @@ logging:
 report:
   stats_json: null      # e.g. stats.json
   html: null            # e.g. report.html
+  pages: null           # e.g. pages-not-saved.csv: url, outcome, reason, status, error; a worker leaves it to the report command
   title: Crawl report
   top_domains: 10       # hosts listed in the statistics
 

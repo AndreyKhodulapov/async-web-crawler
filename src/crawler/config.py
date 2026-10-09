@@ -385,6 +385,7 @@ class ReportOptions:
 
     stats_json: str | None = _option(None, check=_file_path)
     html: str | None = _option(None, check=_file_path)
+    pages: str | None = _option(None, check=_file_path)  # CSV of the pages not saved, with the reasons
     title: str = "Crawl report"
     top_domains: int = _option(10, minimum=1)
 
@@ -497,7 +498,10 @@ class CrawlerConfig:
             storage=dataclasses.replace(self.storage, outputs=tuple(map(named, self.storage.outputs))),
             logging=dataclasses.replace(self.logging, file=named(self.logging.file)),
             report=dataclasses.replace(
-                self.report, stats_json=named(self.report.stats_json), html=named(self.report.html)
+                self.report,
+                stats_json=named(self.report.stats_json),
+                html=named(self.report.html),
+                pages=named(self.report.pages),
             ),
             session=dataclasses.replace(self.session, save_cookies=named(self.session.save_cookies)),
         )

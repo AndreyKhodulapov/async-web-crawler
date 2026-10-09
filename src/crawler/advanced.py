@@ -14,7 +14,7 @@ from crawler.config import CrawlerConfig, load_config
 from crawler.exceptions import ConfigError
 from crawler.frontier import Frontier
 from crawler.models import ParsedPage
-from crawler.report import render_html, render_json
+from crawler.report import render_html, render_json, unsaved_pages_csv
 from crawler.retry import RetryStrategy
 from crawler.session import save_cookies_file
 from crawler.stats import CrawlerStats
@@ -258,7 +258,7 @@ class AdvancedCrawler:
             raise ConfigError(["urls: nothing to crawl, give start URLs here or sitemaps in sitemaps.urls"])
 
     def write_reports(self) -> list[Path]:
-        """Write the statistics to the files of the `report` section; return those written.
+        """Write the statistics and the pages not saved to the files of the `report` section; return those written.
 
         `crawl()` does it when the crawl ends; call it yourself after a
         crawl that was cancelled. A report that cannot be written is logged
@@ -268,6 +268,7 @@ class AdvancedCrawler:
         for path, export in (
             (self.config.report.stats_json, self.export_to_json),
             (self.config.report.html, self.export_to_html_report),
+            (self.config.report.pages, self.export_unsaved_pages),
         ):
             if path is None:
                 continue
@@ -337,6 +338,15 @@ class AdvancedCrawler:
         """
         report = render_html(self.get_stats(), title=self.config.report.title if title is None else title)
         make_directory(filename).write_text(report, encoding="utf-8")
+
+    def export_unsaved_pages(self, filename: str | Path) -> None:
+        """Write `unsaved_pages` of the latest crawl to a CSV file, see `unsaved_pages_csv`.
+
+        Raises:
+            OSError: the file cannot be written.
+        """
+        with unsaved_pages_csv(make_directory(filename)) as writer:
+            writer.writerows(self.crawler.unsaved_pages)
 
     async def close(self) -> None:
         """Close the crawler, write what the storage still holds and stop logging to the file. Safe to call more than once."""

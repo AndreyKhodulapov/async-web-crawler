@@ -7,7 +7,16 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from helpers import UNTHROTTLED, MemoryStorage
 
-from crawler import AsyncCrawler, CSVStorage, DataStorage, JSONStorage, PageRecord, SQLiteStorage, StorageError
+from crawler import (
+    AsyncCrawler,
+    CSVStorage,
+    DataStorage,
+    JSONStorage,
+    PageRecord,
+    SQLiteStorage,
+    StorageError,
+    UnsavedPage,
+)
 from crawler.parser import HTMLParser
 
 DISK_FULL = OSError("disk full")
@@ -288,6 +297,8 @@ class TestSaveErrors:
         stats = crawler.crawl_stats()
         assert (stats.processed, stats.saved, stats.save_failed) == (5, 4, 1)
         assert f"Dropped the record of {url('/site/b.html')}" in caplog.text
+        dropped = UnsavedPage(url("/site/b.html"), "failed", "its record could not be stored", error="RecordDropped")
+        assert dropped in crawler.unsaved_pages
 
     async def test_closed_storage_fails_the_crawl_before_it_requests_anything(self, url, site):
         storage = MemoryStorage()

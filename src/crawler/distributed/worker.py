@@ -36,7 +36,8 @@ async def run_worker(
     What and how to crawl is the job's: the sections of `JOB_SECTIONS`,
     which `create_job` kept. `config` gives the rest: the database and the
     leases in `distributed`, the session, the proxies, the storage, the
-    log, the reports and `crawler.max_concurrent`. The keys of the job that
+    log, the reports (but `report.pages`, which the `report` command
+    writes for the whole job) and `crawler.max_concurrent`. The keys of the job that
     `config` sets otherwise are ignored, which is logged as a warning. The
     pages are not kept in memory, whatever `crawler.keep_pages` says: they
     go to the storage, if the worker has one.
@@ -173,7 +174,11 @@ async def _job_settings(dsn: str, job: str) -> dict[str, Any]:
 
 
 def _worker_config(config: CrawlerConfig, job: str, settings: dict[str, Any]) -> CrawlerConfig:
-    """`config` with the sections of the job taken from `settings`, but `crawler.max_concurrent`; pages not kept."""
+    """`config` with the sections of the job taken from `settings`, but `crawler.max_concurrent`; pages not kept.
+
+    `report.pages` is dropped: the outcomes of the pages are in the
+    database, not in the worker, and the `report` command lists them.
+    """
     given = job_config(config)
     # Those the worker sets, as opposed to defaults it was left with.
     set_here = set(config_differences(job_config(CrawlerConfig()), given))
@@ -185,6 +190,12 @@ def _worker_config(config: CrawlerConfig, job: str, settings: dict[str, Any]) ->
             job,
         )
     part = CrawlerConfig.from_dict(settings, source=f'crawl job "{job}"')
+    if config.report.pages is not None:
+        logger.warning(
+            "report.pages is not written by a worker: the report command lists the pages not saved of crawl job %s",
+            job,
+        )
     crawler = dataclasses.replace(part.crawler, max_concurrent=config.crawler.max_concurrent, keep_pages=False)
+    report = dataclasses.replace(config.report, pages=None)
     sections = {name: getattr(part, name) for name in JOB_SECTIONS}
-    return dataclasses.replace(config, **{**sections, "crawler": crawler})
+    return dataclasses.replace(config, **{**sections, "crawler": crawler, "report": report})
