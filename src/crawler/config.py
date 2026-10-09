@@ -693,6 +693,10 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
         )
         problems.append(f"{path}: expected {expected}{_got(value, limits)}{quote}")
         return _INVALID
+    if "secret" in limits:
+        value = _from_environment(value, path, problems)
+        if value is None:
+            return _INVALID
     if "normalize" in limits:
         value = limits["normalize"](value)
     problem = _out_of_limits(value, limits)
@@ -700,6 +704,28 @@ def _convert(value: Any, hint: Any, limits: Mapping[str, Any], path: str, proble
         problems.append(f"{path}: {problem}{_got(value, limits)}")
         return _INVALID
     return value
+
+
+def _from_environment(value: str, path: str, problems: list[str]) -> str | None:
+    """A secret with "${NAME}" replaced by the variable NAME of the environment; None if one is not set.
+
+    The secret then stays out of the file. "$${NAME}" is the text "${NAME}".
+    """
+    missing: dict[str, None] = {}
+
+    def substitute(match: re.Match[str]) -> str:
+        escaped, name = match.groups()
+        if escaped:
+            return match.group()[1:]
+        if name not in os.environ:
+            missing[name] = None
+            return ""
+        return os.environ[name]
+
+    expanded = re.sub(r"\$(\$?)\{([A-Za-z_][A-Za-z0-9_]*)\}", substitute, value)
+    for name in missing:
+        problems.append(f'{path}: the environment variable "{name}" is not set')
+    return None if missing else expanded
 
 
 def _got(value: Any, limits: Mapping[str, Any], section: type | None = None) -> str:

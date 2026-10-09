@@ -49,6 +49,20 @@ Times are in seconds. Paths are relative to the working directory, not to
 the configuration file; `~` is expanded. Directories of the outputs, the
 log and the reports are created if they are missing.
 
+Secrets can stay out of the file. In the values of `session.headers`,
+`session.cookies`, `proxy.urls` and `distributed.database_url`, `${NAME}`
+is replaced by the environment variable `NAME` when the configuration is
+read; a variable that is not set is an error, and `$${NAME}` is the text
+`${NAME}`. The other keys are taken as written.
+
+```yaml
+session:
+  headers:
+    Authorization: "Bearer ${API_TOKEN}"
+proxy:
+  urls: ["http://user:${PROXY_PASSWORD}@proxy-1.example:3128"]
+```
+
 ## Keys
 
 ### `urls`
@@ -211,7 +225,9 @@ The values of the cookies and the headers are secrets: they are not
 written to the log, the summary, the reports or the messages of the
 validation, and `repr()` of the configuration leaves them out.
 `CrawlerConfig.to_dict()` keeps them, so that `from_dict()` can read it
-back. Keep a file with them private, or keep them in `cookies_file`.
+back. Keep a file with them private, keep them in `cookies_file`, or take
+them from the environment with `${NAME}` (see
+[Where a value comes from](#where-a-value-comes-from)).
 
 ### `proxy`
 

@@ -221,7 +221,7 @@ when the configuration has sitemaps to crawl.
 | `--overwrite`, `--no-overwrite` | `storage.overwrite` | start output files anew, or add to them (the default; the log warns about a file that is not empty); a database keeps a row per URL either way |
 | `--cookies-file PATH` | `session.cookies_file` | send the cookies of a Netscape `cookies.txt` file, as a browser extension or `curl -c` exports it |
 | `--save-cookies PATH` | `session.save_cookies` | write the cookies to a `cookies.txt` file after the crawl, readable by its owner only |
-| `--proxy URL` | `proxy.urls` | send the requests through a proxy, `http://[user:password@]host:port`; repeat for several, in place of those of the file (`proxy.from_env` is turned off) |
+| `--proxy URL` | `proxy.urls` | send the requests through a proxy, `http://[user:password@]host:port`; repeat for several, in place of those of the file (`proxy.from_env` is turned off). A password here is seen by `ps` and kept in the shell history: put it in `proxy.urls` as `${PROXY_PASSWORD}` instead (see [secrets](docs/configuration.md#where-a-value-comes-from)), or use `proxy.from_env` |
 | `--render` | `rendering.mode` | render every HTML page in a headless Chromium, so that links and text JavaScript makes are found; sets `mode: always` and clears `rendering.include` of the file. Without Chromium, exit code 2 with the command to install it |
 | `--respect-robots`, `--no-respect-robots` | `crawler.respect_robots` | follow robots.txt, `nofollow` and `noindex`, or do not |
 | `--same-domain-only`, `--no-same-domain-only` | `filters.same_domain_only` | follow links on the start hosts only (the default), or on any host |
