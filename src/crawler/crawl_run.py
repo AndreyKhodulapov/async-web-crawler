@@ -1204,7 +1204,12 @@ def _first_of(errors: BaseExceptionGroup, kinds: tuple[type[Exception], ...]) ->
 
 
 def _page_record(result: FetchResult, page: ParsedPage, depth: int) -> PageRecord:
-    """A crawled page as a storage keeps it: the parsed page with the facts of its response."""
+    """A crawled page as a storage keeps it: the parsed page with the facts of its response.
+
+    The structured elements of the page and the problems met parsing it go
+    into `metadata`, which a storage keeps as JSON, rather than into columns
+    of their own.
+    """
     assert result.status is not None
     # The title has a field of its own.
     metadata = {name: value for name, value in page["metadata"].items() if name != "title"}
@@ -1213,7 +1218,16 @@ def _page_record(result: FetchResult, page: ParsedPage, depth: int) -> PageRecor
         title=page["title"] or "",
         text=page["text"],
         links=page["links"],
-        metadata={**metadata, "final_url": page["final_url"], "depth": depth},
+        metadata={
+            **metadata,
+            "final_url": page["final_url"],
+            "depth": depth,
+            "headings": page["headings"],
+            "images": page["images"],
+            "tables": page["tables"],
+            "lists": page["lists"],
+            "parse_errors": page["errors"],
+        },
         crawled_at=datetime.now(UTC),
         status_code=result.status,
         content_type=result.content_type or "",

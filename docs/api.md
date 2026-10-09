@@ -1243,7 +1243,7 @@ the same types:
 | `title` | the page title; an empty string if it has none |
 | `text` | visible text of the page |
 | `links` | absolute links found on the page |
-| `metadata` | `description`, `keywords`, `language`, `canonical`, `robots`, plus `final_url` (the URL after redirects) and `depth` in the crawl |
+| `metadata` | `description`, `keywords`, `language`, `canonical`, `robots`, plus `final_url` (the URL after redirects) and `depth` in the crawl, the `headings`, `images`, `tables` and `lists` of the page as in `ParsedPage`, and `parse_errors`, its `errors` (an empty list when the page parsed cleanly) |
 | `crawled_at` | when the page was processed: a `datetime` in UTC |
 | `status_code` | HTTP status of the response |
 | `content_type` | media type of the response; an empty string if the server sent none |

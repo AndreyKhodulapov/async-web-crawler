@@ -58,8 +58,8 @@ configuration file, by command-line options, or from Python.
 - **Clear error types** grouped by whether a retry can help; one failing
   URL never breaks a crawl; a size limit on every body, gzip bombs included
 - **HTML parsing** into title, metadata, text, links, images, headings,
-  tables and lists; broken HTML and any encoding are handled; runs in a
-  worker thread
+  tables and lists, all of them saved with the page; broken HTML and any
+  encoding are handled; runs in a worker thread
 - **Storage** behind one interface: JSON Lines or a JSON array, CSV,
   SQLite, PostgreSQL, or several at once; asynchronous writes in batches
   with retries; a file is added to by the next run, or started anew with

@@ -166,10 +166,11 @@ blocking the event loop, losing pages or writing them twice.
   is `UNIQUE`, which both forbids duplicates and gives the index that makes
   the upsert and lookups by URL fast.
 - Index what is queried: `crawled_at` (what changed since), `status_code`
-  (which pages failed). Every index slows inserts, so not "all columns".
+  (pages by status). Every index slows inserts, so not "all columns".
 - Check that an index is used: `EXPLAIN QUERY PLAN` (SQLite), `EXPLAIN
   ANALYZE` (PostgreSQL).
-- Semi-structured fields (links, meta tags) fit a JSON column: `JSONB` in
+- Semi-structured fields (links, meta tags, headings, tables) fit a JSON
+  column, and a new kind of them needs no migration. `JSONB` in
   PostgreSQL is binary, queryable (`metadata ->> 'language'`) and indexable
   with GIN; in SQLite it is text with JSON functions.
 - **Always bind parameters**; never format values into SQL. Page text is
