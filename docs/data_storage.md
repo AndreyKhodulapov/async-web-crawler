@@ -66,6 +66,15 @@ blocking the event loop, losing pages or writing them twice.
   cell; the header comes from the first record and must not be written twice
   on append; `utf-8-sig` adds the BOM Excel needs; decide what happens to a
   character the encoding lacks.
+- **Formulas in CSV**: a spreadsheet runs a cell that starts with `=`, `+`,
+  `-`, `@`, a tab or a carriage return as a formula, and the titles and
+  texts come from the sites (`=HYPERLINK(...)`). `CSVStorage` writes such a
+  value after an apostrophe (`escape_formulas`, on by default; the key
+  `storage.csv_escape_formulas`), and a value that starts with an
+  apostrophe too, so that `read` can drop it and return the value as it
+  was; an apostrophe followed by anything else is left alone, so files
+  written without escaping read as before. The list of the pages not saved
+  is escaped the same way.
 - **Empty vs missing**: CSV cannot tell `None` from `""`. If all backends
   must return the same record, normalize before saving (here: empty strings).
 - **Time**: store UTC, as ISO 8601 text or a `TIMESTAMPTZ`; ISO 8601 in one

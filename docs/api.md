@@ -869,7 +869,7 @@ asyncio.run(main())
 | `write_reports()` | writes the reports of the `report` section and returns their paths; `crawl()` calls it, call it yourself after a crawl that was cancelled |
 | `get_stats()` | the statistics of the latest crawl, see [Page statistics](#page-statistics); with proxies, `proxies` too: `{label: {state, requests, failures, times_removed}}`, also in the JSON and as a table in the HTML report; with rendering, `rendering`: `{rendered, failed, unrendered, avg_render_time}` (see `render_stats()` in [Rendering](#rendering)), also in the JSON and the HTML report |
 | `export_to_json(filename)`, `export_to_html_report(filename, title=)` | write the statistics to a file; the title is `report.title` by default |
-| `export_unsaved_pages(filename)` | writes `unsaved_pages` of the latest crawl to a CSV file with a header row, `url, outcome, reason, status, error`; a status or an error the page did not have is an empty cell; `write_reports()` calls it for `report.pages` |
+| `export_unsaved_pages(filename)` | writes `unsaved_pages` of the latest crawl to a CSV file with a header row, `url, outcome, reason, status, error`; a status or an error the page did not have is an empty cell; a value a spreadsheet would run as a formula is escaped as `CSVStorage` does it; `write_reports()` calls it for `report.pages` |
 | `await close()` | closes the crawler, writes what the storage still holds, stops logging to the file; `async with` does it too |
 | `config`, `crawler`, `storage`, `stats` | the configuration, the `AsyncCrawler` that does the work, its storage (`None` without outputs) and its `CrawlerStats`; `crawler.proxies` and `crawler.rendering` are the pool and the settings of rendering, `None` without them |
 | `reports` | the report files the latest `write_reports()` wrote |
@@ -1257,7 +1257,7 @@ the same types:
 | Storage | Keeps the pages in | Notes |
 |---------|--------------------|-------|
 | `JSONStorage(path, indent=None, overwrite=False)` | a JSON Lines file, or one indented array with `indent` | records are added without reading the file, and read back in pieces; the array is valid JSON after every write |
-| `CSVStorage(path, encoding="utf-8", overwrite=False)` | a CSV file with a header row | the header comes from the first record, or from the file if it exists; `links` and `metadata` are JSON in a cell; quoting per RFC 4180; a character the encoding lacks is written as `?` |
+| `CSVStorage(path, encoding="utf-8", overwrite=False, escape_formulas=True)` | a CSV file with a header row | the header comes from the first record, or from the file if it exists; `links` and `metadata` are JSON in a cell; quoting per RFC 4180; a character the encoding lacks is written as `?`; with `escape_formulas`, a value a spreadsheet would run as a formula (`=`, `+`, `-`, `@`, a tab or a carriage return at the start), or one starting with an apostrophe, is written after an apostrophe, which `read` drops |
 | `SQLiteStorage(path)` | the `pages` table of an SQLite file | `links` and `metadata` as JSON text, `crawled_at` as ISO 8601 in UTC |
 | `PostgresStorage(dsn)` | the `pages` table of a PostgreSQL database | `links` and `metadata` as `JSONB`, `crawled_at` as `TIMESTAMPTZ`; a connection pool |
 | `CompositeStorage(*storages)` | each of the storages | a page counts as written once all of them have it; one failing does not stop the others |

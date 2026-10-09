@@ -101,6 +101,7 @@ FULL = {
         "outputs": ["pages.jsonl", "pages.csv"],
         "batch_size": 50,
         "csv_encoding": "utf-8-sig",
+        "csv_escape_formulas": False,
         "overwrite": True,
     },
     "logging": {
@@ -165,7 +166,9 @@ class TestDefaults:
             same_domain_only=True, include=(), exclude=(), exclude_extensions=EXCLUDED_EXTENSIONS
         )
         assert {"pdf", "jpg", "zip", "mp4"} <= set(EXCLUDED_EXTENSIONS)
-        assert config.storage == StorageOptions(outputs=(), batch_size=100, csv_encoding="utf-8", overwrite=False)
+        assert config.storage == StorageOptions(
+            outputs=(), batch_size=100, csv_encoding="utf-8", csv_escape_formulas=True, overwrite=False
+        )
         assert config.logging == LoggingOptions(
             level="INFO", file=None, max_bytes=10 * 1024 * 1024, backup_count=5, console_format="text"
         )
@@ -323,6 +326,10 @@ class TestStorage:
         first, second = storage.storages
         assert isinstance(first, JSONStorage) and isinstance(second, CSVStorage)
         assert (second.encoding, first.batch_size, second.batch_size) == ("utf-8-sig", 7, 7)
+
+    def test_escaping_of_formulas_reaches_the_csv_files(self):
+        assert StorageOptions(outputs=("pages.csv",)).build().escape_formulas is True
+        assert StorageOptions(outputs=("pages.csv",), csv_escape_formulas=False).build().escape_formulas is False
 
     def test_overwrite_reaches_the_files(self):
         storage = StorageOptions(outputs=("pages.jsonl", "pages.csv", "pages.db"), overwrite=True).build()

@@ -348,6 +348,7 @@ class StorageOptions:
     outputs: tuple[str, ...] = _option((), check=_file_path)  # files by extension, or database URLs
     batch_size: int = _option(100, minimum=1)
     csv_encoding: str = "utf-8"
+    csv_escape_formulas: bool = True  # values a spreadsheet would run as formulas get an apostrophe, see CSVStorage
     overwrite: bool = False  # files are started anew instead of added to; databases keep a row per URL anyway
 
     def build(self) -> DataStorage | None:
@@ -359,7 +360,11 @@ class StorageOptions:
         """
         storages = [
             storage_from_output(
-                output, csv_encoding=self.csv_encoding, overwrite=self.overwrite, batch_size=self.batch_size
+                output,
+                csv_encoding=self.csv_encoding,
+                csv_escape_formulas=self.csv_escape_formulas,
+                overwrite=self.overwrite,
+                batch_size=self.batch_size,
             )
             for output in self.outputs
         ]

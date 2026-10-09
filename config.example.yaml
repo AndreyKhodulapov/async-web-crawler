@@ -106,6 +106,7 @@ storage:
   outputs: []           # e.g. [pages.jsonl, pages.csv]
   batch_size: 100       # pages written at once
   csv_encoding: utf-8   # utf-8-sig for Excel
+  csv_escape_formulas: true  # an apostrophe before a value that Excel would run as a formula (=, +, -, @)
   overwrite: false      # true starts the files anew; false adds to them (databases keep a row per URL)
 
 logging:

@@ -1,6 +1,7 @@
-"""Unit tests for the export of crawl statistics: the JSON file and the HTML report."""
+"""Unit tests for the export of crawl statistics: the JSON file, the HTML report and the list of the pages not saved."""
 
 import base64
+import csv
 import json
 import re
 from html import unescape
@@ -8,8 +9,8 @@ from html import unescape
 import pytest
 from helpers import FakeClock
 
-from crawler import CrawlerStats
-from crawler.report import render_html, render_json
+from crawler import CrawlerStats, UnsavedPage
+from crawler.report import render_html, render_json, unsaved_pages_csv
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 CHART = re.compile(r'<img src="data:image/png;base64,([A-Za-z0-9+/=]+)"')
@@ -122,6 +123,26 @@ def test_chart_labels_are_not_read_as_formulas():
     html = render_html(empty_stats() | {"total_pages": 1, "top_domains": {"$\\frac{$ host_name": 1}})
 
     assert len(CHART.findall(html)) == 1
+
+
+def test_unsaved_pages_that_a_spreadsheet_would_run_are_escaped(tmp_path):
+    path = tmp_path / "pages.csv"
+    pages = [
+        UnsavedPage("https://site/a", "failed", "-1 is not a page", 404, "@error"),
+        UnsavedPage("https://site/b", "skipped", "=HYPERLINK(1)"),
+        UnsavedPage("https://site/c", "blocked", "disallowed by robots.txt"),
+    ]
+
+    with unsaved_pages_csv(path) as writer:
+        writer.writerows(pages)
+
+    with path.open(encoding="utf-8", newline="") as file:
+        assert list(csv.reader(file)) == [
+            ["url", "outcome", "reason", "status", "error"],
+            ["https://site/a", "failed", "'-1 is not a page", "404", "'@error"],
+            ["https://site/b", "skipped", "'=HYPERLINK(1)", "", ""],
+            ["https://site/c", "blocked", "disallowed by robots.txt", "", ""],
+        ]
 
 
 def test_long_chart_label_is_kept_whole_in_the_table():

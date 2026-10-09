@@ -177,6 +177,63 @@ class TestValues:
             assert await read_all(storage) == records
 
 
+class TestFormulas:
+    @pytest.mark.parametrize("value", ['=HYPERLINK("https://evil","x")', "+1+1", "-2", "@SUM(A1)", "\tcmd", "\rcmd"])
+    async def test_value_a_spreadsheet_would_run_gets_an_apostrophe(self, tmp_path, value):
+        path = tmp_path / "pages.csv"
+        record = make_record(title=value, text=value, content_type=value)
+
+        async with CSVStorage(path) as storage:
+            await storage.save(record)
+
+            assert await read_all(storage) == [record]
+        # Read without translating line breaks: the carriage return is part of the value.
+        row = dict(zip(*csv.reader(io.StringIO(path.read_bytes().decode(), newline="")), strict=True))
+        assert (row["title"], row["text"], row["content_type"]) == (f"'{value}",) * 3
+
+    @pytest.mark.parametrize("value", ["'", "'quoted'", "'=1", "''=1", "' plain"])
+    async def test_value_that_starts_with_an_apostrophe_reads_back_as_it_was(self, tmp_path, value):
+        path = tmp_path / "pages.csv"
+        record = make_record(title=value)
+
+        async with CSVStorage(path) as storage:
+            await storage.save(record)
+
+            assert await read_all(storage) == [record]
+        assert dict(zip(*parse_csv(path), strict=True))["title"] == f"'{value}"
+
+    async def test_other_values_are_written_as_they_are(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        record = make_record("https://site/a", title="Price 5-10 = fair", text="a@b, 1+1", metadata={"a": "=1"})
+
+        async with CSVStorage(path) as storage:
+            await storage.save(record)
+
+        row = dict(zip(*parse_csv(path), strict=True))
+        assert (row["url"], row["title"], row["text"]) == ("https://site/a", "Price 5-10 = fair", "a@b, 1+1")
+        assert json.loads(row["metadata"]) == {"a": "=1"}
+
+    async def test_file_written_without_escaping_reads_as_before(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        records = [make_record("https://site/a", title="'quoted'"), make_record("https://site/b", title="=1")]
+
+        async with CSVStorage(path, escape_formulas=False) as storage:
+            await save_all(storage, records)
+
+        assert [row[1] for row in parse_csv(path)[1:]] == ["'quoted'", "=1"]
+        async with CSVStorage(path) as storage:
+            assert await read_all(storage) == records
+
+    async def test_without_escaping_values_are_read_as_written(self, tmp_path):
+        path = tmp_path / "pages.csv"
+        path.write_text(",".join(FIELDS) + "\n" + "https://site/a,'=1,,[],{},2025-03-14T15:09:26+00:00,200,\n")
+
+        async with CSVStorage(path, escape_formulas=False) as storage:
+            (record,) = await read_all(storage)
+
+        assert record["title"] == "'=1"
+
+
 class TestEncodings:
     @pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16", "cp1252", "latin-1"])
     async def test_file_is_written_in_the_encoding(self, tmp_path, encoding):

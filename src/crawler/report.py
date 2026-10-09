@@ -5,7 +5,7 @@ import contextlib
 import csv
 import json
 import textwrap
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from html import escape
 from http import HTTPStatus
@@ -15,6 +15,7 @@ from typing import Any
 
 from crawler.frontier import UnsavedPage
 from crawler.progress import format_duration
+from crawler.storage.csv_file import escape_formula
 
 # Colors of the charts and of the page around them.
 _SURFACE = "#fcfcfb"
@@ -33,10 +34,13 @@ def render_json(stats: Mapping[str, Any]) -> str:
 
 @contextlib.contextmanager
 def unsaved_pages_csv(path: Path) -> Iterator[Any]:
-    """Open `path` for the list of the pages not saved; yield a `csv.writer` that has written the header row.
+    """Open `path` for the list of the pages not saved; yield a writer that has written the header row.
 
-    The rows are `UnsavedPage`s, a status or an error that is None an
-    empty cell. The file is replaced if it exists.
+    The writer takes the rows with `writerows`. The rows are
+    `UnsavedPage`s, a status or an error that is None an empty cell. A
+    value a spreadsheet would take for a formula (a URL, a reason, an
+    error, all of them from the sites) is escaped as `CSVStorage` does it.
+    The file is replaced if it exists.
 
     Raises:
         OSError: the file cannot be written.
@@ -44,7 +48,19 @@ def unsaved_pages_csv(path: Path) -> Iterator[Any]:
     with path.open("w", encoding="utf-8", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(UnsavedPage._fields)
-        yield writer
+        yield _FormulaEscapingWriter(writer)
+
+
+class _FormulaEscapingWriter:
+    """A `csv.writer` that escapes the values a spreadsheet would take for formulas."""
+
+    def __init__(self, writer: Any) -> None:
+        self._writer = writer
+
+    def writerows(self, rows: Iterable[Iterable[object]]) -> None:
+        self._writer.writerows(
+            [escape_formula(value) if isinstance(value, str) else value for value in row] for row in rows
+        )
 
 
 def render_html(stats: Mapping[str, Any], *, title: str = "Crawl report") -> str:
