@@ -41,8 +41,9 @@ services:
       POSTGRES_USER: crawler
       POSTGRES_PASSWORD: crawler
       POSTGRES_DB: crawler
+    # The password is only for a local run: the port is open to this host alone.
     ports:
-      - "${CRAWLER_POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${CRAWLER_POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
