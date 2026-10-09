@@ -50,6 +50,9 @@ blocking the event loop, losing pages or writing them twice.
 | SQLite | queries, indexes, transactions, zero setup: one file | one writer at a time |
 | PostgreSQL | concurrent writers, `JSONB` queries, real types, scale | a server to run |
 
+- **JSON Lines or an array**: `JSONStorage(path)` writes JSON Lines whatever
+  the extension, so `json.load` fails on its `results.json` ("Extra data");
+  with `indent` it writes one array (and `--output x.json` of the CLI too).
 - **Append without reading**: a JSON array can still be appended in O(1):
   write `\n]\n` after the records, remember where it starts, and overwrite it
   with `,\n<record>\n]\n` next time. The file is valid JSON after every write.

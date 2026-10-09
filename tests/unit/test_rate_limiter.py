@@ -93,9 +93,11 @@ class TestSchedule:
         limiter = RateLimiter(2.0, per_domain=False, clock=clock)
         assert waits(limiter, ["a", "b", None]) == [0.0, 0.5, 1.0]
 
-    def test_domain_is_required_when_limits_are_per_domain(self):
-        with pytest.raises(ValueError, match="domain is required"):
-            RateLimiter().reserve()
+    def test_requests_without_a_domain_share_one_interval_when_limits_are_per_domain(self, clock):
+        # The defaults of the task: acquire() with no domain is spaced out
+        # from the other requests without one, not from those to a domain.
+        limiter = RateLimiter(2.0, clock=clock)
+        assert waits(limiter, [None, "a", None, "a", None]) == [0.0, 0.0, 0.5, 0.5, 1.0]
 
     def test_no_rate_means_no_waiting(self, clock):
         limiter = RateLimiter(None, clock=clock)
@@ -278,6 +280,14 @@ class TestAcquire:
         for _ in range(3):
             await limiter.acquire("a")
         assert time.perf_counter() - started >= 0.1 - EPSILON
+
+    async def test_acquire_with_the_defaults_waits_for_the_interval(self):
+        limiter = RateLimiter(20.0)  # 0.05 s apart
+        started = time.perf_counter()
+        for _ in range(3):
+            await limiter.acquire()
+        assert time.perf_counter() - started >= 0.1 - EPSILON
+        assert limiter.get_stats().requests == 3
 
     async def test_concurrent_requests_are_spaced_out(self):
         limiter = RateLimiter(20.0)  # 0.05 s apart

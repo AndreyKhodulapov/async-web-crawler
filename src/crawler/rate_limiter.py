@@ -51,6 +51,9 @@ class RateLimiter:
     request waits for its turn there first, then books the shared schedule.
     Booking both at once would let a domain waiting out a long delay hold
     the shared schedule, and every other domain with it.
+    A request without a domain (`acquire()`) books the shared schedule
+    alone, under either kind of limits: with `per_domain=True` the requests
+    without a domain are spaced out among themselves, as one more domain.
 
     A domain that answers HTTP 429 asks for fewer requests: `slow_down`
     doubles its interval, and the slowdown wears off by itself over time
@@ -174,8 +177,9 @@ class RateLimiter:
         For callers that sleep on their own. Unlike `acquire`, it books all
         schedules at once: under a global limit a domain's own delay then
         holds back the shared schedule too, and the booking does not move
-        if the domain is penalized after it. `domain` may be None only when
-        `per_domain` is False.
+        if the domain is penalized after it. With `domain` None, the request
+        books the shared schedule: under per-domain limits it is spaced out
+        only from the other requests without a domain.
         """
         now = self._clock()
         start = self._book(self._schedules(domain), now)
@@ -263,12 +267,12 @@ class RateLimiter:
 
     def _schedules(self, domain: str | None) -> list[tuple[str | None, float]]:
         """The schedules a request to `domain` waits for, with the interval of each, in order."""
-        if self.per_domain:
-            if domain is None:
-                raise ValueError("a domain is required when limits are per domain")
-            return [(domain, self.interval_for(domain))]
         shared: list[tuple[str | None, float]] = [(None, self.interval)]
-        return shared if domain is None else [(domain, self._own_delay(domain)), *shared]
+        if domain is None:
+            return shared
+        if self.per_domain:
+            return [(domain, self.interval_for(domain))]
+        return [(domain, self._own_delay(domain)), *shared]
 
     def _own_delay(self, domain: str) -> float:
         """The interval of `domain` alone: its Crawl-delay or what is left of its slowdown, whichever is longer."""

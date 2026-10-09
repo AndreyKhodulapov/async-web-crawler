@@ -72,6 +72,10 @@ leaves a failing site alone.
 - **Retry at one layer**. If the HTTP client, the crawler and the job
   scheduler each make 3 retries, one failing page costs 4 x 4 x 4 = 64
   requests. Here only `RetryStrategy` retries; aiohttp does not.
+  `retry_strategy.execute_with_retry(crawler.fetch_url, url)` adds a second
+  layer: `fetch_url` already retries inside, so with 3 retries in each one
+  503 page costs 4 x 4 = 16 requests. Wrap a function of your own, or give
+  the crawler `RetryStrategy(max_retries=0)`.
 - **Cap the retries**: in total per request (`max_retries`) and per kind of
   error (`RetryRule`). Large systems add a **retry budget**: retries may be at
   most a share of all requests (Finagle, Envoy), so when a whole service
